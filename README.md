@@ -16,12 +16,14 @@
 - 多入口接入：以 FastAPI Gateway、Telegram Bot、Feishu/Lark Bot 为主要入口，同时保留 TUI 用于本地调试。
 - 多 Agent 委派：支持本地 worker 和远端 `remote_ref`，统一通过 task 控制面调度。
 - MCP 工具治理：支持多 MCP server 加载、工具缓存、重名冲突处理、schema 参数校验、工具搜索和按 agent scope 注入。
+- skills:支持给agent配置skills 拓展agent的能力边界
 - 异步任务运行时：支持 `spawn_agent`、`wait_agent`、`send_input`、`cancel_agent`、任务状态查询和终态通知。
 - 任务持久化：基于 SQLite 保存 task、route、checkpoint、review audit 等运行状态。
 - HITL 审批：把 root agent 和 worker/subagent 的审批请求统一投影为 review 资源。
 - 权限策略：基于 `permissions.toml` 声明工具白名单、shell 命令前缀规则、审批策略和拒绝策略。
 - Gateway 控制面：提供 agents、tasks、reviews、artifact download 等 HTTP API。
 - 委派安全边界：通过 delegation context 记录 `root_id`、`depth`、`visited_nodes`，防止环路和深度超限。
+- 执行环境隔离：支持 `local` 和 `daytona` backend，可通过 Daytona sandbox 隔离物理机与 Agent shell 执行环境。
 
 ## 架构图
 
@@ -285,7 +287,13 @@ uv run pytest
 - 对公网暴露 Gateway 前，必须设置强 `GATEWAY_BEARER_TOKEN`，并建议放在反向代理、TLS 和网络访问控制之后。
 - 开源发布前请脱敏 `config/agents.toml`，尤其是远端 URL、私有人设、内部 worker 名称和默认权限 profile。
 
-
+## todo
+- [ ] agent跨线程记忆,接入TencentDB-Agent-Memory （即将完成）
+- [ ] skills 同步机制,自动同步不同wokespace下的skills (正在执行)
+- [ ] 增加示例agent_team,增加开箱使用体验
+- [ ] 更清晰的部署教程（正在执行）
+- [ ] 探索AI 小组/会议 形式的agent协作形式
+- [ ] 增加和优化channle体验(已经支持飞书/telegram)
 ## License
 
 MIT License. See [LICENSE](LICENSE).
