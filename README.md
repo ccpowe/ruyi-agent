@@ -4,6 +4,13 @@
 
 项目仍处在实验和快速演进阶段，适合研究、二次开发和小规模自托管验证。生产环境使用前请重点检查权限策略、Gateway 暴露方式、backend 隔离和密钥管理。
 
+## Demos
+
+![Ruyi Agent 简短演示](docs/简短演示.gif)
+
+- [PPT generation demo](https://github.com/ccpowe/ruyi-agent/releases/download/%E6%BC%94%E7%A4%BA/ruyi_ppt.mp4)：通过 agent workflow 生成演示 PPT。
+- [Snake web app demo](https://github.com/ccpowe/ruyi-agent/releases/download/%E6%BC%94%E7%A4%BA/ruyi_snake.mp4)：通过 agent workflow 生成并运行 Web 贪吃蛇应用。
+
 ## 核心能力
 
 - 多入口接入：以 FastAPI Gateway、Telegram Bot、Feishu/Lark Bot 为主要入口，同时保留 TUI 用于本地调试。
@@ -176,15 +183,6 @@ uv run python main.py tui
 TUI 主要用于本地开发和调试。旧的 `cli` 单轮命令行对话模式已经移除，因为它无法自然承载多 agent task、review 和 channel session 语义。
 
 
-## Demos
-
-完整演示视频通过 GitHub Release assets 托管，仓库内只保留轻量截图或 WebP/GIF 预览。
-
-- [PPT generation demo](https://github.com/ccpowe/ruyi-agent/releases/download/%E6%BC%94%E7%A4%BA/ruyi_ppt.mp4)：通过 agent workflow 生成演示 PPT。
-- [Snake web app demo](https://github.com/ccpowe/ruyi-agent/releases/download/%E6%BC%94%E7%A4%BA/ruyi_snake.mp4)：通过 agent workflow 生成并运行 Web 贪吃蛇应用。
-
-后续可在 `docs/assets/` 中加入 `demo-ppt-cover.webp` 和 `demo-snake-cover.webp` 作为 README 预览封面。
-
 ## 模型 Provider
 
 OpenRouter 和 Kimi/Moonshot 通过 `config/llm_providers.toml` 配置，agent 在 `config/agents.toml` 中通过 `provider` 字段引用。
@@ -286,6 +284,7 @@ uv run pytest
 - `BACKEND_KIND=local` 会在本机执行 shell 命令，不提供 Daytona 级别的进程隔离。
 - 对公网暴露 Gateway 前，必须设置强 `GATEWAY_BEARER_TOKEN`，并建议放在反向代理、TLS 和网络访问控制之后。
 - 开源发布前请脱敏 `config/agents.toml`，尤其是远端 URL、私有人设、内部 worker 名称和默认权限 profile。
+
 
 ## License
 
