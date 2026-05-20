@@ -178,12 +178,12 @@ TUI 主要用于本地开发和调试。旧的 `cli` 单轮命令行对话模式
 
 ## Demos
 
-完整演示视频建议通过 GitHub Release assets 托管，仓库内只保留轻量截图或 WebP/GIF 预览。
+完整演示视频通过 GitHub Release assets 托管，仓库内只保留轻量截图或 WebP/GIF 预览。
 
-后续可在 `docs/assets/` 中加入：
+- [PPT generation demo](https://github.com/ccpowe/ruyi-agent/releases/download/%E6%BC%94%E7%A4%BA/ruyi_ppt.mp4)：通过 agent workflow 生成演示 PPT。
+- [Snake web app demo](https://github.com/ccpowe/ruyi-agent/releases/download/%E6%BC%94%E7%A4%BA/ruyi_snake.mp4)：通过 agent workflow 生成并运行 Web 贪吃蛇应用。
 
-- `demo-ppt-cover.webp`：通过 agent workflow 生成演示 PPT。
-- `demo-snake-cover.webp`：通过 agent workflow 生成并运行 Web 贪吃蛇应用。
+后续可在 `docs/assets/` 中加入 `demo-ppt-cover.webp` 和 `demo-snake-cover.webp` 作为 README 预览封面。
 
 ## 模型 Provider
 
