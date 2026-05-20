@@ -1,0 +1,9 @@
+[mcp_servers.exa]
+transport = "http"
+url = "https://mcp.exa.ai/mcp"
+description = "Search and fetch web content."
+
+[mcp_servers.deepwiki]
+transport = "http"
+url = "https://mcp.deepwiki.com/mcp"
+description = "Answer questions about GitHub repositories using DeepWiki."

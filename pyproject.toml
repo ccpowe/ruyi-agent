@@ -1,0 +1,40 @@
+[project]
+name = "ruyi-agent"
+version = "0.1.0"
+description = "Agent runtime for multi-entrypoint delegation, MCP tools, HITL approvals, and gateway control planes"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.13"
+dependencies = [
+    "aiosqlite>=0.22.1",
+    "deepagents>=0.5,<0.6",
+    "fastapi>=0.116.0",
+    "httpx>=0.28.1",
+    "jsonschema>=4.0.0",
+    "langchain-daytona>=0.0.4",
+    "langchain-mcp-adapters>=0.2.2",
+    "langchain-anthropic>=1.4.0",
+    "langchain-moonshot>=0.1.0",
+    "langchain-openai>=1.0.0",
+    "langchain-openrouter>=0.2.1",
+    "langgraph-checkpoint-sqlite>=3.0.3",
+    "lark-oapi>=1.4.22",
+    "prompt-toolkit>=3.0.50",
+    "typer>=0.22.0",
+    "uvicorn>=0.35.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

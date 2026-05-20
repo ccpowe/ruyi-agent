@@ -1,0 +1,164 @@
+default_profile = "standard"
+
+[profiles.standard]
+description = "Default local runtime permission profile"
+
+[profiles.standard.tools.ls]
+policy = "allow"
+
+[profiles.standard.tools.read_file]
+policy = "allow"
+
+[profiles.standard.tools.grep]
+policy = "allow"
+
+[profiles.standard.tools.glob]
+policy = "allow"
+
+[profiles.standard.tools.write_file]
+policy = "require_approval"
+allowed_decisions = ["approve", "edit", "reject"]
+
+[profiles.standard.tools.edit_file]
+policy = "require_approval"
+allowed_decisions = ["approve", "edit", "reject"]
+
+[profiles.standard.tools.execute]
+policy = "require_approval"
+allowed_decisions = ["approve", "edit", "reject"]
+
+[profiles.standard.tools.cancel_agent]
+policy = "require_approval"
+allowed_decisions = ["approve", "edit", "reject"]
+
+[profiles.standard.tools.spawn_agent]
+policy = "allow"
+
+[profiles.standard.tools.wait_agent]
+policy = "allow"
+
+[profiles.standard.tools.check_agent]
+policy = "allow"
+
+[profiles.standard.tools.send_input]
+policy = "allow"
+
+[profiles.standard.tools.list_agents]
+policy = "allow"
+
+[profiles.standard.tools.tool_search]
+policy = "allow"
+
+[profiles.standard.tools.call_tool]
+policy = "require_approval"
+allowed_decisions = ["approve", "edit", "reject"]
+
+[profiles.standard.tools.default]
+policy = "require_approval"
+allowed_decisions = ["approve", "edit", "reject"]
+
+[[profiles.standard.execute.rules]]
+match = ["git", "status"]
+policy = "allow"
+
+[[profiles.standard.execute.rules]]
+match = ["git", "diff"]
+policy = "allow"
+
+[[profiles.standard.execute.rules]]
+match = ["uv", "run", "pytest"]
+policy = "allow"
+
+[[profiles.standard.execute.rules]]
+match = ["rm"]
+policy = "deny"
+
+[[profiles.standard.execute.rules]]
+match = ["git", "reset", "--hard"]
+policy = "deny"
+
+[[profiles.standard.execute.rules]]
+match = ["git", "clean"]
+policy = "deny"
+
+[profiles.yolo]
+description = "Low-friction runtime profile for trusted interactive use"
+
+[profiles.yolo.tools.ls]
+policy = "allow"
+
+[profiles.yolo.tools.read_file]
+policy = "allow"
+
+[profiles.yolo.tools.grep]
+policy = "allow"
+
+[profiles.yolo.tools.glob]
+policy = "allow"
+
+[profiles.yolo.tools.write_file]
+policy = "allow"
+
+[profiles.yolo.tools.edit_file]
+policy = "allow"
+
+[profiles.yolo.tools.execute]
+policy = "allow"
+allowed_decisions = ["approve", "edit", "reject"]
+
+[profiles.yolo.tools.cancel_agent]
+policy = "require_approval"
+allowed_decisions = ["approve", "edit", "reject"]
+
+[profiles.yolo.tools.spawn_agent]
+policy = "allow"
+
+[profiles.yolo.tools.wait_agent]
+policy = "require_approval"
+allowed_decisions = ["approve", "reject"]
+
+[profiles.yolo.tools.check_agent]
+policy = "allow"
+
+[profiles.yolo.tools.send_input]
+policy = "allow"
+
+[profiles.yolo.tools.list_agents]
+policy = "allow"
+
+[profiles.yolo.tools.tool_search]
+policy = "allow"
+
+[profiles.yolo.tools.call_tool]
+policy = "allow"
+
+[profiles.yolo.tools.default]
+policy = "allow"
+
+[profiles.yolo.execute]
+# YOLO keeps high-impact operations review-gated, but allows ordinary compound
+# shell commands such as `uv sync && uv run pytest` without repeated approvals.
+review_risks = [
+  "command_parse_error",
+  "empty_command",
+  "privilege_escalation",
+  "git_destructive",
+  "destructive_filesystem",
+  "recursive_permission_change",
+]
+
+[[profiles.yolo.execute.rules]]
+match = ["rm"]
+policy = "deny"
+
+[[profiles.yolo.execute.rules]]
+match = ["rmdir"]
+policy = "deny"
+
+[[profiles.yolo.execute.rules]]
+match = ["git", "reset", "--hard"]
+policy = "deny"
+
+[[profiles.yolo.execute.rules]]
+match = ["git", "clean"]
+policy = "deny"
