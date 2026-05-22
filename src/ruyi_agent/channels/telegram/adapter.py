@@ -42,6 +42,8 @@ MEDIA_TAG_PATTERN = re.compile(
 )
 TELEGRAM_API_HOST = "api.telegram.org"
 TELEGRAM_FALLBACK_SEED_IPS = ["149.154.167.220", "149.154.167.99", "149.154.167.50"]
+DEFAULT_GATEWAY_BEARER_TOKEN = "dev-token"
+DEFAULT_CHANNEL_SESSION_DB = "data/channel_sessions.sqlite3"
 DEFAULT_TELEGRAM_MEDIA_MAX_BYTES = 50 * 1024 * 1024
 IMAGE_ATTACHMENT_EXTENSIONS = {
     ".png",
@@ -2015,13 +2017,13 @@ async def run_telegram_adapter() -> None:
     if not bot_token:
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
     gateway_base_url = os.getenv("GATEWAY_BASE_URL", "http://127.0.0.1:8000")
-    gateway_bearer_token = os.getenv("GATEWAY_BEARER_TOKEN")
-    if not gateway_bearer_token:
-        raise SystemExit("Missing GATEWAY_BEARER_TOKEN")
+    gateway_bearer_token = (
+        os.getenv("GATEWAY_BEARER_TOKEN") or DEFAULT_GATEWAY_BEARER_TOKEN
+    )
     default_agent_name = os.getenv("TELEGRAM_DEFAULT_AGENT", "main")
     session_db_path = os.getenv(
         "TELEGRAM_SESSION_DB",
-        os.getenv("CHANNEL_SESSION_DB", ".ruyi_agent/channel_sessions.sqlite3"),
+        os.getenv("CHANNEL_SESSION_DB", DEFAULT_CHANNEL_SESSION_DB),
     )
     update_db_path = os.getenv(
         "TELEGRAM_UPDATE_DB",

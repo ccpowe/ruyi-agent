@@ -3,8 +3,10 @@ from __future__ import annotations
 import pytest
 
 from ruyi_agent.runtime.bootstrap import AppRuntime
+from ruyi_agent.runtime.bootstrap import DEFAULT_AGENT_NODE_ID
 from ruyi_agent.runtime.bootstrap import _attach_delegation_scopes_to_local_specs
-from ruyi_agent.runtime.bootstrap import _read_required_node_id_env
+from ruyi_agent.runtime.bootstrap import _is_loopback_gateway_host
+from ruyi_agent.runtime.bootstrap import _read_node_id_env
 from ruyi_agent.config.loader import LocalWorkerSpec
 from ruyi_agent.config.loader import RemoteRef
 
@@ -157,18 +159,33 @@ def test_app_runtime_rejects_non_local_agent_for_streaming() -> None:
         runtime.get_local_agent("remote_wiki")
 
 
-def test_read_required_node_id_env_rejects_missing_value(
+def test_read_node_id_env_uses_default_for_missing_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("AGENT_NODE_ID", raising=False)
 
-    with pytest.raises(ValueError, match="AGENT_NODE_ID must be set"):
-        _read_required_node_id_env()
+    assert _read_node_id_env() == DEFAULT_AGENT_NODE_ID
 
 
-def test_read_required_node_id_env_returns_configured_value(
+def test_read_node_id_env_returns_configured_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AGENT_NODE_ID", "node-a")
 
-    assert _read_required_node_id_env() == "node-a"
+    assert _read_node_id_env() == "node-a"
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["127.0.0.1", "localhost", "::1", "[::1]"],
+)
+def test_is_loopback_gateway_host_accepts_local_hosts(host: str) -> None:
+    assert _is_loopback_gateway_host(host)
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["0.0.0.0", "::", "example.com"],
+)
+def test_is_loopback_gateway_host_rejects_public_hosts(host: str) -> None:
+    assert not _is_loopback_gateway_host(host)

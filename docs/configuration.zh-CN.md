@@ -15,13 +15,23 @@ Ruyi Agent 的运行配置分为四层：
 cp .env.example .env
 ```
 
-最小本地 Gateway 运行通常需要：
+默认 `config/agents.toml` 使用 OpenRouter，因此最小本地 Gateway/TUI 运行通常只需要：
 
 ```bash
-AGENT_NODE_ID="local-dev"
-BACKEND_KIND="local"
 OPENROUTER_API_KEY="<your-openrouter-api-key>"
-GATEWAY_BEARER_TOKEN="<long-random-token>"
+```
+
+Telegram 额外需要：
+
+```bash
+TELEGRAM_BOT_TOKEN="<your-telegram-bot-token>"
+```
+
+Feishu/Lark 额外需要：
+
+```bash
+FEISHU_APP_ID="<your-feishu-app-id>"
+FEISHU_APP_SECRET="<your-feishu-app-secret>"
 ```
 
 常用变量：
@@ -29,16 +39,16 @@ GATEWAY_BEARER_TOKEN="<long-random-token>"
 | 变量 | 说明 |
 | --- | --- |
 | `APP_MODE` | 不传命令参数时的默认模式。建议默认 `gateway`。 |
-| `AGENT_NODE_ID` | 当前节点稳定 ID，用于远端委派环路检测。必填。 |
+| `AGENT_NODE_ID` | 当前节点稳定 ID，用于远端委派环路检测。单节点本地默认 `local-dev`。 |
 | `BACKEND_KIND` | 工具执行 backend。开发环境建议 `local`，隔离环境可用 `daytona`。 |
 | `LOCAL_BACKEND_ROOT` | `BACKEND_KIND=local` 时暴露给 agent 的工作目录。留空表示当前目录。 |
 | `OPENROUTER_API_KEY` | `provider = "openrouter"` 时使用。 |
 | `KIMI_API_KEY` | `provider = "kimi"` 时使用。 |
-| `GATEWAY_BEARER_TOKEN` | Gateway HTTP API 认证 token。不要使用默认值对外暴露服务。 |
+| `GATEWAY_BEARER_TOKEN` | Gateway HTTP API 认证 token。本地默认 `dev-token`；不要使用默认值对外暴露服务。 |
 | `GATEWAY_BASE_URL` | Telegram / Feishu adapter 调用 Gateway 的地址。 |
-| `CHECKPOINT_DB` | LangGraph checkpoint SQLite 路径。 |
-| `TASK_DB` | async task 状态 SQLite 路径。 |
-| `REVIEW_AUDIT_DB` | HITL 审批审计 SQLite 路径。 |
+| `CHECKPOINT_DB` | LangGraph checkpoint SQLite 路径，默认 `data/checkpoints.sqlite`。 |
+| `TASK_DB` | async task 状态 SQLite 路径，默认 `data/tasks.sqlite`。 |
+| `REVIEW_AUDIT_DB` | HITL 审批审计 SQLite 路径，默认 `data/review_audit.sqlite`。 |
 | `AGENT_MAX_DELEGATION_DEPTH` | 每个 root task 下最大委派深度。 |
 | `AGENT_MAX_TASKS_PER_ROOT` | 每个 root task 下最多创建的 subagent task 数量。 |
 | `TELEGRAM_BOT_TOKEN` | Telegram mode 必填。 |

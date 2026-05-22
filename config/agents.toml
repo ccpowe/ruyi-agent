@@ -9,14 +9,14 @@ public = true
 name = "main"
 description = "General entry agent that can delegate focused research tasks."
 system_prompt = "You are a practical engineering assistant. Be concise, accurate, and explicit about assumptions."
-provider = "openrouter"
-model = "qwen/qwen3.6-plus"
+provider = "openai_codex"
+model = "gpt-5.4"
 memory = []
-skills = []
-server_names = []
+skills = ["data/skills"]
+server_names = ["exa"]
 tool_names = []
 workers = ["background_research"]
-permission_profile = "standard"
+permission_profile = "yolo"
 
 [agents.background_research]
 kind = "local"
@@ -24,14 +24,14 @@ public = false
 name = "background_research"
 description = "Research worker that can answer questions about public GitHub repositories and web-accessible documentation."
 system_prompt = "You are a background research worker. Return a clear answer, important evidence, and any uncertainty."
-provider = "openrouter"
-model = "qwen/qwen3.6-plus"
+provider = "openai_codex"
+model = "gpt-5.4"
 memory = []
 skills = []
 server_names = ["deepwiki"]
 tool_names = []
 workers = []
-permission_profile = "standard"
+permission_profile = "yolo"
 
 # Example remote_ref. Uncomment and set a real gateway URL only when you operate
 # another ruyi-agent Gateway instance.

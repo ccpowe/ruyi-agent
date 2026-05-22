@@ -4,6 +4,8 @@ import os
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from ipaddress import ip_address
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -40,11 +42,16 @@ from ruyi_agent.storage.task_store import TaskStore
 from ruyi_agent.control_plane.permissions import PermissionPolicy
 from ruyi_agent.storage.review_audit import ReviewAuditStore
 
-# 默认的配置 代码优先会从env读取
-# 注意：不要在生产环境依赖默认 token；生产必须显式设置 GATEWAY_BEARER_TOKEN。
+# 默认的配置 代码优先会从env读取。
+# 注意：dev-token 只适合本机开发；对外暴露 Gateway 必须显式设置强 GATEWAY_BEARER_TOKEN。
+DEFAULT_AGENT_NODE_ID = "local-dev"
 DEFAULT_GATEWAY_TOKEN = "dev-token"
 DEFAULT_GATEWAY_HOST = "127.0.0.1"
 DEFAULT_GATEWAY_PORT = 8000
+DEFAULT_CHECKPOINT_DB = "data/checkpoints.sqlite"
+DEFAULT_GATEWAY_ROUTE_DB = "data/gateway_routes.sqlite"
+DEFAULT_TASK_DB = "data/tasks.sqlite"
+DEFAULT_REVIEW_AUDIT_DB = "data/review_audit.sqlite"
 DEFAULT_MAX_DELEGATION_DEPTH = 3
 DEFAULT_MAX_TASKS_PER_ROOT = 20
 
@@ -62,14 +69,29 @@ def _read_positive_int_env(name: str, default: int) -> int:
     return value
 
 
-def _read_required_node_id_env() -> str:
+def _read_node_id_env() -> str:
     raw_value = os.getenv("AGENT_NODE_ID")
     if raw_value is None or not raw_value.strip():
-        raise ValueError(
-            "AGENT_NODE_ID must be set to a stable node identifier for Gateway "
-            "delegation loop detection."
-        )
+        return DEFAULT_AGENT_NODE_ID
     return validate_node_id(raw_value.strip())
+
+
+def _ensure_sqlite_parent_dir(path: str) -> None:
+    if not path or path == ":memory:" or path.startswith("file:"):
+        return
+    parent = Path(path).expanduser().parent
+    if parent != Path("."):
+        parent.mkdir(parents=True, exist_ok=True)
+
+
+def _is_loopback_gateway_host(host: str) -> bool:
+    normalized = host.strip().strip("[]").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 @dataclass(slots=True)
@@ -198,7 +220,7 @@ async def bootstrap_application():
 
     load_dotenv()
 
-    node_id = _read_required_node_id_env()
+    node_id = _read_node_id_env()
 
     # backend 决定 skills、memory 和执行状态所在的位置，所以要先创建 backend，
     # 再把声明式配置翻译成真正可运行的 agent spec。
@@ -206,10 +228,10 @@ async def bootstrap_application():
     home_dir = backend_runtime.home_dir
     skills_root = backend_runtime.skills_root
     agent_backend = backend_runtime.backend
-    checkpoint_db = os.getenv("CHECKPOINT_DB", "checkpoints.sqlite")
-    route_db = os.getenv("GATEWAY_ROUTE_DB", "gateway_routes.sqlite")
-    task_db = os.getenv("TASK_DB", "tasks.sqlite")
-    review_audit_db = os.getenv("REVIEW_AUDIT_DB", "review_audit.sqlite")
+    checkpoint_db = os.getenv("CHECKPOINT_DB", DEFAULT_CHECKPOINT_DB)
+    route_db = os.getenv("GATEWAY_ROUTE_DB", DEFAULT_GATEWAY_ROUTE_DB)
+    task_db = os.getenv("TASK_DB", DEFAULT_TASK_DB)
+    review_audit_db = os.getenv("REVIEW_AUDIT_DB", DEFAULT_REVIEW_AUDIT_DB)
     max_delegation_depth = _read_positive_int_env(
         "AGENT_MAX_DELEGATION_DEPTH",
         DEFAULT_MAX_DELEGATION_DEPTH,
@@ -219,9 +241,10 @@ async def bootstrap_application():
         DEFAULT_MAX_TASKS_PER_ROOT,
     )
     webhook_url = os.getenv("A2A_WEBHOOK_URL")
-    webhook_token = os.getenv(
-        "A2A_WEBHOOK_TOKEN",
-        os.getenv("GATEWAY_BEARER_TOKEN", DEFAULT_GATEWAY_TOKEN),
+    webhook_token = (
+        os.getenv("A2A_WEBHOOK_TOKEN")
+        or os.getenv("GATEWAY_BEARER_TOKEN")
+        or DEFAULT_GATEWAY_TOKEN
     )
     mailbox = AgentMailbox()
 
@@ -248,6 +271,7 @@ async def bootstrap_application():
     try:
         # checkpointer 和 route store 是进程级状态对象。两个 AgentControl 共享同一个
         # checkpointer，让 task 执行状态和主 agent 对话状态落在同一条持久化边界内。
+        _ensure_sqlite_parent_dir(checkpoint_db)
         async with AsyncSqliteSaver.from_conn_string(checkpoint_db) as checkpointer:
             route_store = GatewayRouteStore(route_db)
             task_store = TaskStore(task_db)
@@ -421,16 +445,19 @@ def create_bootstrapped_gateway_app() -> FastAPI:
     """
 
     load_dotenv()
-    bearer_token = os.getenv("GATEWAY_BEARER_TOKEN", DEFAULT_GATEWAY_TOKEN)
+    bearer_token = os.getenv("GATEWAY_BEARER_TOKEN") or DEFAULT_GATEWAY_TOKEN
+    gateway_host = os.getenv("GATEWAY_HOST", DEFAULT_GATEWAY_HOST)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """在 HTTP 服务生命周期内打开 runtime，并把它暴露到 app.state。"""
 
-        if not bearer_token or bearer_token == DEFAULT_GATEWAY_TOKEN:
+        if bearer_token == DEFAULT_GATEWAY_TOKEN and not _is_loopback_gateway_host(
+            gateway_host
+        ):
             raise SystemExit(
                 "Insecure configuration: set a non-default GATEWAY_BEARER_TOKEN "
-                "before starting gateway/telegram mode."
+                "before exposing Gateway outside localhost."
             )
         async with bootstrap_application() as runtime:
             app.state.app_runtime = runtime

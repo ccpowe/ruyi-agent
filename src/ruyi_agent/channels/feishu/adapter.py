@@ -26,6 +26,8 @@ RUNNING_STATES = {"pending", "running"}
 TERMINAL_STATES = {"completed", "failed", "cancelled", "interrupted"}
 FEISHU_TEXT_CHUNK_LIMIT = 4000
 DEFAULT_FEISHU_MEDIA_MAX_BYTES = 30 * 1024 * 1024
+DEFAULT_GATEWAY_BEARER_TOKEN = "dev-token"
+DEFAULT_CHANNEL_SESSION_DB = "data/channel_sessions.sqlite3"
 FEISHU_ACK_MODES = {"reaction", "message", "off"}
 MEDIA_TAG_PATTERN = re.compile(
     r"(?m)^(?P<indent>\s*)`?MEDIA:(?P<path>[^`\s]+)`?\s*$"
@@ -1964,20 +1966,20 @@ async def run_feishu_adapter() -> None:
     if connection_mode != "websocket":
         raise SystemExit("Only FEISHU_CONNECTION_MODE=websocket is supported for now")
     gateway_base_url = os.getenv("GATEWAY_BASE_URL", "http://127.0.0.1:8000")
-    gateway_bearer_token = os.getenv("GATEWAY_BEARER_TOKEN")
-    if not gateway_bearer_token:
-        raise SystemExit("Missing GATEWAY_BEARER_TOKEN")
+    gateway_bearer_token = (
+        os.getenv("GATEWAY_BEARER_TOKEN") or DEFAULT_GATEWAY_BEARER_TOKEN
+    )
     default_agent_name = os.getenv("FEISHU_DEFAULT_AGENT", "main")
     session_db_path = os.getenv(
         "FEISHU_SESSION_DB",
-        os.getenv("CHANNEL_SESSION_DB", ".ruyi_agent/channel_sessions.sqlite3"),
+        os.getenv("CHANNEL_SESSION_DB", DEFAULT_CHANNEL_SESSION_DB),
     )
     event_db_path = os.getenv(
         "FEISHU_EVENT_DB",
         str(Path(session_db_path).expanduser().with_name("feishu_events.sqlite3")),
     )
     require_mention = _env_bool("FEISHU_REQUIRE_MENTION", default=True)
-    group_policy = os.getenv("FEISHU_GROUP_POLICY", "open").strip().lower()
+    group_policy = os.getenv("FEISHU_GROUP_POLICY", "disabled").strip().lower()
     bot_open_id = os.getenv("FEISHU_BOT_OPEN_ID") or None
     bot_user_id = os.getenv("FEISHU_BOT_USER_ID") or None
     bot_union_id = os.getenv("FEISHU_BOT_UNION_ID") or None
