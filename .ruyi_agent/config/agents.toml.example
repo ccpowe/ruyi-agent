@@ -1,5 +1,5 @@
 # Safe starter config for a public repository.
-# Copy to config/agents.toml, then adjust model/provider/tool scopes for your use case.
+# Copy to .ruyi_agent/config/agents.toml, then adjust model/provider/tool scopes for your use case.
 
 main_agent = "main"
 

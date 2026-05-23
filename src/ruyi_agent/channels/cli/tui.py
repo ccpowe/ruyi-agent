@@ -1,27 +1,24 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
-import typer
-from langgraph.types import Command
-from rich.console import Console
-from rich.panel import Panel
-from rich.prompt import Prompt
-from rich.syntax import Syntax
-from rich.table import Table
+import httpx
 
-from ruyi_agent.runtime.bootstrap import bootstrap_application
-from ruyi_agent.runtime.delegation.async_runtime import AgentControl, TaskRecord
+from ruyi_agent.channels.cli.approval_presenter import ApprovalPresenter
+from ruyi_agent.channels.cli.event_adapter import (
+    resume_command_from_decisions,
+    stream_agent_events,
+)
 from ruyi_agent.runtime.agent_turn import normalize_agent_turn
-from ruyi_agent.control_plane.contracts import ReviewDecision, ReviewDecisionKind, ReviewSnapshot
-from ruyi_agent.control_plane.reviews import ReviewControl
-
-app = typer.Typer(help="Review-control TUI MVP.", invoke_without_command=True)
-console = Console()
+from ruyi_agent.runtime.bootstrap import bootstrap_application
+from ruyi_agent.channels.cli.commands import COMMAND_NAMES, CliState, SlashCommandHandler
+from ruyi_agent.channels.cli.prompt import InteractivePrompt
+from ruyi_agent.channels.cli.renderer import InteractiveRenderer
+from ruyi_agent.control_plane.reviews import ReviewControl, runtime_decisions_from_review_payload
 
 
 @dataclass(slots=True)
@@ -32,28 +29,11 @@ class RootTurnResult:
     interrupt_requests: list[dict[str, Any]] = field(default_factory=list)
 
 
-def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
-
-
 @dataclass(slots=True)
 class LocalRootRunner:
     get_agent: Any
     resolve_permission_profile: Any
-
-    async def run_user_message(
-        self,
-        *,
-        agent_name: str,
-        thread_id: str,
-        content: str,
-        metadata: dict[str, Any] | None = None,
-    ) -> RootTurnResult:
-        return await self._run_payload(
-            agent_name=agent_name,
-            thread_id=thread_id,
-            payload={"messages": [{"role": "user", "content": content}]},
-        )
+    resolve_skill_config: Any | None = None
 
     async def resume_review(
         self,
@@ -62,28 +42,18 @@ class LocalRootRunner:
         thread_id: str,
         decisions: list[dict[str, Any]],
     ) -> RootTurnResult:
-        return await self._run_payload(
+        agent = self.get_agent(agent_name)
+        config = _agent_config(
             agent_name=agent_name,
             thread_id=thread_id,
-            payload=Command(resume={"decisions": decisions}),
+            resolve_permission_profile=self.resolve_permission_profile,
+            resolve_skill_config=self.resolve_skill_config,
         )
-
-    async def _run_payload(
-        self,
-        *,
-        agent_name: str,
-        thread_id: str,
-        payload: Any,
-    ) -> RootTurnResult:
-        agent = self.get_agent(agent_name)
-        config = {
-            "configurable": {
-                "thread_id": thread_id,
-                "agent_name": agent_name,
-                "permission_profile": self.resolve_permission_profile(agent_name),
-            }
-        }
-        result = await agent.ainvoke(payload, config=config, version="v2")
+        result = await agent.ainvoke(
+            resume_command_from_decisions(decisions),
+            config=config,
+            version="v2",
+        )
         outcome = await normalize_agent_turn(agent, config, result)
         return RootTurnResult(
             agent_name=agent_name,
@@ -93,206 +63,209 @@ class LocalRootRunner:
         )
 
 
-def _read_json_object(prompt: str) -> dict[str, Any] | None:
-    first_line = console.input(prompt)
-    raw = first_line.strip()
-    if not raw:
-        return None
-    lines = [first_line]
+def _is_retryable_stream_error(exc: BaseException) -> bool:
+    return isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.RemoteProtocolError,
+            httpx.TimeoutException,
+        ),
+    )
+
+
+def _agent_config(
+    *,
+    agent_name: str,
+    thread_id: str,
+    resolve_permission_profile: Any,
+    resolve_skill_config: Any | None = None,
+    resolve_pending_reviews: Any | None = None,
+) -> dict[str, Any]:
+    configurable = {
+        "thread_id": thread_id,
+        "agent_name": agent_name,
+        "permission_profile": resolve_permission_profile(agent_name),
+    }
+    if resolve_skill_config is not None:
+        configurable.update(resolve_skill_config(agent_name))
+    if resolve_pending_reviews is not None:
+        configurable["resolve_pending_reviews"] = resolve_pending_reviews
+    return {"configurable": configurable}
+
+
+async def _stream_turn_once(
+    *,
+    agent: Any,
+    payload: Any,
+    config: dict[str, Any],
+    renderer: InteractiveRenderer,
+    resolve_task_reviews: Any | None = None,
+) -> list[dict[str, Any]]:
+    async for event in stream_agent_events(agent, payload, config):
+        renderer.render_event(event)
+        if resolve_task_reviews is not None:
+            await resolve_task_reviews()
+    outcome = await normalize_agent_turn(agent, config, {})
+    return outcome.review_payloads
+
+
+async def _run_agent_turn(
+    *,
+    runtime: Any,
+    state: CliState,
+    user_input: str,
+    renderer: InteractiveRenderer,
+    approval_presenter: ApprovalPresenter,
+    review_control: ReviewControl,
+    resolve_task_reviews: Any | None = None,
+) -> None:
+    agent = runtime.get_local_agent(state.agent_name)
+    config = _agent_config(
+        agent_name=state.agent_name,
+        thread_id=state.thread_id,
+        resolve_permission_profile=runtime.resolve_root_permission_profile,
+        resolve_skill_config=runtime.resolve_root_skill_config,
+        resolve_pending_reviews=resolve_task_reviews,
+    )
+    payload: Any = {"messages": [{"role": "user", "content": user_input}]}
     while True:
-        try:
-            parsed = json.loads("\n".join(lines))
-        except json.JSONDecodeError as exc:
-            if len(lines) == 1:
-                console.print("[dim]Paste remaining JSON lines. Use END to cancel.[/dim]")
-            next_line = console.input()
-            if next_line.strip() == "END":
-                console.print(f"[red]invalid JSON:[/red] {exc}")
-                return None
-            lines.append(next_line)
-            continue
-        if not isinstance(parsed, dict):
-            console.print("[red]edited args must be a JSON object[/red]")
-            return None
-        return parsed
-
-
-def _render_root_result(result: RootTurnResult, review_control: ReviewControl) -> None:
-    if result.content:
-        console.print(Panel(result.content, title=result.agent_name))
-    review_control.register_root_interrupts(
-        agent_name=result.agent_name,
-        thread_id=result.thread_id,
-        interrupt_requests=result.interrupt_requests,
-    )
-
-
-def _render_task_record(record: TaskRecord) -> None:
-    result = record.result or record.error or ""
-    console.print(
-        Panel(
-            f"task_id={record.task_id}\n"
-            f"agent={record.agent_name}\n"
-            f"route={record.route_kind}\n"
-            f"state={record.state}\n"
-            f"runs={record.run_count}\n\n"
-            f"{result}",
-            title="Task",
+        interrupt_requests = await _stream_turn_once(
+            agent=agent,
+            payload=payload,
+            config=config,
+            renderer=renderer,
+            resolve_task_reviews=resolve_task_reviews,
         )
-    )
-
-
-def _render_review(review: ReviewSnapshot) -> None:
-    console.print(
-        Panel(
-            f"review_id={review.review_id}\n"
-            f"task_id={review.task_id or '<root>'}\n"
-            f"agent={review.agent_name or ''}\n"
-            f"risk={review.risk or ''}\n"
-            f"reason={review.reason or ''}",
-            title="Human Review Requested",
-            style="cyan",
-        )
-    )
-    for idx, action in enumerate(review.actions, start=1):
-        header = (
-            f"{idx}. {action.tool_name} | "
-            f"allowed={','.join(item.value for item in action.allowed_decisions)}"
-        )
-        if action.description:
-            console.print(Panel(action.description, title=header))
-        else:
-            console.print(Panel(header, title="Action"))
-        console.print(Syntax(_json(action.args), "json", word_wrap=True))
-
-
-def _read_review_decisions(review: ReviewSnapshot) -> list[ReviewDecision] | None:
-    decisions: list[ReviewDecision] = []
-    for action in review.actions:
-        allowed = action.allowed_decisions or [
-            ReviewDecisionKind.APPROVE,
-            ReviewDecisionKind.REJECT,
-        ]
-        allowed_values = {item.value for item in allowed}
-        while True:
-            options = ["a=approve", "r=reject", "s=skip"]
-            if "edit" in allowed_values:
-                options.append("e=edit")
-            console.print("[dim]" + ", ".join(options) + "[/dim]")
-            choice = Prompt.ask(
-                f"decision for {action.tool_name}",
-                default="a",
-                show_default=True,
-            ).strip().lower()
-            if choice in {"a", "approve"} and "approve" in allowed_values:
-                decisions.append(
-                    ReviewDecision(
-                        action_id=action.action_id,
-                        decision=ReviewDecisionKind.APPROVE,
-                    )
-                )
-                break
-            if choice in {"r", "reject"} and "reject" in allowed_values:
-                message = Prompt.ask(
-                    "reject reason",
-                    default="User rejected the tool call.",
-                    show_default=True,
-                )
-                decisions.append(
-                    ReviewDecision(
-                        action_id=action.action_id,
-                        decision=ReviewDecisionKind.REJECT,
-                        message=message,
-                    )
-                )
-                break
-            if choice in {"e", "edit"} and "edit" in allowed_values:
-                edited_args = _read_json_object("edited args JSON: ")
-                if edited_args is None:
-                    continue
-                decisions.append(
-                    ReviewDecision(
-                        action_id=action.action_id,
-                        decision=ReviewDecisionKind.EDIT,
-                        edited_args=edited_args,
-                    )
-                )
-                break
-            if choice in {"s", "skip"}:
-                return None
-            console.print(f"[red]unsupported decision:[/red] {choice}")
-    return decisions
-
-
-async def _resolve_reviews(review_control: ReviewControl) -> None:
-    attempted: set[str] = set()
-    while True:
-        pending = [
-            review
-            for review in review_control.list_pending_reviews()
-            if review.review_id not in attempted
-        ]
-        if not pending:
+        if not interrupt_requests:
             return
-        pending.sort(key=lambda item: item.updated_at)
-        review = pending[0]
-        attempted.add(review.review_id)
-        _render_review(review)
-        decisions = _read_review_decisions(review)
+        if len(interrupt_requests) > 1:
+            raise ValueError("Multiple simultaneous root reviews are not supported")
+        registered_reviews = review_control.register_root_interrupts(
+            agent_name=state.agent_name,
+            thread_id=state.thread_id,
+            interrupt_requests=interrupt_requests,
+        )
+        if not registered_reviews:
+            raise ValueError("Root review interrupt could not be registered")
+        review = registered_reviews[0]
+        decisions = await approval_presenter.request_decisions(review)
+        renderer.render_approval_summary(review, decisions)
         if decisions is None:
+            renderer.info("Review remains pending. Use /reviews to continue it later.")
             return
-        has_reject = any(
-            decision.decision == ReviewDecisionKind.REJECT
-            for decision in decisions
+        root_review = review_control.root_reviews.pop(review.review_id)
+        payload = resume_command_from_decisions(
+            runtime_decisions_from_review_payload(
+                decisions,
+                pending_review=root_review.pending_review,
+            )
         )
-        result = await review_control.submit_decision(
-            review.review_id,
-            decisions,
-        )
-        if result.source == "root" and isinstance(result.root_result, RootTurnResult):
-            _render_root_result(result.root_result, review_control)
-        elif result.task_record is not None:
-            _render_task_record(result.task_record)
-        if has_reject:
+
+
+async def _run_agent_turn_with_retry(
+    *,
+    runtime: Any,
+    state: CliState,
+    user_input: str,
+    renderer: InteractiveRenderer,
+    approval_presenter: ApprovalPresenter,
+    review_control: ReviewControl,
+    resolve_task_reviews: Any | None = None,
+) -> None:
+    attempts = 0
+    max_attempts = 2
+    while True:
+        attempts += 1
+        try:
+            await _run_agent_turn(
+                runtime=runtime,
+                state=state,
+                user_input=user_input,
+                renderer=renderer,
+                approval_presenter=approval_presenter,
+                review_control=review_control,
+                resolve_task_reviews=resolve_task_reviews,
+            )
             return
+        except Exception as exc:
+            if attempts < max_attempts and _is_retryable_stream_error(exc):
+                renderer.info(
+                    f"{exc.__class__.__name__}: {exc}. Retrying once..."
+                )
+                await asyncio.sleep(0.5)
+                continue
+            raise
 
 
-def _render_snapshot(control: AgentControl, review_control: ReviewControl) -> None:
-    table = Table(title="Runtime Snapshot")
-    table.add_column("task_id", overflow="fold")
-    table.add_column("agent")
-    table.add_column("route")
-    table.add_column("status")
-    table.add_column("thread")
-    table.add_column("result", overflow="fold")
-    for task in control.list_task_records():
-        table.add_row(
-            task.task_id,
-            task.agent_name,
-            task.route_kind,
-            task.state,
-            task.thread_id,
-            task.result or task.error or "",
+def _has_pending_task_review(
+    review_control: ReviewControl,
+    skipped_review_ids: set[str],
+) -> bool:
+    return any(
+        review.task_id and review.review_id not in skipped_review_ids
+        for review in review_control.list_pending_reviews()
+    )
+
+
+async def _wait_for_pending_task_review(
+    review_control: ReviewControl,
+    skipped_review_ids: set[str],
+    *,
+    poll_interval: float = 0.5,
+) -> None:
+    while not _has_pending_task_review(review_control, skipped_review_ids):
+        await asyncio.sleep(poll_interval)
+
+
+async def _read_prompt_or_wait_for_review(
+    *,
+    prompt: InteractivePrompt,
+    state: CliState,
+    review_control: ReviewControl,
+    skipped_review_ids: set[str],
+) -> str | None:
+    input_task = asyncio.create_task(
+        prompt.read(
+            agent_name=state.agent_name,
+            thread_id=state.thread_id,
         )
-    console.print(table)
-    pending_reviews = review_control.list_pending_reviews()
-    if pending_reviews:
-        console.print(f"[cyan]pending_reviews={len(pending_reviews)}[/cyan]")
+    )
+    review_task = asyncio.create_task(
+        _wait_for_pending_task_review(review_control, skipped_review_ids)
+    )
+    done, pending = await asyncio.wait(
+        {input_task, review_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+    for task in pending:
+        with suppress(asyncio.CancelledError):
+            await task
+    if input_task in done:
+        return await input_task
+    if review_task in done:
+        input_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await input_task
+        return None
+    return None
 
 
-def _render_reviews(review_control: ReviewControl) -> None:
-    pending_reviews = review_control.list_pending_reviews()
-    if not pending_reviews:
-        console.print("[dim]No pending reviews.[/dim]")
-        return
-    for review in pending_reviews:
-        _render_review(review)
-
-
-async def _run_chat(agent_name: str | None, thread_id: str | None) -> None:
+async def run_interactive(
+    *,
+    agent_name: str | None = None,
+    thread_id: str | None = None,
+) -> None:
+    renderer = InteractiveRenderer()
+    approval_presenter = ApprovalPresenter(renderer)
     async with bootstrap_application() as runtime:
-        selected_agent = agent_name or runtime.main_agent_name
-        selected_thread = thread_id or str(uuid.uuid4())
+        state = CliState(
+            agent_name=agent_name or runtime.main_agent_name,
+            thread_id=thread_id or str(uuid4()),
+        )
         root_runner = LocalRootRunner(
             get_agent=runtime.get_local_agent,
             resolve_permission_profile=runtime.resolve_root_permission_profile,
@@ -302,58 +275,120 @@ async def _run_chat(agent_name: str | None, thread_id: str | None) -> None:
             control=runtime.worker_control,
             root_runner=root_runner,
         )
-        console.print(
-            Panel(
-                f"agent={selected_agent}\nthread_id={selected_thread}\n"
-                "commands: /exit, /snapshot, /reviews",
-                title="Review Control TUI",
-            )
+
+        async def resolve_reviews(
+            *,
+            include_root: bool = True,
+            skipped_review_ids: set[str] | None = None,
+        ) -> bool:
+            attempted: set[str] = set(skipped_review_ids or ())
+            handled = False
+            while True:
+                pending = [
+                    review
+                    for review in review_control.list_pending_reviews()
+                    if review.review_id not in attempted
+                    and (include_root or review.task_id)
+                ]
+                if not pending:
+                    return handled
+                pending.sort(key=lambda item: item.updated_at)
+                review = pending[0]
+                attempted.add(review.review_id)
+                decisions = await approval_presenter.request_decisions(review)
+                renderer.render_approval_summary(review, decisions)
+                if decisions is None:
+                    if skipped_review_ids is not None:
+                        skipped_review_ids.add(review.review_id)
+                    return handled
+                result = await review_control.submit_decision(
+                    review.review_id,
+                    decisions,
+                )
+                handled = True
+                if result.root_result is not None:
+                    if result.root_result.content:
+                        renderer.render_assistant_message(
+                            result.root_result.content,
+                            namespace=result.root_result.agent_name,
+                        )
+                    review_control.register_root_interrupts(
+                        agent_name=result.root_result.agent_name,
+                        thread_id=result.root_result.thread_id,
+                        interrupt_requests=result.root_result.interrupt_requests,
+                    )
+
+        command_handler = SlashCommandHandler(
+            runtime=runtime,
+            state=state,
+            renderer=renderer,
+            review_control=review_control,
+            resolve_reviews=resolve_reviews,
         )
+        prompt = InteractivePrompt(command_names=COMMAND_NAMES)
+        renderer.welcome(
+            agent_name=state.agent_name,
+            thread_id=state.thread_id,
+            checkpoint_db=runtime.checkpoint_db,
+        )
+
+        skipped_idle_task_review_ids: set[str] = set()
         while True:
-            user_input = Prompt.ask("you").strip()
+            try:
+                maybe_user_input = await _read_prompt_or_wait_for_review(
+                    prompt=prompt,
+                    state=state,
+                    review_control=review_control,
+                    skipped_review_ids=skipped_idle_task_review_ids,
+                )
+                if maybe_user_input is None:
+                    await resolve_reviews(
+                        include_root=False,
+                        skipped_review_ids=skipped_idle_task_review_ids,
+                    )
+                    continue
+                user_input = maybe_user_input.strip()
+            except EOFError:
+                return
+            except KeyboardInterrupt:
+                renderer.info("Interrupted input.")
+                continue
+
             if not user_input:
                 continue
-            if user_input in {"/exit", "/quit", "exit", "quit"}:
-                return
-            if user_input == "/snapshot":
-                _render_snapshot(runtime.worker_control, review_control)
+            if user_input.startswith("//"):
+                user_input = user_input[1:]
+            elif user_input.startswith("/"):
+                result = await command_handler.execute(user_input)
+                if result.should_exit:
+                    return
                 continue
-            if user_input == "/reviews":
-                _render_reviews(review_control)
-                continue
+
             try:
-                result = await root_runner.run_user_message(
-                    agent_name=selected_agent,
-                    thread_id=selected_thread,
-                    content=user_input,
-                    metadata={},
+                renderer.render_user_message(user_input)
+                skipped_task_review_ids: set[str] = set()
+
+                async def resolve_task_reviews() -> bool:
+                    return await resolve_reviews(
+                        include_root=False,
+                        skipped_review_ids=skipped_task_review_ids,
+                    )
+
+                await _run_agent_turn_with_retry(
+                    runtime=runtime,
+                    state=state,
+                    user_input=user_input,
+                    renderer=renderer,
+                    approval_presenter=approval_presenter,
+                    review_control=review_control,
+                    resolve_task_reviews=resolve_task_reviews,
                 )
-                _render_root_result(result, review_control)
-                await _resolve_reviews(review_control)
+                await resolve_reviews()
+            except asyncio.CancelledError:
+                renderer.info("Turn interrupted.")
+                continue
+            except KeyboardInterrupt:
+                renderer.info("Turn interrupted.")
+                continue
             except Exception as exc:  # noqa: BLE001
-                console.print(f"[red]{exc.__class__.__name__}:[/red] {exc}")
-
-
-@app.callback(invoke_without_command=True)
-def chat(
-    ctx: typer.Context,
-    agent_name: str | None = typer.Option(None, "--agent", "-a"),
-    thread_id: str | None = typer.Option(None, "--thread-id", "-t"),
-) -> None:
-    """Run the local review-control TUI MVP."""
-    if ctx.invoked_subcommand is not None:
-        return
-    asyncio.run(_run_chat(agent_name, thread_id))
-
-
-@app.command("chat")
-def chat_command(
-    agent_name: str | None = typer.Option(None, "--agent", "-a"),
-    thread_id: str | None = typer.Option(None, "--thread-id", "-t"),
-) -> None:
-    """Run the local review-control TUI MVP."""
-    asyncio.run(_run_chat(agent_name, thread_id))
-
-
-if __name__ == "__main__":
-    app()
+                renderer.render_error(exc)

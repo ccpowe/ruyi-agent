@@ -1,0 +1,49 @@
+# Safe starter config for a public repository.
+# Copy to .ruyi_agent/config/agents.toml, then adjust model/provider/tool scopes for your use case.
+
+main_agent = "main"
+
+[agents.main]
+kind = "local"
+public = true
+name = "main"
+description = "General entry agent that can delegate focused research tasks."
+system_prompt = "You are a practical engineering assistant. Be concise, accurate, and explicit about assumptions."
+provider = "openrouter"
+model = "qwen/qwen3.6-plus"
+memory = []
+skills = "inherit"
+server_names = []
+tool_names = []
+workers = ["background_research"]
+permission_profile = "standard"
+
+[agents.background_research]
+kind = "local"
+public = false
+name = "background_research"
+description = "Research worker that can answer questions about public GitHub repositories and web-accessible documentation."
+system_prompt = "You are a background research worker. Return a clear answer, important evidence, and any uncertainty."
+provider = "openrouter"
+model = "qwen/qwen3.6-plus"
+memory = []
+skills = "inherit"
+server_names = ["deepwiki"]
+tool_names = []
+workers = []
+permission_profile = "standard"
+
+# Example remote_ref. Uncomment and set a real gateway URL only when you operate
+# another ruyi-agent Gateway instance.
+#
+# [agents.remote_research]
+# kind = "remote_ref"
+# public = false
+# name = "remote_research"
+# description = "Remote research worker exposed by another gateway."
+# url = "https://example.com"
+# remote_agent_name = "background_research"
+#
+# [agents.remote_research.auth]
+# type = "bearer"
+# token_env = "REMOTE_RESEARCH_TOKEN"

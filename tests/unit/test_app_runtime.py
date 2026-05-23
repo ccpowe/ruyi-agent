@@ -7,6 +7,8 @@ from ruyi_agent.runtime.bootstrap import DEFAULT_AGENT_NODE_ID
 from ruyi_agent.runtime.bootstrap import _attach_delegation_scopes_to_local_specs
 from ruyi_agent.runtime.bootstrap import _is_loopback_gateway_host
 from ruyi_agent.runtime.bootstrap import _read_node_id_env
+from ruyi_agent.runtime.bootstrap import create_bootstrapped_gateway_app
+import ruyi_agent.runtime.bootstrap as bootstrap_module
 from ruyi_agent.config.loader import LocalWorkerSpec
 from ruyi_agent.config.loader import RemoteRef
 
@@ -189,3 +191,23 @@ def test_is_loopback_gateway_host_accepts_local_hosts(host: str) -> None:
 )
 def test_is_loopback_gateway_host_rejects_public_hosts(host: str) -> None:
     assert not _is_loopback_gateway_host(host)
+
+
+def test_create_bootstrapped_gateway_app_configures_runtime_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fake_configure_runtime_environment() -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "configure_runtime_environment",
+        fake_configure_runtime_environment,
+    )
+
+    create_bootstrapped_gateway_app()
+
+    assert calls == 1

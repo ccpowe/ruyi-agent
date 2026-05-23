@@ -10,7 +10,6 @@ wheels/
 .venv
 .env
 .env.*
-!.env.example
 .codex
 .agents/
 wokespace/*
@@ -27,6 +26,9 @@ data/*.sqlite-wal
 data/*.sqlite3
 data/*.sqlite3-shm
 data/*.sqlite3-wal
+.ruyi_agent/runtime/
+.ruyi_agent/skills/
+.ruyi_agent/openai_codex_auth.json
 
 # Runtime state and logs
 logs/

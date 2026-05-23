@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import locale
 import os
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -136,6 +138,124 @@ class AutoStartDaytonaSandbox(DaytonaSandbox):
         return super().download_files(paths)
 
 
+class RuyiLocalShellBackend(LocalShellBackend):
+    """LocalShellBackend variant that decodes process bytes explicitly.
+
+    Windows defaults to a locale code page such as GBK for text-mode subprocess
+    pipes. Many modern tools emit UTF-8, so relying on subprocess text mode can
+    crash its reader thread before the command result is assembled.
+    """
+
+    def execute(
+        self,
+        command: str,
+        *,
+        timeout: int | None = None,
+    ) -> ExecuteResponse:
+        if not command or not isinstance(command, str):
+            return ExecuteResponse(
+                output="Error: Command must be a non-empty string.",
+                exit_code=1,
+                truncated=False,
+            )
+
+        effective_timeout = timeout if timeout is not None else self._default_timeout
+        if effective_timeout <= 0:
+            raise ValueError(f"timeout must be positive, got {effective_timeout}")
+
+        try:
+            result = subprocess.run(  # noqa: S602
+                command,
+                check=False,
+                shell=True,
+                capture_output=True,
+                text=False,
+                timeout=effective_timeout,
+                env=self._env,
+                cwd=str(self.cwd),
+            )
+            stdout = _decode_process_output(result.stdout)
+            stderr = _decode_process_output(result.stderr)
+            output = _combine_process_output(
+                stdout=stdout,
+                stderr=stderr,
+                returncode=result.returncode,
+                max_output_bytes=self._max_output_bytes,
+            )
+            return ExecuteResponse(
+                output=output.text,
+                exit_code=result.returncode,
+                truncated=output.truncated,
+            )
+        except subprocess.TimeoutExpired:
+            if timeout is not None:
+                message = (
+                    "Error: Command timed out after "
+                    f"{effective_timeout} seconds (custom timeout). The command "
+                    "may be stuck or require more time."
+                )
+            else:
+                message = (
+                    f"Error: Command timed out after {effective_timeout} seconds. "
+                    "For long-running commands, re-run using the timeout parameter."
+                )
+            return ExecuteResponse(output=message, exit_code=124, truncated=False)
+        except Exception as exc:  # noqa: BLE001
+            return ExecuteResponse(
+                output=f"Error executing command ({type(exc).__name__}): {exc}",
+                exit_code=1,
+                truncated=False,
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessOutput:
+    text: str
+    truncated: bool
+
+
+def _decode_process_output(data: bytes | str | None) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    if not data:
+        return ""
+    encodings = ["utf-8", locale.getpreferredencoding(False)]
+    for encoding in dict.fromkeys(encodings):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _combine_process_output(
+    *,
+    stdout: str,
+    stderr: str,
+    returncode: int,
+    max_output_bytes: int,
+) -> _ProcessOutput:
+    output_parts: list[str] = []
+    if stdout:
+        output_parts.append(stdout)
+    if stderr:
+        stderr_lines = stderr.strip().split("\n")
+        output_parts.extend(f"[stderr] {line}" for line in stderr_lines)
+
+    output = "\n".join(output_parts) if output_parts else "<no output>"
+    truncated = False
+    if len(output.encode("utf-8")) > max_output_bytes:
+        encoded = output.encode("utf-8")[:max_output_bytes]
+        output = encoded.decode("utf-8", errors="ignore")
+        output += f"\n\n... Output truncated at {max_output_bytes} bytes."
+        truncated = True
+    if returncode != 0:
+        output = f"{output.rstrip()}\n\nExit code: {returncode}"
+    return _ProcessOutput(text=output, truncated=truncated)
+
+
 @dataclass(slots=True)
 class BackendRuntime:
     """保存 agent runtime 使用 backend 时需要的统一运行信息。
@@ -255,7 +375,7 @@ def _create_local_backend_runtime() -> BackendRuntime:
     timeout = int(os.getenv("LOCAL_BACKEND_TIMEOUT", "120"))
     max_output_bytes = int(os.getenv("LOCAL_BACKEND_MAX_OUTPUT_BYTES", "100000"))
     inherit_env = _env_bool("LOCAL_BACKEND_INHERIT_ENV", default=True)
-    local_backend = LocalShellBackend(
+    local_backend = RuyiLocalShellBackend(
         root_dir=root_dir,
         virtual_mode=True,
         timeout=timeout,

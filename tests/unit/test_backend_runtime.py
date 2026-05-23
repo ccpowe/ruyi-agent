@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import ruyi_agent.integrations.backend.runtime as backend_runtime
 from ruyi_agent.integrations.backend.runtime import create_backend_runtime
+from ruyi_agent.integrations.backend.runtime import RuyiLocalShellBackend
 
 
 def test_create_local_backend_runtime_exposes_shell_and_file_transfer(
@@ -55,6 +58,31 @@ def test_create_local_backend_runtime_uses_fixed_skill_views_root(
     assert runtime.kind == "local"
     assert runtime.home_dir == "/"
     assert runtime.skills_root == "/.ruyi_agent/runtime/skill-views"
+
+
+def test_local_shell_backend_decodes_utf8_output_on_windows_codepage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
+        assert kwargs["text"] is False
+        return SimpleNamespace(
+            stdout="box: ╦\n".encode("utf-8"),
+            stderr=b"",
+            returncode=0,
+        )
+
+    monkeypatch.setattr(backend_runtime.subprocess, "run", fake_run)
+    backend = RuyiLocalShellBackend(
+        root_dir=tmp_path,
+        virtual_mode=True,
+        inherit_env=False,
+    )
+
+    result = backend.execute("fake-command")
+
+    assert result.exit_code == 0
+    assert "box: ╦" in result.output
 
 
 def test_create_backend_runtime_rejects_unknown_kind(

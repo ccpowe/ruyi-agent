@@ -8,6 +8,7 @@ from typing import Any
 
 from langchain.chat_models import init_chat_model
 
+from ruyi_agent.config.paths import resolve_ruyi_paths
 from ruyi_agent.integrations.mcp.registry import MCPRegistry
 from ruyi_agent.control_plane.permissions import (
     ExecuteRuleConfig,
@@ -20,7 +21,7 @@ from ruyi_agent.control_plane.permissions import (
 
 SkillSelection = str | list[str]
 
-CONFIG_DIR = Path("config")
+CONFIG_DIR = Path(".ruyi_agent") / "config"
 MCP_CONFIG_PATH = CONFIG_DIR / "mcp_servers.toml"
 AGENTS_CONFIG_PATH = CONFIG_DIR / "agents.toml"
 LLM_PROVIDERS_CONFIG_PATH = CONFIG_DIR / "llm_providers.toml"
@@ -289,22 +290,33 @@ def validate_agent_configs(
 def load_toml_config(path: Path) -> dict[str, Any]:
     """读取并解析指定路径的 TOML 文件，返回顶层字典。"""
     # 为什么集中读取 TOML：让配置入口固定，后续做校验、默认值和错误包装时不需要改业务代码。
-    with path.open("rb") as f:
-        return tomllib.load(f)
+    try:
+        with path.open("rb") as f:
+            return tomllib.load(f)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(
+            f"Invalid TOML in {path}: {exc}. "
+            "TOML requires quote string values, including model names, URLs, "
+            'and Windows paths. Example: model = "qwen/qwen3.6-plus".'
+        ) from exc
 
 
-def load_mcp_server_configs(path: Path = MCP_CONFIG_PATH) -> dict[str, dict[str, Any]]:
+def _config_path(filename: str) -> Path:
+    return resolve_ruyi_paths().config_dir / filename
+
+
+def load_mcp_server_configs(path: Path | None = None) -> dict[str, dict[str, Any]]:
     """从 mcp_servers.toml 读取 MCP server 配置列表。"""
     # 为什么单独暴露 MCP 配置读取：让 registry 初始化和配置来源解耦，新增 MCP 只改配置文件。
-    return load_toml_config(path)["mcp_servers"]
+    return load_toml_config(path or _config_path("mcp_servers.toml"))["mcp_servers"]
 
 
 def load_agent_configs(
-    path: Path = AGENTS_CONFIG_PATH,
+    path: Path | None = None,
 ) -> tuple[str, dict[str, dict[str, Any]]]:
     """从 agents.toml 读取并校验 agent 配置，返回 (main_agent_name, agent_configs)。"""
     # 为什么统一读取 agent 配置：让 main agent 和 worker 都共享同一套声明式来源。
-    data = load_toml_config(path)
+    data = load_toml_config(path or _config_path("agents.toml"))
     main_agent_name = data["main_agent"]
     agent_configs = data["agents"]
     validate_agent_configs(main_agent_name, agent_configs)
@@ -312,10 +324,10 @@ def load_agent_configs(
 
 
 def load_llm_provider_configs(
-    path: Path = LLM_PROVIDERS_CONFIG_PATH,
+    path: Path | None = None,
 ) -> dict[str, LLMProviderSpec]:
     """从 llm_providers.toml 读取 provider 定义，集中管理 base_url/api_key_env。"""
-    data = load_toml_config(path)
+    data = load_toml_config(path or _config_path("llm_providers.toml"))
     raw_providers = data.get("providers", {})
     if not isinstance(raw_providers, dict):
         raise ValueError("providers must be a table")
@@ -456,9 +468,9 @@ def _parse_execute_review_risks(value: Any, *, path: str) -> set[str] | None:
 
 
 def load_permission_config(
-    path: Path = PERMISSIONS_CONFIG_PATH,
+    path: Path | None = None,
 ) -> PermissionConfig:
-    data = load_toml_config(path)
+    data = load_toml_config(path or _config_path("permissions.toml"))
     default_profile = data.get("default_profile")
     if not isinstance(default_profile, str) or not default_profile:
         raise ValueError("permissions.default_profile must be a non-empty string")

@@ -1,9 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ruyi-agent"
 version = "0.1.0"
 description = "Agent runtime for multi-entrypoint delegation, MCP tools, HITL approvals, and gateway control planes"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.13"
 dependencies = [
     "aiosqlite>=0.22.1",
@@ -26,6 +31,9 @@ dependencies = [
     "uvicorn>=0.35.0",
 ]
 
+[project.scripts]
+ruyi = "ruyi_agent.entrypoints.main:main"
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
@@ -40,3 +48,7 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"ruyi_agent.templates.ruyi_home" = ["ruyi.toml"]
+"ruyi_agent.templates.ruyi_home.config" = ["*.toml", "*.toml.example"]

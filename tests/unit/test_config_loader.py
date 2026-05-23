@@ -41,6 +41,29 @@ def test_load_toml_config_reads_generic_toml(tmp_path: Path) -> None:
     assert data == {"name": "demo"}
 
 
+def test_load_toml_config_reports_invalid_toml_path(tmp_path: Path) -> None:
+    config_path = tmp_path / "agents.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                'main_agent = "main"',
+                "",
+                "[agents.main]",
+                "model = qwen/qwen3.6-plus",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        config_loader.load_toml_config(config_path)
+
+    message = str(exc_info.value)
+    assert str(config_path) in message
+    assert "Invalid TOML" in message
+    assert "quote string values" in message
+
+
 def test_load_mcp_server_configs_returns_mcp_section(tmp_path: Path) -> None:
     # 为什么测 MCP 配置读取：确保 registry 初始化拿到的是纯 server 配置而不是整个 TOML。
     config_path = tmp_path / "mcp_servers.toml"
@@ -53,6 +76,26 @@ def test_load_mcp_server_configs_returns_mcp_section(tmp_path: Path) -> None:
 
     assert configs == {
         "exa": {"transport": "http", "url": "https://exa.invalid/mcp"}
+    }
+
+
+def test_default_config_loaders_read_from_ruyi_config_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    config_dir = project / ".ruyi_agent" / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "mcp_servers.toml").write_text(
+        '[mcp_servers.local]\ntransport = "stdio"\ncommand = "local-mcp"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+
+    configs = config_loader.load_mcp_server_configs()
+
+    assert configs == {
+        "local": {"transport": "stdio", "command": "local-mcp"}
     }
 
 

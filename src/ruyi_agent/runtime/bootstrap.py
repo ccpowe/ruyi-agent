@@ -8,10 +8,10 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
 from fastapi import FastAPI
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+from ruyi_agent.config.runtime_settings import configure_runtime_environment
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.runtime.delegation.async_runtime import AgentControl
 from ruyi_agent.integrations.backend.runtime import create_backend_runtime
@@ -244,7 +244,7 @@ async def bootstrap_application():
     这个上下文管理器把启动契约集中在一个地方，并负责在退出时关闭需要释放的资源。
     """
 
-    load_dotenv()
+    configure_runtime_environment()
 
     node_id = _read_node_id_env()
 
@@ -481,7 +481,7 @@ def create_bootstrapped_gateway_app() -> FastAPI:
     request.app.state 取到当前可用的 GatewayService。
     """
 
-    load_dotenv()
+    configure_runtime_environment()
     bearer_token = os.getenv("GATEWAY_BEARER_TOKEN") or DEFAULT_GATEWAY_TOKEN
     gateway_host = os.getenv("GATEWAY_HOST", DEFAULT_GATEWAY_HOST)
 

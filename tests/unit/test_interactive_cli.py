@@ -12,8 +12,8 @@ from ruyi_agent.channels.cli.event_adapter import (
     runtime_event_from_stream_chunk,
 )
 from ruyi_agent.channels.cli.commands import COMMAND_NAMES, CliState, SlashCommandHandler
-from ruyi_agent.channels.cli.interactive import _stream_turn_once
-from ruyi_agent.channels.cli.interactive import _has_pending_task_review
+from ruyi_agent.channels.cli.tui import _stream_turn_once
+from ruyi_agent.channels.cli.tui import _has_pending_task_review
 from ruyi_agent.channels.cli.renderer import InteractiveRenderer
 from ruyi_agent.control_plane.contracts import (
     ReviewActionSnapshot,

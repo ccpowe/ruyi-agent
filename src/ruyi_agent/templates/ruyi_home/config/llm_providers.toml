@@ -1,0 +1,36 @@
+[providers.openrouter]
+kind = "openrouter"
+api_key_env = "OPENROUTER_API_KEY"
+
+[providers.deepseek]
+kind = "deepseek"
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[providers.zai]
+kind = "litellm"
+base_url = "https://open.bigmodel.cn/api/paas/v4/"
+api_key_env = "ZAI_API_KEY"
+
+# [providers.openai]
+# kind = "openai"
+# api_key_env = "OPENAI_API_KEY"
+
+[providers.openai_codex]
+kind = "openai_codex"
+base_url = "https://chatgpt.com/backend-api/codex"
+
+[providers.openai_codex.init_kwargs]
+auth_json = "~/.ruyi_agent/openai_codex_auth.json"
+
+# [providers.anthropic]
+# kind = "anthropic"
+# api_key_env = "ANTHROPIC_API_KEY"
+
+[providers.kimi]
+kind = "moonshot"
+base_url = "https://api.moonshot.cn/v1"
+api_key_env = "KIMI_API_KEY"
+
+[providers.kimi.init_kwargs]
+thinking = true

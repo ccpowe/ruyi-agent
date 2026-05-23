@@ -1,0 +1,94 @@
+# Ruyi runtime settings. User installs can keep this file at ~/.ruyi_agent/ruyi.toml.
+
+[model_credentials]
+openrouter_api_key = ""
+kimi_api_key = ""
+deepseek_api_key = ""
+zai_api_key = ""
+openai_api_key = ""
+anthropic_api_key = ""
+
+[backend]
+kind = "local"
+# Empty means the current working directory for `ruyi`; `ruyi --workspace PATH`
+# has higher precedence.
+workspace = ""
+
+[backend.local]
+timeout = 120
+max_output_bytes = 100000
+inherit_env = true
+
+[backend.daytona]
+api_key = ""
+api_url = ""
+target = ""
+sandbox_name = ""
+
+[gateway]
+host = "127.0.0.1"
+port = 8000
+base_url = "http://127.0.0.1:8000"
+bearer_token = "dev-token"
+
+[storage]
+checkpoint_db = "data/checkpoints.sqlite"
+gateway_route_db = "data/gateway_routes.sqlite"
+task_db = "data/tasks.sqlite"
+review_audit_db = "data/review_audit.sqlite"
+channel_session_db = "data/channel_sessions.sqlite3"
+
+[runtime]
+agent_node_id = "local-dev"
+max_delegation_depth = 3
+max_tasks_per_root = 20
+a2a_webhook_url = ""
+a2a_webhook_token = ""
+remote_research_token = ""
+
+[channels.telegram]
+bot_token = ""
+default_agent = "main"
+session_db = "data/channel_sessions.sqlite3"
+update_db = "data/telegram_updates.sqlite3"
+poll_timeout = 30
+api_timeout = 40
+task_poll_interval = 2
+terminal_review_grace_checks = 3
+message_parse_mode = "MarkdownV2"
+media_max_bytes = 52428800
+fallback_ips = []
+kroki_base_url = "https://kroki.io"
+
+[channels.feishu]
+app_id = ""
+app_secret = ""
+domain = "feishu"
+connection_mode = "websocket"
+default_agent = "main"
+session_db = "data/channel_sessions.sqlite3"
+event_db = "data/feishu_events.sqlite3"
+group_policy = "disabled"
+require_mention = true
+allowed_users = []
+allowed_groups = []
+bot_name = ""
+bot_open_id = ""
+bot_user_id = ""
+bot_union_id = ""
+api_timeout = 10
+task_poll_interval = 2
+terminal_review_grace_checks = 3
+media_root = ""
+media_max_bytes = 31457280
+ack_mode = "reaction"
+reactions = true
+processing_reaction = "Typing"
+approval_reaction = "CheckMark"
+failure_reaction = "CrossMark"
+
+[langsmith]
+tracing = false
+endpoint = "https://api.smith.langchain.com"
+api_key = ""
+project = ""
