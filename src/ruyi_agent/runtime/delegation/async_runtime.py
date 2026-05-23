@@ -38,6 +38,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import httpx
@@ -63,6 +64,9 @@ from ruyi_agent.runtime.agent_factory import create_runtime_agent
 from ruyi_agent.storage.task_store import TaskStore, task_record_for_restart
 from ruyi_agent.control_plane.permissions import PermissionPolicy
 from ruyi_agent.storage.review_audit import ReviewAuditStore
+from ruyi_agent.runtime.skills.resolver import resolve_skill_names
+from ruyi_agent.runtime.skills.sync import SkillSyncer
+from ruyi_agent.runtime.skills.types import SkillEntry
 
 logger = logging.getLogger(__name__)
 
@@ -383,6 +387,9 @@ class TaskRecord:
         delegation_max_tasks_per_root: 跨网关传递的单树任务预算
         delegation_visited_nodes: 跨网关委托已访问节点
         permission_profile: 当前任务运行使用的权限 profile
+        effective_skill_names: 当前任务实际可见的 skill 名称
+        skill_view_path: 同步到 backend 后的 skill view 目录
+        skill_view_hash: skill view 内容指纹
         pending_review: worker 等待人工审批时的 review payload
     """
 
@@ -411,6 +418,9 @@ class TaskRecord:
     delegation_max_tasks_per_root: int | None = None
     delegation_visited_nodes: tuple[str, ...] = ()
     permission_profile: str = ""
+    effective_skill_names: tuple[str, ...] = ()
+    skill_view_path: str | None = None
+    skill_view_hash: str | None = None
     pending_review: dict[str, Any] | None = None
 
 
@@ -786,6 +796,9 @@ class TaskManager:
         webhook: dict[str, Any] | None = None,
         delegation_context: DelegationContext | None = None,
         permission_profile: str = "",
+        effective_skill_names: Sequence[str] = (),
+        skill_view_path: str | None = None,
+        skill_view_hash: str | None = None,
     ) -> TaskRecord:
         """
         创建任务记录
@@ -837,6 +850,9 @@ class TaskManager:
                 else ()
             ),
             permission_profile=permission_profile,
+            effective_skill_names=tuple(effective_skill_names),
+            skill_view_path=skill_view_path,
+            skill_view_hash=skill_view_hash,
         )
         self._tasks[task_id] = record
         self._save(record)
@@ -1160,6 +1176,8 @@ class AgentControl:
         backend_kind: str = "unknown",
         workspace_root: str = "",
         review_audit_store: ReviewAuditStore | None = None,
+        skill_catalog: Mapping[str, SkillEntry] | None = None,
+        skill_syncer: SkillSyncer | None = None,
     ) -> None:
         """
         初始化委托控制器
@@ -1213,6 +1231,8 @@ class AgentControl:
         self._backend_kind = backend_kind
         self._workspace_root = workspace_root
         self._review_audit_store = review_audit_store
+        self._skill_catalog = skill_catalog or {}
+        self._skill_syncer = skill_syncer
 
     @property
     def workspace_root(self) -> str:
@@ -1223,6 +1243,28 @@ class AgentControl:
 
     def download_files(self, paths: list[str]) -> list[Any]:
         return self._backend.download_files(paths)
+
+    def _resolve_task_skill_view(
+        self,
+        entry: RegisteredAgent,
+        *,
+        parent_task_id: str | None,
+    ) -> tuple[tuple[str, ...], str | None, str | None]:
+        if not isinstance(entry, LocalWorkerEntry) or self._skill_syncer is None:
+            return (), None, None
+        parent_skill_names: tuple[str, ...] | None = None
+        if parent_task_id is not None:
+            parent_record = self._task_manager.get_task(parent_task_id)
+            parent_skill_names = parent_record.effective_skill_names
+        skill_names = resolve_skill_names(
+            entry.spec.skills,
+            self._skill_catalog,
+            parent_skill_names=parent_skill_names,
+        )
+        view = self._skill_syncer.ensure_view(self._skill_catalog, skill_names)
+        if view is None:
+            return skill_names, None, None
+        return skill_names, view.path, view.view_hash
 
     def _get_or_create_agent(self, agent_name: str) -> Any:
         """
@@ -1284,6 +1326,9 @@ class AgentControl:
                 "delegation_depth": record.depth,
                 "agent_name": record.agent_name,
                 "permission_profile": record.permission_profile,
+                "effective_skill_names": list(record.effective_skill_names),
+                "skill_view_path": record.skill_view_path,
+                "skill_view_hash": record.skill_view_hash,
             }
         }
 
@@ -2469,6 +2514,9 @@ class AgentControl:
             parent_task_id=parent_task_id,
             delegation_context=delegation_context,
         )
+        effective_skill_names, skill_view_path, skill_view_hash = (
+            self._resolve_task_skill_view(entry, parent_task_id=parent_task_id)
+        )
         async with self._get_root_budget_lock(root_task_id):
             self._enforce_delegation_limits(
                 root_task_id=root_task_id,
@@ -2515,6 +2563,9 @@ class AgentControl:
                     webhook=webhook,
                     delegation_context=task_context,
                     permission_profile=permission_profile,
+                    effective_skill_names=effective_skill_names,
+                    skill_view_path=skill_view_path,
+                    skill_view_hash=skill_view_hash,
                 )
                 return self._task_manager.sync_remote_task(task_id, payload)
 
@@ -2533,6 +2584,9 @@ class AgentControl:
                 webhook=webhook,
                 delegation_context=task_context,
                 permission_profile=permission_profile,
+                effective_skill_names=effective_skill_names,
+                skill_view_path=skill_view_path,
+                skill_view_hash=skill_view_hash,
             )
             self._start_run(task_id, task)
             return self._task_manager.get_task(task_id)

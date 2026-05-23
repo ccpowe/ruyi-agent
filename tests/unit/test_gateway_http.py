@@ -416,7 +416,7 @@ def build_specs() -> dict[str, LocalWorkerSpec]:
             model=object(),
             tools=[],
             memory=["/sandbox/home/AGENTS.md"],
-            skills=["/sandbox/skills/frontend-skill"],
+            skills=["frontend-skill"],
         ),
         "background_research": LocalWorkerSpec(
             name="background_research",
@@ -425,7 +425,7 @@ def build_specs() -> dict[str, LocalWorkerSpec]:
             model=object(),
             tools=[],
             memory=["/sandbox/home/AGENTS.md"],
-            skills=["/sandbox/skills/frontend-skill"],
+            skills=["frontend-skill"],
         ),
     }
 
@@ -1001,7 +1001,7 @@ def test_remote_ref_forwards_via_a2a(
                 model=object(),
                 tools=[],
                 memory=["/sandbox/home/AGENTS.md"],
-                skills=["/sandbox/skills/frontend-skill"],
+                skills=["frontend-skill"],
             )
         },
         {},
@@ -1506,7 +1506,7 @@ def test_remote_route_persists_across_service_restart(
                 model=object(),
                 tools=[],
                 memory=["/sandbox/home/AGENTS.md"],
-                skills=["/sandbox/skills/frontend-skill"],
+                skills=["frontend-skill"],
             )
         },
         {},

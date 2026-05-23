@@ -24,6 +24,7 @@ from langchain_daytona import DaytonaSandbox
 DEFAULT_BACKEND_KIND = "daytona"
 DEFAULT_SANDBOX_NAME = "ruyi-agent"
 LOCAL_VIRTUAL_WORKSPACE_ROOT = "/"
+SKILL_VIEWS_SUBDIR = ".ruyi_agent/runtime/skill-views"
 
 
 class AutoStartDaytonaSandbox(DaytonaSandbox):
@@ -216,31 +217,6 @@ def _env_bool(name: str, *, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _local_virtual_path(raw_path: str | None, root_dir: Path) -> str:
-    """把本地 shell 配置路径映射到 LocalShellBackend 的虚拟路径空间。"""
-
-    if raw_path is None or not raw_path.strip():
-        return LOCAL_VIRTUAL_WORKSPACE_ROOT
-
-    raw = raw_path.strip()
-    candidate = Path(raw)
-    if not candidate.is_absolute():
-        return str(PurePosixPath("/") / raw)
-
-    resolved = candidate.resolve()
-    try:
-        relative = resolved.relative_to(root_dir)
-    except ValueError as exc:
-        raise ValueError(
-            "LOCAL_BACKEND_SKILLS_ROOT must be inside LOCAL_BACKEND_ROOT "
-            "when BACKEND_KIND=local"
-        ) from exc
-
-    if relative == Path("."):
-        return LOCAL_VIRTUAL_WORKSPACE_ROOT
-    return str(PurePosixPath("/") / relative.as_posix())
-
-
 def _create_daytona_backend_runtime() -> BackendRuntime:
     """创建基于 Daytona sandbox 的 backend runtime。
 
@@ -261,7 +237,7 @@ def _create_daytona_backend_runtime() -> BackendRuntime:
         kind="daytona",
         backend=agent_backend,
         home_dir=home_dir,
-        skills_root=f"{home_dir}/skills",
+        skills_root=f"{home_dir}/{SKILL_VIEWS_SUBDIR}",
         _sandbox=sandbox,
     )
 
@@ -287,7 +263,6 @@ def _create_local_backend_runtime() -> BackendRuntime:
         inherit_env=inherit_env,
     )
     home_dir = LOCAL_VIRTUAL_WORKSPACE_ROOT
-    skills_root = _local_virtual_path(os.getenv("LOCAL_BACKEND_SKILLS_ROOT"), root_dir)
     agent_backend = CompositeBackend(
         default=local_backend,
         routes={},
@@ -297,7 +272,7 @@ def _create_local_backend_runtime() -> BackendRuntime:
         kind="local",
         backend=agent_backend,
         home_dir=home_dir,
-        skills_root=skills_root,
+        skills_root=str(PurePosixPath("/") / SKILL_VIEWS_SUBDIR),
     )
 
 

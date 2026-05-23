@@ -296,6 +296,7 @@ async def _run_chat(agent_name: str | None, thread_id: str | None) -> None:
         root_runner = LocalRootRunner(
             get_agent=runtime.get_local_agent,
             resolve_permission_profile=runtime.resolve_root_permission_profile,
+            resolve_skill_config=runtime.resolve_root_skill_config,
         )
         review_control = ReviewControl(
             control=runtime.worker_control,

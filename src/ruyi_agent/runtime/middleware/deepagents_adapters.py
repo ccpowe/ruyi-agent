@@ -10,7 +10,6 @@ from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.memory import MemoryMiddleware
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
-from deepagents.middleware.skills import SkillsMiddleware
 from deepagents.middleware.summarization import create_summarization_middleware
 
 __all__ = [
@@ -18,7 +17,6 @@ __all__ = [
     "FilesystemMiddleware",
     "MemoryMiddleware",
     "PatchToolCallsMiddleware",
-    "SkillsMiddleware",
     "TodoListMiddleware",
     "create_summarization_middleware",
 ]

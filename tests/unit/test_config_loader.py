@@ -615,7 +615,9 @@ def test_load_agent_configs_rejects_legacy_model_fields(tmp_path: Path) -> None:
         config_loader.load_agent_configs(config_path)
 
 
-def test_build_local_worker_spec_resolves_tools_and_maps_paths(monkeypatch) -> None:
+def test_build_local_worker_spec_resolves_tools_and_keeps_skill_names(
+    monkeypatch,
+) -> None:
     # 为什么测本地 worker 构造：这是当前把配置转成可执行 worker 定义的关键路径。
     built_model = object()
     monkeypatch.setattr(config_loader, "init_chat_model", lambda *_a, **_k: built_model)
@@ -668,8 +670,51 @@ def test_build_local_worker_spec_resolves_tools_and_maps_paths(monkeypatch) -> N
     assert worker.system_prompt == "prompt"
     assert worker.model is built_model
     assert worker.tools == fake_tools
-    assert worker.skills == ["/sandbox/skills/frontend-skill"]
+    assert worker.skills == ["frontend-skill"]
     assert worker.permission_profile == "standard"
+
+
+def test_build_local_worker_spec_keeps_special_skill_modes(monkeypatch) -> None:
+    built_model = object()
+    monkeypatch.setattr(config_loader, "init_chat_model", lambda *_a, **_k: built_model)
+    registry = FakeRegistry([])
+    base_config = {
+        "kind": "local",
+        "public": False,
+        "name": "repo_wiki",
+        "description": "repo helper",
+        "system_prompt": "prompt",
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-flash",
+        "memory": [],
+        "server_names": [],
+        "tool_names": [],
+        "workers": [],
+    }
+
+    specs = {}
+    for mode in ("inherit", "none"):
+        agent_configs = {"repo_wiki": {**base_config, "skills": mode}}
+        specs[mode] = asyncio.run(
+            config_loader.build_local_worker_spec(
+                "repo_wiki",
+                agent_configs,
+                registry,
+                home_dir="/sandbox/home",
+                providers={
+                    "openrouter": config_loader.LLMProviderSpec(
+                        name="openrouter",
+                        kind="openrouter",
+                        api_key_env=None,
+                    )
+                },
+                getenv=lambda _name: None,
+                skills_root="/sandbox/skills",
+            )
+        )
+
+    assert specs["inherit"].skills == "inherit"
+    assert specs["none"].skills == "none"
 
 def test_build_local_worker_spec_rejects_non_worker_kind() -> None:
     # 为什么测 kind 校验：避免错误配置在更深层才暴露成难排查的问题。
@@ -776,7 +821,7 @@ def test_build_local_worker_spec_resolves_tools_and_backend_paths(monkeypatch) -
     assert spec.model is built_model
     assert spec.tools == fake_tools
     assert spec.memory == ["/sandbox/home/AGENTS.md"]
-    assert spec.skills == ["/sandbox/skills/frontend-skill"]
+    assert spec.skills == ["frontend-skill"]
 
 
 def test_build_all_local_worker_specs_builds_every_local_agent(monkeypatch) -> None:

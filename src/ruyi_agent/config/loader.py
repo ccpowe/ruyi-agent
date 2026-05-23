@@ -18,6 +18,8 @@ from ruyi_agent.control_plane.permissions import (
     ToolPermissionConfig,
 )
 
+SkillSelection = str | list[str]
+
 CONFIG_DIR = Path("config")
 MCP_CONFIG_PATH = CONFIG_DIR / "mcp_servers.toml"
 AGENTS_CONFIG_PATH = CONFIG_DIR / "agents.toml"
@@ -34,7 +36,7 @@ class LocalWorkerSpec:
     model: Any
     tools: list[Any]
     memory: list[str]
-    skills: list[str]
+    skills: SkillSelection
     permission_profile: str | None = None
     delegation_local_worker_specs: dict[str, LocalWorkerSpec] | None = None
     delegation_remote_refs: dict[str, RemoteRef] | None = None
@@ -528,6 +530,36 @@ def to_backend_paths(paths: list[str], base_dir: str) -> list[str]:
     ]
 
 
+def parse_skill_selection(raw: Any) -> SkillSelection:
+    """Parse agent skills visibility config.
+
+    `skills` no longer names backend directories. It now controls which discovered
+    skill names an agent can see.
+    """
+
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in {"inherit", "none"}:
+            return value
+        raise ValueError(
+            "Agent config field 'skills' must be 'inherit', 'none', "
+            "or a list of skill names."
+        )
+    if isinstance(raw, list):
+        names: list[str] = []
+        for item in raw:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(
+                    "Agent config field 'skills' list must contain non-empty strings."
+                )
+            names.append(item.strip())
+        return names
+    raise ValueError(
+        "Agent config field 'skills' must be 'inherit', 'none', "
+        "or a list of skill names."
+    )
+
+
 def _resolve_api_key_from_provider(
     provider: LLMProviderSpec,
     *,
@@ -801,7 +833,7 @@ async def build_local_worker_spec(
         ),
         tools=tools,
         memory=to_backend_paths(agent_config.get("memory", []), home_dir),
-        skills=to_backend_paths(agent_config.get("skills", []), skills_root),
+        skills=parse_skill_selection(agent_config.get("skills", "inherit")),
         permission_profile=agent_config.get("permission_profile"),
         tool_search=tool_search,
         tool_search_registry=registry if tool_search else None,

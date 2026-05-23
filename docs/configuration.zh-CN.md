@@ -72,7 +72,7 @@ system_prompt = "You are a practical engineering assistant. Be concise, accurate
 provider = "openrouter"
 model = "qwen/qwen3.6-plus"
 memory = []
-skills = []
+skills = "inherit"
 server_names = []
 tool_names = []
 workers = ["background_research"]
@@ -91,7 +91,8 @@ permission_profile = "standard"
 | `tool_names` | 只注入指定工具；留空表示使用 server scope 下可用工具。 |
 | `workers` | 当前 agent 可以委派的 local worker 或 remote_ref 名称。 |
 | `permission_profile` | 引用 `config/permissions.toml` 中的权限 profile。 |
-| `memory` / `skills` | 映射到 backend workspace 的 memory 和 skill 路径。starter 默认留空。 |
+| `memory` | 映射到 backend workspace 的 memory 路径。starter 默认留空。 |
+| `skills` | 控制 agent 可见的 skill 名称。可设为 `"inherit"`、`"none"` 或 `["skill-name"]`。Ruyi 会从固定 skill 目录扫描并同步到 backend view。 |
 
 一个带 MCP 搜索 worker 的例子：
 
@@ -105,7 +106,7 @@ system_prompt = "You are a background research worker. Summarize findings with s
 provider = "openrouter"
 model = "qwen/qwen3.6-plus"
 memory = []
-skills = []
+skills = "none"
 server_names = ["exa"]
 tool_names = []
 workers = []

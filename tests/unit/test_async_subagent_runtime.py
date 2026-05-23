@@ -22,6 +22,8 @@ from ruyi_agent.runtime.delegation.context import (
 )
 from ruyi_agent.channels.http.api import AgentControlGatewayRuntime, GatewayService, create_gateway_app
 from ruyi_agent.storage.task_store import TaskStore
+from ruyi_agent.runtime.skills.sync import SkillSyncer
+from ruyi_agent.runtime.skills.types import SkillEntry
 
 
 class FakeAgent:
@@ -551,6 +553,22 @@ class ReviewRemoteA2AClient:
         }
 
 
+class UploadResponse:
+    def __init__(self, path: str, error: str | None = None) -> None:
+        self.path = path
+        self.error = error
+
+
+class UploadBackend:
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[UploadResponse]:
+        for path, content in files:
+            self.files[path] = content
+        return [UploadResponse(path) for path, _content in files]
+
+
 def build_specs() -> dict[str, LocalWorkerSpec]:
     return {
         "background_research": LocalWorkerSpec(
@@ -560,9 +578,24 @@ def build_specs() -> dict[str, LocalWorkerSpec]:
             model=object(),
             tools=[],
             memory=["/sandbox/home/AGENTS.md"],
-            skills=["/sandbox/skills/frontend-skill"],
+            skills=["frontend-skill"],
         )
     }
+
+
+def write_test_skill(tmp_path, name: str) -> SkillEntry:
+    skill_dir = tmp_path / name
+    skill_dir.mkdir(parents=True)
+    skill_dir.joinpath("SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {name} desc\n---\n",
+        encoding="utf-8",
+    )
+    return SkillEntry(
+        name=name,
+        description=f"{name} desc",
+        path=skill_dir,
+        source_root=tmp_path,
+    )
 
 
 def build_test_remote_refs() -> dict[str, RemoteRef]:
@@ -575,6 +608,118 @@ def build_test_remote_refs() -> dict[str, RemoteRef]:
             auth={"type": "bearer", "token_env": "REMOTE_CODE_WIKI_TOKEN"},
         )
     }
+
+
+def test_spawn_task_materializes_skill_view_and_passes_it_to_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    factory = FakeAgentFactory()
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    frontend = write_test_skill(tmp_path, "frontend")
+    backend = UploadBackend()
+    specs = {
+        "main": LocalWorkerSpec(
+            name="main",
+            description="main helper",
+            system_prompt="prompt",
+            model=object(),
+            tools=[],
+            memory=[],
+            skills=["frontend"],
+        )
+    }
+
+    async def run() -> async_subagent_runtime.TaskRecord:
+        control = async_subagent_runtime.AgentControl(
+            specs,
+            {},
+            checkpointer=object(),
+            backend=backend,
+            skill_catalog={"frontend": frontend},
+            skill_syncer=SkillSyncer(
+                backend=backend,
+                views_root="/.ruyi_agent/runtime/skill-views",
+            ),
+        )
+        record = await control.spawn_task("main", "use frontend skill")
+        if record.active_run is not None:
+            await record.active_run
+        return control.get_task_record(record.task_id)
+
+    record = asyncio.run(run())
+
+    assert record.effective_skill_names == ("frontend",)
+    assert record.skill_view_path is not None
+    assert record.skill_view_hash is not None
+    assert f"{record.skill_view_path}/frontend/SKILL.md" in backend.files
+    assert (
+        factory.created[0].calls[0]["config"]["configurable"]["skill_view_path"]
+        == record.skill_view_path
+    )
+
+
+def test_spawn_task_inherits_parent_effective_skills(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    factory = FakeAgentFactory()
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    frontend = write_test_skill(tmp_path, "frontend")
+    backend = UploadBackend()
+    specs = {
+        "main": LocalWorkerSpec(
+            name="main",
+            description="main helper",
+            system_prompt="prompt",
+            model=object(),
+            tools=[],
+            memory=[],
+            skills=["frontend"],
+        ),
+        "worker": LocalWorkerSpec(
+            name="worker",
+            description="worker helper",
+            system_prompt="prompt",
+            model=object(),
+            tools=[],
+            memory=[],
+            skills="inherit",
+        ),
+    }
+
+    async def run() -> tuple[async_subagent_runtime.TaskRecord, async_subagent_runtime.TaskRecord]:
+        control = async_subagent_runtime.AgentControl(
+            specs,
+            {},
+            checkpointer=object(),
+            backend=backend,
+            skill_catalog={"frontend": frontend},
+            skill_syncer=SkillSyncer(
+                backend=backend,
+                views_root="/.ruyi_agent/runtime/skill-views",
+            ),
+        )
+        parent = await control.spawn_task("main", "parent")
+        if parent.active_run is not None:
+            await parent.active_run
+        child = await control.spawn_task(
+            "worker",
+            "child",
+            parent_task_id=parent.task_id,
+        )
+        if child.active_run is not None:
+            await child.active_run
+        return (
+            control.get_task_record(parent.task_id),
+            control.get_task_record(child.task_id),
+        )
+
+    parent, child = asyncio.run(run())
+
+    assert child.effective_skill_names == parent.effective_skill_names == ("frontend",)
+    assert child.skill_view_path == parent.skill_view_path
+    assert child.skill_view_hash == parent.skill_view_hash
 
 
 def test_spawn_wait_and_check_agent_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1864,7 +2009,7 @@ def test_spawn_remote_ref_runs_via_a2a_gateway(
                 model=object(),
                 tools=[],
                 memory=["/sandbox/home/AGENTS.md"],
-                skills=["/sandbox/skills/frontend-skill"],
+                skills=["frontend-skill"],
             )
         },
         {},

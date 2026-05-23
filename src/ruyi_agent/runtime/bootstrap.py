@@ -41,6 +41,10 @@ from ruyi_agent.runtime.agent_factory import create_runtime_agent
 from ruyi_agent.storage.task_store import TaskStore
 from ruyi_agent.control_plane.permissions import PermissionPolicy
 from ruyi_agent.storage.review_audit import ReviewAuditStore
+from ruyi_agent.runtime.skills.catalog import SkillCatalog
+from ruyi_agent.runtime.skills.resolver import resolve_skill_names
+from ruyi_agent.runtime.skills.sync import SkillSyncer
+from ruyi_agent.runtime.skills.types import SkillEntry
 
 # 默认的配置 代码优先会从env读取。
 # 注意：dev-token 只适合本机开发；对外暴露 Gateway 必须显式设置强 GATEWAY_BEARER_TOKEN。
@@ -112,6 +116,9 @@ class AppRuntime:
     review_audit_store: ReviewAuditStore | None = None
     review_audit_db: str = ""
     permission_default_profile: str = ""
+    skill_catalog: dict[str, SkillEntry] | None = None
+    skill_syncer: SkillSyncer | None = None
+    _root_skill_config_cache: dict[str, dict[str, Any]] | None = None
 
     def list_local_agent_names(self) -> list[str]:
         return sorted(self.local_agent_specs)
@@ -136,6 +143,25 @@ class AppRuntime:
     def resolve_root_permission_profile(self, agent_name: str) -> str:
         spec = self.local_agent_specs[agent_name]
         return spec.permission_profile or self.permission_default_profile
+
+    def resolve_root_skill_config(self, agent_name: str) -> dict[str, Any]:
+        if self.skill_catalog is None or self.skill_syncer is None:
+            return {}
+        if self._root_skill_config_cache is None:
+            self._root_skill_config_cache = {}
+        cached = self._root_skill_config_cache.get(agent_name)
+        if cached is not None:
+            return dict(cached)
+        spec = self.local_agent_specs[agent_name]
+        skill_names = resolve_skill_names(spec.skills, self.skill_catalog)
+        view = self.skill_syncer.ensure_view(self.skill_catalog, skill_names)
+        config = {
+            "effective_skill_names": list(skill_names),
+            "skill_view_path": view.path if view is not None else None,
+            "skill_view_hash": view.view_hash if view is not None else None,
+        }
+        self._root_skill_config_cache[agent_name] = config
+        return dict(config)
 
 
 def _build_scoped_tool_factory(
@@ -228,6 +254,9 @@ async def bootstrap_application():
     home_dir = backend_runtime.home_dir
     skills_root = backend_runtime.skills_root
     agent_backend = backend_runtime.backend
+    host_workspace_root = Path(os.getenv("LOCAL_BACKEND_ROOT", os.getcwd())).resolve()
+    skill_catalog = SkillCatalog(workspace_root=host_workspace_root).scan().skills
+    skill_syncer = SkillSyncer(backend=agent_backend, views_root=skills_root)
     checkpoint_db = os.getenv("CHECKPOINT_DB", DEFAULT_CHECKPOINT_DB)
     route_db = os.getenv("GATEWAY_ROUTE_DB", DEFAULT_GATEWAY_ROUTE_DB)
     task_db = os.getenv("TASK_DB", DEFAULT_TASK_DB)
@@ -312,6 +341,8 @@ async def bootstrap_application():
                 backend_kind=backend_runtime.kind,
                 workspace_root=home_dir,
                 review_audit_store=review_audit_store,
+                skill_catalog=skill_catalog,
+                skill_syncer=skill_syncer,
             )
             worker_control_ref["control"] = worker_control
             main_spec = all_local_specs[main_agent_name]
@@ -341,6 +372,8 @@ async def bootstrap_application():
                 backend_kind=backend_runtime.kind,
                 workspace_root=home_dir,
                 review_audit_store=review_audit_store,
+                skill_catalog=skill_catalog,
+                skill_syncer=skill_syncer,
             )
 
             # TUI/interactive 入口按名称选择 local agent。agent 创建必须等
@@ -405,6 +438,7 @@ async def bootstrap_application():
                 f"max_tasks_per_root={max_tasks_per_root}",
             )
             print(f"configured backend: {backend_runtime.kind} ({home_dir})")
+            print("configured skills:", sorted(skill_catalog.keys()))
             print(
                 "configured permission default profile:",
                 permission_policy.default_profile,
@@ -423,8 +457,11 @@ async def bootstrap_application():
                 task_db=task_db,
                 review_audit_db=review_audit_db,
                 permission_default_profile=permission_policy.default_profile,
+                skill_catalog=skill_catalog,
+                skill_syncer=skill_syncer,
                 _build_local_agent=build_local_agent,
                 _local_agent_cache={},
+                _root_skill_config_cache={},
             )
     finally:
         if route_store is not None:

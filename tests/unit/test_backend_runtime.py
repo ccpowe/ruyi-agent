@@ -21,7 +21,7 @@ def test_create_local_backend_runtime_exposes_shell_and_file_transfer(
 
     assert runtime.kind == "local"
     assert runtime.home_dir == "/"
-    assert runtime.skills_root == "/"
+    assert runtime.skills_root == "/.ruyi_agent/runtime/skill-views"
 
     file_path = "/nested/example.txt"
 
@@ -42,32 +42,19 @@ def test_create_local_backend_runtime_exposes_shell_and_file_transfer(
     runtime.close()
 
 
-def test_create_local_backend_runtime_allows_custom_skills_root(
+def test_create_local_backend_runtime_uses_fixed_skill_views_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    skills_root = tmp_path / "data" / "skills"
     monkeypatch.setenv("BACKEND_KIND", "localshell")
     monkeypatch.setenv("LOCAL_BACKEND_ROOT", str(tmp_path))
-    monkeypatch.setenv("LOCAL_BACKEND_SKILLS_ROOT", str(skills_root))
+    monkeypatch.setenv("LOCAL_BACKEND_SKILLS_ROOT", str(tmp_path / "legacy-skills"))
 
     runtime = create_backend_runtime()
 
     assert runtime.kind == "local"
     assert runtime.home_dir == "/"
-    assert runtime.skills_root == "/data/skills"
-
-
-def test_create_local_backend_runtime_rejects_skills_root_outside_workspace(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("BACKEND_KIND", "localshell")
-    monkeypatch.setenv("LOCAL_BACKEND_ROOT", str(tmp_path / "workspace"))
-    monkeypatch.setenv("LOCAL_BACKEND_SKILLS_ROOT", str(tmp_path / "skills"))
-
-    with pytest.raises(ValueError, match="LOCAL_BACKEND_SKILLS_ROOT"):
-        create_backend_runtime()
+    assert runtime.skills_root == "/.ruyi_agent/runtime/skill-views"
 
 
 def test_create_backend_runtime_rejects_unknown_kind(

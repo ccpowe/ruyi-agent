@@ -11,12 +11,12 @@ from ruyi_agent.runtime.middleware.deepagents_adapters import (
     FilesystemMiddleware,
     MemoryMiddleware,
     PatchToolCallsMiddleware,
-    SkillsMiddleware,
     TodoListMiddleware,
     create_summarization_middleware,
 )
 from ruyi_agent.runtime.middleware.tool_error import ToolErrorMiddleware
 from ruyi_agent.runtime.middleware.tool_search import ToolSearchMiddleware
+from ruyi_agent.runtime.middleware.ruyi_skills import RuyiSkillsMiddleware
 from ruyi_agent.runtime.middleware.mailbox import MailboxMiddleware
 from ruyi_agent.runtime.middleware.task_hydration import TaskHydrationMiddleware
 from ruyi_agent.runtime.middleware.worker_delegation import WorkerDelegationMiddleware
@@ -31,7 +31,7 @@ def build_runtime_middleware(
     *,
     resolved_model: Any,
     backend: BackendProtocol | BackendFactory,
-    skills: list[str] | None,
+    skills: Any,
     memory: list[str] | None,
     local_worker_specs: dict[str, LocalWorkerSpec] | None,
     remote_refs: dict[str, RemoteRef] | None,
@@ -66,8 +66,7 @@ def build_runtime_middleware(
             )
         )
 
-    if skills:
-        middleware.append(SkillsMiddleware(backend=backend, sources=skills))
+    middleware.append(RuyiSkillsMiddleware(backend=backend))
 
     middleware.extend(
         [

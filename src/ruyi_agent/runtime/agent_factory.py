@@ -29,7 +29,7 @@ def create_runtime_agent(
     local_worker_specs: dict[str, LocalWorkerSpec] | None = None,
     remote_refs: dict[str, RemoteRef] | None = None,
     build_worker_tools: Callable[[], list[Any]] | None = None,
-    skills: list[str] | None = None,
+    skills: Any = None,
     memory: list[str] | None = None,
     checkpointer: Any | None = None,
     backend: BackendProtocol | BackendFactory | None = None,

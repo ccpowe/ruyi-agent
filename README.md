@@ -146,6 +146,24 @@ cp .env.example .env
 
 详细说明见 [配置指南](docs/configuration.zh-CN.md)，其中包含 `.env`、`agents.toml`、模型供应商、MCP server 和权限 profile 的示例。
 
+### Skills
+
+Ruyi 会从固定目录扫描 skills，并在创建任务时按 agent 配置同步成 backend 内部 skill view。支持的扫描目录按优先级从高到低为：
+
+```text
+workspace/.agents/skills
+~/.agents/skills
+~/.ruyi_agent/skills
+```
+
+`config/agents.toml` 中的 `skills` 字段现在表示可见性，不再表示目录：
+
+```toml
+skills = ["repo-workflow", "frontend"]  # 只允许这些 skill name
+skills = "inherit"                      # 继承父任务 effective skills；根任务使用扫描到的 skills
+skills = "none"                         # 禁用 skills
+```
+
 ### 4. Gateway 模式
 
 ```bash

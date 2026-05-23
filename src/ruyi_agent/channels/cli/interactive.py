@@ -33,6 +33,7 @@ class RootTurnResult:
 class LocalRootRunner:
     get_agent: Any
     resolve_permission_profile: Any
+    resolve_skill_config: Any | None = None
 
     async def resume_review(
         self,
@@ -46,6 +47,7 @@ class LocalRootRunner:
             agent_name=agent_name,
             thread_id=thread_id,
             resolve_permission_profile=self.resolve_permission_profile,
+            resolve_skill_config=self.resolve_skill_config,
         )
         result = await agent.ainvoke(
             resume_command_from_decisions(decisions),
@@ -78,6 +80,7 @@ def _agent_config(
     agent_name: str,
     thread_id: str,
     resolve_permission_profile: Any,
+    resolve_skill_config: Any | None = None,
     resolve_pending_reviews: Any | None = None,
 ) -> dict[str, Any]:
     configurable = {
@@ -85,6 +88,8 @@ def _agent_config(
         "agent_name": agent_name,
         "permission_profile": resolve_permission_profile(agent_name),
     }
+    if resolve_skill_config is not None:
+        configurable.update(resolve_skill_config(agent_name))
     if resolve_pending_reviews is not None:
         configurable["resolve_pending_reviews"] = resolve_pending_reviews
     return {"configurable": configurable}
@@ -121,6 +126,7 @@ async def _run_agent_turn(
         agent_name=state.agent_name,
         thread_id=state.thread_id,
         resolve_permission_profile=runtime.resolve_root_permission_profile,
+        resolve_skill_config=runtime.resolve_root_skill_config,
         resolve_pending_reviews=resolve_task_reviews,
     )
     payload: Any = {"messages": [{"role": "user", "content": user_input}]}
@@ -263,6 +269,7 @@ async def run_interactive(
         root_runner = LocalRootRunner(
             get_agent=runtime.get_local_agent,
             resolve_permission_profile=runtime.resolve_root_permission_profile,
+            resolve_skill_config=runtime.resolve_root_skill_config,
         )
         review_control = ReviewControl(
             control=runtime.worker_control,

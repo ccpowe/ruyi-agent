@@ -67,8 +67,11 @@ class TaskStore:
                     delegation_max_tasks_per_root,
                     delegation_visited_nodes_json,
                     permission_profile,
+                    effective_skill_names_json,
+                    skill_view_path,
+                    skill_view_hash,
                     pending_review_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.task_id,
@@ -101,6 +104,12 @@ class TaskStore:
                         ensure_ascii=True,
                     ),
                     record.permission_profile,
+                    json.dumps(
+                        list(record.effective_skill_names),
+                        ensure_ascii=True,
+                    ),
+                    record.skill_view_path,
+                    record.skill_view_hash,
                     (
                         json.dumps(
                             record.pending_review,
@@ -215,6 +224,9 @@ class TaskStore:
                     delegation_max_tasks_per_root INTEGER,
                     delegation_visited_nodes_json TEXT NOT NULL DEFAULT '[]',
                     permission_profile TEXT NOT NULL DEFAULT '',
+                    effective_skill_names_json TEXT NOT NULL DEFAULT '[]',
+                    skill_view_path TEXT,
+                    skill_view_hash TEXT,
                     pending_review_json TEXT
                 )
                 """
@@ -227,6 +239,21 @@ class TaskStore:
             self._ensure_column(
                 table="agent_tasks",
                 column="pending_review_json",
+                definition="TEXT",
+            )
+            self._ensure_column(
+                table="agent_tasks",
+                column="effective_skill_names_json",
+                definition="TEXT NOT NULL DEFAULT '[]'",
+            )
+            self._ensure_column(
+                table="agent_tasks",
+                column="skill_view_path",
+                definition="TEXT",
+            )
+            self._ensure_column(
+                table="agent_tasks",
+                column="skill_view_hash",
                 definition="TEXT",
             )
             self._conn.commit()
@@ -264,6 +291,9 @@ class TaskStore:
                     delegation_max_tasks_per_root,
                     delegation_visited_nodes_json,
                     permission_profile,
+                    effective_skill_names_json,
+                    skill_view_path,
+                    skill_view_hash,
                     pending_review_json
         """
 
@@ -306,7 +336,14 @@ class TaskStore:
             delegation_max_tasks_per_root=row[20],
             delegation_visited_nodes=visited_nodes,
             permission_profile=row[22],
-            pending_review=json.loads(row[23]) if row[23] else None,
+            effective_skill_names=tuple(
+                item
+                for item in (json.loads(row[23]) if row[23] else [])
+                if isinstance(item, str)
+            ),
+            skill_view_path=row[24],
+            skill_view_hash=row[25],
+            pending_review=json.loads(row[26]) if row[26] else None,
         )
 
 
