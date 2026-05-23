@@ -2,6 +2,16 @@
 kind = "openrouter"
 api_key_env = "OPENROUTER_API_KEY"
 
+[providers.deepseek]
+kind = "deepseek"
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[providers.zai]
+kind = "litellm"
+base_url = "https://open.bigmodel.cn/api/paas/v4/"
+api_key_env = "ZAI_API_KEY"
+
 # [providers.openai]
 # kind = "openai"
 # api_key_env = "OPENAI_API_KEY"

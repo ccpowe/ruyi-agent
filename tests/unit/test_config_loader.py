@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 
 import ruyi_agent.config.loader as config_loader
 
@@ -227,6 +228,126 @@ def test_build_chat_model_from_config_builds_moonshot_model(monkeypatch) -> None
     ]
 
 
+def test_build_chat_model_from_config_builds_deepseek_model_with_reasoning_echo(
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeChatDeepSeek:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+        def _get_request_payload(
+            self,
+            input_: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            return {
+                "messages": [
+                    {"role": "user", "content": "use tool"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                ]
+            }
+
+    monkeypatch.setattr(
+        config_loader,
+        "_get_chat_deepseek_class",
+        lambda: FakeChatDeepSeek,
+    )
+
+    providers = {
+        "deepseek": config_loader.LLMProviderSpec(
+            name="deepseek",
+            kind="deepseek",
+            base_url="https://api.deepseek.com",
+            api_key_env="DEEPSEEK_API_KEY",
+        )
+    }
+    model = config_loader.build_chat_model_from_config(
+        {
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+        },
+        providers=providers,
+        getenv=lambda name: {"DEEPSEEK_API_KEY": "deepseek-key"}.get(name),
+    )
+
+    payload = model._get_request_payload(
+        [
+            HumanMessage(content="use tool"),
+            AIMessage(
+                content="",
+                additional_kwargs={"reasoning_content": "must echo"},
+                tool_calls=[{"name": "lookup", "args": {}, "id": "call_1"}],
+            ),
+        ]
+    )
+
+    assert calls == [
+        {
+            "model": "deepseek-v4-pro",
+            "api_key": "deepseek-key",
+            "base_url": "https://api.deepseek.com",
+        }
+    ]
+    assert payload["messages"][1]["reasoning_content"] == "must echo"
+
+
+def test_build_chat_model_from_config_builds_litellm_model(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+    built_model = object()
+
+    class FakeChatLiteLLM:
+        def __new__(cls, **kwargs: object):
+            calls.append(kwargs)
+            return built_model
+
+    monkeypatch.setattr(
+        config_loader,
+        "_get_chat_litellm_class",
+        lambda: FakeChatLiteLLM,
+    )
+
+    providers = {
+        "zai": config_loader.LLMProviderSpec(
+            name="zai",
+            kind="litellm",
+            base_url="https://open.bigmodel.cn/api/paas/v4/",
+            api_key_env="ZAI_API_KEY",
+            init_kwargs={"request_timeout": 60},
+        )
+    }
+
+    resolved = config_loader.build_chat_model_from_config(
+        {
+            "provider": "zai",
+            "model": "zai/glm-5.1",
+        },
+        providers=providers,
+        getenv=lambda name: {"ZAI_API_KEY": "zai-key"}.get(name),
+    )
+
+    assert resolved is built_model
+    assert calls == [
+        {
+            "model": "zai/glm-5.1",
+            "request_timeout": 60,
+            "api_key": "zai-key",
+            "api_base": "https://open.bigmodel.cn/api/paas/v4/",
+        }
+    ]
+
+
 def test_build_chat_model_from_config_builds_openai_codex_model(monkeypatch) -> None:
     calls: list[dict[str, object]] = []
     built_model = object()
@@ -337,9 +458,14 @@ def test_load_llm_provider_configs_parses_providers(tmp_path: Path) -> None:
         '\n'.join(
             [
                 "[providers.deepseek]",
-                'kind = "openai"',
+                'kind = "deepseek"',
                 'base_url = "https://api.deepseek.com"',
                 'api_key_env = "DEEPSEEK_API_KEY"',
+                "",
+                "[providers.zai]",
+                'kind = "litellm"',
+                'base_url = "https://open.bigmodel.cn/api/paas/v4/"',
+                'api_key_env = "ZAI_API_KEY"',
                 "",
                 "[providers.openrouter]",
                 'kind = "openrouter"',
@@ -366,9 +492,12 @@ def test_load_llm_provider_configs_parses_providers(tmp_path: Path) -> None:
 
     providers = config_loader.load_llm_provider_configs(config_path)
 
-    assert providers["deepseek"].kind == "openai"
+    assert providers["deepseek"].kind == "deepseek"
     assert providers["deepseek"].base_url == "https://api.deepseek.com"
     assert providers["deepseek"].api_key_env == "DEEPSEEK_API_KEY"
+    assert providers["zai"].kind == "litellm"
+    assert providers["zai"].base_url == "https://open.bigmodel.cn/api/paas/v4/"
+    assert providers["zai"].api_key_env == "ZAI_API_KEY"
     assert providers["openrouter"].kind == "openrouter"
     assert providers["kimi"].kind == "moonshot"
     assert providers["kimi"].init_kwargs == {"thinking": True}

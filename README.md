@@ -187,7 +187,17 @@ TUI 主要用于本地开发和调试。旧的 `cli` 单轮命令行对话模式
 
 ## 模型 Provider
 
-OpenRouter 和 Kimi/Moonshot 通过 `config/llm_providers.toml` 配置，agent 在 `config/agents.toml` 中通过 `provider` 字段引用。
+OpenRouter、DeepSeek、Kimi/Moonshot 和 LiteLLM/Z.AI 通过 `config/llm_providers.toml` 配置，agent 在 `config/agents.toml` 中通过 `provider` 字段引用。
+
+常见切换示例：
+
+```toml
+provider = "deepseek"
+model = "deepseek-v4-pro"
+
+provider = "zai"
+model = "zai/glm-5.1"
+```
 
 OpenAI Codex OAuth provider 也可以用于本机实验。先完成一次 device login：
 

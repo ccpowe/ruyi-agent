@@ -92,6 +92,24 @@ def test_normalize_agent_turn_result_stringifies_list_content_blocks() -> None:
     assert outcome.content == "first\nsecond"
 
 
+def test_normalize_agent_turn_result_hides_litellm_thinking_blocks() -> None:
+    outcome = normalize_agent_turn_result(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "hidden reasoning"},
+                        {"type": "text", "text": "visible answer"},
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert outcome.content == "visible answer"
+
+
 def test_normalize_agent_turn_result_extracts_nested_review_payloads() -> None:
     review_payload = {
         "action_requests": [{"name": "execute", "args": {"command": "python -V"}}],

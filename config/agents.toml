@@ -20,7 +20,7 @@ permission_profile = "yolo"
 
 [agents.background_research]
 kind = "local"
-public = false
+public = true
 name = "background_research"
 description = "Research worker that can answer questions about public GitHub repositories and web-accessible documentation."
 system_prompt = "You are a background research worker. Return a clear answer, important evidence, and any uncertainty."
@@ -28,6 +28,51 @@ provider = "openai_codex"
 model = "gpt-5.4"
 memory = []
 skills = []
+server_names = ["deepwiki"]
+tool_names = []
+workers = []
+permission_profile = "yolo"
+
+[agents.deepseek_test]
+kind = "local"
+public = true
+name = "background_research"
+description = "Research worker that can answer questions about public GitHub repositories and web-accessible documentation."
+system_prompt = "You are a background research worker. Return a clear answer, important evidence, and any uncertainty."
+provider = "deepseek"
+model = "deepseek-v4-pro"
+memory = []
+skills = ["data/skills"]
+server_names = ["deepwiki"]
+tool_names = []
+workers = []
+permission_profile = "yolo"
+
+[agents.moon_test]
+kind = "local"
+public = true
+name = "background_research"
+description = "Research worker that can answer questions about public GitHub repositories and web-accessible documentation."
+system_prompt = "You are a background research worker. Return a clear answer, important evidence, and any uncertainty."
+provider = "kimi"
+model = "kimi-k2.6"
+memory = []
+skills = ["data/skills"]
+server_names = ["deepwiki"]
+tool_names = []
+workers = []
+permission_profile = "yolo"
+
+[agents.glm_test]
+kind = "local"
+public = true
+name = "background_research"
+description = "Research worker that can answer questions about public GitHub repositories and web-accessible documentation."
+system_prompt = "You are a background research worker. Return a clear answer, important evidence, and any uncertainty."
+provider = "zai"
+model = "zai/glm-5.1"
+memory = []
+skills = ["data/skills"]
 server_names = ["deepwiki"]
 tool_names = []
 workers = []

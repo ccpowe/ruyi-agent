@@ -84,6 +84,8 @@ REMOTE_REF_REQUIRED_FIELDS = {
 REMOTE_REF_ALLOWED_FIELDS = REMOTE_REF_REQUIRED_FIELDS | {"auth"}
 SUPPORTED_MODEL_PROVIDERS = {
     "anthropic",
+    "deepseek",
+    "litellm",
     "moonshot",
     "openai",
     "openai_codex",
@@ -565,6 +567,129 @@ def _get_chat_moonshot_class() -> Any:
     return ChatMoonshot
 
 
+def _get_chat_deepseek_class() -> Any:
+    """延迟导入 DeepSeek 集成，避免未使用该 provider 时强制安装。"""
+    try:
+        from langchain_deepseek import ChatDeepSeek
+    except ImportError as exc:
+        raise ValueError(
+            "Provider kind='deepseek' requires the 'langchain-deepseek' package. "
+            "Install it with `uv add langchain-deepseek`."
+        ) from exc
+    return ChatDeepSeek
+
+
+def _message_has_tool_calls(message: Any, encoded: dict[str, Any]) -> bool:
+    if isinstance(message, dict):
+        return bool(
+            message.get("tool_calls")
+            or message.get("invalid_tool_calls")
+            or message.get("function_call")
+            or encoded.get("tool_calls")
+            or encoded.get("function_call")
+        )
+    return bool(
+        getattr(message, "tool_calls", None)
+        or getattr(message, "invalid_tool_calls", None)
+        or getattr(message, "additional_kwargs", {}).get("tool_calls")
+        or encoded.get("tool_calls")
+        or encoded.get("function_call")
+    )
+
+
+def _reasoning_content_for_request(message: Any, encoded: dict[str, Any]) -> str | None:
+    if isinstance(message, dict):
+        additional_kwargs = message.get("additional_kwargs", {})
+        reasoning_content = message.get("reasoning_content")
+        if isinstance(reasoning_content, str) and reasoning_content:
+            return reasoning_content
+        reasoning = message.get("reasoning")
+        if isinstance(reasoning, str) and reasoning:
+            return reasoning
+    else:
+        additional_kwargs = getattr(message, "additional_kwargs", {})
+    reasoning_content = additional_kwargs.get("reasoning_content")
+    if isinstance(reasoning_content, str) and reasoning_content:
+        return reasoning_content
+
+    reasoning = additional_kwargs.get("reasoning")
+    if isinstance(reasoning, str) and reasoning:
+        return reasoning
+
+    if _message_has_tool_calls(message, encoded):
+        return " "
+    return None
+
+
+def _messages_from_model_input(model: Any, input_: Any) -> list[Any]:
+    if isinstance(input_, list):
+        return input_
+    convert_input = getattr(model, "_convert_input", None)
+    if callable(convert_input):
+        converted = convert_input(input_)
+        to_messages = getattr(converted, "to_messages", None)
+        if callable(to_messages):
+            return list(to_messages())
+    return []
+
+
+def _patch_tool_call_reasoning_history(
+    original_messages: list[Any],
+    payload: dict[str, Any],
+) -> None:
+    encoded_messages = payload.get("messages")
+    if not isinstance(encoded_messages, list):
+        return
+
+    for original, encoded in zip(original_messages, encoded_messages, strict=False):
+        if not isinstance(encoded, dict):
+            continue
+        if not _message_has_tool_calls(original, encoded):
+            continue
+        reasoning_content = _reasoning_content_for_request(original, encoded)
+        if reasoning_content is not None:
+            encoded["reasoning_content"] = reasoning_content
+
+
+def _build_deepseek_model(model: str, **kwargs: Any) -> Any:
+    chat_deepseek = _get_chat_deepseek_class()
+
+    class ReasoningChatDeepSeek(chat_deepseek):  # type: ignore[misc, valid-type]
+        def _get_request_payload(
+            self,
+            input_: Any,
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            payload = super()._get_request_payload(input_, *args, **kwargs)
+            _patch_tool_call_reasoning_history(
+                _messages_from_model_input(self, input_),
+                payload,
+            )
+            return payload
+
+    return ReasoningChatDeepSeek(model=model, **kwargs)
+
+
+def _get_chat_litellm_class() -> Any:
+    """延迟导入 LiteLLM 集成，避免未使用该 provider 时强制安装。"""
+    try:
+        from langchain_litellm import ChatLiteLLM
+    except ImportError as exc:
+        raise ValueError(
+            "Provider kind='litellm' requires the 'langchain-litellm' package. "
+            "Install it with `uv add langchain-litellm`."
+        ) from exc
+    return ChatLiteLLM
+
+
+def _build_litellm_model(model: str, **kwargs: Any) -> Any:
+    chat_litellm = _get_chat_litellm_class()
+    if "base_url" in kwargs:
+        kwargs["api_base"] = kwargs.pop("base_url")
+    return chat_litellm(model=model, **kwargs)
+
+
 def _build_openai_codex_model(model: str, **kwargs: Any) -> Any:
     """延迟导入 Codex 模型适配器，避免普通 provider 强制加载 OpenAI SDK 细节。"""
     from ruyi_agent.integrations.openai_codex import CodexChatModel
@@ -609,6 +734,10 @@ def build_chat_model_from_config(
     if provider.kind == "moonshot":
         chat_moonshot = _get_chat_moonshot_class()
         return chat_moonshot(model=model_name, **kwargs)
+    if provider.kind == "deepseek":
+        return _build_deepseek_model(model_name, **kwargs)
+    if provider.kind == "litellm":
+        return _build_litellm_model(model_name, **kwargs)
     if provider.kind == "openai_codex":
         return _build_openai_codex_model(model_name, **kwargs)
 
