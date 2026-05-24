@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run test suite
+        run: uv run pytest
+
+  install-smoke:
+    name: uv tool install and init (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run cross-platform path tests
+        run: >
+          uv run pytest
+          tests/unit/test_ruyi_paths.py
+          tests/unit/test_runtime_settings.py
+          tests/unit/test_entrypoint_cli.py
+          tests/unit/test_packaging.py
+          -q
+
+      - name: Build wheel
+        run: uv build --wheel --out-dir dist-ci --clear
+
+      - name: Install CLI from wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_bin="$(uv tool dir --bin)"
+          printf '%s\n' "$tool_bin" >> "$GITHUB_PATH"
+          export PATH="$tool_bin:$PATH"
+          uv tool install --force dist-ci/*.whl
+          ruyi --help
+
+      - name: Smoke test init in user home
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          ruyi --init --force
+          test -f "$HOME/.ruyi_agent/ruyi.toml"
+          test -f "$HOME/.ruyi_agent/config/agents.toml"
+          test -f "$HOME/.ruyi_agent/config/llm_providers.toml"
+          test -f "$HOME/.ruyi_agent/config/mcp_servers.toml"
+          test -f "$HOME/.ruyi_agent/config/permissions.toml"
+
+      - name: Reject Windows-style RUYI_HOME on POSIX
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          set +e
+          RUYI_HOME='C:\Users\cc\.ruyi_agent' ruyi --init > ruyi-init-error.txt 2>&1
+          status=$?
+          set -e
+          test "$status" -eq 2
+          grep -q "Windows-style path" ruyi-init-error.txt
+          test ! -e "$HOME/C:\Users\cc\.ruyi_agent"

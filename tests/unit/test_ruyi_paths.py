@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import pytest
 
 from ruyi_agent.config.paths import resolve_ruyi_paths
 
@@ -64,6 +67,7 @@ def test_resolve_ruyi_paths_uses_user_home_when_project_has_no_ruyi_home(
     assert paths.workspace == project
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only path guard")
 def test_resolve_ruyi_paths_rejects_windows_style_ruyi_home_on_posix() -> None:
     try:
         resolve_ruyi_paths(env={"RUYI_HOME": r"C:\Users\cc\.ruyi_agent"})
@@ -76,6 +80,7 @@ def test_resolve_ruyi_paths_rejects_windows_style_ruyi_home_on_posix() -> None:
     assert "Windows-style path" in message
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only path guard")
 def test_resolve_ruyi_paths_rejects_windows_style_workspace_env_on_posix() -> None:
     try:
         resolve_ruyi_paths(env={"RUYI_WORKSPACE": r"C:\Users\cc\project"})
@@ -88,6 +93,7 @@ def test_resolve_ruyi_paths_rejects_windows_style_workspace_env_on_posix() -> No
     assert "Windows-style path" in message
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only path guard")
 def test_resolve_ruyi_paths_rejects_windows_style_workspace_arg_on_posix() -> None:
     try:
         resolve_ruyi_paths(workspace="C:/Users/cc/project")
