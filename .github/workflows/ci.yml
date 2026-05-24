@@ -75,7 +75,11 @@ jobs:
           set -euo pipefail
           tool_bin="$(uv tool dir --bin)"
           printf '%s\n' "$tool_bin" >> "$GITHUB_PATH"
-          export PATH="$tool_bin:$PATH"
+          tool_bin_for_shell="$tool_bin"
+          if command -v cygpath >/dev/null 2>&1; then
+            tool_bin_for_shell="$(cygpath -u "$tool_bin")"
+          fi
+          export PATH="$tool_bin_for_shell:$PATH"
           uv tool install --force dist-ci/*.whl
           ruyi --help
 
@@ -84,6 +88,11 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
+          tool_bin="$(uv tool dir --bin)"
+          if command -v cygpath >/dev/null 2>&1; then
+            tool_bin="$(cygpath -u "$tool_bin")"
+          fi
+          export PATH="$tool_bin:$PATH"
           ruyi --init --force
           test -f "$HOME/.ruyi_agent/ruyi.toml"
           test -f "$HOME/.ruyi_agent/config/agents.toml"
