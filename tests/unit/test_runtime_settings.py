@@ -7,6 +7,10 @@ from ruyi_agent.config.runtime_settings import configure_runtime_environment
 from ruyi_agent.config.runtime_settings import load_runtime_settings
 
 
+def _toml_path(path: Path) -> str:
+    return path.as_posix()
+
+
 def test_load_runtime_settings_maps_ruyi_toml_to_runtime_values(
     tmp_path: Path,
     monkeypatch,
@@ -21,7 +25,7 @@ def test_load_runtime_settings_maps_ruyi_toml_to_runtime_values(
             [
                 "[backend]",
                 'kind = "local"',
-                f'workspace = "{workspace}"',
+                f'workspace = "{_toml_path(workspace)}"',
                 "",
                 "[gateway]",
                 'host = "0.0.0.0"',
@@ -132,7 +136,7 @@ def test_configure_runtime_environment_applies_workspace_override(
         "\n".join(
             [
                 "[backend]",
-                f'workspace = "{config_workspace}"',
+                f'workspace = "{_toml_path(config_workspace)}"',
             ]
         ),
         encoding="utf-8",
@@ -161,7 +165,7 @@ def test_configure_runtime_environment_keeps_existing_workspace_override(
         "\n".join(
             [
                 "[backend]",
-                f'workspace = "{config_workspace}"',
+                f'workspace = "{_toml_path(config_workspace)}"',
             ]
         ),
         encoding="utf-8",
