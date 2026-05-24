@@ -32,14 +32,17 @@
 
 推荐把 Ruyi 安装成 `uv tool`。安装后会得到 `ruyi` 命令。
 
+当前发布版通过 GitHub Releases 提供 wheel 文件：
+
 ```bash
 uv tool install https://github.com/ccpowe/ruyi-agent/releases/download/v0.1.0/ruyi_agent-0.1.0-py3-none-any.whl
 ```
 
-如果使用 Python package index 发布版，也可以直接用包名安装：
+安装完成后初始化配置并启动：
 
 ```bash
-uv tool install ruyi-agent
+ruyi --init
+ruyi
 ```
 
 如果希望直接跟随 GitHub 源码版本：
@@ -47,6 +50,8 @@ uv tool install ruyi-agent
 ```bash
 uv tool install git+https://github.com/ccpowe/ruyi-agent.git
 ```
+
+`ruyi-agent` 暂未发布到 PyPI，因此 `uv tool install ruyi-agent` 暂不可用。发布到 Python Package Index 后，才可以直接用包名安装。
 
 本地开发使用源码环境：
 
