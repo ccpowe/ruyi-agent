@@ -41,6 +41,7 @@ from ruyi_agent.runtime.delegation.async_runtime import (
     AgentControl,
     MaxDelegationDepthError,
     MaxTasksPerRootError,
+    PublishedArtifact,
     RegisteredAgent,
     RemoteExecutorNotImplementedError,
     TaskAlreadyRunningError,
@@ -189,6 +190,17 @@ class TaskResponse(BaseModel):
     updated_at: datetime
     metadata: dict[str, MetadataScalar]
     pending_review: dict[str, Any] | None = None
+    artifacts: list["PublishedArtifactResponse"] = Field(default_factory=list)
+
+
+class PublishedArtifactResponse(BaseModel):
+    artifact_id: str
+    path: str
+    name: str
+    caption: str | None = None
+    content_type: str
+    size: int
+    run_count: int
 
 
 class TaskListResponse(BaseModel):
@@ -767,6 +779,28 @@ class GatewayService:
             filename=filename,
             content=content,
             content_type=_guess_content_type(filename),
+        )
+
+    async def download_task_artifact(
+        self,
+        *,
+        task_id: str,
+        artifact_id: str,
+    ) -> GatewayArtifact:
+        route = await self._get_task_route(task_id)
+        if route.route_kind == "remote_ref":
+            record = await self._refresh_route_task(route)
+        else:
+            record = self._get_local_task(task_id)
+        artifact = _find_artifact(record.artifacts, artifact_id)
+        if artifact is None:
+            raise self._artifact_not_found(artifact_id)
+        downloaded = await self.download_artifact(artifact.path)
+        return GatewayArtifact(
+            path=artifact.path,
+            filename=artifact.name,
+            content=downloaded.content,
+            content_type=artifact.content_type,
         )
 
     async def list_tasks(
@@ -1380,6 +1414,10 @@ class GatewayService:
             updated_at=record.updated_at,
             metadata=dict(metadata),
             pending_review=record.pending_review,
+            artifacts=[
+                _build_artifact_response(artifact)
+                for artifact in record.artifacts
+            ],
         )
 
     def _build_review_response(
@@ -1541,6 +1579,28 @@ def _guess_content_type(filename: str) -> str:
         ".ogg": "audio/ogg",
         ".mp4": "video/mp4",
     }.get(suffix, "application/octet-stream")
+
+
+def _build_artifact_response(artifact: PublishedArtifact) -> PublishedArtifactResponse:
+    return PublishedArtifactResponse(
+        artifact_id=artifact.artifact_id,
+        path=artifact.path,
+        name=artifact.name,
+        caption=artifact.caption,
+        content_type=artifact.content_type,
+        size=artifact.size,
+        run_count=artifact.run_count,
+    )
+
+
+def _find_artifact(
+    artifacts: list[PublishedArtifact],
+    artifact_id: str,
+) -> PublishedArtifact | None:
+    return next(
+        (artifact for artifact in artifacts if artifact.artifact_id == artifact_id),
+        None,
+    )
 
 
 def attach_gateway_routes(
@@ -1720,6 +1780,29 @@ def attach_gateway_routes(
         headers = {
             "Content-Disposition": f'attachment; filename="{artifact.filename}"',
             "X-Artifact-Path": artifact.path,
+        }
+        return Response(
+            content=artifact.content,
+            media_type=artifact.content_type,
+            headers=headers,
+        )
+
+    @app.get("/tasks/{task_id}/artifacts/{artifact_id}/download")
+    async def download_task_artifact(
+        request: Request,
+        task_id: str,
+        artifact_id: str,
+        _: None = Depends(require_bearer),
+    ) -> Response:
+        service = service_getter(request)
+        artifact = await service.download_task_artifact(
+            task_id=task_id,
+            artifact_id=artifact_id,
+        )
+        headers = {
+            "Content-Disposition": f'attachment; filename="{artifact.filename}"',
+            "X-Artifact-Path": artifact.path,
+            "X-Artifact-Id": artifact_id,
         }
         return Response(
             content=artifact.content,

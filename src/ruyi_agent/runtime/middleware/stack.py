@@ -14,6 +14,9 @@ from ruyi_agent.runtime.middleware.deepagents_adapters import (
     TodoListMiddleware,
     create_summarization_middleware,
 )
+from ruyi_agent.runtime.middleware.artifact_publishing import (
+    ArtifactPublishingMiddleware,
+)
 from ruyi_agent.runtime.middleware.tool_error import ToolErrorMiddleware
 from ruyi_agent.runtime.middleware.tool_search import ToolSearchMiddleware
 from ruyi_agent.runtime.middleware.ruyi_skills import RuyiSkillsMiddleware
@@ -41,6 +44,7 @@ def build_runtime_middleware(
     permission_policy: PermissionPolicy | None = None,
     backend_kind: str = "unknown",
     workspace_root: str = "",
+    register_artifact: Callable[..., dict[str, Any]] | None = None,
     agent_name: str | None = None,
     permission_profile: str | None = None,
     review_audit_store: ReviewAuditStore | None = None,
@@ -63,6 +67,15 @@ def build_runtime_middleware(
                 registry=tool_search_registry,
                 server_names=tool_search_server_names,
                 tool_names=tool_search_tool_names,
+            )
+        )
+
+    if register_artifact is not None:
+        middleware.append(
+            ArtifactPublishingMiddleware(
+                backend=backend,
+                workspace_root=workspace_root,
+                register_artifact=register_artifact,
             )
         )
 

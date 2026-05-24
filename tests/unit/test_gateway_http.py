@@ -735,6 +735,57 @@ def test_artifact_download_reads_from_backend(
     assert response.headers["x-artifact-path"] == "/workspace/out/report.txt"
 
 
+def test_task_response_includes_published_artifacts_and_downloads_by_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = MemoryBackend(root="/workspace")
+    backend.files["/workspace/out/report.txt"] = b"artifact bytes"
+    app, factory = build_app(
+        monkeypatch,
+        backend=backend,
+        workspace_root="/workspace",
+    )
+
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/agents/main/tasks",
+            headers=auth_headers(),
+            json={"input": {"content": "write report"}},
+        )
+        task_id = create_response.json()["task_id"]
+        artifact = factory.control.register_artifact(
+            task_id=task_id,
+            artifact={
+                "path": "/workspace/out/report.txt",
+                "name": "report.txt",
+                "caption": "Report",
+                "content_type": "text/plain",
+                "size": len(b"artifact bytes"),
+            },
+        )
+        task_response = client.get(f"/tasks/{task_id}", headers=auth_headers())
+        download_response = client.get(
+            f"/tasks/{task_id}/artifacts/{artifact['artifact_id']}/download",
+            headers=auth_headers(),
+        )
+
+    assert task_response.status_code == 200
+    assert task_response.json()["artifacts"] == [
+        {
+            "artifact_id": artifact["artifact_id"],
+            "path": "/workspace/out/report.txt",
+            "name": "report.txt",
+            "caption": "Report",
+            "content_type": "text/plain",
+            "size": len(b"artifact bytes"),
+            "run_count": 1,
+        }
+    ]
+    assert download_response.status_code == 200
+    assert download_response.content == b"artifact bytes"
+    assert download_response.headers["x-artifact-id"] == artifact["artifact_id"]
+
+
 def test_artifact_download_rejects_path_outside_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

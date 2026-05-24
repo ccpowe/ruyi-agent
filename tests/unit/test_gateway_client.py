@@ -67,3 +67,31 @@ def test_download_artifact_falls_back_to_path_name_without_header() -> None:
 
     assert artifact.filename == "index.html"
     assert artifact.content == b"artifact"
+
+
+def test_download_task_artifact_uses_task_scoped_endpoint() -> None:
+    client = FakeGatewayHTTPClient(
+        httpx.Response(
+            200,
+            content=b"artifact",
+            headers={
+                "content-disposition": 'attachment; filename="report.html"',
+                "content-type": "text/html",
+            },
+        )
+    )
+
+    artifact = asyncio.run(
+        client.download_task_artifact(task_id="task-1", artifact_id="art_1")
+    )
+
+    assert artifact.filename == "report.html"
+    assert artifact.content_type == "text/html"
+    assert artifact.content == b"artifact"
+    assert client.requests == [
+        {
+            "method": "GET",
+            "path": "/tasks/task-1/artifacts/art_1/download",
+            "json": None,
+        }
+    ]

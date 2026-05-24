@@ -25,6 +25,65 @@ def _parse_datetime(value: str) -> datetime:
     return parsed
 
 
+def _artifact_to_dict(value: Any) -> dict[str, Any]:
+    return {
+        "artifact_id": value.artifact_id,
+        "path": value.path,
+        "name": value.name,
+        "caption": value.caption,
+        "content_type": value.content_type,
+        "size": value.size,
+        "run_count": value.run_count,
+    }
+
+
+def _parse_artifacts(value: str | None) -> list[Any]:
+    if not value:
+        return []
+    try:
+        raw_items = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(raw_items, list):
+        return []
+    from ruyi_agent.runtime.delegation.async_runtime import PublishedArtifact
+
+    artifacts = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        artifact_id = item.get("artifact_id")
+        path = item.get("path")
+        name = item.get("name")
+        content_type = item.get("content_type")
+        size = item.get("size")
+        run_count = item.get("run_count")
+        if not all(
+            [
+                isinstance(artifact_id, str) and artifact_id,
+                isinstance(path, str) and path,
+                isinstance(name, str) and name,
+                isinstance(content_type, str) and content_type,
+                isinstance(size, int),
+                isinstance(run_count, int),
+            ]
+        ):
+            continue
+        caption = item.get("caption")
+        artifacts.append(
+            PublishedArtifact(
+                artifact_id=artifact_id,
+                path=path,
+                name=name,
+                caption=caption if isinstance(caption, str) and caption else None,
+                content_type=content_type,
+                size=size,
+                run_count=run_count,
+            )
+        )
+    return artifacts
+
+
 class TaskStore:
     """SQLite-backed store for task control-plane state."""
 
@@ -70,8 +129,9 @@ class TaskStore:
                     effective_skill_names_json,
                     skill_view_path,
                     skill_view_hash,
-                    pending_review_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pending_review_json,
+                    artifacts_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.task_id,
@@ -118,6 +178,11 @@ class TaskStore:
                         )
                         if record.pending_review is not None
                         else None
+                    ),
+                    json.dumps(
+                        [_artifact_to_dict(item) for item in record.artifacts],
+                        ensure_ascii=True,
+                        sort_keys=True,
                     ),
                 ),
             )
@@ -227,7 +292,8 @@ class TaskStore:
                     effective_skill_names_json TEXT NOT NULL DEFAULT '[]',
                     skill_view_path TEXT,
                     skill_view_hash TEXT,
-                    pending_review_json TEXT
+                    pending_review_json TEXT,
+                    artifacts_json TEXT NOT NULL DEFAULT '[]'
                 )
                 """
             )
@@ -255,6 +321,11 @@ class TaskStore:
                 table="agent_tasks",
                 column="skill_view_hash",
                 definition="TEXT",
+            )
+            self._ensure_column(
+                table="agent_tasks",
+                column="artifacts_json",
+                definition="TEXT NOT NULL DEFAULT '[]'",
             )
             self._conn.commit()
 
@@ -294,7 +365,8 @@ class TaskStore:
                     effective_skill_names_json,
                     skill_view_path,
                     skill_view_hash,
-                    pending_review_json
+                    pending_review_json,
+                    artifacts_json
         """
 
     def _row_to_task_record(self, row: tuple[Any, ...]) -> TaskRecord:
@@ -344,6 +416,7 @@ class TaskStore:
             skill_view_path=row[24],
             skill_view_hash=row[25],
             pending_review=json.loads(row[26]) if row[26] else None,
+            artifacts=_parse_artifacts(row[27]),
         )
 
 

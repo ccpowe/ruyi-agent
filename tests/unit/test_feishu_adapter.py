@@ -41,6 +41,7 @@ class FakeGatewayClient:
         ]
         self.submitted_reviews: list[dict[str, Any]] = []
         self.artifacts: dict[str, GatewayArtifact] = {}
+        self.task_artifacts: dict[tuple[str, str], GatewayArtifact] = {}
         self.downloaded_artifacts: list[str] = []
         self._counter = 0
 
@@ -113,6 +114,17 @@ class FakeGatewayClient:
         if path not in self.artifacts:
             raise AssertionError(f"unexpected artifact download: {path}")
         return self.artifacts[path]
+
+    async def download_task_artifact(
+        self,
+        *,
+        task_id: str,
+        artifact_id: str,
+    ) -> GatewayArtifact:
+        artifact = self.task_artifacts.get((task_id, artifact_id))
+        if artifact is None:
+            raise AssertionError(f"unexpected artifact download: {task_id}/{artifact_id}")
+        return artifact
 
     async def get_task(self, *, task_id: str) -> dict[str, Any]:
         return self.tasks[task_id]
@@ -1068,7 +1080,7 @@ def test_send_message_falls_back_to_text_when_markdown_send_fails() -> None:
     ]
 
 
-def test_send_message_uploads_local_media_attachment(tmp_path: Path) -> None:
+def test_send_message_does_not_parse_media_reference(tmp_path: Path) -> None:
     gateway = FakeGatewayClient()
     feishu = FakeFeishuClient()
     doc_path = tmp_path / "report.html"
@@ -1091,71 +1103,58 @@ def test_send_message_uploads_local_media_attachment(tmp_path: Path) -> None:
     assert feishu.sent_messages == [
         {
             "chat_id": "chat-1",
-            "text": "文件如下：\n[Attachment: report.html]",
+            "text": f"文件如下：\nMEDIA:{doc_path}",
             "reply_to_message_id": "message-1",
         }
     ]
-    assert feishu.sent_files == [
-        {
-            "chat_id": "chat-1",
-            "filename": "report.html",
-            "content": b"<html>report</html>",
-            "reply_to_message_id": None,
-        }
-    ]
+    assert feishu.sent_files == []
 
 
-def test_send_message_downloads_gateway_artifact_for_external_media(
-    tmp_path: Path,
-) -> None:
+def test_adapter_sends_published_artifacts_on_terminal_task() -> None:
     gateway = FakeGatewayClient()
     feishu = FakeFeishuClient()
-    raw_path = "/workspace/output/report.html"
-    gateway.artifacts[raw_path] = GatewayArtifact(
+    task = {
+        "task_id": "task-7",
+        "agent_name": "main",
+        "status": "completed",
+        "last_result": "done",
+        "error": None,
+        "run_count": 2,
+        "metadata": {},
+        "artifacts": [
+            {
+                "artifact_id": "art_1",
+                "path": "/workspace/out/report.html",
+                "name": "report.html",
+                "caption": "Report",
+                "content_type": "text/html",
+                "size": 13,
+                "run_count": 2,
+            }
+        ],
+    }
+    gateway.task_artifacts[("task-7", "art_1")] = GatewayArtifact(
         kind="file",
         filename="report.html",
         content_type="text/html",
-        content=b"<html>remote</html>",
+        content=b"<html></html>",
     )
     adapter = FeishuAdapter(
         gateway_client=gateway,
         feishu_client=feishu,
         default_agent_name="main",
-        media_root=tmp_path,
+        ack_mode="off",
     )
 
-    asyncio.run(adapter._send_message(chat_id="chat-1", text=f"MEDIA:{raw_path}"))
+    asyncio.run(adapter._send_terminal_if_needed(chat_id="chat-1", task=task))
 
-    assert gateway.downloaded_artifacts == [raw_path]
-    assert feishu.sent_messages == [
-        {
-            "chat_id": "chat-1",
-            "text": "[Attachment: report.html]",
-            "reply_to_message_id": None,
-        }
-    ]
+    assert feishu.sent_messages[0]["text"] == "done\n\ntask_id=task-7"
     assert feishu.sent_files == [
         {
             "chat_id": "chat-1",
             "filename": "report.html",
-            "content": b"<html>remote</html>",
+            "content": b"<html></html>",
             "reply_to_message_id": None,
         }
     ]
 
-
-def test_send_message_reports_missing_media(tmp_path: Path) -> None:
-    gateway = FakeGatewayClient()
-    feishu = FakeFeishuClient()
-    missing_path = tmp_path / "missing.html"
-    adapter = FeishuAdapter(
-        gateway_client=gateway,
-        feishu_client=feishu,
-        default_agent_name="main",
-        media_root=tmp_path,
-    )
-
-    asyncio.run(adapter._send_message(chat_id="chat-1", text=f"MEDIA:{missing_path}"))
-
-    assert feishu.sent_files == []
-    assert "文件不存在、超过大小限制或不可访问" in feishu.sent_messages[0]["text"]

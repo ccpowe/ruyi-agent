@@ -757,6 +757,49 @@ def test_spawn_wait_and_check_agent_lifecycle(monkeypatch: pytest.MonkeyPatch) -
     assert configurable["delegation_depth"] == 1
 
 
+def test_register_artifact_attaches_manifest_to_task_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = FakeAgentFactory()
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        checkpointer=object(),
+        backend=object(),
+    )
+
+    async def scenario() -> async_subagent_runtime.TaskRecord:
+        record = await control.spawn_task("background_research", "produce report")
+        artifact = control.register_artifact(
+            task_id=record.task_id,
+            artifact={
+                "path": "/workspace/out/report.html",
+                "name": "report.html",
+                "caption": None,
+                "content_type": "text/html",
+                "size": 12,
+            },
+        )
+        if record.active_run is not None:
+            await record.active_run
+        assert artifact["artifact_id"].startswith("art_")
+        return control.get_task_record(record.task_id)
+
+    record = asyncio.run(scenario())
+
+    assert record.artifacts == [
+        async_subagent_runtime.PublishedArtifact(
+            artifact_id=record.artifacts[0].artifact_id,
+            path="/workspace/out/report.html",
+            name="report.html",
+            caption=None,
+            content_type="text/html",
+            size=12,
+            run_count=1,
+        )
+    ]
+
+
 def test_wait_agent_reports_worker_human_review_without_tool_interrupt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

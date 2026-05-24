@@ -37,14 +37,10 @@ STRIKE_PATTERN = re.compile(r"~~(.+?)~~", re.DOTALL)
 SPOILER_PATTERN = re.compile(r"\|\|(.+?)\|\|", re.DOTALL)
 BLOCKQUOTE_PATTERN = re.compile(r"^(> ?.*)$", re.MULTILINE)
 TABLE_SEPARATOR_PATTERN = re.compile(r"^\s*\|?[\s:-]+(?:\|[\s:-]+)+\|?\s*$")
-MEDIA_TAG_PATTERN = re.compile(
-    r"(?m)^(?P<indent>\s*)`?MEDIA:(?P<path>[^`\s]+)`?\s*$"
-)
 TELEGRAM_API_HOST = "api.telegram.org"
 TELEGRAM_FALLBACK_SEED_IPS = ["149.154.167.220", "149.154.167.99", "149.154.167.50"]
 DEFAULT_GATEWAY_BEARER_TOKEN = "dev-token"
 DEFAULT_CHANNEL_SESSION_DB = "data/channel_sessions.sqlite3"
-DEFAULT_TELEGRAM_MEDIA_MAX_BYTES = 50 * 1024 * 1024
 IMAGE_ATTACHMENT_EXTENSIONS = {
     ".png",
     ".jpg",
@@ -622,6 +618,26 @@ def _gateway_attachment_kind(kind: str) -> str:
     return "file"
 
 
+def _current_run_artifacts(
+    task: dict[str, Any],
+    run_count: int,
+) -> list[dict[str, Any]]:
+    raw_artifacts = task.get("artifacts")
+    if not isinstance(raw_artifacts, list):
+        return []
+    artifacts: list[dict[str, Any]] = []
+    for item in raw_artifacts:
+        if not isinstance(item, dict):
+            continue
+        artifact_id = item.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            continue
+        if item.get("run_count") != run_count:
+            continue
+        artifacts.append(item)
+    return artifacts
+
+
 class TelegramBotAPIClient:
     def __init__(
         self,
@@ -1001,17 +1017,7 @@ class TelegramAdapter:
         self._mermaid_renderer = mermaid_renderer or KrokiMermaidRenderer(
             base_url=os.getenv("KROKI_BASE_URL", "https://kroki.io")
         )
-        self._media_root = (
-            Path(media_root)
-            if media_root is not None
-            else Path(os.getenv("LOCAL_BACKEND_ROOT", os.getcwd()))
-        ).expanduser().resolve()
-        self._media_max_bytes = int(
-            os.getenv(
-                "TELEGRAM_MEDIA_MAX_BYTES",
-                str(DEFAULT_TELEGRAM_MEDIA_MAX_BYTES),
-            )
-        )
+        del media_root
         self._watchers: dict[tuple[str, int], asyncio.Task[None]] = {}
         self._delivered_terminal_runs: dict[str, int] = {}
 
@@ -1142,95 +1148,95 @@ class TelegramAdapter:
         mermaid_parts.append(stripped[last_end:])
         stripped = "".join(mermaid_parts)
 
-        stripped, media_attachments, media_warnings = await self._extract_media_attachments(
-            stripped
-        )
-        attachments.extend(media_attachments)
-        if media_warnings:
-            warning_text = "\n".join(media_warnings)
-            stripped = f"{stripped}\n\n{warning_text}" if stripped else warning_text
-
         stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
         return stripped, attachments
 
-    async def _extract_media_attachments(
+    async def _send_task_artifacts(
         self,
-        text: str,
-    ) -> tuple[str, list[TelegramAttachment], list[str]]:
-        attachments: list[TelegramAttachment] = []
-        warnings: list[str] = []
-        lines: list[str] = []
-        in_code_fence = False
-        for line in text.splitlines(keepends=True):
-            if line.lstrip().startswith("```"):
-                in_code_fence = not in_code_fence
-                lines.append(line)
+        *,
+        chat_id: int,
+        task: dict[str, Any],
+    ) -> None:
+        task_id = str(task["task_id"])
+        run_count = self._task_run_count(task)
+        for artifact in _current_run_artifacts(task, run_count):
+            artifact_id = str(artifact["artifact_id"])
+            filename = str(artifact.get("name") or artifact_id)
+            try:
+                downloaded = await self._gateway_client.download_task_artifact(
+                    task_id=task_id,
+                    artifact_id=artifact_id,
+                )
+            except Exception as exc:
+                await self._send_attachment_error(
+                    chat_id=chat_id,
+                    filename=filename,
+                    error=exc,
+                )
                 continue
-            if in_code_fence:
-                lines.append(line)
-                continue
-            line_ending = ""
-            content = line
-            if line.endswith("\r\n"):
-                content = line[:-2]
-                line_ending = "\r\n"
-            elif line.endswith("\n"):
-                content = line[:-1]
-                line_ending = "\n"
-            match = MEDIA_TAG_PATTERN.match(content)
-            if match is None:
-                lines.append(line)
-                continue
-            raw_path = match.group("path").rstrip(".,;)")
-            attachment = await self._build_media_attachment(raw_path)
-            if attachment is None:
-                warnings.append(f"文件不存在或不可访问：{raw_path}")
-                lines.append(f"[missing file: {raw_path}]{line_ending}")
-            else:
-                attachments.append(attachment)
-                lines.append(f"[Attachment: {attachment.filename}]{line_ending}")
-        return "".join(lines), attachments, warnings
+            caption = artifact.get("caption")
+            attachment = self._attachment_from_gateway_artifact(
+                downloaded,
+                caption=caption if isinstance(caption, str) and caption else filename,
+            )
+            await self._send_attachment(chat_id=chat_id, attachment=attachment)
 
-    async def _build_media_attachment(self, raw_path: str) -> TelegramAttachment | None:
-        try:
-            candidate = Path(raw_path).expanduser()
-            if not candidate.is_absolute():
-                return None
-            resolved = candidate.resolve(strict=False)
-            if not resolved.is_relative_to(self._media_root):
-                return await self._download_gateway_artifact(raw_path)
-            if not resolved.is_file():
-                return await self._download_gateway_artifact(raw_path)
-            if resolved.stat().st_size > self._media_max_bytes:
-                return await self._download_gateway_artifact(raw_path)
-            content = resolved.read_bytes()
-        except OSError:
-            return await self._download_gateway_artifact(raw_path)
-        kind = "photo" if resolved.suffix.lower() in IMAGE_ATTACHMENT_EXTENSIONS else "document"
-        return TelegramAttachment(
-            kind=kind,
-            filename=resolved.name,
-            content=content,
-            caption=resolved.name,
-        )
-
-    async def _download_gateway_artifact(self, raw_path: str) -> TelegramAttachment | None:
-        try:
-            artifact = await self._gateway_client.download_artifact(path=raw_path)
-        except Exception:
-            return None
+    def _attachment_from_gateway_artifact(
+        self,
+        artifact: Any,
+        *,
+        caption: str | None,
+    ) -> TelegramAttachment:
+        filename = getattr(artifact, "filename", None) or "artifact"
         kind = (
             "photo"
-            if Path(artifact.filename).suffix.lower() in IMAGE_ATTACHMENT_EXTENSIONS
+            if Path(filename).suffix.lower() in IMAGE_ATTACHMENT_EXTENSIONS
             else "document"
         )
         return TelegramAttachment(
             kind=kind,
-            filename=artifact.filename,
-            content=artifact.content,
-            caption=artifact.filename,
-            content_type=artifact.content_type,
+            filename=filename,
+            content=getattr(artifact, "content"),
+            caption=caption,
+            content_type=getattr(artifact, "content_type", None),
         )
+
+    async def _send_attachment(
+        self,
+        *,
+        chat_id: int,
+        attachment: TelegramAttachment,
+    ) -> None:
+        if attachment.kind == "photo":
+            try:
+                await self._telegram_client.send_photo(
+                    chat_id=chat_id,
+                    filename=attachment.filename,
+                    content=attachment.content,
+                    caption=attachment.caption,
+                    parse_mode=None,
+                )
+            except Exception as exc:
+                await self._send_attachment_error(
+                    chat_id=chat_id,
+                    filename=attachment.filename,
+                    error=exc,
+                )
+            return
+        try:
+            await self._telegram_client.send_document(
+                chat_id=chat_id,
+                filename=attachment.filename,
+                content=attachment.content,
+                caption=attachment.caption,
+                parse_mode=None,
+            )
+        except Exception as exc:
+            await self._send_attachment_error(
+                chat_id=chat_id,
+                filename=attachment.filename,
+                error=exc,
+            )
 
     async def run_forever(self) -> None:
         offset: int | None = None
@@ -1996,6 +2002,7 @@ class TelegramAdapter:
             chat_id=chat_id,
             text=self._format_terminal_message(task),
         )
+        await self._send_task_artifacts(chat_id=chat_id, task=task)
         self._delivered_terminal_runs[task_id] = run_count
 
     def _format_terminal_message(self, task: dict[str, Any]) -> str:

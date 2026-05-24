@@ -54,6 +54,13 @@ class GatewayTaskClient(Protocol):
 
     async def download_artifact(self, *, path: str) -> GatewayArtifact: ...
 
+    async def download_task_artifact(
+        self,
+        *,
+        task_id: str,
+        artifact_id: str,
+    ) -> GatewayArtifact: ...
+
     async def get_task(self, *, task_id: str) -> dict[str, Any]: ...
 
     async def submit_review_decision(
@@ -144,6 +151,25 @@ class GatewayHTTPClient:
         )
         content_disposition = response.headers.get("content-disposition", "")
         filename = _filename_from_content_disposition(content_disposition) or Path(path).name
+        return GatewayArtifact(
+            kind="file",
+            filename=filename or "artifact",
+            content_type=response.headers.get("content-type"),
+            content=response.content,
+        )
+
+    async def download_task_artifact(
+        self,
+        *,
+        task_id: str,
+        artifact_id: str,
+    ) -> GatewayArtifact:
+        response = await self._request_raw(
+            "GET",
+            f"/tasks/{task_id}/artifacts/{artifact_id}/download",
+        )
+        content_disposition = response.headers.get("content-disposition", "")
+        filename = _filename_from_content_disposition(content_disposition) or artifact_id
         return GatewayArtifact(
             kind="file",
             filename=filename or "artifact",

@@ -36,7 +36,7 @@ import asyncio
 import inspect
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -291,6 +291,41 @@ def _parse_task_timestamp(value: Any, *, fallback: datetime) -> datetime:
     return parsed
 
 
+def _artifact_string(artifact: dict[str, Any], key: str) -> str:
+    value = artifact.get(key)
+    if isinstance(value, str) and value:
+        return value
+    raise ValueError(f"Artifact field '{key}' must be a non-empty string")
+
+
+def _artifact_optional_string(artifact: dict[str, Any], key: str) -> str | None:
+    value = artifact.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value if value else None
+    raise ValueError(f"Artifact field '{key}' must be a string or null")
+
+
+def _artifact_int(artifact: dict[str, Any], key: str) -> int:
+    value = artifact.get(key)
+    if isinstance(value, int) and value >= 0:
+        return value
+    raise ValueError(f"Artifact field '{key}' must be a non-negative integer")
+
+
+def _published_artifact_to_dict(artifact: PublishedArtifact) -> dict[str, Any]:
+    return {
+        "artifact_id": artifact.artifact_id,
+        "path": artifact.path,
+        "name": artifact.name,
+        "caption": artifact.caption,
+        "content_type": artifact.content_type,
+        "size": artifact.size,
+        "run_count": artifact.run_count,
+    }
+
+
 @dataclass(slots=True)
 class AgentRecord:
     """
@@ -327,6 +362,19 @@ class RegisteredAgent:
     name: str
     description: str
     kind: str
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedArtifact:
+    """A small file published by a task for channel delivery."""
+
+    artifact_id: str
+    path: str
+    name: str
+    caption: str | None
+    content_type: str
+    size: int
+    run_count: int
 
 
 @dataclass(slots=True)
@@ -391,6 +439,7 @@ class TaskRecord:
         skill_view_path: 同步到 backend 后的 skill view 目录
         skill_view_hash: skill view 内容指纹
         pending_review: worker 等待人工审批时的 review payload
+        artifacts: 当前 task 已发布的结构化产物清单
     """
 
     task_id: str
@@ -422,6 +471,7 @@ class TaskRecord:
     skill_view_path: str | None = None
     skill_view_hash: str | None = None
     pending_review: dict[str, Any] | None = None
+    artifacts: list[PublishedArtifact] = field(default_factory=list)
 
 
 class AgentRegistry:
@@ -965,6 +1015,13 @@ class TaskManager:
         record.error = None
         self._save(record)
 
+    def add_artifact(self, task_id: str, artifact: PublishedArtifact) -> None:
+        """Append a published artifact manifest to a task."""
+        record = self.get_task(task_id)
+        record.artifacts.append(artifact)
+        record.updated_at = _now()
+        self._save(record)
+
     def mark_waiting_for_human(
         self,
         task_id: str,
@@ -1244,6 +1301,25 @@ class AgentControl:
     def download_files(self, paths: list[str]) -> list[Any]:
         return self._backend.download_files(paths)
 
+    def register_artifact(
+        self,
+        *,
+        task_id: str,
+        artifact: dict[str, Any],
+    ) -> dict[str, Any]:
+        record = self._task_manager.get_task(task_id)
+        published = PublishedArtifact(
+            artifact_id=f"art_{uuid.uuid4().hex}",
+            path=_artifact_string(artifact, "path"),
+            name=_artifact_string(artifact, "name"),
+            caption=_artifact_optional_string(artifact, "caption"),
+            content_type=_artifact_string(artifact, "content_type"),
+            size=_artifact_int(artifact, "size"),
+            run_count=record.run_count,
+        )
+        self._task_manager.add_artifact(task_id, published)
+        return _published_artifact_to_dict(published)
+
     def _resolve_task_skill_view(
         self,
         entry: RegisteredAgent,
@@ -1304,6 +1380,7 @@ class AgentControl:
             permission_policy=self._permission_policy,
             backend_kind=self._backend_kind,
             workspace_root=self._workspace_root,
+            register_artifact=self.register_artifact,
             permission_profile=(
                 spec.permission_profile or self._permission_default_profile
             ),

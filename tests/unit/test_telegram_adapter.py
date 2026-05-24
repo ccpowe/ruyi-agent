@@ -50,6 +50,7 @@ class FakeGatewayClient:
         self.get_sequences: dict[str, list[dict[str, Any]]] = {}
         self.get_errors: dict[str, GatewayClientError] = {}
         self.artifacts: dict[str, TelegramInboundAttachment] = {}
+        self.task_artifacts: dict[tuple[str, str], TelegramInboundAttachment] = {}
         self.list_calls: list[dict[str, str]] = []
         self._counter = 0
 
@@ -113,6 +114,21 @@ class FakeGatewayClient:
                 status_code=404,
                 code="artifact_not_found",
                 message=f"missing artifact: {path}",
+            )
+        return artifact
+
+    async def download_task_artifact(
+        self,
+        *,
+        task_id: str,
+        artifact_id: str,
+    ) -> TelegramInboundAttachment:
+        artifact = self.task_artifacts.get((task_id, artifact_id))
+        if artifact is None:
+            raise GatewayClientError(
+                status_code=404,
+                code="artifact_not_found",
+                message=f"missing artifact: {task_id}/{artifact_id}",
             )
         return artifact
 
@@ -740,32 +756,7 @@ def test_adapter_keeps_tables_inline_instead_of_csv_attachment() -> None:
     assert telegram.sent_documents == []
 
 
-def test_adapter_sends_media_image_as_photo(tmp_path: Path) -> None:
-    image_path = tmp_path / "chart.png"
-    image_path.write_bytes(b"png-bytes")
-    telegram = FakeTelegramClient()
-    adapter = TelegramAdapter(
-        gateway_client=FakeGatewayClient(),
-        telegram_client=telegram,
-        default_agent_name="main",
-        media_root=tmp_path,
-    )
-
-    asyncio.run(
-        adapter._send_message(
-            chat_id=100,
-            text=f"see this\nMEDIA:{image_path}\ndone",
-        )
-    )
-
-    assert "Attachment: chart\\.png" in telegram.sent_messages[0]["text"]
-    assert len(telegram.sent_photos) == 1
-    assert telegram.sent_photos[0]["filename"] == "chart.png"
-    assert telegram.sent_photos[0]["content"] == b"png-bytes"
-    assert telegram.sent_documents == []
-
-
-def test_adapter_sends_media_document(tmp_path: Path) -> None:
+def test_adapter_does_not_parse_media_references(tmp_path: Path) -> None:
     doc_path = tmp_path / "slides.pptx"
     doc_path.write_bytes(b"pptx-bytes")
     telegram = FakeTelegramClient()
@@ -778,192 +769,59 @@ def test_adapter_sends_media_document(tmp_path: Path) -> None:
 
     asyncio.run(adapter._send_message(chat_id=100, text=f"MEDIA:{doc_path}"))
 
-    assert len(telegram.sent_documents) == 1
-    assert telegram.sent_documents[0]["filename"] == "slides.pptx"
-    assert telegram.sent_documents[0]["content"] == b"pptx-bytes"
-    assert telegram.sent_documents[0]["parse_mode"] is None
+    assert telegram.sent_photos == []
+    assert telegram.sent_documents == []
+    assert "MEDIA:" in telegram.sent_messages[0]["text"]
 
 
-def test_adapter_downloads_media_document_from_gateway_when_not_local(tmp_path: Path) -> None:
+def test_adapter_sends_published_artifacts_on_terminal_task() -> None:
     gateway = FakeGatewayClient()
-    gateway.artifacts["/home/daytona/snake.html"] = TelegramInboundAttachment(
-        kind="file",
-        filename="snake.html",
-        content_type="text/html",
-        content=b"artifact",
-    )
     telegram = FakeTelegramClient()
+    task = {
+        "task_id": "task-7",
+        "agent_name": "main",
+        "status": "completed",
+        "last_result": "done",
+        "error": None,
+        "run_count": 2,
+        "metadata": {},
+        "artifacts": [
+            {
+                "artifact_id": "art_1",
+                "path": "/workspace/out/report.html",
+                "name": "report.html",
+                "caption": "Report",
+                "content_type": "text/html",
+                "size": 13,
+                "run_count": 2,
+            }
+        ],
+    }
+    gateway.task_artifacts[("task-7", "art_1")] = TelegramInboundAttachment(
+        kind="file",
+        filename="report.html",
+        content_type="text/html",
+        content=b"<html></html>",
+    )
     adapter = TelegramAdapter(
         gateway_client=gateway,
         telegram_client=telegram,
         default_agent_name="main",
-        media_root=tmp_path,
     )
 
-    asyncio.run(adapter._send_message(chat_id=100, text="MEDIA:/home/daytona/snake.html"))
+    asyncio.run(adapter._send_terminal_if_needed(chat_id=100, task=task))
 
-    assert len(telegram.sent_documents) == 1
-    assert telegram.sent_documents[0]["filename"] == "snake.html"
-    assert telegram.sent_documents[0]["content"] == b"artifact"
-    assert "missing file" not in telegram.sent_messages[0]["text"]
-
-
-def test_adapter_sends_backticked_media_reference(tmp_path: Path) -> None:
-    doc_path = tmp_path / "README.md"
-    doc_path.write_bytes(b"readme")
-    telegram = FakeTelegramClient()
-    adapter = TelegramAdapter(
-        gateway_client=FakeGatewayClient(),
-        telegram_client=telegram,
-        default_agent_name="main",
-        media_root=tmp_path,
-    )
-
-    asyncio.run(adapter._send_message(chat_id=100, text=f"`MEDIA:{doc_path}`"))
-
-    assert len(telegram.sent_documents) == 1
-    assert telegram.sent_documents[0]["filename"] == "README.md"
-    assert telegram.sent_messages[0]["text"] == "\\[Attachment: README\\.md\\]"
-
-
-def test_adapter_ignores_inline_media_reference(tmp_path: Path) -> None:
-    doc_path = tmp_path / "README.md"
-    doc_path.write_bytes(b"readme")
-    telegram = FakeTelegramClient()
-    adapter = TelegramAdapter(
-        gateway_client=FakeGatewayClient(),
-        telegram_client=telegram,
-        default_agent_name="main",
-        media_root=tmp_path,
-    )
-
-    asyncio.run(adapter._send_message(chat_id=100, text=f"see MEDIA:{doc_path}"))
-
-    assert telegram.sent_documents == []
-    assert "MEDIA:" in telegram.sent_messages[0]["text"]
-
-
-def test_adapter_ignores_media_reference_inside_code_block(tmp_path: Path) -> None:
-    doc_path = tmp_path / "README.md"
-    doc_path.write_bytes(b"readme")
-    telegram = FakeTelegramClient()
-    adapter = TelegramAdapter(
-        gateway_client=FakeGatewayClient(),
-        telegram_client=telegram,
-        default_agent_name="main",
-        media_root=tmp_path,
-    )
-
-    asyncio.run(
-        adapter._send_message(
-            chat_id=100,
-            text=f"```\nMEDIA:{doc_path}\n```",
-        )
-    )
-
-    assert telegram.sent_documents == []
-    assert "MEDIA:" in telegram.sent_messages[0]["text"]
-
-
-def test_adapter_reports_document_send_failure(tmp_path: Path) -> None:
-    doc_path = tmp_path / "README.md"
-    doc_path.write_bytes(b"readme")
-    telegram = FakeTelegramClient()
-    telegram.fail_documents = True
-    adapter = TelegramAdapter(
-        gateway_client=FakeGatewayClient(),
-        telegram_client=telegram,
-        default_agent_name="main",
-        media_root=tmp_path,
-    )
-
-    asyncio.run(adapter._send_message(chat_id=100, text=f"MEDIA:{doc_path}"))
-
-    assert telegram.sent_documents == []
-    assert len(telegram.sent_messages) == 2
-    assert telegram.sent_messages[1]["parse_mode"] is None
-    assert "文件发送失败：README.md" in telegram.sent_messages[1]["text"]
-    assert "document send failed" in telegram.sent_messages[1]["text"]
-
-
-def test_adapter_reports_missing_media_file(tmp_path: Path) -> None:
-    missing_path = tmp_path / "missing.csv"
-    telegram = FakeTelegramClient()
-    adapter = TelegramAdapter(
-        gateway_client=FakeGatewayClient(),
-        telegram_client=telegram,
-        default_agent_name="main",
-        media_root=tmp_path,
-    )
-
-    asyncio.run(adapter._send_message(chat_id=100, text=f"MEDIA:{missing_path}"))
-
-    assert "文件不存在或不可访问" in telegram.sent_messages[0]["text"]
-    assert "missing\\.csv" in telegram.sent_messages[0]["text"]
-    assert telegram.sent_photos == []
-    assert telegram.sent_documents == []
-
-
-def test_adapter_rejects_media_outside_media_root(tmp_path: Path) -> None:
-    media_root = tmp_path / "root"
-    outside_root = tmp_path / "outside"
-    media_root.mkdir()
-    outside_root.mkdir()
-    outside_file = outside_root / "secret.txt"
-    outside_file.write_text("secret")
-    telegram = FakeTelegramClient()
-    adapter = TelegramAdapter(
-        gateway_client=FakeGatewayClient(),
-        telegram_client=telegram,
-        default_agent_name="main",
-        media_root=media_root,
-    )
-
-    asyncio.run(adapter._send_message(chat_id=100, text=f"MEDIA:{outside_file}"))
-
-    assert "文件不存在或不可访问" in telegram.sent_messages[0]["text"]
-    assert telegram.sent_documents == []
-
-
-def test_adapter_rejects_media_symlink_escape(tmp_path: Path) -> None:
-    media_root = tmp_path / "root"
-    outside_root = tmp_path / "outside"
-    media_root.mkdir()
-    outside_root.mkdir()
-    outside_file = outside_root / "secret.txt"
-    outside_file.write_text("secret")
-    symlink_path = media_root / "secret-link.txt"
-    symlink_path.symlink_to(outside_file)
-    telegram = FakeTelegramClient()
-    adapter = TelegramAdapter(
-        gateway_client=FakeGatewayClient(),
-        telegram_client=telegram,
-        default_agent_name="main",
-        media_root=media_root,
-    )
-
-    asyncio.run(adapter._send_message(chat_id=100, text=f"MEDIA:{symlink_path}"))
-
-    assert "文件不存在或不可访问" in telegram.sent_messages[0]["text"]
-    assert telegram.sent_documents == []
-
-
-def test_adapter_rejects_media_file_over_size_limit(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("TELEGRAM_MEDIA_MAX_BYTES", "4")
-    doc_path = tmp_path / "large.txt"
-    doc_path.write_bytes(b"12345")
-    telegram = FakeTelegramClient()
-    adapter = TelegramAdapter(
-        gateway_client=FakeGatewayClient(),
-        telegram_client=telegram,
-        default_agent_name="main",
-        media_root=tmp_path,
-    )
-
-    asyncio.run(adapter._send_message(chat_id=100, text=f"MEDIA:{doc_path}"))
-
-    assert "文件不存在或不可访问" in telegram.sent_messages[0]["text"]
-    assert telegram.sent_documents == []
+    assert telegram.sent_messages[0]["text"] == "done\n\ntask\\_id\\=task\\-7"
+    assert telegram.sent_documents == [
+        {
+            "chat_id": 100,
+            "filename": "report.html",
+            "content": b"<html></html>",
+            "caption": "Report",
+            "reply_to_message_id": None,
+            "parse_mode": None,
+        }
+    ]
 
 
 def test_adapter_continues_existing_task_when_not_running() -> None:

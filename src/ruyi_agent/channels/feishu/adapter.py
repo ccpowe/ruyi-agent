@@ -29,10 +29,6 @@ DEFAULT_FEISHU_MEDIA_MAX_BYTES = 30 * 1024 * 1024
 DEFAULT_GATEWAY_BEARER_TOKEN = "dev-token"
 DEFAULT_CHANNEL_SESSION_DB = "data/channel_sessions.sqlite3"
 FEISHU_ACK_MODES = {"reaction", "message", "off"}
-MEDIA_TAG_PATTERN = re.compile(
-    r"(?m)^(?P<indent>\s*)`?MEDIA:(?P<path>[^`\s]+)`?\s*$"
-)
-
 
 @dataclass(slots=True)
 class FeishuMention:
@@ -217,6 +213,26 @@ def _build_feishu_markdown_card(markdown: str) -> dict[str, Any]:
             }
         ],
     }
+
+
+def _current_run_artifacts(
+    task: dict[str, Any],
+    run_count: int,
+) -> list[dict[str, Any]]:
+    raw_artifacts = task.get("artifacts")
+    if not isinstance(raw_artifacts, list):
+        return []
+    artifacts: list[dict[str, Any]] = []
+    for item in raw_artifacts:
+        if not isinstance(item, dict):
+            continue
+        artifact_id = item.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            continue
+        if item.get("run_count") != run_count:
+            continue
+        artifacts.append(item)
+    return artifacts
 
 
 class FeishuEventStore:
@@ -843,12 +859,7 @@ class FeishuAdapter:
         self._processing_reaction = processing_reaction
         self._approval_reaction = approval_reaction
         self._failure_reaction = failure_reaction
-        self._media_root = (
-            Path(media_root)
-            if media_root is not None
-            else Path.cwd()
-        ).expanduser().resolve()
-        self._media_max_bytes = max(0, media_max_bytes)
+        del media_root, media_max_bytes
         self._watchers: dict[tuple[str, int], asyncio.Task[None]] = {}
         self._delivered_terminal_runs: dict[str, int] = {}
         self._task_reactions: dict[tuple[str, int], list[FeishuReactionReceipt]] = {}
@@ -1277,86 +1288,51 @@ class FeishuAdapter:
         )
 
     async def _extract_attachments(self, text: str) -> tuple[str, list[FeishuAttachment]]:
-        stripped, attachments, warnings = await self._extract_media_attachments(text)
-        if warnings:
-            warning_text = "\n".join(warnings)
-            stripped = f"{stripped}\n\n{warning_text}" if stripped.strip() else warning_text
-        stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
-        return stripped, attachments
-
-    async def _extract_media_attachments(
-        self,
-        text: str,
-    ) -> tuple[str, list[FeishuAttachment], list[str]]:
-        attachments: list[FeishuAttachment] = []
-        warnings: list[str] = []
-        lines: list[str] = []
-        in_code_fence = False
-        for line in text.splitlines(keepends=True):
-            if line.lstrip().startswith("```"):
-                in_code_fence = not in_code_fence
-                lines.append(line)
-                continue
-            if in_code_fence:
-                lines.append(line)
-                continue
-            line_ending = ""
-            content = line
-            if line.endswith("\r\n"):
-                content = line[:-2]
-                line_ending = "\r\n"
-            elif line.endswith("\n"):
-                content = line[:-1]
-                line_ending = "\n"
-            match = MEDIA_TAG_PATTERN.match(content)
-            if match is None:
-                lines.append(line)
-                continue
-            raw_path = match.group("path").rstrip(".,;)")
-            attachment = await self._build_media_attachment(raw_path)
-            if attachment is None:
-                warnings.append(f"文件不存在、超过大小限制或不可访问：{raw_path}")
-                lines.append(f"[missing file: {raw_path}]{line_ending}")
-            else:
-                attachments.append(attachment)
-                lines.append(f"[Attachment: {attachment.filename}]{line_ending}")
-        return "".join(lines), attachments, warnings
-
-    async def _build_media_attachment(self, raw_path: str) -> FeishuAttachment | None:
-        try:
-            candidate = Path(raw_path).expanduser()
-            if not candidate.is_absolute():
-                return None
-            resolved = candidate.resolve(strict=False)
-            if not resolved.is_relative_to(self._media_root):
-                return await self._download_gateway_artifact(raw_path)
-            if not resolved.is_file():
-                return await self._download_gateway_artifact(raw_path)
-            if resolved.stat().st_size > self._media_max_bytes:
-                return None
-            content = resolved.read_bytes()
-        except OSError:
-            return await self._download_gateway_artifact(raw_path)
-        return FeishuAttachment(
-            filename=resolved.name,
-            content=content,
-        )
-
-    async def _download_gateway_artifact(self, raw_path: str) -> FeishuAttachment | None:
-        try:
-            artifact = await self._gateway_client.download_artifact(path=raw_path)
-        except Exception:
-            return None
-        attachment = self._attachment_from_gateway_artifact(artifact)
-        if len(attachment.content) > self._media_max_bytes:
-            return None
-        return attachment
+        stripped = re.sub(r"\n{3,}", "\n\n", text).strip()
+        return stripped, []
 
     def _attachment_from_gateway_artifact(self, artifact: GatewayArtifact) -> FeishuAttachment:
         return FeishuAttachment(
             filename=artifact.filename or "artifact",
             content=artifact.content,
         )
+
+    async def _send_task_artifacts(
+        self,
+        *,
+        chat_id: str,
+        task: dict[str, Any],
+    ) -> None:
+        task_id = str(task["task_id"])
+        run_count = self._task_run_count(task)
+        for artifact in _current_run_artifacts(task, run_count):
+            artifact_id = str(artifact["artifact_id"])
+            filename = str(artifact.get("name") or artifact_id)
+            try:
+                downloaded = await self._gateway_client.download_task_artifact(
+                    task_id=task_id,
+                    artifact_id=artifact_id,
+                )
+            except Exception as exc:
+                await self._send_attachment_error(
+                    chat_id=chat_id,
+                    filename=filename,
+                    error=exc,
+                )
+                continue
+            attachment = self._attachment_from_gateway_artifact(downloaded)
+            try:
+                await self._feishu_client.send_file(
+                    chat_id=chat_id,
+                    filename=attachment.filename,
+                    content=attachment.content,
+                )
+            except Exception as exc:
+                await self._send_attachment_error(
+                    chat_id=chat_id,
+                    filename=attachment.filename,
+                    error=exc,
+                )
 
     async def wait_for_watchers(self) -> None:
         active = [task for task in self._watchers.values() if not task.done()]
@@ -1903,6 +1879,7 @@ class FeishuAdapter:
             chat_id=chat_id,
             text=self._format_terminal_message(task),
         )
+        await self._send_task_artifacts(chat_id=chat_id, task=task)
         self._delivered_terminal_runs[task_id] = run_count
         await self._complete_task_reactions(
             key=(task_id, run_count),
