@@ -786,6 +786,47 @@ def test_task_response_includes_published_artifacts_and_downloads_by_id(
     assert download_response.headers["x-artifact-id"] == artifact["artifact_id"]
 
 
+def test_task_artifact_download_encodes_non_ascii_filename_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = MemoryBackend(root="/workspace")
+    backend.files["/workspace/out/intro.txt"] = b"artifact bytes"
+    app, factory = build_app(
+        monkeypatch,
+        backend=backend,
+        workspace_root="/workspace",
+    )
+
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/agents/main/tasks",
+            headers=auth_headers(),
+            json={"input": {"content": "write report"}},
+        )
+        task_id = create_response.json()["task_id"]
+        artifact = factory.control.register_artifact(
+            task_id=task_id,
+            artifact={
+                "path": "/workspace/out/intro.txt",
+                "name": "自我介绍.txt",
+                "caption": "Report",
+                "content_type": "text/plain",
+                "size": len(b"artifact bytes"),
+            },
+        )
+        response = client.get(
+            f"/tasks/{task_id}/artifacts/{artifact['artifact_id']}/download",
+            headers=auth_headers(),
+        )
+
+    assert response.status_code == 200
+    assert response.content == b"artifact bytes"
+    assert response.headers["content-disposition"] == (
+        'attachment; filename="artifact.txt"; '
+        "filename*=UTF-8''%E8%87%AA%E6%88%91%E4%BB%8B%E7%BB%8D.txt"
+    )
+
+
 def test_artifact_download_rejects_path_outside_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

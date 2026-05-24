@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any, Callable, Literal, Protocol
+from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, Request
@@ -1603,6 +1604,39 @@ def _find_artifact(
     )
 
 
+def _attachment_content_disposition(filename: str) -> str:
+    safe_filename = _header_filename(filename)
+    if safe_filename.isascii():
+        return f'attachment; filename="{_quote_header_filename(safe_filename)}"'
+    fallback = _ascii_filename_fallback(safe_filename)
+    encoded = quote(safe_filename, safe="")
+    return (
+        f'attachment; filename="{_quote_header_filename(fallback)}"; '
+        f"filename*=UTF-8''{encoded}"
+    )
+
+
+def _header_filename(filename: str) -> str:
+    cleaned = PurePosixPath(filename.replace("\\", "/")).name.strip()
+    cleaned = cleaned.replace("\r", "").replace("\n", "")
+    return cleaned or "artifact"
+
+
+def _quote_header_filename(filename: str) -> str:
+    return filename.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _ascii_filename_fallback(filename: str) -> str:
+    suffix = PurePosixPath(filename).suffix
+    if not suffix.isascii():
+        suffix = ""
+    return f"artifact{suffix}" if suffix else "artifact"
+
+
+def _header_path_value(path: str) -> str:
+    return quote(path, safe="/-._~")
+
+
 def attach_gateway_routes(
     app: FastAPI,
     *,
@@ -1778,8 +1812,10 @@ def attach_gateway_routes(
         service = service_getter(request)
         artifact = await service.download_artifact(payload.path)
         headers = {
-            "Content-Disposition": f'attachment; filename="{artifact.filename}"',
-            "X-Artifact-Path": artifact.path,
+            "Content-Disposition": _attachment_content_disposition(
+                artifact.filename
+            ),
+            "X-Artifact-Path": _header_path_value(artifact.path),
         }
         return Response(
             content=artifact.content,
@@ -1800,8 +1836,10 @@ def attach_gateway_routes(
             artifact_id=artifact_id,
         )
         headers = {
-            "Content-Disposition": f'attachment; filename="{artifact.filename}"',
-            "X-Artifact-Path": artifact.path,
+            "Content-Disposition": _attachment_content_disposition(
+                artifact.filename
+            ),
+            "X-Artifact-Path": _header_path_value(artifact.path),
             "X-Artifact-Id": artifact_id,
         }
         return Response(
