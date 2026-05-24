@@ -62,3 +62,39 @@ def test_resolve_ruyi_paths_uses_user_home_when_project_has_no_ruyi_home(
 
     assert paths.ruyi_home == user_home / ".ruyi_agent"
     assert paths.workspace == project
+
+
+def test_resolve_ruyi_paths_rejects_windows_style_ruyi_home_on_posix() -> None:
+    try:
+        resolve_ruyi_paths(env={"RUYI_HOME": r"C:\Users\cc\.ruyi_agent"})
+    except ValueError as exc:
+        message = str(exc)
+    else:  # pragma: no cover - assertion helper
+        raise AssertionError("expected Windows-style RUYI_HOME to fail on POSIX")
+
+    assert "RUYI_HOME" in message
+    assert "Windows-style path" in message
+
+
+def test_resolve_ruyi_paths_rejects_windows_style_workspace_env_on_posix() -> None:
+    try:
+        resolve_ruyi_paths(env={"RUYI_WORKSPACE": r"C:\Users\cc\project"})
+    except ValueError as exc:
+        message = str(exc)
+    else:  # pragma: no cover - assertion helper
+        raise AssertionError("expected Windows-style RUYI_WORKSPACE to fail on POSIX")
+
+    assert "RUYI_WORKSPACE" in message
+    assert "Windows-style path" in message
+
+
+def test_resolve_ruyi_paths_rejects_windows_style_workspace_arg_on_posix() -> None:
+    try:
+        resolve_ruyi_paths(workspace="C:/Users/cc/project")
+    except ValueError as exc:
+        message = str(exc)
+    else:  # pragma: no cover - assertion helper
+        raise AssertionError("expected Windows-style workspace to fail on POSIX")
+
+    assert "workspace" in message
+    assert "Windows-style path" in message
