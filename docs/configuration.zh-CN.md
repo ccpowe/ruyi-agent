@@ -8,22 +8,61 @@ Ruyi Agent 的配置统一放在 `.ruyi_agent/`：
 - `.ruyi_agent/config/mcp_servers.toml`：MCP server 声明。
 - `.ruyi_agent/config/permissions.toml`：工具调用、shell 命令和 HITL 审批策略。
 
-源码开发时，当前项目下存在有效 `.ruyi_agent/` 配置就优先使用它；只有 `.ruyi_agent/runtime/` 这类运行态目录不会被当成配置根。uv tool 安装后，通常使用用户目录下的 `~/.ruyi_agent/`。`uv tool install` 不会执行项目代码，普通启动命令也不会自动生成配置模板；首次使用前需要运行 `ruyi --init` 显式创建配置目录。如果旧安装留下了空白或损坏的 starter config，可运行 `ruyi --init --force` 用当前包内模板覆盖生成文件。TUI 默认 workspace 是当前目录，显式 `ruyi --workspace PATH` 会覆盖 `ruyi.toml` 里的 backend workspace。
+源码开发时，当前项目下存在有效 `.ruyi_agent/` 配置就优先使用它；只有 `.ruyi_agent/runtime/` 这类运行态目录不会被当成配置根。uv tool 安装后，通常使用用户目录下的 `~/.ruyi_agent/`。首次使用前运行 `ruyi --init` 创建配置模板。如果旧安装留下了空白或损坏的 starter config，可运行 `ruyi --init --force` 用当前包内模板覆盖生成文件。TUI 默认 workspace 是当前目录，显式 `ruyi --workspace PATH` 会覆盖 `ruyi.toml` 里的 backend workspace。
 
 ## 运行配置
 
-`.ruyi_agent/ruyi.toml` 的最小配置通常只需要填模型或 channel 凭据：
+`.ruyi_agent/ruyi.toml` 的最小配置取决于启动模式。
+
+TUI 或 Gateway 至少需要一个模型 provider 可用。starter agent 默认使用 OpenRouter：
 
 ```toml
 [model_credentials]
 openrouter_api_key = "<your-openrouter-api-key>"
+```
 
+如果你在 `.ruyi_agent/config/agents.toml` 中把 agent 改成其他 provider，则填对应 key：
+
+```toml
+[model_credentials]
+deepseek_api_key = "<your-deepseek-api-key>"
+kimi_api_key = "<your-kimi-api-key>"
+zai_api_key = "<your-zai-api-key>"
+openai_api_key = "<your-openai-api-key>"
+anthropic_api_key = "<your-anthropic-api-key>"
+```
+
+Telegram 模式除模型 key 外，还需要 bot token。`default_agent` 默认是 `main`，只有想改变入口 agent 时才需要改：
+
+```toml
 [channels.telegram]
 bot_token = "<your-telegram-bot-token>"
+default_agent = "main"
+```
 
+Feishu/Lark 模式除模型 key 外，还需要应用凭据。`domain = "feishu"` 对应飞书中国站；国际版 Lark 使用 `domain = "lark"`：
+
+```toml
 [channels.feishu]
 app_id = "<your-feishu-app-id>"
 app_secret = "<your-feishu-app-secret>"
+domain = "feishu"
+default_agent = "main"
+```
+
+Feishu 群聊默认关闭。需要群聊时可设置：
+
+```toml
+[channels.feishu]
+group_policy = "open"
+require_mention = true
+```
+
+对公网暴露 Gateway 时，需要修改默认 bearer token：
+
+```toml
+[gateway]
+bearer_token = "<long-random-token>"
 ```
 
 TOML 不支持未加引号的 URL 或 Windows 路径；这类值要写成字符串，例如：
@@ -53,8 +92,13 @@ workspace = "C:/Users/name/project"
 | `storage.*` | SQLite 状态文件路径。相对路径按 `.ruyi_agent/` 解析。 |
 | `runtime.max_delegation_depth` | 每个 root task 下最大委派深度。 |
 | `runtime.max_tasks_per_root` | 每个 root task 下最多创建的 subagent task 数量。 |
-| `channels.telegram.bot_token` | Telegram channel 必填。 |
-| `channels.feishu.app_id` / `channels.feishu.app_secret` | Feishu/Lark channel 必填。 |
+| `channels.telegram.bot_token` | Telegram channel 必填，来自 BotFather。 |
+| `channels.telegram.default_agent` | Telegram 默认入口 agent，默认 `main`。 |
+| `channels.feishu.app_id` / `channels.feishu.app_secret` | Feishu/Lark channel 必填，来自开放平台应用。 |
+| `channels.feishu.domain` | `feishu` 使用飞书中国站，`lark` 使用国际版 Lark。 |
+| `channels.feishu.default_agent` | Feishu/Lark 默认入口 agent，默认 `main`。 |
+| `channels.feishu.group_policy` | 群聊策略，默认 `disabled`；需要群聊时设为 `open` 并建议保留 mention 要求。 |
+| `channels.feishu.require_mention` | 群聊中是否要求 mention bot，默认 `true`。 |
 
 ## Agent 配置
 
