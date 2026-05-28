@@ -13,7 +13,6 @@ from typing import Any
 from urllib.parse import urljoin
 
 import httpx
-from openai import OpenAI
 
 
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
@@ -49,6 +48,30 @@ def jwt_claims(token: str) -> dict[str, Any]:
         return {}
 
 
+def chatgpt_account_id_from_token(token: str) -> str | None:
+    claims = jwt_claims(token)
+    account = claims.get("https://api.openai.com/auth", {})
+    if not isinstance(account, dict):
+        return None
+    account_id = account.get("chatgpt_account_id")
+    return account_id.strip() if isinstance(account_id, str) and account_id.strip() else None
+
+
+def chatgpt_account_id_from_tokens(tokens: dict[str, Any]) -> str | None:
+    account_id = tokens.get("account_id")
+    if isinstance(account_id, str) and account_id.strip():
+        return account_id.strip()
+    access_token = tokens.get("access_token")
+    if isinstance(access_token, str):
+        from_access = chatgpt_account_id_from_token(access_token)
+        if from_access:
+            return from_access
+    id_token = tokens.get("id_token")
+    if isinstance(id_token, str):
+        return chatgpt_account_id_from_token(id_token)
+    return None
+
+
 def token_summary(token: str) -> dict[str, Any]:
     claims = jwt_claims(token)
     exp = claims.get("exp")
@@ -68,22 +91,64 @@ def token_summary(token: str) -> dict[str, Any]:
     }
 
 
-def codex_cloudflare_headers(access_token: str) -> dict[str, str]:
+def codex_cloudflare_headers(
+    access_token: str,
+    *,
+    chatgpt_account_id: str | None = None,
+) -> dict[str, str]:
     headers = {
         "User-Agent": "codex_cli_rs/0.0.0 (ruyi-agent)",
         "originator": "codex_cli_rs",
     }
-    claims = jwt_claims(access_token)
-    account = claims.get("https://api.openai.com/auth", {})
-    if isinstance(account, dict):
-        account_id = account.get("chatgpt_account_id")
-        if isinstance(account_id, str) and account_id:
-            headers["ChatGPT-Account-ID"] = account_id
+    account_id = chatgpt_account_id or chatgpt_account_id_from_token(access_token)
+    if account_id:
+        headers["ChatGPT-Account-ID"] = account_id
     return headers
 
 
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.expanduser().read_text(encoding="utf-8"))
+
+
+def _has_access_token(tokens: dict[str, Any]) -> bool:
+    access_token = tokens.get("access_token")
+    return isinstance(access_token, str) and bool(access_token.strip())
+
+
+def _tokens_payload(
+    tokens: dict[str, Any],
+    *,
+    source: str,
+    last_refresh: Any = None,
+    auth_mode: Any = None,
+) -> dict[str, Any]:
+    return {
+        "access_token": tokens.get("access_token"),
+        "refresh_token": tokens.get("refresh_token"),
+        "id_token": tokens.get("id_token"),
+        "account_id": tokens.get("account_id") or chatgpt_account_id_from_tokens(tokens),
+        "source": source,
+        "last_refresh": last_refresh,
+        "auth_mode": auth_mode,
+    }
+
+
+def _codex_pool_tokens(payload: dict[str, Any]) -> dict[str, Any] | None:
+    pool = payload.get("credential_pool")
+    if not isinstance(pool, dict):
+        return None
+    entries = pool.get("openai-codex")
+    if not isinstance(entries, list):
+        return None
+    now = time.time()
+    for entry in entries:
+        if not isinstance(entry, dict) or not _has_access_token(entry):
+            continue
+        reset_at = entry.get("last_error_reset_at")
+        if isinstance(reset_at, (int, float)) and reset_at > now:
+            continue
+        return entry
+    return None
 
 
 def extract_tokens_from_auth_json(path: Path) -> dict[str, Any]:
@@ -93,23 +158,29 @@ def extract_tokens_from_auth_json(path: Path) -> dict[str, Any]:
         state = providers.get("openai-codex")
         if isinstance(state, dict):
             tokens = state.get("tokens")
-            if isinstance(tokens, dict):
-                return {
-                    "access_token": tokens.get("access_token"),
-                    "refresh_token": tokens.get("refresh_token"),
-                    "source": str(path),
-                    "last_refresh": state.get("last_refresh"),
-                    "auth_mode": state.get("auth_mode"),
-                }
+            if isinstance(tokens, dict) and _has_access_token(tokens):
+                return _tokens_payload(
+                    tokens,
+                    source=str(path),
+                    last_refresh=state.get("last_refresh"),
+                    auth_mode=state.get("auth_mode"),
+                )
     tokens = payload.get("tokens")
-    if isinstance(tokens, dict):
-        return {
-            "access_token": tokens.get("access_token"),
-            "refresh_token": tokens.get("refresh_token"),
-            "source": str(path),
-            "last_refresh": payload.get("last_refresh"),
-            "auth_mode": payload.get("auth_mode"),
-        }
+    if isinstance(tokens, dict) and _has_access_token(tokens):
+        return _tokens_payload(
+            tokens,
+            source=str(path),
+            last_refresh=payload.get("last_refresh"),
+            auth_mode=payload.get("auth_mode"),
+        )
+    pool_tokens = _codex_pool_tokens(payload)
+    if pool_tokens:
+        return _tokens_payload(
+            pool_tokens,
+            source=str(path),
+            last_refresh=pool_tokens.get("last_refresh"),
+            auth_mode=payload.get("auth_mode") or "chatgpt",
+        )
     return {"source": str(path)}
 
 
@@ -238,15 +309,60 @@ def device_login(timeout: float, max_wait_seconds: int) -> dict[str, Any]:
     token_payload = token_response.json()
     access_token = str(token_payload.get("access_token") or "").strip()
     refresh_token = str(token_payload.get("refresh_token") or "").strip()
+    id_token = str(token_payload.get("id_token") or "").strip()
     if not access_token:
         raise RuntimeError("token exchange response missing access_token")
+    token_data: dict[str, Any] = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": id_token,
+    }
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
+        "id_token": id_token,
+        "account_id": chatgpt_account_id_from_tokens(token_data),
         "source": "device-code",
         "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "auth_mode": "chatgpt",
     }
+
+
+def sync_codex_pool_entries(existing: dict[str, Any], tokens: dict[str, Any]) -> None:
+    pool = existing.get("credential_pool")
+    if not isinstance(pool, dict):
+        return
+    entries = pool.get("openai-codex")
+    if not isinstance(entries, list):
+        return
+    access_token = tokens.get("access_token")
+    if not access_token:
+        return
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("source") != "device_code":
+            continue
+        entry["access_token"] = access_token
+        refresh_token = tokens.get("refresh_token")
+        if refresh_token:
+            entry["refresh_token"] = refresh_token
+        id_token = tokens.get("id_token")
+        if id_token:
+            entry["id_token"] = id_token
+        account_id = tokens.get("account_id") or chatgpt_account_id_from_tokens(tokens)
+        if account_id:
+            entry["account_id"] = account_id
+        last_refresh = tokens.get("last_refresh")
+        if last_refresh:
+            entry["last_refresh"] = last_refresh
+        for field_name in (
+            "last_status",
+            "last_status_at",
+            "last_error_code",
+            "last_error_reason",
+            "last_error_message",
+            "last_error_reset_at",
+        ):
+            entry[field_name] = None
 
 
 def save_ruyi_auth_json(path: Path, tokens: dict[str, Any]) -> None:
@@ -262,14 +378,25 @@ def save_ruyi_auth_json(path: Path, tokens: dict[str, Any]) -> None:
         providers = {}
         existing["providers"] = providers
 
+    saved_tokens = {
+        "access_token": tokens.get("access_token"),
+        "refresh_token": tokens.get("refresh_token"),
+    }
+    id_token = tokens.get("id_token")
+    if id_token:
+        saved_tokens["id_token"] = id_token
+    account_id = tokens.get("account_id") or chatgpt_account_id_from_tokens(tokens)
+    if account_id:
+        saved_tokens["account_id"] = account_id
+
+    provider_tokens = dict(tokens)
+    provider_tokens.update(saved_tokens)
     providers["openai-codex"] = {
-        "tokens": {
-            "access_token": tokens.get("access_token"),
-            "refresh_token": tokens.get("refresh_token"),
-        },
+        "tokens": saved_tokens,
         "last_refresh": tokens.get("last_refresh"),
         "auth_mode": "chatgpt",
     }
+    sync_codex_pool_entries(existing, provider_tokens)
     existing["version"] = existing.get("version") or 1
     existing["active_provider"] = "openai-codex"
     existing["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -281,11 +408,15 @@ def save_ruyi_auth_json(path: Path, tokens: dict[str, Any]) -> None:
         handle.write(payload)
 
 
-def list_models(args: argparse.Namespace, access_token: str) -> dict[str, Any]:
+def list_models(
+    args: argparse.Namespace,
+    access_token: str,
+    account_id: str | None,
+) -> dict[str, Any]:
     url = urljoin(args.base_url.rstrip("/") + "/", "models?client_version=1.0.0")
     headers = {
         "Authorization": f"Bearer {access_token}",
-        **codex_cloudflare_headers(access_token),
+        **codex_cloudflare_headers(access_token, chatgpt_account_id=account_id),
     }
     with httpx.Client(timeout=httpx.Timeout(args.timeout)) as client:
         response = client.get(url, headers=headers)
@@ -347,27 +478,68 @@ def choose_model(args: argparse.Namespace, model_ids: list[str]) -> str:
     return DEFAULT_MODEL
 
 
-def summarize_response(response: Any) -> dict[str, Any]:
-    output = getattr(response, "output", None)
-    usage = getattr(response, "usage", None)
-    return {
-        "id": getattr(response, "id", None),
-        "status": getattr(response, "status", None),
-        "output_text": getattr(response, "output_text", None),
-        "output_count": len(output) if isinstance(output, list) else None,
-        "usage": usage.to_dict() if hasattr(usage, "to_dict") else usage,
-    }
+def parse_sse_payload(
+    event_name: str | None,
+    data_lines: list[str],
+) -> dict[str, Any] | None:
+    if not data_lines:
+        return None
+    data = "\n".join(data_lines)
+    if data == "[DONE]":
+        return None
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if event_name and "type" not in payload:
+        payload["type"] = event_name
+    return payload
 
 
-def create_response(args: argparse.Namespace, access_token: str, model: str) -> dict[str, Any]:
-    client = OpenAI(
-        api_key=access_token,
-        base_url=args.base_url,
-        default_headers=codex_cloudflare_headers(access_token),
-        timeout=args.timeout,
-    )
+def codex_event_text(payload: dict[str, Any], *, yielded_delta: bool) -> str:
+    event_type = payload.get("type")
+    delta = payload.get("delta")
+    if event_type == "response.output_text.delta" and isinstance(delta, str):
+        return delta
+    if yielded_delta or event_type != "response.output_text.done":
+        return ""
+    text = payload.get("text")
+    return text if isinstance(text, str) else ""
+
+
+def raise_for_codex_event_error(payload: dict[str, Any]) -> None:
+    event_type = str(payload.get("type") or "")
+    error = payload.get("error")
+    response = payload.get("response")
+    if error is None and isinstance(response, dict):
+        error = response.get("error")
+    if error is not None:
+        raise RuntimeError(f"Codex response stream failed: {error!r}")
+    if event_type in {"response.failed", "response.incomplete"}:
+        raise RuntimeError(f"Codex response stream ended with {event_type}")
+
+
+def create_response(
+    args: argparse.Namespace,
+    access_token: str,
+    model: str,
+    account_id: str | None,
+) -> dict[str, Any]:
     request_id = args.client_request_id or args.session_id or uuid.uuid4().hex
-    api_kwargs: dict[str, Any] = {
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "session_id": args.session_id or request_id,
+        "x-client-request-id": request_id,
+        **codex_cloudflare_headers(
+            access_token,
+            chatgpt_account_id=account_id,
+        ),
+    }
+    request_body: dict[str, Any] = {
         "model": model,
         "instructions": args.instructions,
         "input": [
@@ -377,34 +549,67 @@ def create_response(args: argparse.Namespace, access_token: str, model: str) -> 
             }
         ],
         "store": False,
-        "extra_headers": {
-            "session_id": args.session_id or request_id,
-            "x-client-request-id": request_id,
-        },
+        "stream": True,
     }
+    url = urljoin(args.base_url.rstrip("/") + "/", "responses")
     event_counts: dict[str, int] = {}
     text_parts: list[str] = []
-    with client.responses.stream(**api_kwargs) as stream:
-        for event in stream:
-            event_type = str(getattr(event, "type", "") or "")
-            event_counts[event_type] = event_counts.get(event_type, 0) + 1
-            delta = getattr(event, "delta", None)
-            if isinstance(delta, str) and event_type.endswith(".delta"):
-                text_parts.append(delta)
-        final_response = stream.get_final_response()
+    final_response: dict[str, Any] | None = None
+    yielded_delta = False
+    event_name: str | None = None
+    data_lines: list[str] = []
 
-    summary = summarize_response(final_response)
-    if text_parts and not summary.get("output_text"):
-        summary["output_text"] = "".join(text_parts)
-    summary["stream_event_counts"] = event_counts
-    return summary
+    def flush_event() -> None:
+        nonlocal event_name, data_lines, final_response, yielded_delta
+        payload = parse_sse_payload(event_name, data_lines)
+        event_name = None
+        data_lines = []
+        if payload is None:
+            return
+        event_type = str(payload.get("type") or "")
+        if event_type:
+            event_counts[event_type] = event_counts.get(event_type, 0) + 1
+        raise_for_codex_event_error(payload)
+        text = codex_event_text(payload, yielded_delta=yielded_delta)
+        if text:
+            text_parts.append(text)
+            yielded_delta = True
+        response = payload.get("response")
+        if isinstance(response, dict) and event_type in {
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+        }:
+            final_response = response
+
+    with httpx.Client(timeout=httpx.Timeout(args.timeout)) as client:
+        with client.stream("POST", url, headers=headers, json=request_body) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line == "":
+                    flush_event()
+                elif line.startswith("event:"):
+                    event_name = line.split(":", 1)[1].strip()
+                elif line.startswith("data:"):
+                    data_lines.append(line.split(":", 1)[1].lstrip())
+            flush_event()
+
+    output = final_response.get("output") if isinstance(final_response, dict) else None
+    return {
+        "id": final_response.get("id") if isinstance(final_response, dict) else None,
+        "status": final_response.get("status") if isinstance(final_response, dict) else None,
+        "output_text": "".join(text_parts),
+        "output_count": len(output) if isinstance(output, list) else None,
+        "usage": final_response.get("usage") if isinstance(final_response, dict) else None,
+        "stream_event_counts": event_counts,
+    }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Ruyi OpenAI Codex probe: read Codex OAuth tokens and call "
-            "chatgpt.com/backend-api/codex with OpenAI SDK Responses."
+            "chatgpt.com/backend-api/codex Responses with streaming enabled."
         )
     )
     parser.add_argument(
@@ -459,6 +664,7 @@ def main() -> int:
         tokens = resolve_tokens(args)
     access_token = str(tokens.get("access_token") or "").strip()
     refresh = str(tokens.get("refresh_token") or "").strip()
+    account_id = chatgpt_account_id_from_tokens(tokens)
     secrets = [access_token, refresh]
 
     output: dict[str, Any] = {
@@ -472,12 +678,15 @@ def main() -> int:
         "access_token_summary": token_summary(access_token) if access_token else None,
         "codex_headers": {
             key: ("present" if key == "ChatGPT-Account-ID" else value)
-            for key, value in codex_cloudflare_headers(access_token).items()
+            for key, value in codex_cloudflare_headers(
+                access_token,
+                chatgpt_account_id=account_id,
+            ).items()
         },
         "codex_flow": [
             "device auth gets authorization_code from auth.openai.com/codex/device",
             "token exchange/refresh uses auth.openai.com/oauth/token",
-            "runtime calls OpenAI SDK Responses against chatgpt.com/backend-api/codex",
+            "runtime calls the Codex Responses endpoint with streaming enabled",
             "requests include originator=codex_cli_rs and ChatGPT-Account-ID when present",
         ],
     }
@@ -509,7 +718,7 @@ def main() -> int:
             output["models_result"] = {"ok": False, "error": "No access token available."}
         else:
             try:
-                models = list_models(args, access_token)
+                models = list_models(args, access_token, account_id)
                 model_ids = models.get("model_ids") or []
                 output["models_result"] = models
             except Exception as exc:
@@ -527,7 +736,7 @@ def main() -> int:
                 output["response_result"] = {
                     "ok": True,
                     "model": model,
-                    "detail": create_response(args, access_token, model),
+                    "detail": create_response(args, access_token, model, account_id),
                 }
             except Exception as exc:
                 output["response_result"] = {

@@ -8,10 +8,11 @@ import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator, Iterator
 
 import httpx
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_openai import ChatOpenAI
 
 
@@ -49,6 +50,18 @@ def _content_to_text(content: Any) -> str:
     return "\n".join(part for part in parts if part).strip()
 
 
+def _strip_none_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_none_values(child)
+            for key, child in value.items()
+            if child is not None
+        }
+    if isinstance(value, list):
+        return [_strip_none_values(child) for child in value]
+    return value
+
+
 def _decode_jwt_claims(token: str) -> dict[str, Any]:
     parts = token.split(".")
     if len(parts) < 2:
@@ -62,17 +75,97 @@ def _decode_jwt_claims(token: str) -> dict[str, Any]:
     return claims if isinstance(claims, dict) else {}
 
 
-def codex_default_headers(access_token: str) -> dict[str, str]:
+def _chatgpt_account_id_from_token(token: str) -> str | None:
+    claims = _decode_jwt_claims(token)
+    auth_claim = claims.get("https://api.openai.com/auth")
+    if not isinstance(auth_claim, dict):
+        return None
+    account_id = auth_claim.get("chatgpt_account_id")
+    return account_id.strip() if isinstance(account_id, str) and account_id.strip() else None
+
+
+def _chatgpt_account_id_from_tokens(tokens: dict[str, Any]) -> str | None:
+    account_id = tokens.get("account_id")
+    if isinstance(account_id, str) and account_id.strip():
+        return account_id.strip()
+    access_token = tokens.get("access_token")
+    if isinstance(access_token, str):
+        from_access = _chatgpt_account_id_from_token(access_token)
+        if from_access:
+            return from_access
+    id_token = tokens.get("id_token")
+    if isinstance(id_token, str):
+        return _chatgpt_account_id_from_token(id_token)
+    return None
+
+
+def _codex_pool_tokens(payload: dict[str, Any], *, now: float) -> dict[str, Any] | None:
+    pool = payload.get("credential_pool")
+    if not isinstance(pool, dict):
+        return None
+    entries = pool.get("openai-codex")
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        access_token = entry.get("access_token")
+        if not isinstance(access_token, str) or not access_token.strip():
+            continue
+        reset_at = entry.get("last_error_reset_at")
+        if isinstance(reset_at, (int, float)) and reset_at > now:
+            continue
+        return entry
+    return None
+
+
+def _sync_codex_pool_entries(
+    payload: dict[str, Any],
+    *,
+    access_token: str,
+    refresh_token: str | None,
+    id_token: str | None,
+    account_id: str | None,
+) -> None:
+    pool = payload.get("credential_pool")
+    if not isinstance(pool, dict):
+        return
+    entries = pool.get("openai-codex")
+    if not isinstance(entries, list):
+        return
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("source") != "device_code":
+            continue
+        entry["access_token"] = access_token
+        if refresh_token:
+            entry["refresh_token"] = refresh_token
+        if id_token:
+            entry["id_token"] = id_token
+        if account_id:
+            entry["account_id"] = account_id
+        for field_name in (
+            "last_status",
+            "last_status_at",
+            "last_error_code",
+            "last_error_reason",
+            "last_error_message",
+            "last_error_reset_at",
+        ):
+            entry[field_name] = None
+
+
+def codex_default_headers(
+    access_token: str,
+    *,
+    chatgpt_account_id: str | None = None,
+) -> dict[str, str]:
     headers = {
         "User-Agent": CODEX_USER_AGENT,
         "originator": "codex_cli_rs",
     }
-    claims = _decode_jwt_claims(access_token)
-    auth_claim = claims.get("https://api.openai.com/auth")
-    if isinstance(auth_claim, dict):
-        account_id = auth_claim.get("chatgpt_account_id")
-        if isinstance(account_id, str) and account_id:
-            headers["ChatGPT-Account-ID"] = account_id
+    account_id = chatgpt_account_id or _chatgpt_account_id_from_token(access_token)
+    if account_id:
+        headers["ChatGPT-Account-ID"] = account_id
     return headers
 
 
@@ -139,6 +232,13 @@ def _save_codex_tokens(
     tokens["access_token"] = access_token
     if refresh_token:
         tokens["refresh_token"] = refresh_token
+    _sync_codex_pool_entries(
+        payload,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        id_token=tokens.get("id_token") if isinstance(tokens.get("id_token"), str) else None,
+        account_id=_chatgpt_account_id_from_tokens(tokens),
+    )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
@@ -153,6 +253,46 @@ def _save_codex_tokens(
 
 def _resolve_codex_auth_path(auth_json: str) -> Path:
     return Path(auth_json).expanduser()
+
+
+def _parse_sse_payload(
+    event_name: str | None,
+    data_lines: list[str],
+) -> dict[str, Any] | None:
+    if not data_lines:
+        return None
+    try:
+        payload = json.loads("\n".join(data_lines))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if event_name and "type" not in payload:
+        payload["type"] = event_name
+    return payload
+
+
+def _codex_event_text(payload: dict[str, Any], *, yielded_delta: bool) -> str:
+    event_type = payload.get("type")
+    delta = payload.get("delta")
+    if event_type == "response.output_text.delta" and isinstance(delta, str):
+        return delta
+    if yielded_delta or event_type != "response.output_text.done":
+        return ""
+    text = payload.get("text")
+    return text if isinstance(text, str) else ""
+
+
+def _raise_for_codex_event_error(payload: dict[str, Any]) -> None:
+    event_type = str(payload.get("type") or "")
+    error = payload.get("error")
+    response = payload.get("response")
+    if error is None and isinstance(response, dict):
+        error = response.get("error")
+    if error is not None:
+        raise ValueError(f"OpenAI Codex response stream failed: {error!r}")
+    if event_type in {"response.failed", "response.incomplete"}:
+        raise ValueError(f"OpenAI Codex response stream ended with {event_type}")
 
 
 def resolve_codex_credentials(
@@ -174,9 +314,14 @@ def resolve_codex_credentials(
     if not isinstance(payload, dict):
         raise ValueError(f"OpenAI Codex auth file has invalid shape: {path}")
 
+    resolved_now = time.time() if now is None else now
     providers = payload.get("providers")
     state = providers.get("openai-codex") if isinstance(providers, dict) else None
     tokens = state.get("tokens") if isinstance(state, dict) else payload.get("tokens")
+    if not isinstance(tokens, dict) or not (
+        isinstance(tokens.get("access_token"), str) and tokens["access_token"].strip()
+    ):
+        tokens = _codex_pool_tokens(payload, now=resolved_now) or tokens
     if not isinstance(tokens, dict):
         raise ValueError(f"OpenAI Codex auth file is missing tokens: {path}")
 
@@ -194,7 +339,7 @@ def resolve_codex_credentials(
         and normalized_refresh_token
         and _access_token_is_expiring(
             access_token.strip(),
-            now=time.time() if now is None else now,
+            now=resolved_now,
             skew_seconds=refresh_skew_seconds,
         )
     ):
@@ -213,7 +358,10 @@ def resolve_codex_credentials(
     return CodexCredentials(
         api_key=access_token.strip(),
         refresh_token=normalized_refresh_token,
-        default_headers=codex_default_headers(access_token.strip()),
+        default_headers=codex_default_headers(
+            access_token.strip(),
+            chatgpt_account_id=_chatgpt_account_id_from_tokens(tokens),
+        ),
     )
 
 
@@ -239,6 +387,179 @@ class CodexChatModel(ChatOpenAI):
     @property
     def _llm_type(self) -> str:
         return "openai-codex"
+
+    def _codex_http_headers(
+        self,
+        extra_headers: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        api_key = self.openai_api_key.get_secret_value() if self.openai_api_key else ""
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        headers.update(
+            {
+                str(key): str(value)
+                for key, value in (self.default_headers or {}).items()
+                if value is not None
+            }
+        )
+        headers.update(
+            {
+                str(key): str(value)
+                for key, value in (extra_headers or {}).items()
+                if value is not None
+            }
+        )
+        return headers
+
+    def _codex_responses_url(self) -> str:
+        return f"{str(self.openai_api_base).rstrip('/')}/responses"
+
+    def _codex_http_timeout(self) -> httpx.Timeout:
+        timeout = self.request_timeout
+        if isinstance(timeout, httpx.Timeout):
+            return timeout
+        if isinstance(timeout, (int, float)):
+            return httpx.Timeout(float(timeout))
+        return httpx.Timeout(60.0)
+
+    def _codex_stream_payload(
+        self,
+        messages: list[BaseMessage],
+        *,
+        stop: list[str] | None,
+        kwargs: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        payload = self._get_request_payload(messages, stop=stop, stream=True, **kwargs)
+        extra_headers = payload.pop("extra_headers", None)
+        extra_body = payload.pop("extra_body", None)
+        if isinstance(extra_body, dict):
+            payload.update(extra_body)
+        payload["stream"] = True
+        return _strip_none_values(payload), self._codex_http_headers(extra_headers)
+
+    def _stream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        payload, headers = self._codex_stream_payload(
+            messages,
+            stop=stop,
+            kwargs=kwargs,
+        )
+        yielded_delta = False
+        with httpx.Client(timeout=self._codex_http_timeout()) as client:
+            with client.stream(
+                "POST",
+                self._codex_responses_url(),
+                headers=headers,
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                event_name: str | None = None
+                data_lines: list[str] = []
+
+                def flush_event() -> Iterator[ChatGenerationChunk]:
+                    nonlocal event_name, data_lines, yielded_delta
+                    payload = _parse_sse_payload(event_name, data_lines)
+                    event_name = None
+                    data_lines = []
+                    if payload is None:
+                        return
+                    _raise_for_codex_event_error(payload)
+                    text = _codex_event_text(payload, yielded_delta=yielded_delta)
+                    if not text:
+                        return
+                    yielded_delta = True
+                    yield ChatGenerationChunk(message=AIMessageChunk(content=text))
+
+                for line in response.iter_lines():
+                    if line == "":
+                        yield from flush_event()
+                    elif line.startswith("event:"):
+                        event_name = line.split(":", 1)[1].strip()
+                    elif line.startswith("data:"):
+                        data_lines.append(line.split(":", 1)[1].lstrip())
+                yield from flush_event()
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        payload, headers = self._codex_stream_payload(
+            messages,
+            stop=stop,
+            kwargs=kwargs,
+        )
+        yielded_delta = False
+        async with httpx.AsyncClient(timeout=self._codex_http_timeout()) as client:
+            async with client.stream(
+                "POST",
+                self._codex_responses_url(),
+                headers=headers,
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                event_name: str | None = None
+                data_lines: list[str] = []
+
+                async def flush_event() -> list[ChatGenerationChunk]:
+                    nonlocal event_name, data_lines, yielded_delta
+                    payload = _parse_sse_payload(event_name, data_lines)
+                    event_name = None
+                    data_lines = []
+                    if payload is None:
+                        return []
+                    _raise_for_codex_event_error(payload)
+                    text = _codex_event_text(payload, yielded_delta=yielded_delta)
+                    if not text:
+                        return []
+                    yielded_delta = True
+                    return [ChatGenerationChunk(message=AIMessageChunk(content=text))]
+
+                async for line in response.aiter_lines():
+                    if line == "":
+                        for chunk in await flush_event():
+                            yield chunk
+                    elif line.startswith("event:"):
+                        event_name = line.split(":", 1)[1].strip()
+                    elif line.startswith("data:"):
+                        data_lines.append(line.split(":", 1)[1].lstrip())
+                for chunk in await flush_event():
+                    yield chunk
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        chunks = list(self._stream(messages, stop=stop, **kwargs))
+        text = "".join(chunk.text for chunk in chunks)
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=text))])
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        text_parts: list[str] = []
+        async for chunk in self._astream(messages, stop=stop, **kwargs):
+            text_parts.append(chunk.text)
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content="".join(text_parts)))]
+        )
 
     def _get_request_payload(
         self,
