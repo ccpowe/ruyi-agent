@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Annotated, Any, Required
 
 from deepagents._models import resolve_model
 from deepagents._version import __version__
 from deepagents.backends import StateBackend
 from deepagents.backends.protocol import BackendFactory, BackendProtocol
 from langchain.agents import create_agent
+from langchain.agents.middleware.types import AgentState
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import AnyMessage, SystemMessage
 from langchain_core.tools import BaseTool
+from langgraph.channels import DeltaChannel
+from langgraph.graph.message import add_messages
 
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.runtime.middleware.stack import build_runtime_middleware
@@ -19,6 +22,25 @@ from ruyi_agent.config.loader import LocalWorkerSpec, RemoteRef
 from ruyi_agent.control_plane.permissions import PermissionPolicy
 from ruyi_agent.integrations.mcp.registry import MCPRegistry
 from ruyi_agent.storage.review_audit import ReviewAuditStore
+
+
+def _add_messages_delta(
+    state: list[AnyMessage] | None,
+    writes: Sequence[Any],
+) -> list[AnyMessage]:
+    result: list[AnyMessage] = list(state or [])
+    for write in writes:
+        result = add_messages(result, write)
+    return result
+
+
+class RuyiAgentState(AgentState):
+    messages: Required[
+        Annotated[
+            list[AnyMessage],
+            DeltaChannel(_add_messages_delta),
+        ]
+    ]
 
 
 def create_runtime_agent(
@@ -95,6 +117,7 @@ def create_runtime_agent(
         system_prompt=final_system_prompt,
         tools=tools,
         middleware=middleware,
+        state_schema=RuyiAgentState,
         checkpointer=checkpointer,
         debug=debug,
         name=name,
