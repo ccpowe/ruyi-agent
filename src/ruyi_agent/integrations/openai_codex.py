@@ -12,6 +12,7 @@ from typing import Any, AsyncIterator, Iterator
 
 import httpx
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.messages.tool import tool_call_chunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_openai import ChatOpenAI
 
@@ -283,6 +284,91 @@ def _codex_event_text(payload: dict[str, Any], *, yielded_delta: bool) -> str:
     return text if isinstance(text, str) else ""
 
 
+def _codex_event_index(payload: dict[str, Any]) -> int | None:
+    index = payload.get("output_index")
+    return index if isinstance(index, int) else None
+
+
+def _codex_event_item(payload: dict[str, Any]) -> dict[str, Any]:
+    item = payload.get("item")
+    return item if isinstance(item, dict) else {}
+
+
+def _codex_event_generation_chunk(
+    payload: dict[str, Any],
+    *,
+    yielded_delta: bool,
+) -> tuple[ChatGenerationChunk | None, bool]:
+    text = _codex_event_text(payload, yielded_delta=yielded_delta)
+    if text:
+        return ChatGenerationChunk(message=AIMessageChunk(content=text)), True
+
+    event_type = payload.get("type")
+    item = _codex_event_item(payload)
+    item_type = item.get("type")
+    if event_type == "response.output_item.added" and item_type == "function_call":
+        return (
+            ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[
+                        tool_call_chunk(
+                            name=str(item.get("name") or ""),
+                            args=str(item.get("arguments") or ""),
+                            id=str(item.get("call_id") or item.get("id") or ""),
+                            index=_codex_event_index(payload),
+                        )
+                    ],
+                )
+            ),
+            False,
+        )
+    if event_type == "response.function_call_arguments.delta":
+        delta = payload.get("delta")
+        if isinstance(delta, str):
+            return (
+                ChatGenerationChunk(
+                    message=AIMessageChunk(
+                        content="",
+                        tool_call_chunks=[
+                            tool_call_chunk(
+                                args=delta,
+                                index=_codex_event_index(payload),
+                            )
+                        ],
+                    )
+                ),
+                False,
+            )
+    if event_type == "response.output_item.done" and item_type == "custom_tool_call":
+        custom_input = item.get("input")
+        args = json.dumps({"__arg1": custom_input}, ensure_ascii=False)
+        return (
+            ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[
+                        tool_call_chunk(
+                            name=str(item.get("name") or ""),
+                            args=args,
+                            id=str(item.get("call_id") or item.get("id") or ""),
+                            index=_codex_event_index(payload),
+                        )
+                    ],
+                )
+            ),
+            False,
+        )
+    if event_type in {"response.completed", "response.incomplete"}:
+        return (
+            ChatGenerationChunk(
+                message=AIMessageChunk(content="", chunk_position="last")
+            ),
+            False,
+        )
+    return None, False
+
+
 def _raise_for_codex_event_error(payload: dict[str, Any]) -> None:
     event_type = str(payload.get("type") or "")
     error = payload.get("error")
@@ -472,11 +558,14 @@ class CodexChatModel(ChatOpenAI):
                     if payload is None:
                         return
                     _raise_for_codex_event_error(payload)
-                    text = _codex_event_text(payload, yielded_delta=yielded_delta)
-                    if not text:
+                    chunk, yielded_text = _codex_event_generation_chunk(
+                        payload,
+                        yielded_delta=yielded_delta,
+                    )
+                    if chunk is None:
                         return
-                    yielded_delta = True
-                    yield ChatGenerationChunk(message=AIMessageChunk(content=text))
+                    yielded_delta = yielded_delta or yielded_text
+                    yield chunk
 
                 for line in response.iter_lines():
                     if line == "":
@@ -519,11 +608,14 @@ class CodexChatModel(ChatOpenAI):
                     if payload is None:
                         return []
                     _raise_for_codex_event_error(payload)
-                    text = _codex_event_text(payload, yielded_delta=yielded_delta)
-                    if not text:
+                    chunk, yielded_text = _codex_event_generation_chunk(
+                        payload,
+                        yielded_delta=yielded_delta,
+                    )
+                    if chunk is None:
                         return []
-                    yielded_delta = True
-                    return [ChatGenerationChunk(message=AIMessageChunk(content=text))]
+                    yielded_delta = yielded_delta or yielded_text
+                    return [chunk]
 
                 async for line in response.aiter_lines():
                     if line == "":

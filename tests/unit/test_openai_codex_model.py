@@ -148,6 +148,86 @@ def test_codex_chat_model_streams_codex_sse_with_null_completed_output() -> None
         thread.join(timeout=2)
 
 
+class _CodexToolCallSSEHandler(BaseHTTPRequestHandler):
+    request_payload: dict[str, object] | None = None
+
+    def do_POST(self) -> None:
+        content_length = int(self.headers.get("content-length") or "0")
+        body = self.rfile.read(content_length)
+        type(self).request_payload = json.loads(body)
+        events = [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "fc_test",
+                    "type": "function_call",
+                    "call_id": "call_test",
+                    "name": "search_web",
+                    "arguments": "",
+                },
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": '{"query":"Hacker News top 10"}',
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_test",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
+                    "model": "gpt-5.4",
+                    "output": [],
+                    "error": None,
+                    "usage": None,
+                },
+            },
+        ]
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+        for event in events:
+            self.wfile.write(f"event: {event['type']}\n".encode())
+            self.wfile.write(
+                f"data: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
+            )
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def test_codex_chat_model_streams_tool_call_chunks_without_text() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CodexToolCallSSEHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        model = CodexChatModel(
+            model="gpt-5.4",
+            api_key="codex-token",
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            default_headers={},
+            codex_session_id="session-1",
+        )
+
+        response = model.invoke([HumanMessage(content="Search the web.")])
+
+        assert response.content == ""
+        assert response.tool_calls == [
+            {
+                "name": "search_web",
+                "args": {"query": "Hacker News top 10"},
+                "id": "call_test",
+                "type": "tool_call",
+            }
+        ]
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+
 def test_resolve_codex_credentials_reads_ruyi_auth_json(tmp_path) -> None:
     token = _jwt_with_chatgpt_account_id("acct-123")
     auth_json = tmp_path / "auth.json"
