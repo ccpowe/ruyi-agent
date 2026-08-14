@@ -334,7 +334,7 @@ agent 配置中使用：
 
 ```toml
 provider = "openai_codex"
-model = "gpt-5.3-codex"
+model = "gpt-5.6-sol"
 ```
 
 这个 provider 不需要在 `.ruyi_agent/ruyi.toml` 里配置 OpenAI API key。它使用的是 OAuth 认证文件。

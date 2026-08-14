@@ -16,12 +16,12 @@ mailbox 通知和工具暴露统一在一个 runtime 中。
 - 主 agent 把可并行或可分工的工作委托给本地 worker
 - 本地网关把任务转发给远端网关上的 agent
 - Gateway HTTP 层需要结构化创建、查询、取消任务
-- 子任务终态后通过 mailbox 或 webhook 通知父调用方
+- 子任务每轮 run settled 后通过 mailbox 或 webhook 通知父调用方
 
 数据流：
   spawn_agent/spawn_task → AgentRegistry 校验目标 → TaskManager 创建记录
     → 本地 worker 异步运行 或 A2AClient 调用远端网关
-    → TaskManager 更新状态 → mailbox/webhook 投递终态
+    → TaskManager 更新状态 → mailbox/webhook 投递本轮结果
 
 关键概念：
 - task_id: 本地 runtime 追踪的任务 ID
@@ -205,8 +205,8 @@ class MaxTasksPerRootError(ValueError):
 
 
 ACTIVE_TASK_STATES = {"pending", "running", "waiting_for_human"}
-TERMINAL_TASK_STATES = {"completed", "failed", "cancelled", "interrupted"}
-RESUMABLE_TASK_STATES = TERMINAL_TASK_STATES
+SETTLED_TASK_STATES = {"completed", "failed", "cancelled", "interrupted"}
+RESUMABLE_TASK_STATES = SETTLED_TASK_STATES
 
 
 def _now() -> datetime:
@@ -419,16 +419,16 @@ class TaskRecord:
         depth: 当前任务在委托树中的深度
         created_at: 任务创建时间
         updated_at: 任务最后更新时间
-        result: 成功终态的结果摘要
-        error: 失败终态的错误摘要
+        result: 最近一次成功 run 的结果摘要
+        error: 最近一次失败或中断 run 的错误摘要
         active_run: 本地任务当前活跃的 asyncio task
         run_count: 当前任务已执行的轮次数
         route_kind: 执行路由（local/remote_ref）
         upstream_task_id: 远端网关上的原始任务 ID
         parent_thread_id: 接收 mailbox 通知的父 thread ID
-        mailbox_suppressed: 是否禁止终态 mailbox 投递
-        mailbox_delivered: 是否已经投递过终态 mailbox 消息
-        webhook: 终态 webhook 配置
+        mailbox_suppressed: 是否禁止当前 run 的 mailbox 投递
+        mailbox_delivered: 是否已经投递过当前 run 的 mailbox 消息
+        webhook: run settled webhook 配置
         cancel_requested: 是否由显式 cancel_task 请求触发取消
         delegation_root_id: 跨网关传递的委托根 ID
         delegation_max_depth: 跨网关传递的最大委托深度
@@ -862,7 +862,7 @@ class TaskManager:
             route_kind: 执行路由（local/remote_ref）
             upstream_task_id: 远端网关原始任务 ID
             parent_thread_id: 父 agent thread ID
-            webhook: 终态 webhook 配置
+            webhook: 当前 run settled 后的 webhook 配置
             delegation_context: 跨网关委托上下文
 
         Returns:
@@ -939,6 +939,20 @@ class TaskManager:
         """
         # 为什么暴露任务列表：主 agent 和 UI 都需要知道当前 runtime 中有哪些活动任务。
         return list(self._tasks.values())
+
+    def list_persisted_tasks(self) -> list[TaskRecord]:
+        """List all known tasks, lazily restoring persisted records when needed."""
+        if self._store is None:
+            return self.list_tasks()
+        for stored in self._store.list_tasks():
+            current = self._tasks.get(stored.task_id)
+            if current is not None and self._has_live_active_run(current):
+                continue
+            record = task_record_for_restart(stored)
+            self._tasks[record.task_id] = record
+            if record.state != stored.state or record.error != stored.error:
+                self._save(record)
+        return self.list_tasks()
 
     def find_by_review_id(self, review_id: str) -> TaskRecord | None:
         mirrored_match: TaskRecord | None = None
@@ -1022,6 +1036,18 @@ class TaskManager:
         record.updated_at = _now()
         self._save(record)
 
+    def mark_mailbox_delivered(self, task_id: str) -> None:
+        """记录当前 run 的 mailbox 消息已经成功入队。"""
+        record = self.get_task(task_id)
+        record.mailbox_delivered = True
+        self._save(record)
+
+    def mark_mailbox_suppressed(self, task_id: str) -> None:
+        """记录当前 run 的 mailbox 消息不再需要投递。"""
+        record = self.get_task(task_id)
+        record.mailbox_suppressed = True
+        self._save(record)
+
     def mark_waiting_for_human(
         self,
         task_id: str,
@@ -1049,7 +1075,7 @@ class TaskManager:
             task_id: 当前 runtime 内部任务 ID
             result: 最终结果摘要
         """
-        # 为什么单独标记 completed：wait/check 依赖一个稳定的终态和最终文本结果。
+        # 为什么单独标记 completed：wait/check 依赖稳定的本轮状态和结果。
         record = self.get_task(task_id)
         record.state = "completed"
         record.result = result
@@ -1085,7 +1111,7 @@ class TaskManager:
         Args:
             task_id: 当前 runtime 内部任务 ID
         """
-        # 为什么单独标记 cancelled：取消是有业务语义的终态，不应和失败混在一起。
+        # 为什么单独标记 cancelled：主动取消当前 run 不应和失败混在一起。
         record = self.get_task(task_id)
         record.state = "cancelled"
         record.updated_at = _now()
@@ -1207,7 +1233,7 @@ class AgentControl:
         _task_manager: 任务状态管理器
         _compiled_agents: 已编译本地 worker agent 缓存
         _a2a_client: 远端网关 A2A 客户端
-        _mailbox: 进程内终态消息通道
+        _mailbox: 进程内 run settled 消息通道
         _root_budget_locks: 按 root_task_id 分组的预算锁
     """
 
@@ -1245,7 +1271,7 @@ class AgentControl:
             checkpointer: LangGraph checkpointer
             backend: runtime 后端依赖
             a2a_client: 自定义 A2A 客户端（测试或特殊传输层使用）
-            mailbox: 进程内 mailbox，用于向父 thread 投递终态消息
+            mailbox: 进程内 mailbox，用于向父 thread 投递每轮 run 的结果
             webhook_url: 当前节点接收远端 webhook 的 URL
             webhook_token: webhook Bearer Token
             remote_poll_interval: 轮询远端任务状态的间隔（秒）
@@ -1283,6 +1309,8 @@ class AgentControl:
         self._max_tasks_per_root = max_tasks_per_root
         self._node_id = validate_node_id(node_id or f"node-{uuid.uuid4()}")
         self._root_budget_locks: dict[str, asyncio.Lock] = {}
+        self._task_input_locks: dict[str, asyncio.Lock] = {}
+        self._mailbox_recovery_task: asyncio.Task[None] | None = None
         self._permission_default_profile = permission_default_profile
         self._permission_policy = permission_policy
         self._backend_kind = backend_kind
@@ -1385,9 +1413,12 @@ class AgentControl:
                 spec.permission_profile or self._permission_default_profile
             ),
             review_audit_store=self._review_audit_store,
-            tool_search_registry=spec.tool_search_registry if spec.tool_search else None,
+            tool_search_registry=spec.tool_search_registry
+            if spec.tool_search
+            else None,
             tool_search_server_names=spec.tool_search_server_names,
             tool_search_tool_names=spec.tool_search_tool_names,
+            system_tools=spec.system_tools,
             name=agent_name,
         )
         self._compiled_agents[agent_name] = agent  # agent 对象被复用（缓存）
@@ -1454,6 +1485,10 @@ class AgentControl:
                 config=run_config,
                 version="v2",
             )
+            # ainvoke returns only after LangGraph has completed and checkpointed
+            # the graph step, so durable mailbox claims can now be acknowledged.
+            if self._mailbox is not None:
+                self._mailbox.acknowledge_task(task_id, record.thread_id)
         except asyncio.CancelledError as exc:
             latest = self._task_manager.get_task(task_id)
             if latest.cancel_requested:
@@ -1463,13 +1498,13 @@ class AgentControl:
                     task_id,
                     _format_interrupted_error(exc),
                 )
-            self._maybe_publish_terminal_message(task_id)
-            await self._send_terminal_webhook(task_id)  # 如果配置了webhook 就会发送
+            self._maybe_publish_settled_message(task_id)
+            await self._send_settled_webhook(task_id)  # 如果配置了webhook 就会发送
             raise
         except Exception as exc:
             self._task_manager.mark_failed(task_id, _format_exception_summary(exc))
-            self._maybe_publish_terminal_message(task_id)
-            await self._send_terminal_webhook(task_id)
+            self._maybe_publish_settled_message(task_id)
+            await self._send_settled_webhook(task_id)
             return
 
         outcome = await normalize_agent_turn(agent, run_config, result)
@@ -1479,8 +1514,8 @@ class AgentControl:
                     task_id,
                     "Worker produced multiple simultaneous human review requests.",
                 )
-                self._maybe_publish_terminal_message(task_id)
-                await self._send_terminal_webhook(task_id)
+                self._maybe_publish_settled_message(task_id)
+                await self._send_settled_webhook(task_id)
                 return
             self._task_manager.mark_waiting_for_human(
                 task_id,
@@ -1498,8 +1533,8 @@ class AgentControl:
                 task_id,
                 "Worker stopped before resolving pending tool calls.",
             )
-            self._maybe_publish_terminal_message(task_id)
-            await self._send_terminal_webhook(task_id)
+            self._maybe_publish_settled_message(task_id)
+            await self._send_settled_webhook(task_id)
             return
 
         result_text = (
@@ -1507,8 +1542,8 @@ class AgentControl:
             or "Task completed, but the final assistant reply was empty."
         )
         self._task_manager.mark_completed(task_id, result_text)
-        self._maybe_publish_terminal_message(task_id)
-        await self._send_terminal_webhook(task_id)
+        self._maybe_publish_settled_message(task_id)
+        await self._send_settled_webhook(task_id)
 
     async def _run_agent_turn(self, task_id: str, user_input: str) -> None:
         await self._run_agent_payload(
@@ -1533,6 +1568,78 @@ class AgentControl:
             raise TaskAlreadyRunningError(f"Worker task is already running: {task_id}")
         run_task = asyncio.create_task(self._run_agent_turn(task_id, user_input))
         self._task_manager.mark_running(task_id, run_task)
+        self._attach_mailbox_wakeup(task_id, run_task)
+
+    def _start_mailbox_run(self, task_id: str) -> None:
+        """Start a run whose user input will be supplied by MailboxMiddleware."""
+        record = self._task_manager.get_task(task_id)
+        if record.active_run is not None and not record.active_run.done():
+            raise TaskAlreadyRunningError(f"Worker task is already running: {task_id}")
+        run_task = asyncio.create_task(
+            self._run_agent_payload(task_id, {"messages": []})
+        )
+        self._task_manager.mark_running(task_id, run_task)
+        self._attach_mailbox_wakeup(task_id, run_task)
+
+    def _attach_mailbox_wakeup(
+        self,
+        task_id: str,
+        run_task: asyncio.Task[None],
+    ) -> None:
+        """Recheck durable input after a run exits to close the final-answer race."""
+        if self._mailbox is None:
+            return
+
+        def schedule_wakeup(_: asyncio.Task[None]) -> None:
+            asyncio.create_task(self._ensure_task_awake(task_id))
+
+        run_task.add_done_callback(schedule_wakeup)
+
+    async def _ensure_task_awake(self, task_id: str) -> TaskRecord:
+        """Start at most one mailbox-driven run when a resumable task has input."""
+        lock = self._task_input_locks.setdefault(task_id, asyncio.Lock())
+        async with lock:
+            record = self._task_manager.get_task(task_id)
+            if self._mailbox is None or record.route_kind != "local":
+                return record
+            if record.active_run is not None and not record.active_run.done():
+                return record
+            if record.state not in RESUMABLE_TASK_STATES:
+                return record
+            if not self._mailbox.has_triggering_messages(task_id):
+                return record
+            self._start_mailbox_run(task_id)
+            return self._task_manager.get_task(task_id)
+
+    async def wake_pending_mailbox_tasks(self) -> None:
+        """Resume durable triggering inputs left behind by a process restart."""
+        if self._mailbox is not None:
+            self._mailbox.recover_claims()
+        for record in self._task_manager.list_persisted_tasks():
+            await self._ensure_task_awake(record.task_id)
+
+    def start_mailbox_recovery(self) -> None:
+        """Periodically recover expired claims from interrupted runtimes."""
+        if self._mailbox is None or self._mailbox_recovery_task is not None:
+            return
+
+        async def recover() -> None:
+            while True:
+                await asyncio.sleep(5)
+                await self.wake_pending_mailbox_tasks()
+
+        self._mailbox_recovery_task = asyncio.create_task(recover())
+
+    async def close(self) -> None:
+        """Stop runtime-owned background maintenance tasks."""
+        if self._mailbox_recovery_task is None:
+            return
+        self._mailbox_recovery_task.cancel()
+        try:
+            await self._mailbox_recovery_task
+        except asyncio.CancelledError:
+            pass
+        self._mailbox_recovery_task = None
 
     def _resume_run(self, task_id: str, decisions: list[dict[str, Any]]) -> None:
         record = self._task_manager.get_task(task_id)
@@ -1548,13 +1655,12 @@ class AgentControl:
             "task_review_resumed",
             record,
             payload={
-                "review_id": (
-                    record.pending_review or {}
-                ).get("review_id"),
+                "review_id": (record.pending_review or {}).get("review_id"),
                 "decisions": decisions,
             },
         )
         self._task_manager.mark_running(task_id, run_task)
+        self._attach_mailbox_wakeup(task_id, run_task)
 
     def _format_task_record(self, record: TaskRecord) -> str:
         """
@@ -1569,9 +1675,7 @@ class AgentControl:
         # waiting_for_human is a control-plane pause, not useful model context.
         # Keep it internal and expose it as running so callers do not retry or
         # re-delegate while a user is reviewing the blocked tool call.
-        model_state = (
-            "running" if record.state == "waiting_for_human" else record.state
-        )
+        model_state = "running" if record.state == "waiting_for_human" else record.state
         parts = [
             f"task_id={record.task_id}",
             f"agent={record.agent_name}",
@@ -1957,56 +2061,60 @@ class AgentControl:
             webhook["token"] = self._webhook_token
         return webhook
 
-    def _is_terminal_record(self, record: TaskRecord) -> bool:
+    def _is_settled_record(self, record: TaskRecord) -> bool:
         """
-        判断任务是否处于终态
+        判断 Task 当前一轮 run 是否已经 settled
 
         Args:
             record: 任务记录
 
         Returns:
-            completed、failed 或 cancelled 返回 True
+            completed、failed、cancelled 或 interrupted 返回 True
         """
-        return record.state in TERMINAL_TASK_STATES
+        return record.state in SETTLED_TASK_STATES
 
-    def _maybe_publish_terminal_message(self, task_id: str) -> None:
+    def _maybe_publish_settled_message(self, task_id: str) -> None:
         """
-        尝试向父 thread 发布终态 mailbox 消息
+        尝试向父 thread 发布当前 run 的 settled mailbox 消息
 
         只有配置了 mailbox、任务有 parent_thread_id、未被 suppress、未投递过且
-        已进入终态时才会发布。
+        当前 run 已经 settled 时才会发布。Task 会话本身仍可继续输入。
 
         Args:
             task_id: 当前 runtime 内部任务 ID
         """
-        # 如果任务终止，发布消息到 mailbox
+        # 当前 run 结束后发布消息到 mailbox；Task 本身仍然保持可恢复。
         record = self._task_manager.get_task(task_id)
         if (
             self._mailbox is None
             or record.parent_thread_id is None
             or record.mailbox_suppressed
             or record.mailbox_delivered
-            or not self._is_terminal_record(record)
+            or not self._is_settled_record(record)
         ):
             return
         status = record.state
-        if status not in TERMINAL_TASK_STATES:
+        if status not in SETTLED_TASK_STATES:
             return
-        content = record.result or record.error or f"Task ended with state={status}"
+        content = record.result or record.error or f"Task run ended with state={status}"
         # content 支持 执行结果 已知错误 或者未知状态
-        published = self._mailbox.publish_terminal(
+        published = self._mailbox.publish_settled(
             recipient_thread_id=record.parent_thread_id,
+            recipient_task_id=record.parent_task_id,
             child_task_id=record.task_id,
             child_agent_name=record.agent_name,
-            status=status,  # type: ignore[arg-type]
+            run_count=record.run_count,
+            status=status,
             content=content,
         )
         if published is not None:
-            record.mailbox_delivered = True
+            self._task_manager.mark_mailbox_delivered(record.task_id)
+            if record.parent_task_id is not None:
+                asyncio.create_task(self._ensure_task_awake(record.parent_task_id))
 
     def _suppress_mailbox_delivery(self, record: TaskRecord) -> None:
         """
-        禁止或撤回任务的 mailbox 终态投递
+        禁止或撤回任务当前 run 的 mailbox 投递
 
         当调用方已经通过 wait/check 主动获取结果时，后续不应再把同一个结果
         作为 mailbox 消息注入父 agent。
@@ -2014,22 +2122,23 @@ class AgentControl:
         Args:
             record: 需要抑制 mailbox 投递的任务记录
         """
-        record.mailbox_suppressed = True
+        self._task_manager.mark_mailbox_suppressed(record.task_id)
         if self._mailbox is not None and record.parent_thread_id is not None:
             self._mailbox.retract(
                 recipient_thread_id=record.parent_thread_id,
                 child_task_id=record.task_id,
+                run_count=record.run_count,
             )
 
-    async def _send_terminal_webhook(self, task_id: str) -> None:
+    async def _send_settled_webhook(self, task_id: str) -> None:
         """
-        发送任务终态 webhook
+        发送 Task 当前 run 的 settled webhook
 
         Args:
             task_id: 当前 runtime 内部任务 ID
         """
         record = self._task_manager.get_task(task_id)
-        if not record.webhook or not self._is_terminal_record(record):
+        if not record.webhook or not self._is_settled_record(record):
             return
         url = record.webhook.get("url")
         if not isinstance(url, str) or not url:
@@ -2073,9 +2182,9 @@ class AgentControl:
         if record is None:
             return False
         synced = self._task_manager.sync_remote_task(record.task_id, payload)
-        if self._is_terminal_record(synced):
-            self._maybe_publish_terminal_message(synced.task_id)
-            await self._send_terminal_webhook(synced.task_id)
+        if self._is_settled_record(synced):
+            self._maybe_publish_settled_message(synced.task_id)
+            await self._send_settled_webhook(synced.task_id)
         return True
 
     def _allowed_targets_for_agent(self, agent_name: str) -> set[str]:
@@ -2106,9 +2215,11 @@ class AgentControl:
         Returns:
             该 worker 可使用的 StructuredTool 列表
         """
+        spec = self._registry.get_spec(agent_name)
         return self._build_tools(
             allowed_targets=self._allowed_targets_for_agent(agent_name),
             caller_agent_name=agent_name,
+            enabled_tools=spec.system_tools,
         )
 
     def build_tools(self) -> list[StructuredTool]:
@@ -2125,6 +2236,7 @@ class AgentControl:
         *,
         allowed_targets: set[str] | None = None,
         caller_agent_name: str | None = None,
+        enabled_tools: frozenset[str] | None = None,
     ) -> list[StructuredTool]:
         """
         构造委托工具集合
@@ -2146,36 +2258,86 @@ class AgentControl:
             ),
         )
 
-        def task_is_visible_to_caller(
-            record: TaskRecord,
+        def caller_and_visible_tasks(
             config: RunnableConfig | None,
-        ) -> bool:
-            """
-            判断任务是否对当前工具调用方可见
-
-            worker 的委托工具只能操作自己创建或同一父 thread 下的任务，避免
-            子 agent 越权查看其他分支的 task。
-            """
-            if allowed_targets is None:
-                return True
-            if record.agent_name not in allowed_targets:
-                return False
-            if not config:
-                return False
+        ) -> tuple[TaskRecord | None, list[TaskRecord]]:
             try:
-                parent_record = self._extract_parent_task_record(config)
+                caller = self._extract_parent_task_record(config)
             except UnknownWorkerTaskError:
-                parent_record = None
-            if parent_record is not None:
-                return record.parent_task_id == parent_record.task_id
+                caller = None
+            if caller is not None:
+                records: list[TaskRecord] = [caller]
+                if caller.parent_task_id is not None:
+                    try:
+                        records.append(
+                            self._task_manager.get_task(caller.parent_task_id)
+                        )
+                    except UnknownWorkerTaskError:
+                        pass
+                records.extend(
+                    record
+                    for record in self._task_manager.list_persisted_tasks()
+                    if record.parent_task_id == caller.task_id
+                )
+                return caller, records
             parent_thread_id = self._extract_parent_thread_id(config)
-            if parent_thread_id is not None:
-                return record.parent_thread_id == parent_thread_id
-            return False
+            if parent_thread_id is None:
+                return None, []
+            self._task_manager.load_by_parent_thread_id(parent_thread_id)
+            return None, [
+                record
+                for record in self._task_manager.list_tasks()
+                if record.parent_thread_id == parent_thread_id
+                and (allowed_targets is None or record.agent_name in allowed_targets)
+            ]
+
+        def format_scope_error(
+            *,
+            operation: str,
+            requested_task_id: str,
+            caller: TaskRecord | None,
+            visible: list[TaskRecord],
+        ) -> str:
+            allowed = [
+                record
+                for record in visible
+                if record.task_id != (caller.task_id if caller else None)
+                and (
+                    operation == "send_input"
+                    or caller is None
+                    or record.parent_task_id == caller.task_id
+                )
+            ]
+            lines = [
+                f"Cannot use {operation} with task '{requested_task_id}'.",
+                (
+                    "send_input may target only your direct parent or direct children."
+                    if operation == "send_input"
+                    else f"{operation} may target only your direct children."
+                ),
+                "Allowed task IDs:",
+            ]
+            if not allowed:
+                lines.append("- none")
+            else:
+                for record in allowed:
+                    relation = (
+                        "parent"
+                        if caller is not None
+                        and caller.parent_task_id == record.task_id
+                        else "child"
+                    )
+                    lines.append(f"- {relation}: {record.task_id}")
+            lines.append(
+                "Use an exact ID above, or call list_agents to refresh the task list."
+            )
+            return "\n".join(lines)
 
         def get_scoped_task(
             task_id: str,
             config: RunnableConfig | None,
+            *,
+            operation: str,
         ) -> TaskRecord:
             """
             获取当前调用方可见的任务
@@ -2183,23 +2345,28 @@ class AgentControl:
             Raises:
                 UnknownWorkerTaskError: 任务不存在或不在当前工具作用域内
             """
-            parent_thread_id = self._extract_parent_thread_id(config)
             try:
                 record = self._task_manager.get_task(task_id)
             except UnknownWorkerTaskError:
-                if parent_thread_id is None:
-                    raise
-                loaded = self._task_manager.load_task_for_parent_thread(
-                    task_id=task_id,
-                    parent_thread_id=parent_thread_id,
-                )
-                if loaded is None:
-                    raise
-                record = loaded
-            if not task_is_visible_to_caller(record, config):
-                caller = caller_agent_name or "current agent"
                 raise UnknownWorkerTaskError(
-                    f"Worker task '{task_id}' is not visible to '{caller}'."
+                    f"Unknown task_id '{task_id}'. Call list_agents and use an exact "
+                    "task_id from its result."
+                ) from None
+            caller, visible = caller_and_visible_tasks(config)
+            visible_ids = {item.task_id for item in visible}
+            allowed = record.task_id in visible_ids
+            if caller is not None:
+                is_parent = caller.parent_task_id == record.task_id
+                is_child = record.parent_task_id == caller.task_id
+                allowed = is_child or (operation == "send_input" and is_parent)
+            if not allowed:
+                raise UnknownWorkerTaskError(
+                    format_scope_error(
+                        operation=operation,
+                        requested_task_id=task_id,
+                        caller=caller,
+                        visible=visible,
+                    )
                 )
             return record
 
@@ -2224,7 +2391,7 @@ class AgentControl:
         ) -> str:
             """带任务可见性校验的 wait_agent 包装器"""
             try:
-                get_scoped_task(task_id, config)
+                get_scoped_task(task_id, config, operation="wait_agent")
             except UnknownWorkerTaskError as exc:
                 return str(exc)
             return await self.wait_agent(task_id, config)
@@ -2235,7 +2402,7 @@ class AgentControl:
         ) -> str:
             """带任务可见性校验的 check_agent 包装器"""
             try:
-                get_scoped_task(task_id, config)
+                get_scoped_task(task_id, config, operation="check_agent")
             except UnknownWorkerTaskError as exc:
                 return str(exc)
             return await self.check_agent(task_id, config)
@@ -2247,7 +2414,7 @@ class AgentControl:
         ) -> str:
             """带任务可见性校验的 send_input 包装器"""
             try:
-                get_scoped_task(task_id, config)
+                get_scoped_task(task_id, config, operation="send_input")
             except UnknownWorkerTaskError as exc:
                 return str(exc)
             return await self.send_input(task_id, message)
@@ -2258,7 +2425,7 @@ class AgentControl:
         ) -> str:
             """带任务可见性校验的 cancel_agent 包装器"""
             try:
-                get_scoped_task(task_id, config)
+                get_scoped_task(task_id, config, operation="cancel_agent")
             except UnknownWorkerTaskError as exc:
                 return str(exc)
             return await self.cancel_agent(task_id)
@@ -2270,11 +2437,8 @@ class AgentControl:
             parent_thread_id = self._extract_parent_thread_id(config)
             if parent_thread_id is not None:
                 self._task_manager.load_by_parent_thread_id(parent_thread_id)
-            visible_task_ids = {
-                record.task_id
-                for record in self._task_manager.list_tasks()
-                if task_is_visible_to_caller(record, config)
-            }
+            _, visible = caller_and_visible_tasks(config)
+            visible_task_ids = {record.task_id for record in visible}
             return self._format_agents_and_tasks(
                 allowed_targets,
                 visible_task_ids=visible_task_ids,
@@ -2282,7 +2446,7 @@ class AgentControl:
 
         # 这里统一生成 StructuredTool，主 agent 看到的是稳定的 schema + description，
         # 而不是一组信息不足的裸方法。
-        return [
+        tools = [
             StructuredTool.from_function(
                 coroutine=scoped_spawn_agent,
                 name="spawn_agent",
@@ -2294,8 +2458,8 @@ class AgentControl:
                 coroutine=scoped_wait_agent,
                 name="wait_agent",
                 description=(
-                    "Wait for a delegated task to reach a final state. If the "
-                    "task is blocked on external review and no review handler can "
+                    "Wait for a delegated task's current run to settle. If the "
+                    "run is blocked on external review and no review handler can "
                     "resolve it, return the latest running state instead."
                 ),
                 infer_schema=False,
@@ -2314,8 +2478,9 @@ class AgentControl:
                 coroutine=scoped_send_input,
                 name="send_input",
                 description=(
-                    "Send follow-up instructions to an existing delegated task "
-                    "after its current run has finished."
+                    "Send additional input to your direct parent task or one of "
+                    "your direct child tasks. Running tasks receive it at the "
+                    "next safe model boundary; idle tasks are awakened."
                 ),
                 infer_schema=False,
                 args_schema=SendInputSchema,
@@ -2323,7 +2488,10 @@ class AgentControl:
             StructuredTool.from_function(
                 coroutine=scoped_cancel_agent,
                 name="cancel_agent",
-                description="Cancel a delegated task that is no longer needed.",
+                description=(
+                    "Cancel a delegated task's current run. The agent session "
+                    "remains available for follow-up input."
+                ),
                 infer_schema=False,
                 args_schema=TaskIdSchema,
             ),
@@ -2335,6 +2503,9 @@ class AgentControl:
                 args_schema=ListAgentsSchema,
             ),
         ]
+        if enabled_tools is None:
+            return tools
+        return [tool for tool in tools if tool.name in enabled_tools]
 
     def list_registered_agents_snapshot(self) -> list[RegisteredAgent]:
         """
@@ -2387,6 +2558,10 @@ class AgentControl:
             任务记录列表
         """
         return self._task_manager.list_tasks()
+
+    def list_persisted_task_records(self) -> list[TaskRecord]:
+        """List runtime and persisted tasks for Gateway discovery."""
+        return self._task_manager.list_persisted_tasks()
 
     def list_pending_review_records(self) -> list[TaskRecord]:
         return [
@@ -2476,7 +2651,7 @@ class AgentControl:
             agent_name: 远端引用名称
             task_id: 当前 runtime 内部任务 ID
             upstream_task_id: 远端网关上的任务 ID
-            webhook: 终态 webhook 配置
+            webhook: 当前 run settled 后的 webhook 配置
 
         Returns:
             已存在或新创建的任务记录
@@ -2566,7 +2741,7 @@ class AgentControl:
             parent_task_id: 父任务 ID
             parent_thread_id: 父 agent thread ID，用于 mailbox 回投
             metadata: 传给远端任务的 metadata
-            webhook: 当前调用方希望接收的终态 webhook
+            webhook: 当前调用方希望接收的 run settled webhook
             delegation_context: 入站或显式委托上下文
 
         Returns:
@@ -2706,25 +2881,39 @@ class AgentControl:
                 attachments=attachments,
             )
             return self._task_manager.sync_remote_task(task_id, payload)
-        if record.active_run is not None and not record.active_run.done():
-            # 或许之后可以投递到 subagent的mailbox里 这样可以对运行的agent提供命令而不是只有一切结束才行
-            raise TaskAlreadyRunningError(f"Worker task is already running: {task_id}")
-        if record.state in ACTIVE_TASK_STATES:
-            raise TaskAlreadyRunningError(f"Worker task is already running: {task_id}")
-        if record.state not in RESUMABLE_TASK_STATES:
+        if record.state == "waiting_for_human":
+            raise TaskAlreadyRunningError(
+                f"Worker task is waiting for review: {task_id}"
+            )
+        if record.state not in ACTIVE_TASK_STATES | RESUMABLE_TASK_STATES:
             raise ValueError(
                 f"Task '{task_id}' cannot receive input in state={record.state}"
             )
-        # send_input 延续同一个 task/thread，不是新建一次委派，因此不增加 depth。
-        self._start_run(task_id, message)
-        return self._task_manager.get_task(task_id)
+        if self._mailbox is None:
+            if record.state in ACTIVE_TASK_STATES:
+                raise TaskAlreadyRunningError(
+                    f"Worker task is already running: {task_id}"
+                )
+            self._start_run(task_id, message)
+            return self._task_manager.get_task(task_id)
+
+        self._mailbox.publish_input(
+            recipient_task_id=record.task_id,
+            recipient_thread_id=record.thread_id,
+            content=message,
+            trigger_run=True,
+        )
+        # Active runs consume this at their next before_model boundary. Settled
+        # tasks are resumed immediately; the done callback covers the race where
+        # an active run settles after the message was queued.
+        return await self._ensure_task_awake(task_id)
 
     async def cancel_task(self, task_id: str) -> TaskRecord:
         """
-        取消已有任务
+        取消已有 Task 当前正在执行或等待审批的 run
 
-        本地任务会取消活跃 asyncio task；远端任务会通过 A2AClient 转发取消
-        请求到远端网关。
+        本地 Task 会取消活跃 asyncio task；远端 Task 会通过 A2AClient 转发
+        取消请求。Task 已 settled 时保持原状态，长期会话仍可继续输入。
 
         Args:
             task_id: 当前 runtime 内部任务 ID
@@ -2739,6 +2928,8 @@ class AgentControl:
         # 为什么提供结构化取消接口：HTTP 层要返回最新 task 视图，而不是人类可读文本。
         record = self._task_manager.get_task(task_id)
         if record.route_kind == "remote_ref":
+            if record.state not in ACTIVE_TASK_STATES:
+                return record
             entry = self._get_remote_entry_for_task(task_id)
             payload = await self._a2a_client.cancel_task(
                 entry.ref,
@@ -2746,7 +2937,7 @@ class AgentControl:
             )
             return self._task_manager.sync_remote_task(task_id, payload)
         if record.active_run is None or record.active_run.done():
-            if record.state != "cancelled":
+            if record.state in ACTIVE_TASK_STATES:
                 self._task_manager.mark_cancelled(task_id)
             return self._task_manager.get_task(task_id)
         record.cancel_requested = True
@@ -2812,7 +3003,7 @@ class AgentControl:
     ) -> str:
         # 为什么有这个工具：让主 agent 在需要同步结果时，再显式等待本地或远端任务完成。
         """
-        等待委托任务进入终态。
+        等待委托任务当前 run settled。
 
         如果任务暂停在人工审批点，且当前 config 没有可用的审批处理回调，
         本方法会返回最新的 agent-facing running 状态，而不是无限阻塞。
@@ -2833,7 +3024,7 @@ class AgentControl:
             try:
                 while True:
                     record = await self._refresh_remote_task_with_retries(task_id)
-                    if record.state in TERMINAL_TASK_STATES:
+                    if record.state in SETTLED_TASK_STATES:
                         return self._format_task_record(record)
                     if record.state == "waiting_for_human":
                         resolved = await self._resolve_pending_reviews_from_config(
@@ -2856,7 +3047,7 @@ class AgentControl:
                 except asyncio.CancelledError:
                     pass
             record = self._task_manager.get_task(task_id)
-            if record.state in TERMINAL_TASK_STATES:
+            if record.state in SETTLED_TASK_STATES:
                 return self._format_task_record(record)
             if record.state == "waiting_for_human":
                 resolved = await self._resolve_pending_reviews_from_config(config)
@@ -2887,7 +3078,7 @@ class AgentControl:
             record = self._task_manager.get_task(task_id)
             if record.route_kind == "remote_ref":
                 record = await self._refresh_remote_task_with_retries(task_id)
-            if record.state in TERMINAL_TASK_STATES:
+            if record.state in SETTLED_TASK_STATES:
                 self._suppress_mailbox_delivery(record)
             return self._format_task_record(record)
         except UnknownWorkerTaskError as exc:
@@ -2924,9 +3115,9 @@ class AgentControl:
         return f"Sent input to worker task: task_id={record.task_id}"
 
     async def cancel_agent(self, task_id: str) -> str:
-        # 为什么有这个工具：让主 agent 可以主动中断不再需要的 worker 任务。
+        # 为什么有这个工具：让主 agent 可以中断 worker 当前 run，同时保留会话。
         """
-        取消不再需要的委托任务
+        取消委托 Task 当前 run，不关闭长期 agent 会话
 
         Args:
             task_id: 当前 runtime 内部任务 ID
@@ -2941,8 +3132,11 @@ class AgentControl:
         except (A2AClientError, ValueError) as exc:
             return str(exc)
         if record.state == "cancelled":
-            return f"Cancelled worker task: task_id={record.task_id}"
-        return f"Cancelled worker task: task_id={record.task_id}"
+            return f"Cancelled current worker run: task_id={record.task_id}"
+        return (
+            "No active worker run to cancel: "
+            f"task_id={record.task_id} state={record.state}"
+        )
 
     async def list_agents(self) -> str:
         # 为什么有这个工具：让主 agent 能看到当前 runtime 里有哪些 worker 任务正在被管理。
@@ -2986,8 +3180,11 @@ class AgentControl:
         task_lines.extend(
             self._format_task_record(record)
             for record in records
-            if (allowed_targets is None or record.agent_name in allowed_targets)
-            and (visible_task_ids is None or record.task_id in visible_task_ids)
+            if (
+                record.task_id in visible_task_ids
+                if visible_task_ids is not None
+                else allowed_targets is None or record.agent_name in allowed_targets
+            )
         )
         if len(task_lines) == 1:
             task_lines.append("- none")

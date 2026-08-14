@@ -19,7 +19,7 @@ DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 DEFAULT_CODEX_AUTH_JSON = "~/.ruyi_agent/openai_codex_auth.json"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
-DEFAULT_MODEL = "gpt-5.3-codex"
+DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_INSTRUCTIONS = (
     "You are a minimal Codex backend probe. Answer the user request directly."
 )
@@ -471,7 +471,15 @@ def extract_model_ids(value: Any) -> list[str]:
 def choose_model(args: argparse.Namespace, model_ids: list[str]) -> str:
     if args.model:
         return args.model
-    for needle in ("codex", "gpt-5.5", "gpt-5.4", "gpt-5.3", "gpt-5.2"):
+    for needle in (
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "codex",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.3",
+        "gpt-5.2",
+    ):
         for model_id in model_ids:
             if needle in model_id:
                 return model_id

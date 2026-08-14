@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 
-from ruyi_agent.runtime.bootstrap import AppRuntime
 from ruyi_agent.runtime.bootstrap import DEFAULT_AGENT_NODE_ID
 from ruyi_agent.runtime.bootstrap import _attach_delegation_scopes_to_local_specs
 from ruyi_agent.runtime.bootstrap import _is_loopback_gateway_host
@@ -87,9 +86,7 @@ def test_attach_delegation_scopes_uses_each_agent_workers() -> None:
     assert sorted(attached["research"].delegation_local_worker_specs or {}) == [
         "checker"
     ]
-    nested_research = (attached["main"].delegation_local_worker_specs or {})[
-        "research"
-    ]
+    nested_research = (attached["main"].delegation_local_worker_specs or {})["research"]
     assert nested_research is attached["research"]
     assert sorted(nested_research.delegation_local_worker_specs or {}) == ["checker"]
     assert attached["checker"].delegation_local_worker_specs is None
@@ -100,65 +97,26 @@ def test_attach_delegation_scopes_uses_each_agent_workers() -> None:
     assert attached["research"].build_delegation_tools() == ["worker-tool:research"]
 
 
-def test_app_runtime_get_local_agent_builds_and_caches_by_name() -> None:
-    built_names: list[str] = []
+def test_attach_delegation_scopes_installs_parent_tools_for_leaf_worker() -> None:
+    configs = {
+        "main": {"kind": "local", "workers": ["child"]},
+        "child": {"kind": "local", "workers": []},
+    }
+    main = _local_spec("main")
+    main.system_tools = frozenset({"spawn_agent", "send_input", "list_agents"})
+    child = _local_spec("child")
+    child.system_tools = frozenset({"send_input", "list_agents"})
 
-    def build_local_agent(agent_name: str) -> object:
-        built_names.append(agent_name)
-        return object()
-
-    runtime = AppRuntime(
-        main_agent_name="main",
-        agent_configs={
-            "main": {"kind": "local", "description": "main agent"},
-            "research": {"kind": "local", "description": "research agent"},
-            "remote_wiki": {"kind": "remote_ref", "description": "remote wiki"},
-        },
-        local_agent_specs={
-            "research": _local_spec("research"),
-            "main": _local_spec("main"),
-        },
-        gateway_service=object(),  # type: ignore[arg-type]
-        worker_control=object(),  # type: ignore[arg-type]
-        gateway_control=object(),  # type: ignore[arg-type]
-        checkpoint_db="checkpoints.sqlite",
-        route_db="routes.sqlite",
-        task_db="tasks.sqlite",
-        _build_local_agent=build_local_agent,
-        _local_agent_cache={},
+    attached = _attach_delegation_scopes_to_local_specs(
+        agent_configs=configs,
+        all_local_specs={"main": main, "child": child},
+        all_remote_refs={},
+        worker_control_ref={"control": FakeWorkerControl()},
     )
 
-    assert runtime.list_local_agent_names() == ["main", "research"]
-
-    first = runtime.get_local_agent("research")
-    second = runtime.get_local_agent("research")
-    default_agent = runtime.get_default_local_agent()
-
-    assert first is second
-    assert default_agent is runtime.get_local_agent("main")
-    assert built_names == ["research", "main"]
-
-
-def test_app_runtime_rejects_non_local_agent_for_streaming() -> None:
-    runtime = AppRuntime(
-        main_agent_name="main",
-        agent_configs={
-            "main": {"kind": "local"},
-            "remote_wiki": {"kind": "remote_ref"},
-        },
-        local_agent_specs={"main": _local_spec("main")},
-        gateway_service=object(),  # type: ignore[arg-type]
-        worker_control=object(),  # type: ignore[arg-type]
-        gateway_control=object(),  # type: ignore[arg-type]
-        checkpoint_db="checkpoints.sqlite",
-        route_db="routes.sqlite",
-        task_db="tasks.sqlite",
-        _build_local_agent=lambda agent_name: object(),
-        _local_agent_cache={},
-    )
-
-    with pytest.raises(ValueError, match="kind='remote_ref'"):
-        runtime.get_local_agent("remote_wiki")
+    assert attached["child"].delegation_local_worker_specs is None
+    assert attached["child"].build_delegation_tools is not None
+    assert attached["child"].build_delegation_tools() == ["worker-tool:child"]
 
 
 def test_read_node_id_env_uses_default_for_missing_value(

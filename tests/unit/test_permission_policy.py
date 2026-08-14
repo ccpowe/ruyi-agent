@@ -55,6 +55,9 @@ def build_yolo_policy() -> PermissionPolicy:
                             policy=PermissionDecision.ALLOW,
                             allowed_decisions=["approve", "edit", "reject"],
                         ),
+                        "wait_agent": ToolPermissionConfig(
+                            policy=PermissionDecision.ALLOW,
+                        ),
                     },
                     execute_rules=[
                         ExecuteRuleConfig(
@@ -102,6 +105,16 @@ def test_execute_allow_prefix_matches_simple_command() -> None:
 
     assert result.decision == PermissionDecision.ALLOW
     assert result.risk == "execute_prefix_rule"
+
+
+def test_yolo_wait_agent_is_allowed_without_review() -> None:
+    result = build_yolo_policy().evaluate(
+        tool_name="wait_agent",
+        tool_args={"task_id": "task-1"},
+        context=build_context("yolo"),
+    )
+
+    assert result.decision == PermissionDecision.ALLOW
 
 
 def test_execute_deny_prefix_wins() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 import base64
 import json
@@ -26,6 +27,14 @@ DEFAULT_CODEX_INSTRUCTIONS = (
     "You are a Codex backend model used by ruyi-agent. Answer directly."
 )
 CODEX_USER_AGENT = "codex_cli_rs/0.0.0 (ruyi-agent)"
+
+
+def _retryable_codex_stream_error(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.TransportError):
+        return True
+    return isinstance(exc, httpx.HTTPStatusError) and (
+        exc.response.status_code == 429 or exc.response.status_code >= 500
+    )
 
 
 @dataclass(slots=True)
@@ -468,6 +477,7 @@ class CodexChatModel(ChatOpenAI):
         kwargs.setdefault("use_responses_api", True)
         kwargs.setdefault("streaming", True)
         kwargs.setdefault("temperature", None)
+        kwargs.setdefault("max_retries", 2)
         super().__init__(**kwargs)
 
     @property
@@ -539,42 +549,57 @@ class CodexChatModel(ChatOpenAI):
             kwargs=kwargs,
         )
         yielded_delta = False
-        with httpx.Client(timeout=self._codex_http_timeout()) as client:
-            with client.stream(
-                "POST",
-                self._codex_responses_url(),
-                headers=headers,
-                json=payload,
-            ) as response:
-                response.raise_for_status()
-                event_name: str | None = None
-                data_lines: list[str] = []
+        yielded_effect = False
+        attempts = max(1, int(self.max_retries or 0) + 1)
+        for attempt in range(attempts):
+            try:
+                with httpx.Client(timeout=self._codex_http_timeout()) as client:
+                    with client.stream(
+                        "POST",
+                        self._codex_responses_url(),
+                        headers=headers,
+                        json=payload,
+                    ) as response:
+                        response.raise_for_status()
+                        event_name: str | None = None
+                        data_lines: list[str] = []
 
-                def flush_event() -> Iterator[ChatGenerationChunk]:
-                    nonlocal event_name, data_lines, yielded_delta
-                    payload = _parse_sse_payload(event_name, data_lines)
-                    event_name = None
-                    data_lines = []
-                    if payload is None:
-                        return
-                    _raise_for_codex_event_error(payload)
-                    chunk, yielded_text = _codex_event_generation_chunk(
-                        payload,
-                        yielded_delta=yielded_delta,
-                    )
-                    if chunk is None:
-                        return
-                    yielded_delta = yielded_delta or yielded_text
-                    yield chunk
+                        def flush_event() -> Iterator[ChatGenerationChunk]:
+                            nonlocal event_name, data_lines, yielded_delta, yielded_effect
+                            event_payload = _parse_sse_payload(event_name, data_lines)
+                            event_name = None
+                            data_lines = []
+                            if event_payload is None:
+                                return
+                            _raise_for_codex_event_error(event_payload)
+                            chunk, yielded_text = _codex_event_generation_chunk(
+                                event_payload,
+                                yielded_delta=yielded_delta,
+                            )
+                            if chunk is None:
+                                return
+                            yielded_delta = yielded_delta or yielded_text
+                            tool_chunks = getattr(chunk.message, "tool_call_chunks", None)
+                            yielded_effect = yielded_effect or yielded_text or bool(tool_chunks)
+                            yield chunk
 
-                for line in response.iter_lines():
-                    if line == "":
+                        for line in response.iter_lines():
+                            if line == "":
+                                yield from flush_event()
+                            elif line.startswith("event:"):
+                                event_name = line.split(":", 1)[1].strip()
+                            elif line.startswith("data:"):
+                                data_lines.append(line.split(":", 1)[1].lstrip())
                         yield from flush_event()
-                    elif line.startswith("event:"):
-                        event_name = line.split(":", 1)[1].strip()
-                    elif line.startswith("data:"):
-                        data_lines.append(line.split(":", 1)[1].lstrip())
-                yield from flush_event()
+                return
+            except Exception as exc:
+                if (
+                    yielded_effect
+                    or attempt + 1 >= attempts
+                    or not _retryable_codex_stream_error(exc)
+                ):
+                    raise
+                time.sleep(min(2**attempt, 4))
 
     async def _astream(
         self,
@@ -589,44 +614,59 @@ class CodexChatModel(ChatOpenAI):
             kwargs=kwargs,
         )
         yielded_delta = False
-        async with httpx.AsyncClient(timeout=self._codex_http_timeout()) as client:
-            async with client.stream(
-                "POST",
-                self._codex_responses_url(),
-                headers=headers,
-                json=payload,
-            ) as response:
-                response.raise_for_status()
-                event_name: str | None = None
-                data_lines: list[str] = []
+        yielded_effect = False
+        attempts = max(1, int(self.max_retries or 0) + 1)
+        for attempt in range(attempts):
+            try:
+                async with httpx.AsyncClient(timeout=self._codex_http_timeout()) as client:
+                    async with client.stream(
+                        "POST",
+                        self._codex_responses_url(),
+                        headers=headers,
+                        json=payload,
+                    ) as response:
+                        response.raise_for_status()
+                        event_name: str | None = None
+                        data_lines: list[str] = []
 
-                async def flush_event() -> list[ChatGenerationChunk]:
-                    nonlocal event_name, data_lines, yielded_delta
-                    payload = _parse_sse_payload(event_name, data_lines)
-                    event_name = None
-                    data_lines = []
-                    if payload is None:
-                        return []
-                    _raise_for_codex_event_error(payload)
-                    chunk, yielded_text = _codex_event_generation_chunk(
-                        payload,
-                        yielded_delta=yielded_delta,
-                    )
-                    if chunk is None:
-                        return []
-                    yielded_delta = yielded_delta or yielded_text
-                    return [chunk]
+                        async def flush_event() -> list[ChatGenerationChunk]:
+                            nonlocal event_name, data_lines, yielded_delta, yielded_effect
+                            event_payload = _parse_sse_payload(event_name, data_lines)
+                            event_name = None
+                            data_lines = []
+                            if event_payload is None:
+                                return []
+                            _raise_for_codex_event_error(event_payload)
+                            chunk, yielded_text = _codex_event_generation_chunk(
+                                event_payload,
+                                yielded_delta=yielded_delta,
+                            )
+                            if chunk is None:
+                                return []
+                            yielded_delta = yielded_delta or yielded_text
+                            tool_chunks = getattr(chunk.message, "tool_call_chunks", None)
+                            yielded_effect = yielded_effect or yielded_text or bool(tool_chunks)
+                            return [chunk]
 
-                async for line in response.aiter_lines():
-                    if line == "":
+                        async for line in response.aiter_lines():
+                            if line == "":
+                                for chunk in await flush_event():
+                                    yield chunk
+                            elif line.startswith("event:"):
+                                event_name = line.split(":", 1)[1].strip()
+                            elif line.startswith("data:"):
+                                data_lines.append(line.split(":", 1)[1].lstrip())
                         for chunk in await flush_event():
                             yield chunk
-                    elif line.startswith("event:"):
-                        event_name = line.split(":", 1)[1].strip()
-                    elif line.startswith("data:"):
-                        data_lines.append(line.split(":", 1)[1].lstrip())
-                for chunk in await flush_event():
-                    yield chunk
+                return
+            except Exception as exc:
+                if (
+                    yielded_effect
+                    or attempt + 1 >= attempts
+                    or not _retryable_codex_stream_error(exc)
+                ):
+                    raise
+                await asyncio.sleep(min(2**attempt, 4))
 
     def _generate(
         self,

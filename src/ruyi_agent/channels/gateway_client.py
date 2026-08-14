@@ -33,6 +33,7 @@ class GatewayTaskClient(Protocol):
         agent_name: str | None = None,
         metadata: dict[str, str],
         limit: int = 1,
+        root_task_id: str | None = None,
     ) -> list[dict[str, Any]]: ...
 
     async def create_task(
@@ -83,10 +84,18 @@ def _filename_from_content_disposition(value: str) -> str | None:
 
 
 class GatewayHTTPClient:
-    def __init__(self, *, base_url: str, bearer_token: str, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        bearer_token: str,
+        timeout: float = 10.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._bearer_token = bearer_token
         self._timeout = timeout
+        self._transport = transport
 
     async def list_tasks(
         self,
@@ -94,6 +103,7 @@ class GatewayHTTPClient:
         agent_name: str | None = None,
         metadata: dict[str, str],
         limit: int = 1,
+        root_task_id: str | None = None,
     ) -> list[dict[str, Any]]:
         params = {
             "limit": str(limit),
@@ -101,6 +111,8 @@ class GatewayHTTPClient:
         }
         if agent_name is not None:
             params["agent_name"] = agent_name
+        if root_task_id is not None:
+            params["root_task_id"] = root_task_id
         payload = await self._request("GET", "/tasks", params=params)
         items = payload.get("items")
         return items if isinstance(items, list) else []
@@ -209,6 +221,7 @@ class GatewayHTTPClient:
             base_url=self._base_url,
             timeout=self._timeout,
             headers=headers,
+            transport=self._transport,
         ) as client:
             response = await client.request(method, path, params=params, json=json)
         payload = self._decode_json(response)
@@ -242,6 +255,7 @@ class GatewayHTTPClient:
             base_url=self._base_url,
             timeout=self._timeout,
             headers=headers,
+            transport=self._transport,
         ) as client:
             response = await client.request(method, path, json=json)
         if response.is_success:

@@ -1,0 +1,21 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+class GatewayTaskError(Exception):
+    """A transport-neutral failure exposed by the Gateway Task Interface."""
+
+    def __init__(
+        self,
+        *,
+        code: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+        kind: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details
+        self.kind = kind

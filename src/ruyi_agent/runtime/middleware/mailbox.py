@@ -30,14 +30,23 @@ class MailboxMiddleware(AgentMiddleware[object, ContextT, ResponseT]):
         thread_id = (config.get("configurable") or {}).get("thread_id")
         if not isinstance(thread_id, str) or not thread_id:
             return None
-        messages = self._mailbox.drain(thread_id)
+        task_id = (config.get("configurable") or {}).get("task_id")
+        messages = self._mailbox.claim(
+            recipient_task_id=(task_id if isinstance(task_id, str) else None),
+            recipient_thread_id=thread_id,
+        )
         if not messages:
             return None
         return {
             "messages": [
                 HumanMessage(
                     content=render_mailbox_messages(messages),
-                    additional_kwargs={"source": "agent_mailbox"},
+                    additional_kwargs={
+                        "source": "agent_mailbox",
+                        "mailbox_message_ids": [
+                            message.message_id for message in messages
+                        ],
+                    },
                 )
             ]
         }

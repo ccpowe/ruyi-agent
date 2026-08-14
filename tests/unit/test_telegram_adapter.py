@@ -6,8 +6,8 @@ from typing import Any
 
 import httpx
 
+from ruyi_agent.channels.gateway_client import GatewayClientError
 from ruyi_agent.channels.telegram.adapter import (
-    GatewayClientError,
     TelegramAdapter,
     TelegramAttachmentDownloadWarning,
     TelegramFallbackTransport,

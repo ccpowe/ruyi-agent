@@ -1,6 +1,6 @@
 """
 控制面模块包
 
-这里集中放置 task、review、permission 和协议 controller 相关代码，是 CLI、
-TUI、Gateway 等入口复用 runtime 能力的边界层。
+这里集中放置 review、permission 等控制策略，供 Gateway 和 Channel
+Adapter 复用。
 """

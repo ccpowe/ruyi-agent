@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ruyi_agent.channels.http.api import MetadataScalar, TaskRouteRecord
+    from ruyi_agent.gateway.models import TaskRouteRecord
 
 
 class GatewayRouteStore:
@@ -147,7 +147,7 @@ class GatewayRouteStore:
         self,
         row: tuple[str, str, str, str, str, str | None],
     ) -> TaskRouteRecord:
-        from ruyi_agent.channels.http.api import TaskRouteRecord
+        from ruyi_agent.gateway.models import TaskRouteRecord
 
         metadata_json = row[2]
         metadata = json.loads(metadata_json)

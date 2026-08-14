@@ -17,16 +17,31 @@ The persisted relationship between a channel identity and the active agent or cu
 _Avoid_: chat state, conversation cache
 
 **Gateway Task**:
-A task created through the Gateway control plane and later continued, reviewed, cancelled, or queried by channel turns.
+A long-lived agent session created through the Gateway control plane. It keeps a stable task/thread identity across multiple runs and can later be continued, reviewed, interrupted, or queried by channel turns. Its state describes the current or latest run; a settled run does not close the task.
 _Avoid_: job, request
+
+**Gateway Task Module**:
+The transport-neutral module that exposes public Agent discovery and Gateway Task creation, continuation, review, cancellation, querying, artifact retrieval, and remote routing. HTTP and Channel code reach Gateway Tasks through adapters and do not own task policy.
+_Avoid_: HTTP service, gateway controller
+
+**Task Router**:
+The internal Gateway Task module that owns local/remote route persistence, runtime-record recovery, remote refresh, routed task operations, and routing error translation. It does not build transport responses or process attachment contents.
+_Avoid_: route helper, remote task utility
 
 **Review Command**:
 A channel command that resolves a pending human review for a gateway task.
 _Avoid_: approval message, HITL reply
 
 **Task Watch**:
-The shared policy for observing a gateway task after a channel turn until it reaches a pending review, a newer run, or a terminal state.
+The shared policy for observing one gateway task run after a channel turn until it reaches a pending review, is superseded by a newer run, or settles.
 _Avoid_: polling loop, watcher task
+
+**Task Mailbox**:
+The durable inbox for inputs addressed to a Gateway Task. It accepts user,
+agent, workflow, and delegated-run-settled inputs, injects them before a safe
+model call, and wakes a resumable task when a triggering input would otherwise
+remain unread.
+_Avoid_: event bus, workflow queue
 
 **Active Agent**:
 The agent selected for future channel turns within a channel identity.
@@ -37,8 +52,13 @@ _Avoid_: default bot, current worker
 - A **Channel Adapter** produces **Channel Turns**.
 - A **Channel Turn** reads and updates one **Channel Session**.
 - A **Channel Session** may point to one current **Gateway Task**.
+- A **Channel Adapter** reaches a **Gateway Task** through the **Gateway Task Module**.
+- The **Gateway Task Module** delegates execution and task state transitions to `AgentControl`.
+- The **Gateway Task Module** delegates local and remote routing policy to the **Task Router**.
 - A **Review Command** resolves a pending review on one **Gateway Task**.
 - A **Task Watch** observes one run of one **Gateway Task**.
+- A **Task Mailbox** delivers input to one **Gateway Task** without defining
+  workflow dependencies or collaboration policy.
 - An **Active Agent** determines which agent receives a new **Gateway Task** when a **Channel Turn** starts a fresh task.
 
 ## Example Dialogue

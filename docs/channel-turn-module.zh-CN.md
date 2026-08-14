@@ -6,6 +6,12 @@ Telegram 和 Feishu adapter 当前都包含一套相似的对话轮次逻辑：�
 
 这些逻辑不是平台能力，而是 Ruyi Agent 的跨平台 channel 策略。平台 adapter 应该主要负责接收和发送消息，Channel Turn Module 负责统一的对话状态机。
 
+当前迁移已经完成：`channels/turn.py` 中的 `ChannelTurnHandler` 接管普通
+消息的 Channel Session 恢复、Gateway Task 状态判断、create/send_input 和
+会话绑定，并统一解析和提交 Review Command、处理 `/agent` 与 `/resume`。
+`channels/task_watch.py` 中的 `TaskWatchManager` 接管共享的 Task Watch 状态机和
+并发生命周期。
+
 ## 目标
 
 - 把跨平台一致的 **Channel Turn** 规则集中到一个 Module。
@@ -47,7 +53,7 @@ Telegram / Feishu raw event
   -> InboundTurn
   -> ChannelTurnHandler
   -> GatewayTaskClient / ChannelSessionStore
-  -> TaskWatch
+  -> TaskWatchManager
   -> Channel Adapter send hooks
 ```
 
@@ -56,24 +62,25 @@ Telegram / Feishu raw event
 ```text
 InboundTurn:
   channel
-  identity_key
   session_key
+  agent_name
   text
+  metadata / fallback_metadata
   attachments
-  reply_ref
 
-TurnAdapterPort:
-  send_text
-  send_artifact
-  ack_task_accepted
-  ack_running_task
-  mark_watch_started
-  mark_watch_done
+ChannelTurnResult:
+  kind = pending_review | active | started
+  task
+  created
 ```
+
+当前通过 `before_continue` hook 保留平台对上一轮 settled 结果的投递时机。
+Task Watch 的轮询策略由共享 Module 处理，文本、reaction 和 artifact delivery
+仍由 Channel Adapter 的 hook 处理。
 
 ## 关键决定
 
-`identity_key` 和 `session_key` 由平台 adapter 生成，不由 Channel Turn Module 生成。
+`identity_key` 和 `session_key` 由平台 adapter 生成，不由 Channel Turn Module 生成。第一阶段只有普通消息路由需要 `session_key`；`identity_key` 仍留在 Adapter，用于 Active Agent 命令。
 
 原因是 session key 的组成依赖平台语义：Telegram 有 DM、group、supergroup topic；Feishu 有 chat、thread、mention 和不同用户 ID。把这些规则放进共享 Module 会污染它的 Interface。
 
@@ -81,31 +88,32 @@ Channel Turn Module 只相信 adapter 给出的 key，并负责用这些 key 读
 
 ## Task Watch
 
-Task Watch 也属于共享策略，而不是平台 adapter 的私有逻辑。
+Task Watch 属于共享策略，而不是平台 adapter 的私有逻辑。
 
 它负责：
 
 - 轮询当前 Gateway Task。
 - 检测 `run_count` 是否已经进入更新的一轮。
-- 检测 pending review 并通知用户。
-- 检测 terminal 状态并发送结果。
-- 发送当前 run 产生的 artifacts。
-- 避免同一 run 的 terminal 消息重复发送。
+- 检测 pending review 并触发平台 hook。
+- 检测 terminal 状态并且每次 watch 只触发一次 terminal hook。
 - 支持 terminal 后的短暂 grace checks，捕获延迟出现的 mirrored review。
+- 管理相同 task/run 的并发去重、活跃状态和等待生命周期。
 
-平台 adapter 只提供发送能力和可选 reaction hook。
+平台 adapter 通过 hook 发送结果、artifacts 和可选 reaction，并继续维护跨 watch
+的 terminal delivery 去重。
 
 ## 迁移顺序
 
-1. 提取只读的 `InboundTurn`、`TurnAdapterPort`、`ChannelTurnHandler` 类型和空实现。
-2. 先把 review command 解析、review 提交和 pending review 提示迁入 Channel Turn Module。
-3. 再迁入 session lookup/bind、`/new`、create task 和 send input。
-4. 最后迁入 Task Watch 和 terminal/artifact delivery 策略。
-5. Telegram 和 Feishu adapter 删除重复 orchestration，只保留平台 parsing 和 send hooks。
+1. ~~提取 `InboundTurn`、`ChannelTurnResult` 和 `ChannelTurnHandler`，迁移普通消息的 Session/Task 路由。~~ 已完成。
+2. ~~把 Review Command 解析、待审批 Task 恢复、review_id 校验和决策提交迁入 Channel Turn Module。~~ 已完成。
+3. ~~迁入 session lookup/bind、`/new`、create/send input、`/agent` 和 `/resume`。~~ 已完成。
+4. ~~迁入 Task Watch 的轮询状态机和并发生命周期。~~ 已完成。
+5. ~~Telegram 和 Feishu adapter 删除重复 orchestration，只保留平台 parsing 和 send hooks。~~ 已完成。
 
 ## 测试策略
 
-- 新增共享 Channel Turn tests，覆盖 `/new`、`/agent`、`/resume`、review command、running task、terminal continue、pending review 和 task watch。
+- 共享 Channel Turn tests 覆盖 `/new`、`/agent`、`/resume`、review command、running task、terminal continue 和 pending review。
+- 共享 Task Watch tests 覆盖 run supersede、pending review、terminal、grace checks、并发去重和异常传播。
 - Telegram tests 保留 MarkdownV2、附件下载、session key、topic、Bot API 发送行为。
 - Feishu tests 保留 mention、群聊策略、thread、card、reaction 和 SDK 发送行为。
 - `ChannelSessionStore` tests 只关注存储 CRUD，不再承载 channel turn policy。

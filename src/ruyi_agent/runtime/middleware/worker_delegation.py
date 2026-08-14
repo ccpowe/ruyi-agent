@@ -32,7 +32,7 @@ You have access to agent control tools that manage delegated work inside the cur
 1. **Start** — Use `spawn_agent` with a valid registered `agent_name` from the lists below.
 2. **Wait when needed** — If the current turn depends on the result, call `wait_agent` after spawning.
 3. **Check on request** — If the task can run in the background, report the task ID and continue. Use `check_agent` only when status is needed.
-4. **Continue** — Use `send_input` to add follow-up instructions after a task finishes a run.
+4. **Communicate** — Use `send_input` to add input to a direct parent or child task. Running tasks receive it at the next safe model boundary; idle tasks are awakened.
 5. **Cancel** — Use `cancel_agent` to stop a task that is no longer useful.
 
 ### Critical rules:
@@ -40,10 +40,27 @@ You have access to agent control tools that manage delegated work inside the cur
 - Local workers run inside the current runtime, while remote refs run through their configured remote gateway.
 - Remote refs may fail because of network, authentication, or upstream gateway errors.
 - Do not invent agent target names.
-- If a task is still running, do not call `send_input` again until it finishes or is cancelled.
 - Task status in conversation history may be stale. When status matters, call a tool to refresh it.
 - For work that must finish before you respond, use `spawn_agent` followed by `wait_agent`.
 """
+
+
+def _parent_communication_prompt(tool_names: set[str]) -> str:
+    lines = ["## Task communication", ""]
+    if "list_agents" in tool_names:
+        lines.append("- Use `list_agents` to obtain exact permitted task IDs.")
+    if "send_input" in tool_names:
+        lines.extend(
+            [
+                "- Use `send_input` to ask a direct parent for clarification, "
+                "escalate a blocker, or report an important finding before this run finishes.",
+                "- `send_input` accepts only direct parent or direct child task IDs. "
+                "Do not invent task IDs.",
+                "- Running tasks receive input at the next safe model boundary; "
+                "idle tasks are awakened.",
+            ]
+        )
+    return "\n".join(lines) + "\n"
 
 
 class WorkerDelegationMiddleware(AgentMiddleware[object, ContextT, ResponseT]):
@@ -58,11 +75,8 @@ class WorkerDelegationMiddleware(AgentMiddleware[object, ContextT, ResponseT]):
         system_prompt: str | None = WORKER_DELEGATION_SYSTEM_PROMPT,
     ) -> None:
         super().__init__()
-        if not specs and not remote_refs:
-            msg = "At least one local worker spec or remote ref must be provided"
-            raise ValueError(msg)
         if build_tools is None:
-            msg = "Worker delegation tool factory must be provided when targets are configured"
+            msg = "Worker delegation tool factory must be provided"
             raise ValueError(msg)
 
         self._specs = specs
@@ -71,8 +85,12 @@ class WorkerDelegationMiddleware(AgentMiddleware[object, ContextT, ResponseT]):
         if not self.tools:
             msg = "Worker delegation tool factory returned no tools"
             raise ValueError(msg)
-        if system_prompt:
-            self.system_prompt = system_prompt + self._render_available_targets()
+        tool_names = {tool.name for tool in self.tools}
+        resolved_prompt = system_prompt
+        if "spawn_agent" not in tool_names:
+            resolved_prompt = _parent_communication_prompt(tool_names)
+        if resolved_prompt:
+            self.system_prompt = resolved_prompt + self._render_available_targets()
         else:
             self.system_prompt = system_prompt
 

@@ -224,7 +224,7 @@ Send additional input to your direct parent task or one of your direct child tas
 - `runtime/agent_factory.py` 与 `runtime/middleware/stack.py`
   - 按解析结果装配 Tool 与 Middleware。
 - `runtime/delegation/async_runtime.py`
-  - Task 工具采用 ToolRuntime 身份。
+  - Task 工具通过 LangChain 隐藏的运行配置取得调用方身份。
   - 将通用可见性判断替换为按操作授权。
   - 改进 `list_agents` 与错误反馈。
 - `runtime/middleware/worker_delegation.py`

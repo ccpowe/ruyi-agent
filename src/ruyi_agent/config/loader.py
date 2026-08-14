@@ -18,6 +18,8 @@ from ruyi_agent.control_plane.permissions import (
     PermissionProfile,
     ToolPermissionConfig,
 )
+from ruyi_agent.config.system_tools import resolve_system_tools
+from ruyi_agent.config.system_tools import validate_system_tool_names
 
 SkillSelection = str | list[str]
 
@@ -46,6 +48,7 @@ class LocalWorkerSpec:
     tool_search_registry: MCPRegistry | None = None
     tool_search_server_names: list[str] = field(default_factory=list)
     tool_search_tool_names: list[str] = field(default_factory=list)
+    system_tools: frozenset[str] | None = None
 
 
 @dataclass(slots=True)
@@ -75,6 +78,8 @@ LOCAL_AGENT_REQUIRED_FIELDS = {
 LOCAL_AGENT_ALLOWED_FIELDS = set(LOCAL_AGENT_REQUIRED_FIELDS) | {
     "permission_profile",
     "tool_search",
+    "system_tools",
+    "disabled_system_tools",
 }
 REMOTE_REF_REQUIRED_FIELDS = {
     "kind",
@@ -159,9 +164,7 @@ def _validate_agent_kind(agent_name: str, agent_config: dict[str, Any]) -> None:
             allowed_fields=LOCAL_AGENT_ALLOWED_FIELDS,
         )
         permission_profile = agent_config.get("permission_profile")
-        if permission_profile is not None and not isinstance(
-            permission_profile, str
-        ):
+        if permission_profile is not None and not isinstance(permission_profile, str):
             raise ValueError(
                 f"Agent '{agent_name}' field 'permission_profile' must be a string."
             )
@@ -176,6 +179,12 @@ def _validate_agent_kind(agent_name: str, agent_config: dict[str, Any]) -> None:
             raise ValueError(
                 f"Agent '{agent_name}' field 'tool_search' must be a boolean."
             )
+        for field_name in ("system_tools", "disabled_system_tools"):
+            validate_system_tool_names(
+                agent_name,
+                field_name,
+                agent_config.get(field_name, []),
+            )
         return
 
     _validate_required_fields(
@@ -188,6 +197,19 @@ def _validate_agent_kind(agent_name: str, agent_config: dict[str, Any]) -> None:
         agent_config,
         allowed_fields=REMOTE_REF_ALLOWED_FIELDS,
     )
+
+
+def _validate_agent_names_match_keys(
+    agent_configs: dict[str, dict[str, Any]],
+) -> None:
+    """确保配置 key 与运行时、Gateway 对外使用的 agent 名称一致。"""
+    for agent_name, agent_config in agent_configs.items():
+        configured_name = agent_config.get("name")
+        if configured_name != agent_name:
+            raise ValueError(
+                f"Agent key '{agent_name}' must match its configured name "
+                f"'{configured_name}'."
+            )
 
 
 def _validate_main_agent_reference(
@@ -281,6 +303,7 @@ def validate_agent_configs(
     # 为什么集中做字段校验：配置模型要在 loader 层收口，不能把歧义留到 runtime。
     for agent_name, agent_config in agent_configs.items():
         _validate_agent_kind(agent_name, agent_config)
+    _validate_agent_names_match_keys(agent_configs)
     _validate_main_agent_reference(main_agent_name, agent_configs)
     _validate_worker_targets(agent_configs)
     _validate_no_self_workers(agent_configs)
@@ -341,7 +364,9 @@ def load_llm_provider_configs(
 
         kind = raw_provider.get("kind")
         if not isinstance(kind, str) or not kind.strip():
-            raise ValueError(f"providers.{provider_name}.kind must be a non-empty string")
+            raise ValueError(
+                f"providers.{provider_name}.kind must be a non-empty string"
+            )
         if kind not in SUPPORTED_MODEL_PROVIDERS:
             allowed = ", ".join(sorted(SUPPORTED_MODEL_PROVIDERS))
             raise ValueError(
@@ -397,17 +422,14 @@ def _parse_permission_decision(value: Any, *, path: str) -> PermissionDecision:
 def _parse_allowed_decisions(value: Any, *, path: str) -> list[str]:
     if value is None:
         return []
-    if not isinstance(value, list) or not all(
-        isinstance(item, str) for item in value
-    ):
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"{path}.allowed_decisions must be a string list")
     unexpected = sorted(
         item for item in value if item not in {"approve", "edit", "reject"}
     )
     if unexpected:
         raise ValueError(
-            f"{path}.allowed_decisions has unsupported values: "
-            + ", ".join(unexpected)
+            f"{path}.allowed_decisions has unsupported values: " + ", ".join(unexpected)
         )
     return list(value)
 
@@ -823,7 +845,8 @@ async def build_local_worker_spec(
     if agent_config["kind"] != "local":
         raise ValueError(f"Agent '{agent_name}' is not a local agent.")
 
-    tool_search = bool(agent_config.get("tool_search", False))
+    resolved_system_tools = resolve_system_tools(agent_name, agent_configs)
+    tool_search = bool(resolved_system_tools.enabled & {"tool_search", "call_tool"})
     server_names = list(agent_config.get("server_names", []))
     tool_names = list(agent_config.get("tool_names", []))
     tools = (
@@ -851,6 +874,7 @@ async def build_local_worker_spec(
         tool_search_registry=registry if tool_search else None,
         tool_search_server_names=server_names,
         tool_search_tool_names=tool_names,
+        system_tools=resolved_system_tools.enabled,
     )
 
 
@@ -862,6 +886,7 @@ async def build_all_local_worker_specs(
     getenv: Callable[[str], str | None],
     home_dir: str,
     skills_root: str,
+    unavailable_errors: dict[str, str] | None = None,
 ) -> dict[str, LocalWorkerSpec]:
     """构造所有 local agent 的基础 LocalWorkerSpec，不含 delegation scope。"""
     # 为什么先构造全量基础 spec：main/gateway/worker 都应从同一批本地 agent 定义中选择，
@@ -870,15 +895,20 @@ async def build_all_local_worker_specs(
     for agent_name, agent_config in agent_configs.items():
         if agent_config["kind"] != "local":
             continue
-        specs[agent_name] = await build_local_worker_spec(
-            agent_name,
-            agent_configs,
-            registry,
-            providers=providers,
-            getenv=getenv,
-            home_dir=home_dir,
-            skills_root=skills_root,
-        )
+        try:
+            specs[agent_name] = await build_local_worker_spec(
+                agent_name,
+                agent_configs,
+                registry,
+                providers=providers,
+                getenv=getenv,
+                home_dir=home_dir,
+                skills_root=skills_root,
+            )
+        except Exception as exc:
+            if unavailable_errors is None:
+                raise
+            unavailable_errors[agent_name] = str(exc) or exc.__class__.__name__
     return specs
 
 

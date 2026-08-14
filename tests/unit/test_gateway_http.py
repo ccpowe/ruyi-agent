@@ -22,12 +22,9 @@ from ruyi_agent.runtime.delegation.context import (
     ROOT_ID_FIELD,
     VISITED_NODES_FIELD,
 )
-from ruyi_agent.channels.http.api import (
-    AgentControlGatewayRuntime,
-    GatewayService,
-    TaskRouteRecord,
-    create_gateway_app,
-)
+from ruyi_agent.gateway.models import TaskResponse, TaskRouteRecord
+from ruyi_agent.gateway.tasks import GatewayTaskModule
+from ruyi_agent.channels.http.routes import create_gateway_app
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
 
 
@@ -158,7 +155,9 @@ class RemoteBackDelegatingAgentFactory:
 
 
 class MemoryBackend:
-    def __init__(self, *, root: str = "/workspace", truncate_upload_results: bool = False) -> None:
+    def __init__(
+        self, *, root: str = "/workspace", truncate_upload_results: bool = False
+    ) -> None:
         self.root = root
         self.files: dict[str, bytes] = {}
         self.truncate_upload_results = truncate_upload_results
@@ -477,6 +476,7 @@ def build_app(
     node_id: str | None = None,
     backend: object | None = None,
     workspace_root: str = "/workspace",
+    unavailable_agents: dict[str, str] | None = None,
 ) -> tuple[object, DelayedAgentFactory]:
     factory = DelayedAgentFactory(delay=delay)
     monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
@@ -490,11 +490,12 @@ def build_app(
         workspace_root=workspace_root,
     )
     factory.control = control
-    service = GatewayService(
+    service = GatewayTaskModule(
         main_agent_name="main",
         agent_configs=build_agent_configs(),
-        runtime=AgentControlGatewayRuntime(control),
+        control=control,
         route_store=route_store,
+        unavailable_agents=unavailable_agents,
     )
     return create_gateway_app(service=service, bearer_token="secret-token"), factory
 
@@ -503,7 +504,7 @@ def auth_headers() -> dict[str, str]:
     return {"Authorization": "Bearer secret-token"}
 
 
-def test_gateway_public_local_agent_can_delegate_to_its_workers(
+def test_gateway_exposes_subagent_task_created_by_public_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -523,8 +524,8 @@ def test_gateway_public_local_agent_can_delegate_to_its_workers(
         delegation_local_worker_specs={"background_research": child_spec},
     )
     control_ref: dict[str, async_subagent_runtime.AgentControl] = {}
-    parent_spec.build_delegation_tools = (
-        lambda: control_ref["control"].build_tools_for("main")
+    parent_spec.build_delegation_tools = lambda: control_ref["control"].build_tools_for(
+        "main"
     )
     control = async_subagent_runtime.AgentControl(
         {
@@ -536,17 +537,22 @@ def test_gateway_public_local_agent_can_delegate_to_its_workers(
         backend=object(),
     )
     control_ref["control"] = control
-    service = GatewayService(
+    service = GatewayTaskModule(
         main_agent_name="main",
         agent_configs=build_agent_configs(),
-        runtime=AgentControlGatewayRuntime(control),
+        control=control,
     )
 
-    async def scenario() -> list[async_subagent_runtime.TaskRecord]:
+    async def scenario() -> tuple[
+        list[async_subagent_runtime.TaskRecord],
+        TaskResponse,
+        TaskResponse,
+        list[TaskResponse],
+    ]:
         response = await service.create_task(
             agent_name="main",
             input_content="gateway task",
-            metadata={},
+            metadata={"channel_user": "alice"},
         )
         parent = control.get_task_record(response.task_id)
         # Route persistence is now executed via asyncio.to_thread to avoid blocking
@@ -562,13 +568,39 @@ def test_gateway_public_local_agent_can_delegate_to_its_workers(
         for record in child_records:
             if record.active_run is not None:
                 await record.active_run
-        return child_records
+        child_response = await service.get_task(child_records[0].task_id)
+        continued_child = await service.send_input(
+            child_records[0].task_id,
+            "follow-up",
+        )
+        continued_record = control.get_task_record(child_records[0].task_id)
+        if continued_record.active_run is not None:
+            await continued_record.active_run
+        task_tree = await service.list_tasks(
+            agent_name=None,
+            status=None,
+            metadata_filters={},
+            cursor=None,
+            limit=10,
+            root_task_id=response.task_id,
+        )
+        return child_records, child_response, continued_child, task_tree.items
 
-    child_records = asyncio.run(scenario())
+    child_records, child_response, continued_child, task_tree = asyncio.run(scenario())
 
     assert len(child_records) == 1
     assert child_records[0].parent_task_id is not None
     assert child_records[0].depth == 2
+    assert child_response.task_id == child_records[0].task_id
+    assert child_response.parent_task_id == child_records[0].parent_task_id
+    assert child_response.root_task_id == child_records[0].root_task_id
+    assert child_response.depth == 2
+    assert child_response.metadata == {"channel_user": "alice"}
+    assert continued_child.run_count == 2
+    assert {task.task_id for task in task_tree} == {
+        child_records[0].root_task_id,
+        child_records[0].task_id,
+    }
 
 
 def test_gateway_requires_bearer_token(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -578,6 +610,24 @@ def test_gateway_requires_bearer_token(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_team_console_shell_is_served_without_embedding_gateway_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = build_app(monkeypatch)
+    with TestClient(app) as client:
+        page = client.get("/debug/team")
+        styles = client.get("/debug/team/app.css")
+        script = client.get("/debug/team/app.js")
+
+    assert page.status_code == 200
+    assert "RUYI / ARCHITECTURE DESK" in page.text
+    assert "dev-token" not in page.text
+    assert styles.status_code == 200
+    assert "--paper" in styles.text
+    assert script.status_code == 200
+    assert 'api("/agents")' in script.text
 
 
 def test_get_agents_returns_public_targets_only(
@@ -596,6 +646,42 @@ def test_get_agents_returns_public_targets_only(
     assert default_agent["is_default"] is True
 
 
+def test_unavailable_agent_does_not_block_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = build_app(
+        monkeypatch,
+        unavailable_agents={"main": "missing provider credential"},
+    )
+    with TestClient(app) as client:
+        listed = client.get("/agents", headers=auth_headers())
+        created = client.post(
+            "/agents/main/tasks",
+            headers=auth_headers(),
+            json={"input": {"content": "hello"}},
+        )
+
+    main = next(item for item in listed.json()["items"] if item["name"] == "main")
+    assert main["available"] is False
+    assert main["unavailable_reason"] == "missing provider credential"
+    assert created.status_code == 503
+    assert created.json()["error"]["code"] == "agent_unavailable"
+
+
+def test_get_private_agent_returns_documented_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = build_app(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get(
+            "/agents/background_research",
+            headers=auth_headers(),
+        )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "agent_not_public"
+
+
 def test_create_task_returns_201_and_running_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -604,7 +690,10 @@ def test_create_task_returns_201_and_running_state(
         response = client.post(
             "/agents/main/tasks",
             headers=auth_headers(),
-            json={"input": {"content": "research react"}, "metadata": {"channel": "tg"}},
+            json={
+                "input": {"content": "research react"},
+                "metadata": {"channel": "tg"},
+            },
         )
 
     assert response.status_code == 201
@@ -1100,7 +1189,7 @@ def test_remote_ref_forwards_via_a2a(
         checkpointer=object(),
         backend=object(),
     )
-    remote_service = GatewayService(
+    remote_service = GatewayTaskModule(
         main_agent_name="code_wiki",
         agent_configs={
             "code_wiki": {
@@ -1110,7 +1199,7 @@ def test_remote_ref_forwards_via_a2a(
                 "description": "remote code wiki",
             }
         },
-        runtime=AgentControlGatewayRuntime(remote_control),
+        control=remote_control,
     )
     remote_app = create_gateway_app(
         service=remote_service,
@@ -1300,7 +1389,9 @@ def test_remote_ref_review_is_exposed_and_forwarded(
             headers=auth_headers(),
         )
         assert task_reviews_response.status_code == 200
-        assert task_reviews_response.json()["items"][0]["review_id"] == "remote-review-1"
+        assert (
+            task_reviews_response.json()["items"][0]["review_id"] == "remote-review-1"
+        )
 
         assert factory.control is not None
         pending = factory.control.list_pending_review_records()
@@ -1360,16 +1451,20 @@ def test_review_submit_accepts_root_task_mirrored_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     interrupt_factory = ReviewInterruptingAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", interrupt_factory)
+    monkeypatch.setattr(
+        async_subagent_runtime, "create_runtime_agent", interrupt_factory
+    )
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         checkpointer=object(),
         backend=object(),
     )
-    service = GatewayService(
+    route_store = GatewayRouteStore(":memory:")
+    service = GatewayTaskModule(
         main_agent_name="main",
         agent_configs=build_agent_configs(),
-        runtime=AgentControlGatewayRuntime(control),
+        control=control,
+        route_store=route_store,
     )
     app = create_gateway_app(service=service, bearer_token="secret-token")
 
@@ -1390,14 +1485,16 @@ def test_review_submit_accepts_root_task_mirrored_review(
         if child.active_run is not None:
             await child.active_run
         root_task_id = root.task_id
-        child_review_id = control.get_task_record(child.task_id).pending_review["review_id"]
+        child_review_id = control.get_task_record(child.task_id).pending_review[
+            "review_id"
+        ]
 
     asyncio.run(seed_review())
 
     assert root_task_id is not None
     assert child_review_id is not None
     asyncio.run(
-        service._route_store.asave_route(
+        route_store.asave_route(
             TaskRouteRecord(
                 task_id=root_task_id,
                 agent_name="background_research",
@@ -1465,7 +1562,7 @@ def test_remote_a_to_b_to_a_loop_is_rejected_by_visited_nodes(
         a2a_client=A2AClient(transports=transports_a),
         node_id="node-a",
     )
-    a_service = GatewayService(
+    a_service = GatewayTaskModule(
         main_agent_name="main",
         agent_configs={
             "main": {
@@ -1483,7 +1580,7 @@ def test_remote_a_to_b_to_a_loop_is_rejected_by_visited_nodes(
                 "remote_agent_name": "code_wiki",
             },
         },
-        runtime=AgentControlGatewayRuntime(a_control),
+        control=a_control,
     )
     a_app = create_gateway_app(service=a_service, bearer_token="secret-token")
     a_root_app = FastAPI()
@@ -1500,8 +1597,8 @@ def test_remote_a_to_b_to_a_loop_is_rejected_by_visited_nodes(
         skills=[],
         delegation_remote_refs={"back_to_a": b_to_a_ref},
     )
-    b_spec.build_delegation_tools = (
-        lambda: b_control_ref["control"].build_tools_for("code_wiki")
+    b_spec.build_delegation_tools = lambda: b_control_ref["control"].build_tools_for(
+        "code_wiki"
     )
     b_control = async_subagent_runtime.AgentControl(
         {"code_wiki": b_spec},
@@ -1512,7 +1609,7 @@ def test_remote_a_to_b_to_a_loop_is_rejected_by_visited_nodes(
         node_id="node-b",
     )
     b_control_ref["control"] = b_control
-    b_service = GatewayService(
+    b_service = GatewayTaskModule(
         main_agent_name="code_wiki",
         agent_configs={
             "code_wiki": {
@@ -1522,7 +1619,7 @@ def test_remote_a_to_b_to_a_loop_is_rejected_by_visited_nodes(
                 "description": "node b code wiki",
             }
         },
-        runtime=AgentControlGatewayRuntime(b_control),
+        control=b_control,
     )
     b_app = create_gateway_app(service=b_service, bearer_token="secret-token")
     b_root_app = FastAPI()
@@ -1560,10 +1657,10 @@ def test_public_remote_ref_not_registered_in_runtime_returns_unavailable(
         backend=object(),
     )
     a2a_client = StaticRemoteA2AClient()
-    service = GatewayService(
+    service = GatewayTaskModule(
         main_agent_name="main",
         agent_configs=build_agent_configs(),
-        runtime=AgentControlGatewayRuntime(control),
+        control=control,
     )
     app = create_gateway_app(service=service, bearer_token="secret-token")
 
@@ -1605,7 +1702,7 @@ def test_remote_route_persists_across_service_restart(
         checkpointer=object(),
         backend=object(),
     )
-    remote_service = GatewayService(
+    remote_service = GatewayTaskModule(
         main_agent_name="code_wiki",
         agent_configs={
             "code_wiki": {
@@ -1615,9 +1712,11 @@ def test_remote_route_persists_across_service_restart(
                 "description": "remote code wiki",
             }
         },
-        runtime=AgentControlGatewayRuntime(remote_control),
+        control=remote_control,
     )
-    remote_app = create_gateway_app(service=remote_service, bearer_token="remote-secret")
+    remote_app = create_gateway_app(
+        service=remote_service, bearer_token="remote-secret"
+    )
     remote_root_app = FastAPI()
     remote_root_app.mount("/a2a", remote_app)
     transport = httpx.ASGITransport(app=remote_root_app)

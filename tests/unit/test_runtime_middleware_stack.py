@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import ruyi_agent.runtime.middleware.stack as stack
-from ruyi_agent.runtime.middleware.artifact_publishing import ArtifactPublishingMiddleware
+from ruyi_agent.runtime.middleware.artifact_publishing import (
+    ArtifactPublishingMiddleware,
+)
+from ruyi_agent.runtime.middleware.deepagents_adapters import FilesystemMiddleware
 from ruyi_agent.runtime.middleware.ruyi_skills import RuyiSkillsMiddleware
 from ruyi_agent.runtime.middleware.stack import build_runtime_middleware
 
@@ -46,3 +49,26 @@ def test_runtime_stack_adds_artifact_publishing_middleware_when_enabled(
     )
 
     assert any(isinstance(item, ArtifactPublishingMiddleware) for item in middleware)
+
+
+def test_runtime_stack_filters_individual_filesystem_tools(monkeypatch) -> None:
+    monkeypatch.setattr(
+        stack,
+        "create_summarization_middleware",
+        lambda _model, _backend: object(),
+    )
+
+    middleware = build_runtime_middleware(
+        resolved_model=object(),
+        backend=object(),
+        skills=None,
+        memory=None,
+        local_worker_specs=None,
+        remote_refs=None,
+        system_tools=frozenset({"read_file", "grep"}),
+    )
+
+    filesystem = next(
+        item for item in middleware if isinstance(item, FilesystemMiddleware)
+    )
+    assert {tool.name for tool in filesystem.tools} == {"read_file", "grep"}

@@ -11,7 +11,7 @@
 4. 将 approve/reject/edit 决策转换为 runtime 可恢复执行的结构
 
 使用场景：
-- CLI/TUI/Gateway 查询所有待处理审批
+- Gateway 和 Channel Adapter 查询所有待处理审批
 - 用户提交审批决策后恢复 root agent 或 worker task
 - 审批 UI 需要展示工具名、参数、风险和可选决策
 

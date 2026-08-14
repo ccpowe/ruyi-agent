@@ -1,6 +1,6 @@
 # Ruyi Agent
 
-`ruyi-agent` 是一个面向工程化场景的 Agent Runtime。它把 TUI、HTTP Gateway、Telegram Bot、Feishu/Lark Bot 接到同一套任务控制面，支持多 Agent 委派、MCP 工具、skills、HITL 审批、SQLite 状态持久化、附件上传和任务产物下载。
+`ruyi-agent` 是一个面向工程化场景的 Agent Runtime。它把 HTTP Gateway、Telegram Bot、Feishu/Lark Bot 接到同一套任务控制面，支持多 Agent 委派、MCP 工具、skills、HITL 审批、SQLite 状态持久化、附件上传和任务产物下载。
 
 项目仍在快速演进阶段，适合研究、二次开发和小规模自托管验证。生产环境使用前请重点检查权限策略、Gateway 暴露方式、backend 隔离和密钥管理。
 
@@ -13,7 +13,7 @@
 
 ## 核心能力
 
-- 多入口接入：本地 TUI、FastAPI Gateway、Telegram、Feishu/Lark。
+- 多入口接入：FastAPI Gateway、Telegram、Feishu/Lark。
 - 多 Agent 委派：支持本地 worker 和远端 `remote_ref`，统一通过 task 控制面调度。
 - MCP 工具治理：支持多 MCP server、工具搜索、schema 校验、按 agent scope 注入。
 - Skills：按 agent 配置控制 skill 可见性，并同步到 backend 内部 skill view。
@@ -99,7 +99,7 @@ Ruyi 的配置目录选择规则：
 - `config/mcp_servers.toml`：MCP server 声明。
 - `config/permissions.toml`：工具和 shell 命令权限策略。
 
-starter config 默认使用 OpenRouter provider 和 `qwen/qwen3.6-plus` 模型。运行 TUI 或 Gateway 时，最小配置是填入模型 key：
+starter config 默认使用 OpenRouter provider 和 `qwen/qwen3.6-plus` 模型。运行 Gateway 时，最小配置是填入模型 key：
 
 ```toml
 [model_credentials]
@@ -143,17 +143,10 @@ Gateway 默认 token 是 `dev-token`，只适合本地调试。对外暴露 Gate
 
 ## 使用
 
-本地 TUI：
-
-```bash
-ruyi
-ruyi --tui
-```
-
 指定工作区：
 
 ```bash
-ruyi --workspace /path/to/workspace
+ruyi --workspace /path/to/workspace --gateway
 ```
 
 启动 Gateway：
@@ -180,7 +173,7 @@ ruyi --telegram
 ruyi --feishu
 ```
 
-启动所有已配置的非 TUI channel：
+启动所有已配置的 channel：
 
 ```bash
 ruyi --all
@@ -296,7 +289,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/probe_openai_codex.py \
 
 ```toml
 provider = "openai_codex"
-model = "gpt-5.3-codex"
+model = "gpt-5.6-sol"
 ```
 
 ## 开发

@@ -7,6 +7,11 @@ kind = "deepseek"
 base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
 
+[providers.deepseek.init_kwargs]
+max_tokens = 8192
+max_retries = 3
+extra_body = { thinking = { type = "disabled" } }
+
 [providers.zai]
 kind = "litellm"
 base_url = "https://open.bigmodel.cn/api/paas/v4/"
@@ -21,7 +26,7 @@ kind = "openai_codex"
 base_url = "https://chatgpt.com/backend-api/codex"
 
 [providers.openai_codex.init_kwargs]
-auth_json = "~/.ruyi_agent/openai_codex_auth.json"
+auth_json = "~/.codex/auth.json"
 
 # [providers.anthropic]
 # kind = "anthropic"

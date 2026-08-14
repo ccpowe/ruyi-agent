@@ -1,0 +1,40 @@
+{
+  "worktree": {
+    "setup": [
+      "uv sync --locked",
+      "if [ -f \"$PASEO_SOURCE_CHECKOUT_PATH/.ruyi_agent/openai_codex_auth.json\" ]; then install -m 600 \"$PASEO_SOURCE_CHECKOUT_PATH/.ruyi_agent/openai_codex_auth.json\" .ruyi_agent/openai_codex_auth.json; fi"
+    ]
+  },
+  "scripts": {
+    "test": {
+      "command": "uv run pytest"
+    },
+    "test-unit": {
+      "command": "uv run pytest tests/unit"
+    },
+    "test-integration": {
+      "command": "uv run pytest tests/integration"
+    },
+    "coverage": {
+      "command": "uv run pytest --cov=ruyi_agent --cov-report=term-missing"
+    },
+    "gateway": {
+      "type": "service",
+      "command": "uv run python -c 'import os; from ruyi_agent.config.runtime_settings import configure_runtime_environment; configure_runtime_environment(); os.environ.update(GATEWAY_HOST=os.environ.get(\"HOST\", \"127.0.0.1\"), GATEWAY_PORT=os.environ[\"PASEO_PORT\"], GATEWAY_BASE_URL=os.environ.get(\"PASEO_URL\", \"http://127.0.0.1:\" + os.environ[\"PASEO_PORT\"])); from ruyi_agent.entrypoints.main import run_gateway; run_gateway()'"
+    }
+  },
+  "metadataGeneration": {
+    "title": {
+      "instructions": "使用任务的主要语言，用 3 到 8 个词概括目标；不要加句号或泛化前缀。"
+    },
+    "branchName": {
+      "instructions": "使用 <type>/<short-description> 格式。type 仅使用 feat、fix、refactor、docs、test 或 chore；描述使用小写 kebab-case。已知 GitHub Issue 编号时放在描述开头，例如 fix/123-task-mailbox-race；总长度尽量不超过 50 个字符。"
+    },
+    "commitMessage": {
+      "instructions": "遵循 Conventional Commits：<type>(<scope>): <summary>。scope 优先使用项目领域名，如 runtime、gateway、channel、config、storage 或 openai-codex；summary 使用祈使语气，不加句号，首行不超过 72 个字符。"
+    },
+    "pullRequest": {
+      "instructions": "标题遵循 Conventional Commits 风格。正文使用任务的主要语言，并包含 ## Summary 和 ## Test plan；列出实际执行的验证命令及结果，未运行的测试必须明确说明。存在关联 GitHub Issue 时使用 Closes #<number>。"
+    }
+  }
+}

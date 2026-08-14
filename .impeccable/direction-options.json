@@ -1,0 +1,73 @@
+{
+  "title": "选择 Ruyi 调试台的视觉世界",
+  "question": "这个界面需要同时承载独立 Session、分歧轮次与底层证据。选择一个方向，或重新抽取。",
+  "followup": true,
+  "options": [
+    {
+      "id": "assigned",
+      "label": "编辑部任务台",
+      "kicker": "THE ROLL",
+      "lineage": "新闻编辑部的选题桌、校样和截稿板",
+      "thesis": "把主持人当总编，两位架构师的独立稿件在同一张决策桌上被校对、质询和定稿。",
+      "palette": ["#F3EEDB", "#171916", "#C54632", "#2C625A"],
+      "materials": ["新闻纸", "校样批注", "金属夹板"],
+      "viewport": "左侧是任务稿签，中间并排展示两份架构稿，右侧决策栏持续收录共识、分歧和待裁决项。",
+      "risk": "若排版纪律不足，会退化成普通项目管理看板。",
+      "raised": [
+        {"from": "数据场", "raise": "Run、时间戳和 Task ID 使用严谨的表格化数据层。"},
+        {"from": "工业标签", "raise": "运行、失败、等待与已裁决状态必须拥有一眼可辨的实体标记。"}
+      ]
+    },
+    {
+      "id": "model-pick",
+      "label": "事故指挥中心",
+      "kicker": "MY PICK",
+      "lineage": "SRE incident command 与作战时间线",
+      "thesis": "每个 Agent 是一个可独立进入的响应席位，主持人的决策日志贯穿整场协作。",
+      "palette": ["#111715", "#E8EEE8", "#F0A84B", "#60A38F"],
+      "materials": ["状态灯", "事件时间线", "哑光仪表面板"],
+      "viewport": "顶部显示任务态势，中部是三席实时活动面，底部是一条可展开的消息与工具证据时间线。",
+      "risk": "这是工程控制台较熟悉的方向，辨识度依赖细节与信息编排。"
+    },
+    {
+      "id": "challenger-crouwel",
+      "label": "构造网格",
+      "verdict": "competitive",
+      "lineage": "Wim Crouwel 的网格字样与系统海报",
+      "thesis": "让 DAG、Task 树和讨论轮次共享一套可见构造网格，关系本身成为界面骨架。",
+      "palette": ["#F7F5EC", "#17202A", "#176B87", "#E04B32"],
+      "materials": ["构造网格", "编号字模", "透明覆片"],
+      "viewport": "巨大而克制的任务标题跨越网格，三条 Agent 轨道沿整格展开，分歧在交点处成为可操作节点。",
+      "case": "对架构师辨识度高，关系表达强；但长对话阅读不如编辑部方向自然。",
+      "risk": "网格处理稍弱就会变成装饰线，影响密集文本阅读。",
+      "hero": "https://impeccable.style/worlds/cards/crouwel-grid-specimen-hero.webp",
+      "board": "https://impeccable.style/worlds/cards/crouwel-grid-specimen.webp"
+    },
+    {
+      "id": "challenger-ikeda",
+      "label": "黑白数据场",
+      "verdict": "declined",
+      "lineage": "Ryoji Ikeda 式数据密度",
+      "thesis": "把 Tool、Mailbox 和 Run 事件压成精确的黑白数据场。",
+      "palette": ["#000000", "#FFFFFF"],
+      "materials": ["条码列", "像素线", "密集数字"],
+      "viewport": "Agent 会话成为三条高速数据轨，选中事件时才展开人类可读内容。",
+      "case": "证据密度极强，但人类阅读架构方案的清晰度明显不足。",
+      "kept": "所有技术证据都保持可核验的数据精度。",
+      "risk": "长时间阅读疲劳，并可能让调试台显得像艺术演示。",
+      "hero": "https://impeccable.style/worlds/cards/ikeda-datamatics-hero.webp",
+      "board": "https://impeccable.style/worlds/cards/ikeda-datamatics.webp"
+    }
+  ],
+  "reroll": {"registers": ["safer", "bolder"]},
+  "canon": true,
+  "canonCard": {
+    "label": "标准开发者控制台",
+    "thesis": "侧边导航、三栏会话和状态卡片，按行业惯例做到完整。",
+    "palette": ["#F8FAFC", "#0F172A", "#2563EB", "#64748B"],
+    "materials": ["产品网格", "中性面板", "标准表格"],
+    "viewport": "左侧 Task Tree，中间聊天，右侧详情检查器。",
+    "risk": "学习成本最低，但与其他 Agent 控制台难以区分。"
+  },
+  "steer": true
+}

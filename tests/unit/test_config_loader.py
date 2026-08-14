@@ -131,6 +131,40 @@ def test_load_agent_configs_returns_main_agent_and_agents_section(tmp_path: Path
     assert agents["main"]["kind"] == "local"
 
 
+def test_load_agent_configs_rejects_name_that_differs_from_agent_key(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "agents.toml"
+    config_path.write_text(
+        '\n'.join(
+            [
+                'main_agent = "main"',
+                "",
+                "[agents.main]",
+                'kind = "local"',
+                "public = true",
+                'name = "different_name"',
+                'description = "desc"',
+                'system_prompt = "prompt"',
+                'provider = "openrouter"',
+                'model = "deepseek/deepseek-v4-flash"',
+                "memory = []",
+                "skills = []",
+                "server_names = []",
+                "tool_names = []",
+                "workers = []",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Agent key 'main' must match its configured name 'different_name'",
+    ):
+        config_loader.load_agent_configs(config_path)
+
+
 def test_load_permission_config_parses_profiles(tmp_path: Path) -> None:
     config_path = tmp_path / "permissions.toml"
     config_path.write_text(
@@ -784,6 +818,39 @@ def test_build_local_worker_spec_rejects_non_worker_kind() -> None:
                 skills_root="/sandbox/skills",
             )
         )
+
+
+def test_build_all_local_specs_isolates_unavailable_agent(monkeypatch) -> None:
+    healthy_spec = object()
+
+    async def fake_build(agent_name, *_args, **_kwargs):
+        if agent_name == "broken":
+            raise ValueError("Environment variable 'BROKEN_API_KEY' is not set")
+        return healthy_spec
+
+    monkeypatch.setattr(config_loader, "build_local_worker_spec", fake_build)
+    errors: dict[str, str] = {}
+    configs = {
+        "main": {"kind": "local"},
+        "broken": {"kind": "local"},
+    }
+
+    specs = asyncio.run(
+        config_loader.build_all_local_worker_specs(
+            configs,
+            FakeRegistry([]),
+            providers={},
+            getenv=lambda _name: None,
+            home_dir="/workspace",
+            skills_root="/skills",
+            unavailable_errors=errors,
+        )
+    )
+
+    assert specs == {"main": healthy_spec}
+    assert errors == {
+        "broken": "Environment variable 'BROKEN_API_KEY' is not set"
+    }
 
 
 def test_build_remote_ref_returns_remote_spec() -> None:

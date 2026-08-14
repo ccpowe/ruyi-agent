@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from ruyi_agent.config.loader import LocalWorkerSpec, RemoteRef
 from ruyi_agent.runtime.middleware.worker_delegation import WorkerDelegationMiddleware
 
@@ -25,10 +27,10 @@ def test_worker_delegation_lists_local_workers_and_remote_refs() -> None:
                 remote_agent_name="code_wiki",
             )
         },
-        build_tools=lambda: ["worker-tool"],
+        build_tools=lambda: [SimpleNamespace(name="spawn_agent")],
     )
 
-    assert middleware.tools == ["worker-tool"]
+    assert [tool.name for tool in middleware.tools] == ["spawn_agent"]
     assert middleware.system_prompt is not None
     assert "Available local workers" in middleware.system_prompt
     assert "background_research" in middleware.system_prompt
@@ -37,17 +39,18 @@ def test_worker_delegation_lists_local_workers_and_remote_refs() -> None:
     assert "spawned through their configured remote gateway" in middleware.system_prompt
 
 
-def test_worker_delegation_rejects_missing_targets() -> None:
-    try:
-        WorkerDelegationMiddleware(
-            specs={},
-            remote_refs={},
-            build_tools=lambda: ["worker-tool"],
-        )
-    except ValueError as exc:
-        assert "At least one local worker spec or remote ref" in str(exc)
-    else:
-        raise AssertionError("expected WorkerDelegationMiddleware to reject no targets")
+def test_worker_delegation_allows_parent_communication_without_child_targets() -> None:
+    middleware = WorkerDelegationMiddleware(
+        specs={},
+        remote_refs={},
+        build_tools=lambda: [
+            SimpleNamespace(name="send_input"),
+            SimpleNamespace(name="list_agents"),
+        ],
+    )
+
+    assert "task communication" in middleware.system_prompt.lower()
+    assert "spawn_agent" not in middleware.system_prompt
 
 
 def test_worker_delegation_rejects_missing_tools() -> None:

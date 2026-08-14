@@ -15,16 +15,25 @@ from typing import Any, Protocol
 import httpx
 
 from ruyi_agent.channels.gateway_client import (
-    GatewayClientError,
     GatewayHTTPClient,
     GatewayTaskClient,
+)
+from ruyi_agent.channels.turn import (
+    AgentCommandTurn,
+    ChannelTurnHandler,
+    InboundTurn,
+    ResumeCommandTurn,
+    ReviewTurn,
+    parse_review_command,
+)
+from ruyi_agent.channels.task_watch import (
+    TERMINAL_TASK_STATES,
+    TaskWatchHooks,
+    TaskWatchManager,
 )
 from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 
 
-RUNNING_STATES = {"pending", "running"}
-WAITING_STATES = {"waiting_for_human"}
-TERMINAL_STATES = {"completed", "failed", "cancelled", "interrupted"}
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 TELEGRAM_MDV2_SPECIAL_CHARS = r"_*[]()~`>#+-=|{}.!"
 FENCED_CODE_PATTERN = re.compile(r"```(?P<lang>[^\n`]*)\n?(?P<body>.*?)```", re.DOTALL)
@@ -277,13 +286,6 @@ def _utc_now_iso() -> str:
 def _env_list(name: str) -> list[str]:
     raw = os.getenv(name, "")
     return [item.strip() for item in raw.split(",") if item.strip()]
-
-
-def _single_line_preview(text: str, *, limit: int = 80) -> str:
-    preview = re.sub(r"\s+", " ", text).strip()
-    if len(preview) <= limit:
-        return preview
-    return f"{preview[: limit - 3]}..."
 
 
 def _telegram_help_text() -> str:
@@ -1009,16 +1011,22 @@ class TelegramAdapter:
         self._telegram_client = telegram_client
         self._default_agent_name = default_agent_name
         self._session_store = session_store or ChannelSessionStore(":memory:")
+        self._turn_handler = ChannelTurnHandler(
+            gateway_client=self._gateway_client,
+            session_store=self._session_store,
+        )
         self._update_store = update_store or TelegramUpdateStore(":memory:")
         self._poll_timeout = poll_timeout
-        self._task_poll_interval = task_poll_interval
-        self._terminal_review_grace_checks = max(0, terminal_review_grace_checks)
+        self._task_watch = TaskWatchManager(
+            gateway_client=self._gateway_client,
+            poll_interval=task_poll_interval,
+            terminal_review_grace_checks=terminal_review_grace_checks,
+        )
         self._message_parse_mode = message_parse_mode
         self._mermaid_renderer = mermaid_renderer or KrokiMermaidRenderer(
             base_url=os.getenv("KROKI_BASE_URL", "https://kroki.io")
         )
         del media_root
-        self._watchers: dict[tuple[str, int], asyncio.Task[None]] = {}
         self._delivered_terminal_runs: dict[str, int] = {}
 
     async def _send_message(
@@ -1372,64 +1380,58 @@ class TelegramAdapter:
             )
             return
 
-        latest_task = None if force_new else await self._find_session_task(session_key)
-        if latest_task is None and not force_new:
-            latest_task = await self._find_latest_task(
-                self._legacy_lookup_metadata(message),
-                agent_name=active_agent_name,
-            )
-            if latest_task is not None:
-                await self._bind_session(
-                    session_key=session_key,
-                    task_id=str(latest_task["task_id"]),
-                    message=message,
-                    agent_name=active_agent_name,
-                )
-        if latest_task is not None and self._task_has_pending_review(latest_task):
-            await self._send_message(
-                chat_id=message.chat_id,
-                text=self._format_review_message(latest_task),
-                reply_to_message_id=message.message_id,
-            )
-            return
-        if latest_task is not None and latest_task["status"] in RUNNING_STATES:
-            await self._send_message(
-                chat_id=message.chat_id,
-                text=f"当前任务仍在处理中，请稍后再试。task_id={latest_task['task_id']}",
-                reply_to_message_id=message.message_id,
-            )
-            return
-        if latest_task is not None and latest_task["status"] in TERMINAL_STATES:
-            current_run_count = self._task_run_count(latest_task)
+        async def before_continue(task: dict[str, Any]) -> None:
+            if task.get("status") not in TERMINAL_TASK_STATES:
+                return
+            run_count = self._task_run_count(task)
             if self._has_active_watcher(
-                task_id=str(latest_task["task_id"]),
-                run_count=current_run_count,
+                task_id=str(task["task_id"]),
+                run_count=run_count,
             ):
                 await self._send_terminal_if_needed(
                     chat_id=message.chat_id,
-                    task=latest_task,
+                    task=task,
                 )
 
-        if latest_task is None:
-            task = await self._gateway_client.create_task(
+        outcome = await self._turn_handler.handle(
+            InboundTurn(
+                platform="telegram",
+                session_key=session_key,
                 agent_name=active_agent_name,
                 content=text,
                 metadata=metadata,
+                fallback_metadata=self._legacy_lookup_metadata(message),
+                chat_id=str(message.chat_id),
+                user_id=str(message.user_id),
+                thread_id=(
+                    str(message.message_thread_id)
+                    if message.message_thread_id is not None
+                    else None
+                ),
                 attachments=inbound_attachments,
-            )
-        else:
-            task = await self._gateway_client.send_input(
-                task_id=latest_task["task_id"],
-                content=text,
-                attachments=inbound_attachments,
-            )
-        task_id = str(task["task_id"])
-        await self._bind_session(
-            session_key=session_key,
-            task_id=task_id,
-            message=message,
-            agent_name=active_agent_name,
+                force_new=force_new,
+            ),
+            before_continue=before_continue,
         )
+        if outcome.kind == "pending_review":
+            await self._send_message(
+                chat_id=message.chat_id,
+                text=self._format_review_message(outcome.task),
+                reply_to_message_id=message.message_id,
+            )
+            return
+        if outcome.kind == "active":
+            await self._send_message(
+                chat_id=message.chat_id,
+                text=(
+                    "当前任务仍在处理中，请稍后再试。"
+                    f"task_id={outcome.task['task_id']}"
+                ),
+                reply_to_message_id=message.message_id,
+            )
+            return
+        task = outcome.task
+        task_id = str(task["task_id"])
         self._ensure_watcher(
             task_id=task_id,
             chat_id=message.chat_id,
@@ -1442,23 +1444,7 @@ class TelegramAdapter:
         )
 
     async def wait_for_watchers(self) -> None:
-        active = [task for task in self._watchers.values() if not task.done()]
-        if active:
-            await asyncio.gather(*active)
-
-    async def _find_latest_task(
-        self,
-        metadata: dict[str, str],
-        *,
-        agent_name: str | None = None,
-        limit: int = 1,
-    ) -> dict[str, Any] | None:
-        items = await self._gateway_client.list_tasks(
-            agent_name=agent_name or self._default_agent_name,
-            metadata=metadata,
-            limit=limit,
-        )
-        return items[0] if items else None
+        await self._task_watch.wait()
 
     def _legacy_lookup_metadata(self, message: TelegramMessage) -> dict[str, str]:
         return {
@@ -1473,27 +1459,6 @@ class TelegramAdapter:
             return self._default_agent_name
         return session.agent_name
 
-    async def _set_active_agent_name(
-        self,
-        *,
-        identity_key: str,
-        agent_name: str,
-        message: TelegramMessage,
-    ) -> None:
-        await self._session_store.abind_session(
-            session_key=identity_key,
-            platform="telegram",
-            agent_name=agent_name,
-            current_task_id="",
-            chat_id=str(message.chat_id),
-            user_id=str(message.user_id),
-            thread_id=(
-                str(message.message_thread_id)
-                if message.message_thread_id is not None
-                else None
-            ),
-        )
-
     async def _handle_agent_command(
         self,
         *,
@@ -1502,99 +1467,39 @@ class TelegramAdapter:
         active_agent_name: str,
         text: str,
     ) -> None:
-        parts = text.split(maxsplit=2)
-        agents = await self._gateway_client.list_agents()
-        public_agent_names = {
-            str(agent.get("name"))
-            for agent in agents
-            if agent.get("public") is True and agent.get("name")
-        }
-        if len(parts) == 1:
-            lines = [f"当前 agent：`{active_agent_name}`", "", "可用 agents："]
-            for agent in sorted(agents, key=lambda item: str(item.get("name", ""))):
-                if agent.get("public") is not True:
-                    continue
-                name = str(agent.get("name", ""))
-                marker = " *" if name == active_agent_name else ""
-                description = str(agent.get("description") or "")
-                suffix = f" - {description}" if description else ""
-                lines.append(f"- `{name}`{marker}{suffix}")
-            lines.append("")
-            lines.append("切换：`/agent <agent_name>`")
-            await self._send_message(
-                chat_id=message.chat_id,
-                text="\n".join(lines),
-                reply_to_message_id=message.message_id,
+        result = await self._turn_handler.handle_agent_command(
+            AgentCommandTurn(
+                platform="telegram",
+                identity_key=identity_key,
+                active_agent_name=active_agent_name,
+                text=text,
+                chat_id=str(message.chat_id),
+                user_id=str(message.user_id),
+                thread_id=(
+                    str(message.message_thread_id)
+                    if message.message_thread_id is not None
+                    else None
+                ),
+                session_key_for_agent=lambda agent_name: (
+                    build_telegram_session_key(message, agent_name=agent_name)
+                ),
+                metadata_for_session=lambda session_key: (
+                    self._build_message_metadata(message, session_key=session_key)
+                ),
             )
-            return
-        requested_agent_name = self._resolve_agent_name(parts[1], public_agent_names)
-        if requested_agent_name is None:
-            await self._send_message(
+        )
+        if result.kind == "started" and result.task is not None:
+            task_id = str(result.task["task_id"])
+            self._ensure_watcher(
+                task_id=task_id,
                 chat_id=message.chat_id,
-                text=f"未知或不可用 agent：{parts[1]}。使用 /agent 查看列表。",
-                reply_to_message_id=message.message_id,
+                run_count=self._task_run_count(result.task),
             )
-            return
-        await self._set_active_agent_name(
-            identity_key=identity_key,
-            agent_name=requested_agent_name,
-            message=message,
-        )
-        agent_session_key = build_telegram_session_key(
-            message,
-            agent_name=requested_agent_name,
-        )
-        await self._session_store.aunbind_session(agent_session_key)
-        initial_message = parts[2].strip() if len(parts) > 2 else ""
-        if not initial_message:
-            await self._send_message(
-                chat_id=message.chat_id,
-                text=f"已切换到 agent={requested_agent_name}。发送消息即可开始新会话。",
-                reply_to_message_id=message.message_id,
-            )
-            return
-        task = await self._gateway_client.create_task(
-            agent_name=requested_agent_name,
-            content=initial_message,
-            metadata=self._build_message_metadata(
-                message,
-                session_key=agent_session_key,
-            ),
-        )
-        task_id = str(task["task_id"])
-        await self._bind_session(
-            session_key=agent_session_key,
-            task_id=task_id,
-            message=message,
-            agent_name=requested_agent_name,
-        )
-        self._ensure_watcher(
-            task_id=task_id,
-            chat_id=message.chat_id,
-            run_count=self._task_run_count(task),
-        )
         await self._send_message(
             chat_id=message.chat_id,
-            text=f"已切换到 agent={requested_agent_name}，并创建新会话 task_id={task_id}",
+            text=result.message,
             reply_to_message_id=message.message_id,
         )
-
-    def _resolve_agent_name(
-        self,
-        requested_agent_name: str,
-        public_agent_names: set[str],
-    ) -> str | None:
-        if requested_agent_name in public_agent_names:
-            return requested_agent_name
-        normalized = requested_agent_name.replace("_", "")
-        matches = [
-            agent_name
-            for agent_name in public_agent_names
-            if agent_name.replace("_", "") == normalized
-        ]
-        if len(matches) == 1:
-            return matches[0]
-        return None
 
     async def _handle_resume_command(
         self,
@@ -1603,76 +1508,33 @@ class TelegramAdapter:
         identity_key: str,
         text: str,
     ) -> None:
-        parts = text.split(maxsplit=1)
-        if len(parts) == 1:
-            items = await self._gateway_client.list_tasks(
-                agent_name=None,
-                metadata=self._legacy_lookup_metadata(message),
-                limit=10,
+        result = await self._turn_handler.handle_resume_command(
+            ResumeCommandTurn(
+                platform="telegram",
+                platform_label="Telegram",
+                identity_key=identity_key,
+                default_agent_name=self._default_agent_name,
+                text=text,
+                fallback_metadata=self._legacy_lookup_metadata(message),
+                chat_id=str(message.chat_id),
+                user_id=str(message.user_id),
+                thread_id=(
+                    str(message.message_thread_id)
+                    if message.message_thread_id is not None
+                    else None
+                ),
+                task_belongs_to_turn=lambda task: self._task_belongs_to_message(
+                    task,
+                    message,
+                ),
+                session_key_for_agent=lambda agent_name: (
+                    build_telegram_session_key(message, agent_name=agent_name)
+                ),
             )
-            if not items:
-                await self._send_message(
-                    chat_id=message.chat_id,
-                    text="暂无可恢复会话。",
-                    reply_to_message_id=message.message_id,
-                )
-                return
-            lines = ["最近会话："]
-            for item in items:
-                task_id = str(item.get("task_id", ""))
-                agent_name = str(item.get("agent_name", ""))
-                status = str(item.get("status", ""))
-                result = str(item.get("last_result") or item.get("error") or "")
-                preview = _single_line_preview(result) if result else ""
-                suffix = f"\n   {preview}" if preview else ""
-                lines.append(
-                    f"- task_id={task_id} agent={agent_name} status={status}{suffix}"
-                )
-            lines.append("")
-            lines.append("恢复：/resume <task_id>")
-            await self._send_message(
-                chat_id=message.chat_id,
-                text="\n".join(lines),
-                reply_to_message_id=message.message_id,
-            )
-            return
-        task_id = parts[1].strip()
-        if not task_id:
-            return
-        try:
-            task = await self._gateway_client.get_task(task_id=task_id)
-        except GatewayClientError as exc:
-            if exc.status_code in {404, 410}:
-                await self._send_message(
-                    chat_id=message.chat_id,
-                    text=f"没有找到会话：{task_id}",
-                    reply_to_message_id=message.message_id,
-                )
-                return
-            raise
-        if not self._task_belongs_to_message(task, message):
-            await self._send_message(
-                chat_id=message.chat_id,
-                text=f"不能恢复不属于当前 Telegram 会话的 task：{task_id}",
-                reply_to_message_id=message.message_id,
-            )
-            return
-        agent_name = str(task.get("agent_name") or self._default_agent_name)
-        await self._set_active_agent_name(
-            identity_key=identity_key,
-            agent_name=agent_name,
-            message=message,
-        )
-        session_key = build_telegram_session_key(message, agent_name=agent_name)
-        await self._bind_session(
-            session_key=session_key,
-            task_id=task_id,
-            message=message,
-            agent_name=agent_name,
         )
         await self._send_message(
             chat_id=message.chat_id,
-            text=f"已恢复 agent={agent_name} task_id={task_id}。继续发送消息即可续聊。",
+            text=result.message,
             reply_to_message_id=message.message_id,
         )
 
@@ -1743,114 +1605,24 @@ class TelegramAdapter:
             )
         return metadata.get("message_thread_id") in {None, ""}
 
-    async def _find_session_task(self, session_key: str) -> dict[str, Any] | None:
-        session = await self._session_store.aget_session(session_key)
-        if session is None or not session.current_task_id:
-            return None
-        try:
-            return await self._gateway_client.get_task(task_id=session.current_task_id)
-        except GatewayClientError as exc:
-            if exc.status_code in {401, 403, 404, 410}:
-                await self._session_store.aunbind_session(session_key)
-                return None
-            raise
-
-    async def _bind_session(
-        self,
-        *,
-        session_key: str,
-        task_id: str,
-        message: TelegramMessage,
-        agent_name: str | None = None,
-    ) -> None:
-        await self._session_store.abind_session(
-            session_key=session_key,
-            platform="telegram",
-            agent_name=agent_name or self._default_agent_name,
-            current_task_id=task_id,
-            chat_id=str(message.chat_id),
-            user_id=str(message.user_id),
-            thread_id=(
-                str(message.message_thread_id)
-                if message.message_thread_id is not None
-                else None
+    def _ensure_watcher(self, *, task_id: str, chat_id: int, run_count: int) -> None:
+        self._task_watch.ensure(
+            task_id=task_id,
+            run_count=run_count,
+            hooks=TaskWatchHooks(
+                on_pending_review=lambda task: self._send_message(
+                    chat_id=chat_id,
+                    text=self._format_review_message(task),
+                ),
+                on_terminal=lambda task: self._send_terminal_if_needed(
+                    chat_id=chat_id,
+                    task=task,
+                ),
             ),
         )
 
-    def _ensure_watcher(self, *, task_id: str, chat_id: int, run_count: int) -> None:
-        key = (task_id, run_count)
-        existing = self._watchers.get(key)
-        if existing is not None and not existing.done():
-            return
-        self._watchers[key] = asyncio.create_task(
-            self._watch_task(
-                task_id=task_id,
-                chat_id=chat_id,
-                expected_run_count=run_count,
-            )
-        )
-
-    async def _watch_task(
-        self,
-        *,
-        task_id: str,
-        chat_id: int,
-        expected_run_count: int,
-    ) -> None:
-        terminal_sent = False
-        terminal_review_grace_checks_remaining = self._terminal_review_grace_checks
-        key = (task_id, expected_run_count)
-        try:
-            while True:
-                task = await self._gateway_client.get_task(task_id=task_id)
-                current_run_count = self._task_run_count(task)
-                if current_run_count > expected_run_count:
-                    return
-                if self._task_has_pending_review(task):
-                    await self._send_message(
-                        chat_id=chat_id,
-                        text=self._format_review_message(task),
-                    )
-                    return
-                status = task["status"]
-                if status in TERMINAL_STATES:
-                    if not terminal_sent:
-                        await self._send_terminal_if_needed(
-                            chat_id=chat_id,
-                            task=task,
-                        )
-                        terminal_sent = True
-                    if terminal_review_grace_checks_remaining <= 0:
-                        return
-                    terminal_review_grace_checks_remaining -= 1
-                await asyncio.sleep(self._task_poll_interval)
-        finally:
-            self._watchers.pop(key, None)
-
     def _parse_review_command(self, text: str) -> dict[str, Any] | None:
-        parts = text.split(maxsplit=2)
-        if not parts:
-            return None
-        command = self._normalize_command_token(parts[0])
-        if command in {"y", "yes", "/yes", "/approve"}:
-            payload: dict[str, Any] = {"type": "approve"}
-            if len(parts) >= 2:
-                payload["review_id"] = parts[1]
-            return payload
-        if command in {"n", "no", "/no", "/reject"}:
-            payload = {"type": "reject"}
-            if len(parts) >= 2 and command == "/reject":
-                payload["review_id"] = parts[1]
-            if len(parts) > 2 and command == "/reject":
-                payload["message"] = parts[2]
-            return payload
-        return None
-
-    def _normalize_command_token(self, token: str) -> str:
-        command = token.lower()
-        if not command.startswith("/"):
-            return command
-        return command.split("@", 1)[0]
+        return parse_review_command(text)
 
     async def _handle_review_command(
         self,
@@ -1859,71 +1631,33 @@ class TelegramAdapter:
         metadata: dict[str, str],
         command: dict[str, Any],
     ) -> None:
-        if command.get("type") == "invalid":
-            await self._send_message(
-                chat_id=message.chat_id,
-                text=str(command["message"]),
-                reply_to_message_id=message.message_id,
-            )
-            return
         session_key = metadata["channel_session_key"]
-        latest_task = await self._find_session_task(session_key)
-        if latest_task is None:
-            latest_task = await self._find_latest_task(
-                self._legacy_lookup_metadata(message)
+        result = await self._turn_handler.handle_review(
+            ReviewTurn(
+                platform="telegram",
+                session_key=session_key,
+                default_agent_name=self._default_agent_name,
+                fallback_metadata=self._legacy_lookup_metadata(message),
+                fallback_agent_name=self._default_agent_name,
+                chat_id=str(message.chat_id),
+                user_id=str(message.user_id),
+                thread_id=(
+                    str(message.message_thread_id)
+                    if message.message_thread_id is not None
+                    else None
+                ),
+                command=command,
             )
-            if latest_task is not None:
-                await self._bind_session(
-                    session_key=session_key,
-                    task_id=str(latest_task["task_id"]),
-                    message=message,
-                    agent_name=str(latest_task.get("agent_name") or self._default_agent_name),
-                )
-        if latest_task is None:
-            await self._send_message(
-                chat_id=message.chat_id,
-                text="没有可审批的任务。",
-                reply_to_message_id=message.message_id,
-            )
-            return
-        pending_review = latest_task.get("pending_review")
-        if not isinstance(pending_review, dict):
-            await self._send_message(
-                chat_id=message.chat_id,
-                text="当前任务没有待审批项。",
-                reply_to_message_id=message.message_id,
-            )
-            return
-        review_id = str(command.get("review_id") or pending_review.get("review_id") or "")
-        if not review_id:
-            await self._send_message(
-                chat_id=message.chat_id,
-                text="待审批任务缺少 review_id。",
-                reply_to_message_id=message.message_id,
-            )
-            return
-        if command.get("review_id") is not None and pending_review.get("review_id") != review_id:
-            await self._send_message(
-                chat_id=message.chat_id,
-                text=f"没有找到待审批 review：{review_id}",
-                reply_to_message_id=message.message_id,
-            )
-            return
-        decision: dict[str, Any] = {"type": command["type"]}
-        if command.get("type") == "reject" and command.get("message"):
-            decision["message"] = command["message"]
-        task = await self._gateway_client.submit_review_decision(
-            task_id=str(latest_task["task_id"]),
-            review_id=review_id,
-            decisions=[decision],
         )
+        if result.kind != "submitted" or result.task is None:
+            await self._send_message(
+                chat_id=message.chat_id,
+                text=result.message,
+                reply_to_message_id=message.message_id,
+            )
+            return
+        task = result.task
         task_id = str(task["task_id"])
-        await self._bind_session(
-            session_key=session_key,
-            task_id=task_id,
-            message=message,
-            agent_name=str(task.get("agent_name") or self._default_agent_name),
-        )
         self._ensure_watcher(
             task_id=task_id,
             chat_id=message.chat_id,
@@ -1931,7 +1665,7 @@ class TelegramAdapter:
         )
         await self._send_message(
             chat_id=message.chat_id,
-            text=f"审批已提交，task_id={task_id}",
+            text=result.message,
             reply_to_message_id=message.message_id,
         )
 
@@ -1970,10 +1704,6 @@ class TelegramAdapter:
             f"指定拒绝：/reject {review_id} 原因"
         )
 
-    def _task_has_pending_review(self, task: dict[str, Any]) -> bool:
-        pending_review = task.get("pending_review")
-        return isinstance(pending_review, dict) and bool(pending_review)
-
     def _task_run_count(self, task: dict[str, Any]) -> int:
         value = task.get("run_count")
         if isinstance(value, int):
@@ -1984,8 +1714,7 @@ class TelegramAdapter:
             return 0
 
     def _has_active_watcher(self, *, task_id: str, run_count: int) -> bool:
-        watcher = self._watchers.get((task_id, run_count))
-        return watcher is not None and not watcher.done()
+        return self._task_watch.is_active(task_id=task_id, run_count=run_count)
 
     async def _send_terminal_if_needed(
         self,

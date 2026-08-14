@@ -9,9 +9,6 @@ class FakeRunner:
     def __init__(self) -> None:
         self.calls: list[object] = []
 
-    def run_tui(self) -> None:
-        self.calls.append("tui")
-
     def run_channels(self, channels: tuple[str, ...]) -> None:
         self.calls.append(("channels", channels))
 
@@ -25,26 +22,15 @@ def _clear_channel_env(monkeypatch) -> None:
         monkeypatch.delenv(env_name, raising=False)
 
 
-def test_cli_defaults_to_tui_and_applies_workspace(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    configured_calls: list[tuple[Path | str | None, bool]] = []
-    monkeypatch.setattr(
-        entrypoint,
-        "configure_runtime_environment",
-        lambda *, workspace=None, init_force=False, init_templates=False: configured_calls.append(
-            (workspace, init_templates)
-        ),
-    )
-    runner = FakeRunner()
+def test_cli_requires_an_explicit_entrypoint(capsys) -> None:
+    try:
+        entrypoint.parse_cli_options([])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:  # pragma: no cover - assertion helper
+        raise AssertionError("expected missing entrypoint to fail")
 
-    entrypoint.main(["--workspace", str(workspace)], runner=runner)
-
-    assert configured_calls == [(str(workspace), False)]
-    assert runner.calls == ["tui"]
+    assert "select an entrypoint" in capsys.readouterr().err
 
 
 def test_cli_all_starts_gateway_only_when_no_adapters_are_configured(monkeypatch) -> None:
@@ -144,19 +130,6 @@ def test_cli_gateway_flag_starts_gateway_only(monkeypatch) -> None:
     assert runner.calls == [("channels", ("gateway",))]
 
 
-def test_cli_tui_flag_starts_tui(monkeypatch) -> None:
-    monkeypatch.setattr(
-        entrypoint,
-        "configure_runtime_environment",
-        lambda *, workspace=None, init_force=False, init_templates=False: None,
-    )
-    runner = FakeRunner()
-
-    entrypoint.main(["--tui"], runner=runner)
-
-    assert runner.calls == ["tui"]
-
-
 def test_cli_init_configures_runtime_and_exits(monkeypatch) -> None:
     configured_calls: list[tuple[Path | str | None, bool, bool]] = []
     monkeypatch.setattr(
@@ -210,7 +183,7 @@ def test_cli_reports_runtime_configuration_errors(monkeypatch, capsys) -> None:
     )
 
     try:
-        entrypoint.main(["--tui"], runner=FakeRunner())
+        entrypoint.main(["--gateway"], runner=FakeRunner())
     except SystemExit as exc:
         assert exc.code == 2
     else:  # pragma: no cover - assertion helper

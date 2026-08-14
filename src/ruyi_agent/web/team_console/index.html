@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Ruyi · 架构编辑部</title>
+  <link rel="stylesheet" href="/debug/team/app.css">
+</head>
+<body>
+  <header class="masthead">
+    <a class="wordmark" href="/debug/team" aria-label="Ruyi 架构编辑部首页">
+      <span class="wordmark-mark" aria-hidden="true">如</span>
+      <span>RUYI / ARCHITECTURE DESK</span>
+    </a>
+    <div class="connection">
+      <label for="token">Gateway Token</label>
+      <input id="token" type="password" autocomplete="off" placeholder="输入 token">
+      <button id="connect" class="button quiet" type="button">连接</button>
+      <span id="connection-state" class="status neutral">未连接</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="brief" aria-labelledby="brief-title">
+      <div class="brief-copy">
+        <p class="edition">Architecture desk · live proof</p>
+        <h1 id="brief-title">把一个问题，交给两个真正独立的判断。</h1>
+        <p>主持人分别委派 Codex 与 DeepSeek，提取分歧，复用原 Session 追问，最后形成一份可审查方案。</p>
+      </div>
+      <form id="start-form" class="assignment-form">
+        <label for="requirement">本期选题</label>
+        <textarea id="requirement" rows="5" required placeholder="描述一个架构需求或 Bug。主持人会把同一份材料独立交给两位架构师。"></textarea>
+        <div class="form-actions">
+          <span id="form-note">只分析和收敛，不执行代码修改。</span>
+          <button id="start" class="button primary" type="submit">送审</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="desk" aria-label="Agent 协作工作台">
+      <aside class="assignment-rail">
+        <div class="rail-heading">
+          <h2>任务稿签</h2>
+          <button id="refresh" class="icon-button" type="button" aria-label="刷新任务">↻</button>
+        </div>
+        <dl id="root-meta" class="task-meta">
+          <div><dt>Task</dt><dd>尚未创建</dd></div>
+          <div><dt>Run</dt><dd>—</dd></div>
+          <div><dt>Status</dt><dd>—</dd></div>
+          <div><dt>Updated</dt><dd>—</dd></div>
+        </dl>
+        <label for="root-id">恢复已有主持 Task</label>
+        <div class="inline-input">
+          <input id="root-id" placeholder="粘贴 task_id">
+          <button id="load-root" class="button quiet" type="button">载入</button>
+        </div>
+        <button id="cancel-root" class="text-action danger" type="button" disabled>取消当前 Run</button>
+      </aside>
+
+      <section class="copy-desk">
+        <header class="section-heading">
+          <div>
+            <p>Independent copy</p>
+            <h2>两份独立架构稿</h2>
+          </div>
+          <span id="round-state">等待选题</span>
+        </header>
+        <div class="architects">
+          <article class="architect-sheet" data-agent="architect_codex">
+            <header>
+              <div><span class="agent-index">C</span><h3>Codex</h3></div>
+              <span class="status neutral">未创建</span>
+            </header>
+            <p class="task-id">等待主持人委派</p>
+            <div class="result empty">独立方案将在这里出现。</div>
+            <footer>
+              <span class="run-count">Run —</span>
+              <button class="text-action open-session" type="button" disabled>进入 Session</button>
+            </footer>
+          </article>
+          <article class="architect-sheet" data-agent="architect_deepseek">
+            <header>
+              <div><span class="agent-index">D</span><h3>DeepSeek</h3></div>
+              <span class="status neutral">未创建</span>
+            </header>
+            <p class="task-id">等待主持人委派</p>
+            <div class="result empty">独立方案将在这里出现。</div>
+            <footer>
+              <span class="run-count">Run —</span>
+              <button class="text-action open-session" type="button" disabled>进入 Session</button>
+            </footer>
+          </article>
+        </div>
+      </section>
+
+      <aside class="decision-ledger">
+        <header class="section-heading">
+          <div><p>Editor’s ledger</p><h2>主持人定稿</h2></div>
+        </header>
+        <div id="moderator-result" class="result empty">共识、分歧、裁决和执行 DAG 将在这里汇成一份方案。</div>
+      </aside>
+    </section>
+
+    <details class="evidence" id="evidence">
+      <summary><span>底层证据</span><small>API 响应、状态变化与错误 · 默认折叠</small></summary>
+      <div class="evidence-body">
+        <div class="evidence-toolbar"><button id="clear-events" class="text-action" type="button">清空记录</button></div>
+        <ol id="event-log"></ol>
+      </div>
+    </details>
+  </main>
+
+  <dialog id="session-dialog">
+    <form method="dialog" class="dialog-close"><button aria-label="关闭 Session">×</button></form>
+    <header><p id="session-agent">Agent Session</p><h2 id="session-title">独立会话</h2><span id="session-status" class="status neutral">—</span></header>
+    <div id="session-result" class="result"></div>
+    <form id="session-form">
+      <label for="session-message">直接追问这个 Agent</label>
+      <textarea id="session-message" rows="4" required placeholder="补充约束、要求举证，或询问它是否认同另一方。"></textarea>
+      <button class="button primary" type="submit">发送到同一 Task</button>
+    </form>
+  </dialog>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/debug/team/app.js" defer></script>
+</body>
+</html>

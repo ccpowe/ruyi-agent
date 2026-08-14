@@ -8,13 +8,13 @@ Ruyi Agent 的配置统一放在 `.ruyi_agent/`：
 - `.ruyi_agent/config/mcp_servers.toml`：MCP server 声明。
 - `.ruyi_agent/config/permissions.toml`：工具调用、shell 命令和 HITL 审批策略。
 
-源码开发时，当前项目下存在有效 `.ruyi_agent/` 配置就优先使用它；只有 `.ruyi_agent/runtime/` 这类运行态目录不会被当成配置根。uv tool 安装后，通常使用用户目录下的 `~/.ruyi_agent/`。首次使用前运行 `ruyi --init` 创建配置模板。如果旧安装留下了空白或损坏的 starter config，可运行 `ruyi --init --force` 用当前包内模板覆盖生成文件。TUI 默认 workspace 是当前目录，显式 `ruyi --workspace PATH` 会覆盖 `ruyi.toml` 里的 backend workspace。
+源码开发时，当前项目下存在有效 `.ruyi_agent/` 配置就优先使用它；只有 `.ruyi_agent/runtime/` 这类运行态目录不会被当成配置根。uv tool 安装后，通常使用用户目录下的 `~/.ruyi_agent/`。首次使用前运行 `ruyi --init` 创建配置模板。如果旧安装留下了空白或损坏的 starter config，可运行 `ruyi --init --force` 用当前包内模板覆盖生成文件。显式 `ruyi --workspace PATH` 会覆盖 `ruyi.toml` 里的 backend workspace。
 
 ## 运行配置
 
 `.ruyi_agent/ruyi.toml` 的最小配置取决于启动模式。
 
-TUI 或 Gateway 至少需要一个模型 provider 可用。starter agent 默认使用 OpenRouter：
+Gateway 至少需要一个模型 provider 可用。starter agent 默认使用 OpenRouter：
 
 ```toml
 [model_credentials]
@@ -121,6 +121,9 @@ server_names = []
 tool_names = []
 workers = ["background_research"]
 permission_profile = "standard"
+# 可选：在自动推导结果上增减 Ruyi 内置工具
+system_tools = ["tool_search"]
+disabled_system_tools = ["execute"]
 ```
 
 关键字段：
@@ -134,9 +137,13 @@ permission_profile = "standard"
 | `server_names` | 注入该 agent 的 MCP server 名称列表。 |
 | `tool_names` | 只注入指定工具；留空表示使用 server scope 下可用工具。 |
 | `workers` | 当前 agent 可以委派的 local worker 或 remote_ref 名称。 |
+| `system_tools` | 显式增加 Ruyi 内置工具；与自动推导结果取并集。 |
+| `disabled_system_tools` | 显式禁用内置工具，优先级高于自动推导和 `system_tools`。 |
 | `permission_profile` | 引用 `.ruyi_agent/config/permissions.toml` 中的权限 profile。 |
 | `memory` | 映射到 backend workspace 的 memory 路径。starter 默认留空。 |
 | `skills` | 控制 agent 可见的 skill 名称。可设为 `"inherit"`、`"none"` 或 `["skill-name"]`。 |
+
+系统工具会按运行能力自动推导：配置了 `workers` 的 Agent 获得委派工具；被其他本地 Agent 作为 Worker 引用的 Agent 至少获得 `send_input` 与 `list_agents`；Backend、Artifact 和 `tool_search` 分别启用对应工具。两个配置字段用于覆盖自动结果，未知工具名会在启动时直接报错。
 
 ## Skills
 
@@ -192,16 +199,10 @@ default_profile = "standard"
 `standard` 更适合开源默认值：读文件、搜索、列目录默认允许；写文件、编辑文件、执行 shell、调用外部 MCP 工具默认需要 HITL 审批；高风险命令如 `rm`、`git reset --hard`、`git clean` 默认拒绝。
 
 `yolo` 适合可信本地实验，不建议作为公开服务默认权限。
+在 `yolo` 中，`spawn_agent`、`wait_agent`、`check_agent` 和 `send_input` 默认允许；
+取消 Agent 仍需要审批，因为它会中断正在执行的工作。
 
 ## 常见启动组合
-
-TUI 本地调试：
-
-```bash
-ruyi
-ruyi --tui
-ruyi --workspace /path/to/workspace
-```
 
 Gateway：
 
@@ -221,7 +222,7 @@ Feishu adapter 与 Gateway：
 ruyi --feishu
 ```
 
-所有已配置的非 TUI channel：
+所有已配置的 channel：
 
 ```bash
 ruyi --all

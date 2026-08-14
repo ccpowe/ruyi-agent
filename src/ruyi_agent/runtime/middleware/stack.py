@@ -21,6 +21,9 @@ from ruyi_agent.runtime.middleware.tool_error import ToolErrorMiddleware
 from ruyi_agent.runtime.middleware.tool_search import ToolSearchMiddleware
 from ruyi_agent.runtime.middleware.ruyi_skills import RuyiSkillsMiddleware
 from ruyi_agent.runtime.middleware.mailbox import MailboxMiddleware
+from ruyi_agent.runtime.middleware.tool_call_protocol import (
+    ToolCallProtocolMiddleware,
+)
 from ruyi_agent.runtime.middleware.task_hydration import TaskHydrationMiddleware
 from ruyi_agent.runtime.middleware.worker_delegation import WorkerDelegationMiddleware
 from ruyi_agent.runtime.middleware.human_approval import HumanApprovalMiddleware
@@ -51,6 +54,7 @@ def build_runtime_middleware(
     tool_search_registry: MCPRegistry | None = None,
     tool_search_server_names: list[str] | None = None,
     tool_search_tool_names: list[str] | None = None,
+    system_tools: frozenset[str] | None = None,
 ) -> list[Any]:
     """Build the middleware stack used by project runtime agents."""
     middleware: list[Any] = [TodoListMiddleware(), ToolErrorMiddleware()]
@@ -61,35 +65,64 @@ def build_runtime_middleware(
     if mailbox is not None:
         middleware.append(MailboxMiddleware(mailbox))
 
-    if tool_search_registry is not None:
-        middleware.append(
-            ToolSearchMiddleware(
-                registry=tool_search_registry,
-                server_names=tool_search_server_names,
-                tool_names=tool_search_tool_names,
-            )
-        )
+    # Mailbox input can arrive while a tool call is in flight.  Normalize the
+    # resulting history immediately after mailbox delivery so strict OpenAI-
+    # compatible providers always see contiguous tool responses.
+    middleware.append(ToolCallProtocolMiddleware())
 
-    if register_artifact is not None:
-        middleware.append(
-            ArtifactPublishingMiddleware(
-                backend=backend,
-                workspace_root=workspace_root,
-                register_artifact=register_artifact,
-            )
+    enabled_system_tools = system_tools
+
+    if tool_search_registry is not None and (
+        enabled_system_tools is None
+        or bool(enabled_system_tools & {"tool_search", "call_tool"})
+    ):
+        tool_search_middleware = ToolSearchMiddleware(
+            registry=tool_search_registry,
+            server_names=tool_search_server_names,
+            tool_names=tool_search_tool_names,
         )
+        if enabled_system_tools is not None:
+            tool_search_middleware.tools = [
+                tool
+                for tool in tool_search_middleware.tools
+                if tool.name in enabled_system_tools
+            ]
+        if tool_search_middleware.tools:
+            middleware.append(tool_search_middleware)
+
+    if register_artifact is not None and (
+        enabled_system_tools is None or "publish_artifact" in enabled_system_tools
+    ):
+        artifact_middleware = ArtifactPublishingMiddleware(
+            backend=backend,
+            workspace_root=workspace_root,
+            register_artifact=register_artifact,
+        )
+        middleware.append(artifact_middleware)
 
     middleware.append(RuyiSkillsMiddleware(backend=backend))
 
+    if enabled_system_tools is None or bool(
+        enabled_system_tools
+        & {"ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute"}
+    ):
+        filesystem_middleware = FilesystemMiddleware(backend=backend)
+        if enabled_system_tools is not None:
+            filesystem_middleware.tools = [
+                tool
+                for tool in filesystem_middleware.tools
+                if tool.name in enabled_system_tools
+            ]
+        if filesystem_middleware.tools:
+            middleware.append(filesystem_middleware)
     middleware.extend(
         [
-            FilesystemMiddleware(backend=backend),
             create_summarization_middleware(resolved_model, backend),
             PatchToolCallsMiddleware(),
         ]
     )
 
-    if local_worker_specs or remote_refs:
+    if build_worker_tools is not None:
         middleware.append(
             WorkerDelegationMiddleware(
                 specs=local_worker_specs or {},

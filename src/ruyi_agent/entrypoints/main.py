@@ -30,11 +30,6 @@ CHANNEL_ENV_REQUIREMENTS: dict[str, tuple[str, ...]] = {
 
 
 class EntrypointRunner:
-    def run_tui(self) -> None:
-        from ruyi_agent.channels.cli.tui import run_interactive
-
-        asyncio.run(run_interactive())
-
     def run_channels(self, channels: ChannelSet) -> None:
         if channels == ("gateway",):
             run_gateway()
@@ -84,16 +79,16 @@ def parse_cli_options(argv: Sequence[str] | None = None) -> CliOptions:
     parser = argparse.ArgumentParser(
         prog="ruyi",
         usage=(
-            "ruyi [-h] [--init] [--force] [--workspace WORKSPACE] [--tui] [--gateway] "
+            "ruyi [-h] [--init] [--force] [--workspace WORKSPACE] [--gateway] "
             "[--telegram] [--feishu] [--all] [mode]"
         ),
     )
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=["gateway", "telegram", "feishu", "tui", "interactive"],
+        choices=["gateway", "telegram", "feishu"],
         metavar="mode",
-        help="Legacy positional mode: gateway, telegram, feishu, tui, interactive.",
+        help="Legacy positional mode: gateway, telegram, or feishu.",
     )
     parser.add_argument("--init", action="store_true")
     parser.add_argument(
@@ -102,7 +97,6 @@ def parse_cli_options(argv: Sequence[str] | None = None) -> CliOptions:
         help="With --init, overwrite existing generated config templates.",
     )
     parser.add_argument("--workspace", type=str, default=None)
-    parser.add_argument("--tui", action="store_true")
     parser.add_argument("--gateway", action="store_true")
     parser.add_argument("--telegram", action="store_true")
     parser.add_argument("--feishu", action="store_true")
@@ -110,19 +104,21 @@ def parse_cli_options(argv: Sequence[str] | None = None) -> CliOptions:
     args = parser.parse_args(argv)
     if args.force and not args.init:
         parser.error("--force can only be used with --init")
+    channels = _select_channels(
+        mode=args.mode,
+        gateway=args.gateway,
+        telegram=args.telegram,
+        feishu=args.feishu,
+        all_channels=args.all,
+    )
+    if channels is None and not args.init:
+        parser.error("select an entrypoint: --gateway, --telegram, --feishu, or --all")
     return CliOptions(
         workspace=args.workspace,
         init_only=args.init,
         init_force=args.force,
         all_channels=args.all,
-        channels=_select_channels(
-            mode=args.mode,
-            tui=args.tui,
-            gateway=args.gateway,
-            telegram=args.telegram,
-            feishu=args.feishu,
-            all_channels=args.all,
-        ),
+        channels=channels,
     )
 
 
@@ -144,9 +140,7 @@ def main(
     if options.init_only:
         return
     active_runner = runner or EntrypointRunner()
-    if options.channels is None:
-        active_runner.run_tui()
-        return
+    assert options.channels is not None
     channels = (
         _filter_configured_channels(options.channels)
         if options.all_channels
@@ -171,14 +165,11 @@ def _filter_configured_channels(
 def _select_channels(
     *,
     mode: str | None,
-    tui: bool,
     gateway: bool,
     telegram: bool,
     feishu: bool,
     all_channels: bool,
 ) -> ChannelSet | None:
-    if tui or mode in {"tui", "interactive"}:
-        return None
     if gateway or mode == "gateway":
         return ("gateway",)
 

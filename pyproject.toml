@@ -26,7 +26,6 @@ dependencies = [
     "langchain-openrouter>=0.2.1",
     "langgraph-checkpoint-sqlite>=3.1.0",
     "lark-oapi>=1.4.22",
-    "prompt-toolkit>=3.0.50",
     "typer>=0.22.0",
     "uvicorn>=0.35.0",
 ]
@@ -52,3 +51,4 @@ where = ["src"]
 [tool.setuptools.package-data]
 "ruyi_agent.templates.ruyi_home" = ["ruyi.toml"]
 "ruyi_agent.templates.ruyi_home.config" = ["*.toml", "*.toml.example"]
+"ruyi_agent.web.team_console" = ["*.html", "*.css", "*.js"]

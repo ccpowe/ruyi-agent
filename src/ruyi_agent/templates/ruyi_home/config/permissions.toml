@@ -114,8 +114,7 @@ allowed_decisions = ["approve", "edit", "reject"]
 policy = "allow"
 
 [profiles.yolo.tools.wait_agent]
-policy = "require_approval"
-allowed_decisions = ["approve", "reject"]
+policy = "allow"
 
 [profiles.yolo.tools.check_agent]
 policy = "allow"

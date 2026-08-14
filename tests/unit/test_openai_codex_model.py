@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -143,6 +145,97 @@ def test_codex_chat_model_streams_codex_sse_with_null_completed_output() -> None
         assert response.content == "ruyi codex ok"
         assert _CodexSSEHandler.request_payload is not None
         assert _CodexSSEHandler.request_payload["stream"] is True
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+
+class _DisconnectOnceCodexSSEHandler(_CodexSSEHandler):
+    request_count = 0
+
+    def do_POST(self) -> None:
+        type(self).request_count += 1
+        if type(self).request_count == 1:
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+            return
+        super().do_POST()
+
+
+class _MetadataThenDisconnectCodexSSEHandler(_CodexSSEHandler):
+    request_count = 0
+
+    def do_POST(self) -> None:
+        type(self).request_count += 1
+        if type(self).request_count == 1:
+            event = {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_incomplete",
+                    "status": "in_progress",
+                    "output": [],
+                },
+            }
+            body = b"event: response.created\n" + (
+                f"data: {json.dumps(event)}\n\n".encode()
+            )
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(body) + 1000))
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+            return
+        super().do_POST()
+
+
+def test_codex_async_stream_retries_disconnect_before_first_event() -> None:
+    _DisconnectOnceCodexSSEHandler.request_count = 0
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _DisconnectOnceCodexSSEHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        model = CodexChatModel(
+            model="gpt-5.4",
+            api_key="codex-token",
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            default_headers={},
+            codex_session_id="session-retry",
+            max_retries=1,
+        )
+
+        response = asyncio.run(model.ainvoke([HumanMessage(content="Say hi.")]))
+
+        assert response.content == "ruyi codex ok"
+        assert _DisconnectOnceCodexSSEHandler.request_count == 2
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+
+def test_codex_async_stream_retries_after_metadata_but_before_effect() -> None:
+    _MetadataThenDisconnectCodexSSEHandler.request_count = 0
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), _MetadataThenDisconnectCodexSSEHandler
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        model = CodexChatModel(
+            model="gpt-5.4",
+            api_key="codex-token",
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            default_headers={},
+            codex_session_id="session-metadata-retry",
+            max_retries=1,
+        )
+
+        response = asyncio.run(model.ainvoke([HumanMessage(content="Say hi.")]))
+
+        assert response.content == "ruyi codex ok"
+        assert _MetadataThenDisconnectCodexSSEHandler.request_count == 2
     finally:
         server.shutdown()
         thread.join(timeout=2)

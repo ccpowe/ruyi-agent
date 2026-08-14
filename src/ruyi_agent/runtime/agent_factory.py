@@ -66,6 +66,7 @@ def create_runtime_agent(
     tool_search_registry: MCPRegistry | None = None,
     tool_search_server_names: list[str] | None = None,
     tool_search_tool_names: list[str] | None = None,
+    system_tools: frozenset[str] | None = None,
     debug: bool = False,
     name: str | None = None,
 ):
@@ -95,6 +96,7 @@ def create_runtime_agent(
         tool_search_registry=tool_search_registry,
         tool_search_server_names=tool_search_server_names,
         tool_search_tool_names=tool_search_tool_names,
+        system_tools=system_tools,
     )
 
     # base prompt 固定在项目代码里，避免 deepagents profile 动态拼接系统提示词。
