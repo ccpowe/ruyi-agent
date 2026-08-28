@@ -10,6 +10,7 @@ from ruyi_agent.gateway.models import MetadataScalar, TaskRouteRecord
 from ruyi_agent.integrations.a2a.client import A2AClientError
 from ruyi_agent.runtime.delegation.async_runtime import (
     AgentControl,
+    DurableTaskMailboxRequiredError,
     MaxDelegationDepthError,
     MaxTasksPerRootError,
     RemoteExecutorNotImplementedError,
@@ -76,6 +77,8 @@ class TaskRouter:
         webhook: dict[str, MetadataScalar] | None,
         delegation_context: DelegationContext | None,
         attachments: list[dict[str, Any]] | None = None,
+        task_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> RoutedTask:
         kwargs: dict[str, Any] = {
             "webhook": dict(webhook) if webhook is not None else None,
@@ -84,6 +87,10 @@ class TaskRouter:
         if route_kind == "remote_ref":
             kwargs["attachments"] = attachments or []
             kwargs["metadata"] = dict(metadata)
+        if task_id is not None:
+            kwargs["task_id"] = task_id
+        if idempotency_key is not None:
+            kwargs["idempotency_key"] = idempotency_key
         try:
             record = await self._control.spawn_task(
                 agent_name,
@@ -194,6 +201,8 @@ class TaskRouter:
         input_content: str,
         *,
         attachments: list[dict[str, Any]] | None = None,
+        idempotency_key: str | None = None,
+        mailbox_message_id: str | None = None,
     ) -> TaskRecord:
         self.ensure_record(route)
         try:
@@ -201,6 +210,8 @@ class TaskRouter:
                 route.task_id,
                 input_content,
                 attachments=attachments if route.route_kind == "remote_ref" else None,
+                idempotency_key=idempotency_key,
+                mailbox_message_id=mailbox_message_id,
             )
         except UnknownWorkerTaskError as exc:
             raise _task_not_found(route.task_id) from exc
@@ -210,6 +221,11 @@ class TaskRouter:
                 message=(
                     f"Task '{route.task_id}' has an active run, cannot send input"
                 ),
+            ) from exc
+        except DurableTaskMailboxRequiredError as exc:
+            raise GatewayTaskError(
+                code="idempotency_unavailable",
+                message=str(exc),
             ) from exc
         except A2AClientError as exc:
             raise _remote_gateway_error(exc) from exc

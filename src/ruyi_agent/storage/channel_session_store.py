@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from asyncio import to_thread
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 
 def _utc_now_iso() -> str:
@@ -23,6 +25,18 @@ class ChannelSessionRecord:
     thread_id: str | None = None
     created_at: str = ""
     updated_at: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelTurnReceipt:
+    idempotency_key: str
+    platform: str
+    session_key: str
+    operation: str
+    request_hash: str
+    task_id: str
+    response: dict[str, Any]
+    created_at: str
 
 
 class ChannelSessionStore:
@@ -55,6 +69,44 @@ class ChannelSessionStore:
     async def aget_session(self, session_key: str) -> ChannelSessionRecord | None:
         return await to_thread(self.get_session, session_key)
 
+    def get_turn_receipt(
+        self,
+        idempotency_key: str,
+    ) -> ChannelTurnReceipt | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT idempotency_key, platform, session_key, operation,
+                    request_hash, task_id, response_json, created_at
+                FROM channel_turn_receipts
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        response = json.loads(row[6])
+        if not isinstance(response, dict):
+            raise RuntimeError(
+                f"Channel turn receipt '{idempotency_key}' has an invalid response"
+            )
+        return ChannelTurnReceipt(
+            idempotency_key=row[0],
+            platform=row[1],
+            session_key=row[2],
+            operation=row[3],
+            request_hash=row[4],
+            task_id=row[5],
+            response=response,
+            created_at=row[7],
+        )
+
+    async def aget_turn_receipt(
+        self,
+        idempotency_key: str,
+    ) -> ChannelTurnReceipt | None:
+        return await to_thread(self.get_turn_receipt, idempotency_key)
+
     def bind_session(
         self,
         *,
@@ -65,44 +117,84 @@ class ChannelSessionStore:
         chat_id: str | None = None,
         user_id: str | None = None,
         thread_id: str | None = None,
+        turn_idempotency_key: str | None = None,
+        turn_operation: str | None = None,
+        turn_request_hash: str | None = None,
+        turn_response: dict[str, Any] | None = None,
     ) -> ChannelSessionRecord:
-        now = _utc_now_iso()
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO channel_sessions (
-                    session_key,
-                    platform,
-                    agent_name,
-                    current_task_id,
-                    chat_id,
-                    user_id,
-                    thread_id,
-                    created_at,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(session_key) DO UPDATE SET
-                    platform = excluded.platform,
-                    agent_name = excluded.agent_name,
-                    current_task_id = excluded.current_task_id,
-                    chat_id = excluded.chat_id,
-                    user_id = excluded.user_id,
-                    thread_id = excluded.thread_id,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    session_key,
-                    platform,
-                    agent_name,
-                    current_task_id,
-                    chat_id,
-                    user_id,
-                    thread_id,
-                    now,
-                    now,
-                ),
+        if turn_idempotency_key is None:
+            if (
+                turn_operation is not None
+                or turn_request_hash is not None
+                or turn_response is not None
+            ):
+                raise ValueError("Turn receipt fields require an idempotency key")
+        elif (
+            turn_operation not in {"create", "send"}
+            or not turn_request_hash
+            or turn_response is None
+        ):
+            raise ValueError(
+                "Turn receipt requires operation, request hash, and response"
             )
-            self._conn.commit()
+        now = _utc_now_iso()
+        response_json = (
+            json.dumps(turn_response, ensure_ascii=True, sort_keys=True)
+            if turn_response is not None
+            else None
+        )
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO channel_sessions (
+                        session_key,
+                        platform,
+                        agent_name,
+                        current_task_id,
+                        chat_id,
+                        user_id,
+                        thread_id,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_key) DO UPDATE SET
+                        platform = excluded.platform,
+                        agent_name = excluded.agent_name,
+                        current_task_id = excluded.current_task_id,
+                        chat_id = excluded.chat_id,
+                        user_id = excluded.user_id,
+                        thread_id = excluded.thread_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        session_key,
+                        platform,
+                        agent_name,
+                        current_task_id,
+                        chat_id,
+                        user_id,
+                        thread_id,
+                        now,
+                        now,
+                    ),
+                )
+                if turn_idempotency_key is not None:
+                    self._insert_or_validate_turn_receipt(
+                        idempotency_key=turn_idempotency_key,
+                        platform=platform,
+                        session_key=session_key,
+                        operation=str(turn_operation),
+                        request_hash=str(turn_request_hash),
+                        task_id=current_task_id,
+                        response_json=str(response_json),
+                        created_at=now,
+                    )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
         record = self.get_session(session_key)
         if record is None:
             raise RuntimeError(f"Channel session '{session_key}' was not saved")
@@ -118,6 +210,10 @@ class ChannelSessionStore:
         chat_id: str | None = None,
         user_id: str | None = None,
         thread_id: str | None = None,
+        turn_idempotency_key: str | None = None,
+        turn_operation: str | None = None,
+        turn_request_hash: str | None = None,
+        turn_response: dict[str, Any] | None = None,
     ) -> ChannelSessionRecord:
         return await to_thread(
             self.bind_session,
@@ -128,6 +224,10 @@ class ChannelSessionStore:
             chat_id=chat_id,
             user_id=user_id,
             thread_id=thread_id,
+            turn_idempotency_key=turn_idempotency_key,
+            turn_operation=turn_operation,
+            turn_request_hash=turn_request_hash,
+            turn_response=turn_response,
         )
 
     def unbind_session(self, session_key: str) -> ChannelSessionRecord | None:
@@ -176,7 +276,75 @@ class ChannelSessionStore:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS channel_turn_receipts (
+                    idempotency_key TEXT PRIMARY KEY,
+                    platform TEXT NOT NULL,
+                    session_key TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    response_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
             self._conn.commit()
+
+    def _insert_or_validate_turn_receipt(
+        self,
+        *,
+        idempotency_key: str,
+        platform: str,
+        session_key: str,
+        operation: str,
+        request_hash: str,
+        task_id: str,
+        response_json: str,
+        created_at: str,
+    ) -> None:
+        existing = self._conn.execute(
+            """
+            SELECT platform, session_key, operation, request_hash, task_id,
+                response_json
+            FROM channel_turn_receipts
+            WHERE idempotency_key = ?
+            """,
+            (idempotency_key,),
+        ).fetchone()
+        requested = (
+            platform,
+            session_key,
+            operation,
+            request_hash,
+            task_id,
+            response_json,
+        )
+        if existing is not None:
+            if tuple(existing) != requested:
+                raise ValueError(
+                    f"Channel turn receipt conflict for key '{idempotency_key}'"
+                )
+            return
+        self._conn.execute(
+            """
+            INSERT INTO channel_turn_receipts (
+                idempotency_key, platform, session_key, operation, request_hash,
+                task_id, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                idempotency_key,
+                platform,
+                session_key,
+                operation,
+                request_hash,
+                task_id,
+                response_json,
+                created_at,
+            ),
+        )
 
     def _row_to_record(self, row: tuple[str, ...]) -> ChannelSessionRecord:
         return ChannelSessionRecord(

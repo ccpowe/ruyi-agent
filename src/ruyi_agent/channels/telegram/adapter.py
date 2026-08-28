@@ -1410,6 +1410,7 @@ class TelegramAdapter:
                 ),
                 attachments=inbound_attachments,
                 force_new=force_new,
+                idempotency_key=f"telegram:update:{message.update_id}",
             ),
             before_continue=before_continue,
         )
@@ -1486,6 +1487,7 @@ class TelegramAdapter:
                 metadata_for_session=lambda session_key: (
                     self._build_message_metadata(message, session_key=session_key)
                 ),
+                idempotency_key=f"telegram:update:{message.update_id}",
             )
         )
         if result.kind == "started" and result.task is not None:

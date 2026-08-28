@@ -12,17 +12,30 @@ from ruyi_agent.channels.telegram.adapter import (
     TelegramMessage,
 )
 from ruyi_agent.config.loader import LocalWorkerSpec
+from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
+from ruyi_agent.storage.mailbox_store import MailboxStore
 from ruyi_agent.storage.task_store import TaskStore
 
 
 class RecordingAgent:
-    def __init__(self) -> None:
+    def __init__(self, mailbox: AgentMailbox) -> None:
         self.inputs: list[str] = []
+        self._mailbox = mailbox
 
     async def ainvoke(self, payload, *, config, version):
-        content = str(payload["messages"][0]["content"])
+        del version
+        messages = payload["messages"]
+        if messages:
+            content = str(messages[0]["content"])
+        else:
+            configurable = config["configurable"]
+            claimed = self._mailbox.claim(
+                recipient_task_id=str(configurable["task_id"]),
+                recipient_thread_id=str(configurable["thread_id"]),
+            )
+            content = "\n".join(message.content for message in claimed)
         self.inputs.append(content)
         await asyncio.sleep(0)
         return {"messages": [{"role": "assistant", "content": f"done: {content}"}]}
@@ -40,13 +53,16 @@ def test_telegram_channel_turn_reuses_gateway_task_through_real_http_and_sqlite(
     monkeypatch,
     tmp_path,
 ) -> None:
-    agent = RecordingAgent()
+    task_db = str(tmp_path / "tasks.sqlite")
+    task_store = TaskStore(task_db)
+    mailbox_store = MailboxStore(task_db)
+    mailbox = AgentMailbox(mailbox_store)
+    agent = RecordingAgent(mailbox)
     monkeypatch.setattr(
         async_runtime,
         "create_runtime_agent",
         lambda **kwargs: agent,
     )
-    task_store = TaskStore(str(tmp_path / "tasks.sqlite"))
     route_store = GatewayRouteStore(str(tmp_path / "routes.sqlite"))
     session_store = ChannelSessionStore(str(tmp_path / "sessions.sqlite"))
     control = async_runtime.AgentControl(
@@ -64,6 +80,7 @@ def test_telegram_channel_turn_reuses_gateway_task_through_real_http_and_sqlite(
         checkpointer=object(),
         backend=object(),
         task_store=task_store,
+        mailbox=mailbox,
     )
     service = GatewayTaskModule(
         main_agent_name="main",
@@ -135,4 +152,5 @@ def test_telegram_channel_turn_reuses_gateway_task_through_real_http_and_sqlite(
     finally:
         session_store.close()
         route_store.close()
+        mailbox_store.close()
         task_store.close()

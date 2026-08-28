@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import sqlite3
 import time
 from pathlib import Path
 
@@ -25,7 +26,11 @@ from ruyi_agent.runtime.delegation.context import (
 from ruyi_agent.gateway.models import TaskResponse, TaskRouteRecord
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.channels.http.routes import create_gateway_app
+from ruyi_agent.runtime.mailbox.service import AgentMailbox
+from ruyi_agent.storage.gateway_command_store import GatewayCommandStore
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
+from ruyi_agent.storage.mailbox_store import MailboxStore
+from ruyi_agent.storage.task_store import TaskStore
 
 
 class DelayedFakeAgent:
@@ -56,6 +61,18 @@ class DelayedAgentFactory:
         agent = DelayedFakeAgent(delay=self.delay)
         self.created.append(agent)
         return agent
+
+
+class FailOnceGatewayCommandStore(GatewayCommandStore):
+    def __init__(self, db_path: str) -> None:
+        super().__init__(db_path)
+        self.fail_next_complete = True
+
+    async def acomplete(self, **kwargs: str) -> None:
+        if self.fail_next_complete:
+            self.fail_next_complete = False
+            raise RuntimeError("simulated command completion failure")
+        await super().acomplete(**kwargs)
 
 
 class ReviewInterruptingAgent:
@@ -473,6 +490,7 @@ def build_app(
     delay: float = 0.05,
     a2a_client: A2AClient | None = None,
     route_store: GatewayRouteStore | None = None,
+    command_store: GatewayCommandStore | None = None,
     node_id: str | None = None,
     backend: object | None = None,
     workspace_root: str = "/workspace",
@@ -495,6 +513,7 @@ def build_app(
         agent_configs=build_agent_configs(),
         control=control,
         route_store=route_store,
+        command_store=command_store,
         unavailable_agents=unavailable_agents,
     )
     return create_gateway_app(service=service, bearer_token="secret-token"), factory
@@ -703,6 +722,234 @@ def test_create_task_returns_201_and_running_state(
     assert payload["run_count"] == 1
     assert payload["metadata"] == {"channel": "tg"}
     assert len(factory.created) == 1
+
+
+def test_create_task_idempotency_replays_same_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    command_store = GatewayCommandStore(str(tmp_path / "commands.sqlite"))
+    app, factory = build_app(
+        monkeypatch,
+        delay=0.1,
+        command_store=command_store,
+    )
+    headers = {**auth_headers(), "Idempotency-Key": "create-request-1"}
+    body = {
+        "input": {"content": "research react"},
+        "metadata": {"channel": "tg"},
+    }
+    try:
+        with TestClient(app) as client:
+            first = client.post("/agents/main/tasks", headers=headers, json=body)
+            replay = client.post("/agents/main/tasks", headers=headers, json=body)
+
+        assert first.status_code == 201
+        assert replay.status_code == 201
+        assert replay.json() == first.json()
+        assert replay.headers["idempotency-replayed"] == "true"
+        assert replay.headers["location"] == first.headers["location"]
+        assert "idempotency-replayed" not in first.headers
+        assert command_store.count_commands() == 1
+        assert len(factory.created) == 1
+    finally:
+        command_store.close()
+
+
+def test_create_replay_does_not_depend_on_current_agent_availability(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    factory = DelayedAgentFactory(delay=0.1)
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        build_test_remote_refs(),
+        checkpointer=object(),
+        backend=MemoryBackend(),
+        workspace_root="/workspace",
+    )
+    command_store = GatewayCommandStore(str(tmp_path / "commands.sqlite"))
+    service = GatewayTaskModule(
+        main_agent_name="main",
+        agent_configs=build_agent_configs(),
+        control=control,
+        command_store=command_store,
+    )
+    app = create_gateway_app(service=service, bearer_token="secret-token")
+    headers = {**auth_headers(), "Idempotency-Key": "availability-change"}
+    body = {"input": {"content": "hello"}, "metadata": {}}
+    try:
+        with TestClient(app) as client:
+            first = client.post("/agents/main/tasks", headers=headers, json=body)
+            service._unavailable_agents["main"] = "maintenance"  # noqa: SLF001
+            replay = client.post("/agents/main/tasks", headers=headers, json=body)
+
+        assert first.status_code == 201
+        assert replay.status_code == 201
+        assert replay.json() == first.json()
+        assert replay.headers["idempotency-replayed"] == "true"
+    finally:
+        command_store.close()
+
+
+def test_create_idempotency_hash_ignores_json_object_key_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = build_app(monkeypatch, delay=0.1)
+    headers = {**auth_headers(), "Idempotency-Key": "canonical-json"}
+    with TestClient(app) as client:
+        first = client.post(
+            "/agents/main/tasks",
+            headers=headers,
+            json={
+                "input": {"content": "hello"},
+                "metadata": {"source": "test", "sequence": 1},
+            },
+        )
+        replay = client.post(
+            "/agents/main/tasks",
+            headers=headers,
+            json={
+                "metadata": {"sequence": 1, "source": "test"},
+                "input": {"content": "hello"},
+            },
+        )
+
+    assert first.status_code == 201
+    assert replay.status_code == 201
+    assert replay.json() == first.json()
+    assert replay.headers["idempotency-replayed"] == "true"
+
+
+def test_create_without_idempotency_key_preserves_non_idempotent_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = build_app(monkeypatch, delay=0.1)
+    body = {"input": {"content": "hello"}, "metadata": {}}
+    with TestClient(app) as client:
+        first = client.post(
+            "/agents/main/tasks",
+            headers=auth_headers(),
+            json=body,
+        )
+        second = client.post(
+            "/agents/main/tasks",
+            headers=auth_headers(),
+            json=body,
+        )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["task_id"] != second.json()["task_id"]
+
+
+def test_idempotency_key_reuse_with_different_request_returns_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = build_app(monkeypatch, delay=0.1)
+    headers = {**auth_headers(), "Idempotency-Key": "globally-unique-key"}
+    with TestClient(app) as client:
+        first = client.post(
+            "/agents/main/tasks",
+            headers=headers,
+            json={"input": {"content": "first"}, "metadata": {}},
+        )
+        different_body = client.post(
+            "/agents/main/tasks",
+            headers=headers,
+            json={"input": {"content": "second"}, "metadata": {}},
+        )
+        different_operation = client.post(
+            f"/tasks/{first.json()['task_id']}/input",
+            headers=headers,
+            json={"input": {"content": "first"}},
+        )
+        nonexistent_target = client.post(
+            "/tasks/does-not-exist/input",
+            headers=headers,
+            json={"input": {"content": "first"}},
+        )
+
+    assert first.status_code == 201
+    assert different_body.status_code == 409
+    assert different_body.json()["error"]["code"] == "idempotency_key_reused"
+    assert different_operation.status_code == 409
+    assert different_operation.json()["error"]["code"] == "idempotency_key_reused"
+    assert nonexistent_target.status_code == 409
+    assert nonexistent_target.json()["error"]["code"] == "idempotency_key_reused"
+
+
+def test_invalid_idempotency_key_returns_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = build_app(monkeypatch)
+    with TestClient(app) as client:
+        response = client.post(
+            "/agents/main/tasks",
+            headers={**auth_headers(), "Idempotency-Key": "contains whitespace"},
+            json={"input": {"content": "hello"}, "metadata": {}},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_concurrent_create_requests_share_one_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, factory = build_app(monkeypatch, delay=0.1)
+    headers = {**auth_headers(), "Idempotency-Key": "concurrent-create"}
+    body = {"input": {"content": "hello"}, "metadata": {}}
+
+    async def scenario() -> list[httpx.Response]:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://gateway.test",
+        ) as client:
+            return await asyncio.gather(
+                *[
+                    client.post("/agents/main/tasks", headers=headers, json=body)
+                    for _ in range(100)
+                ]
+            )
+
+    responses = asyncio.run(scenario())
+
+    assert {response.status_code for response in responses} == {201}
+    assert len({response.json()["task_id"] for response in responses}) == 1
+    assert sum("idempotency-replayed" in response.headers for response in responses) == 99
+    assert len(factory.created) == 1
+
+
+def test_create_retry_recovers_after_effect_before_command_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    command_store = FailOnceGatewayCommandStore(str(tmp_path / "commands.sqlite"))
+    app, factory = build_app(
+        monkeypatch,
+        delay=0.1,
+        command_store=command_store,
+    )
+    headers = {**auth_headers(), "Idempotency-Key": "create-after-crash"}
+    body = {"input": {"content": "hello"}, "metadata": {}}
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            failed = client.post("/agents/main/tasks", headers=headers, json=body)
+            recovered = client.post("/agents/main/tasks", headers=headers, json=body)
+            replay = client.post("/agents/main/tasks", headers=headers, json=body)
+
+        assert failed.status_code == 500
+        assert recovered.status_code == 201
+        assert replay.status_code == 201
+        assert replay.json() == recovered.json()
+        assert replay.headers["idempotency-replayed"] == "true"
+        assert len(factory.created) == 1
+        assert command_store.count_commands() == 1
+    finally:
+        command_store.close()
 
 
 def test_create_task_uploads_attachments_and_injects_paths(
@@ -1128,6 +1375,151 @@ def test_send_input_and_list_tasks_follow_contract(
         assert len(items) == 1
         assert items[0]["task_id"] == task_id
         assert list_response.json()["next_cursor"] is None
+
+
+def test_idempotent_send_requires_durable_mailbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, factory = build_app(monkeypatch, delay=0.03)
+    with TestClient(app) as client:
+        created = client.post(
+            "/agents/main/tasks",
+            headers=auth_headers(),
+            json={"input": {"content": "first"}, "metadata": {}},
+        )
+        task_id = created.json()["task_id"]
+        time.sleep(0.08)
+
+        headers = {**auth_headers(), "Idempotency-Key": "send-request-1"}
+        first = client.post(
+            f"/tasks/{task_id}/input",
+            headers=headers,
+            json={"input": {"content": "second"}},
+        )
+        retry = client.post(
+            f"/tasks/{task_id}/input",
+            headers=headers,
+            json={"input": {"content": "second"}},
+        )
+
+    assert first.status_code == 503
+    assert first.json()["error"]["code"] == "idempotency_unavailable"
+    assert retry.status_code == 503
+    assert retry.json()["error"]["code"] == "idempotency_unavailable"
+    assert factory.control is not None
+    assert factory.control.get_task_record(task_id).run_count == 1
+
+
+def test_send_retry_after_command_completion_failure_publishes_one_mailbox_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    factory = DelayedAgentFactory(delay=0.03)
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    db_path = str(tmp_path / "tasks.sqlite")
+    task_store = TaskStore(db_path)
+    mailbox_store = MailboxStore(db_path)
+    mailbox = AgentMailbox(mailbox_store)
+    route_store = GatewayRouteStore(str(tmp_path / "routes.sqlite"))
+    command_store = FailOnceGatewayCommandStore(db_path)
+    command_store.fail_next_complete = False
+    control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        build_test_remote_refs(),
+        checkpointer=object(),
+        backend=MemoryBackend(),
+        mailbox=mailbox,
+        task_store=task_store,
+        workspace_root="/workspace",
+    )
+    factory.control = control
+    service = GatewayTaskModule(
+        main_agent_name="main",
+        agent_configs=build_agent_configs(),
+        control=control,
+        route_store=route_store,
+        command_store=command_store,
+    )
+    app = create_gateway_app(service=service, bearer_token="secret-token")
+    replay_route_store: GatewayRouteStore | None = None
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            created = client.post(
+                "/agents/main/tasks",
+                headers=auth_headers(),
+                json={"input": {"content": "first"}, "metadata": {}},
+            )
+            task_id = created.json()["task_id"]
+            time.sleep(0.08)
+            command_store.fail_next_complete = True
+            headers = {**auth_headers(), "Idempotency-Key": "durable-send-1"}
+
+            failed = client.post(
+                f"/tasks/{task_id}/input",
+                headers=headers,
+                json={"input": {"content": "second"}},
+            )
+            recovered = client.post(
+                f"/tasks/{task_id}/input",
+                headers=headers,
+                json={"input": {"content": "second"}},
+            )
+            replay = client.post(
+                f"/tasks/{task_id}/input",
+                headers=headers,
+                json={"input": {"content": "second"}},
+            )
+            claimed = mailbox.claim(
+                recipient_task_id=task_id,
+                recipient_thread_id=task_id,
+            )
+            mailbox.acknowledge([message.message_id for message in claimed])
+            time.sleep(0.08)
+
+        replay_route_store = GatewayRouteStore(":memory:")
+        replay_service = GatewayTaskModule(
+            main_agent_name="main",
+            agent_configs=build_agent_configs(),
+            control=control,
+            route_store=replay_route_store,
+            command_store=command_store,
+        )
+        replay_app = create_gateway_app(
+            service=replay_service,
+            bearer_token="secret-token",
+        )
+        with TestClient(replay_app) as client:
+            replay_without_route = client.post(
+                f"/tasks/{task_id}/input",
+                headers=headers,
+                json={"input": {"content": "second"}},
+            )
+
+        assert failed.status_code == 500
+        assert recovered.status_code == 202
+        assert replay.status_code == 202
+        assert replay.json() == recovered.json()
+        assert replay.headers["idempotency-replayed"] == "true"
+        assert replay_without_route.status_code == 202
+        assert replay_without_route.json() == recovered.json()
+        assert replay_without_route.headers["idempotency-replayed"] == "true"
+        with sqlite3.connect(db_path) as conn:
+            mailbox_rows = conn.execute(
+                "SELECT message_id, idempotency_key, content "
+                "FROM agent_mailbox_messages"
+            ).fetchall()
+        assert len(mailbox_rows) == 1
+        assert str(mailbox_rows[0][1]).startswith("gateway-input:")
+        assert mailbox_rows[0][2] == "second"
+        assert command_store.count_commands() == 1
+    finally:
+        time.sleep(0.08)
+        if replay_route_store is not None:
+            replay_route_store.close()
+        command_store.close()
+        route_store.close()
+        task_store.close()
+        mailbox_store.close()
 
 
 def test_non_public_agent_returns_documented_error(

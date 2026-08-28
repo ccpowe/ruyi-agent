@@ -101,6 +101,13 @@ class AgentMailbox:
         self._lock = threading.Lock()
         self._messages_by_recipient: dict[str, list[InterAgentMessage]] = {}
         self._seen_message_keys: set[tuple[str, str, int]] = set()
+        self._seen_input_idempotency_keys: set[str] = set()
+
+    @property
+    def is_durable(self) -> bool:
+        """Whether input identities survive through a backing MailboxStore."""
+
+        return self._store is not None
 
     def publish_settled(
         self,
@@ -174,10 +181,11 @@ class AgentMailbox:
         sender_agent_name: str | None = None,
         trigger_run: bool = True,
         idempotency_key: str | None = None,
+        message_id: str | None = None,
     ) -> InterAgentMessage | None:
         """Publish a user or agent input for delivery to a Gateway Task."""
         message = InterAgentMessage(
-            message_id=str(uuid.uuid4()),
+            message_id=message_id or str(uuid.uuid4()),
             recipient_task_id=recipient_task_id,
             recipient_thread_id=recipient_thread_id,
             sender_task_id=sender_task_id,
@@ -196,6 +204,13 @@ class AgentMailbox:
             )
             return message if published else None
         with self._lock:
+            if (
+                idempotency_key is not None
+                and idempotency_key in self._seen_input_idempotency_keys
+            ):
+                return None
+            if idempotency_key is not None:
+                self._seen_input_idempotency_keys.add(idempotency_key)
             self._messages_by_recipient.setdefault(recipient_thread_id, []).append(
                 message
             )

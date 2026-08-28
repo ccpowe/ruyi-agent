@@ -95,3 +95,37 @@ def test_download_task_artifact_uses_task_scoped_endpoint() -> None:
             "json": None,
         }
     ]
+
+
+def test_gateway_http_client_sends_idempotency_header_for_mutations() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"task_id": "task-1"})
+
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def scenario() -> None:
+        await client.create_task(
+            agent_name="main",
+            content="hello",
+            metadata={},
+            idempotency_key="channel-event-1",
+        )
+        await client.send_input(
+            task_id="task-1",
+            content="follow up",
+            idempotency_key="channel-event-2",
+        )
+
+    asyncio.run(scenario())
+
+    assert [request.headers["idempotency-key"] for request in requests] == [
+        "channel-event-1",
+        "channel-event-2",
+    ]

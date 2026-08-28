@@ -49,14 +49,17 @@ def test_mailbox_idempotency_key_deduplicates_network_retry(tmp_path) -> None:
             recipient_thread_id="thread-1",
             content="same logical input",
             idempotency_key="request-1",
+            message_id="message-1",
         )
         duplicate = mailbox.publish_input(
             recipient_task_id="task-1",
             recipient_thread_id="thread-1",
             content="same logical input",
             idempotency_key="request-1",
+            message_id="message-1",
         )
         assert first is not None
+        assert first.message_id == "message-1"
         assert duplicate is None
         assert len(
             mailbox.claim(
@@ -66,6 +69,29 @@ def test_mailbox_idempotency_key_deduplicates_network_retry(tmp_path) -> None:
         ) == 1
     finally:
         store.close()
+
+
+def test_in_memory_mailbox_deduplicates_preallocated_input_identity() -> None:
+    mailbox = AgentMailbox()
+    first = mailbox.publish_input(
+        recipient_task_id="task-1",
+        recipient_thread_id="thread-1",
+        content="same logical input",
+        idempotency_key="request-1",
+        message_id="message-1",
+    )
+    duplicate = mailbox.publish_input(
+        recipient_task_id="task-1",
+        recipient_thread_id="thread-1",
+        content="same logical input",
+        idempotency_key="request-1",
+        message_id="message-1",
+    )
+
+    assert first is not None
+    assert first.message_id == "message-1"
+    assert duplicate is None
+    assert [item.message_id for item in mailbox.drain("thread-1")] == ["message-1"]
 
 
 def test_render_general_mailbox_input_includes_sender_identity() -> None:

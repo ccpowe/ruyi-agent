@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -31,6 +33,7 @@ class InboundTurn:
     thread_id: str | None = None
     attachments: list[dict[str, str]] | None = None
     force_new: bool = False
+    idempotency_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +88,7 @@ class AgentCommandTurn:
     thread_id: str | None
     session_key_for_agent: Callable[[str], str]
     metadata_for_session: Callable[[str], dict[str, str]]
+    idempotency_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +130,10 @@ class ResumeCommandResult:
 BeforeContinue = Callable[[dict[str, Any]], Awaitable[None]]
 
 
+class ChannelTurnIdempotencyConflictError(ValueError):
+    """Raised when one Channel Turn key is reused for another request."""
+
+
 class ChannelTurnHandler:
     """Route ordinary Channel Turns while preserving Task and Session invariants."""
 
@@ -145,6 +153,28 @@ class ChannelTurnHandler:
         before_continue: BeforeContinue | None = None,
     ) -> ChannelTurnResult:
         """Create or continue the Gateway Task selected by one Channel Turn."""
+        turn_request_hash = None
+        if turn.idempotency_key is not None:
+            turn_request_hash = _inbound_turn_request_hash(turn)
+            receipt = await self._session_store.aget_turn_receipt(
+                turn.idempotency_key
+            )
+            if receipt is not None:
+                if (
+                    receipt.platform != turn.platform
+                    or receipt.session_key != turn.session_key
+                    or receipt.request_hash != turn_request_hash
+                ):
+                    raise ChannelTurnIdempotencyConflictError(
+                        "Channel Turn idempotency key was reused for a different "
+                        "request"
+                    )
+                return ChannelTurnResult(
+                    kind="started",
+                    task=dict(receipt.response),
+                    created=receipt.operation == "create",
+                )
+
         latest_task = None
         if not turn.force_new:
             latest_task = await self._find_session_task(turn.session_key)
@@ -160,24 +190,36 @@ class ChannelTurnHandler:
             return ChannelTurnResult(kind="active", task=latest_task)
 
         if latest_task is None:
-            task = await self._gateway_client.create_task(
-                agent_name=turn.agent_name,
-                content=turn.content,
-                metadata=turn.metadata,
-                attachments=turn.attachments,
-            )
+            create_kwargs: dict[str, Any] = {
+                "agent_name": turn.agent_name,
+                "content": turn.content,
+                "metadata": turn.metadata,
+                "attachments": turn.attachments,
+            }
+            if turn.idempotency_key is not None:
+                create_kwargs["idempotency_key"] = turn.idempotency_key
+            task = await self._gateway_client.create_task(**create_kwargs)
             created = True
         else:
             if before_continue is not None:
                 await before_continue(latest_task)
-            task = await self._gateway_client.send_input(
-                task_id=str(latest_task["task_id"]),
-                content=turn.content,
-                attachments=turn.attachments,
-            )
+            send_kwargs: dict[str, Any] = {
+                "task_id": str(latest_task["task_id"]),
+                "content": turn.content,
+                "attachments": turn.attachments,
+            }
+            if turn.idempotency_key is not None:
+                send_kwargs["idempotency_key"] = turn.idempotency_key
+            task = await self._gateway_client.send_input(**send_kwargs)
             created = False
 
-        await self._bind_session(turn, str(task["task_id"]))
+        await self._bind_session(
+            turn,
+            str(task["task_id"]),
+            operation="create" if created else "send",
+            request_hash=turn_request_hash,
+            response=task,
+        )
         return ChannelTurnResult(kind="started", task=task, created=created)
 
     async def handle_review(self, turn: ReviewTurn) -> ReviewTurnResult:
@@ -299,11 +341,14 @@ class ChannelTurnHandler:
                 ),
             )
 
-        task = await self._gateway_client.create_task(
-            agent_name=requested_name,
-            content=initial_message,
-            metadata=turn.metadata_for_session(agent_session_key),
-        )
+        create_kwargs = {
+            "agent_name": requested_name,
+            "content": initial_message,
+            "metadata": turn.metadata_for_session(agent_session_key),
+        }
+        if turn.idempotency_key is not None:
+            create_kwargs["idempotency_key"] = turn.idempotency_key
+        task = await self._gateway_client.create_task(**create_kwargs)
         await self._session_store.abind_session(
             session_key=agent_session_key,
             platform=turn.platform,
@@ -425,7 +470,16 @@ class ChannelTurnHandler:
         )
         return items[0] if items else None
 
-    async def _bind_session(self, turn: InboundTurn, task_id: str) -> None:
+    async def _bind_session(
+        self,
+        turn: InboundTurn,
+        task_id: str,
+        *,
+        operation: str | None = None,
+        request_hash: str | None = None,
+        response: dict[str, Any] | None = None,
+    ) -> None:
+        record_turn = turn.idempotency_key is not None and operation is not None
         await self._session_store.abind_session(
             session_key=turn.session_key,
             platform=turn.platform,
@@ -434,6 +488,10 @@ class ChannelTurnHandler:
             chat_id=turn.chat_id,
             user_id=turn.user_id,
             thread_id=turn.thread_id,
+            turn_idempotency_key=turn.idempotency_key if record_turn else None,
+            turn_operation=operation if record_turn else None,
+            turn_request_hash=request_hash if record_turn else None,
+            turn_response=response if record_turn else None,
         )
 
     async def _bind_review_session(
@@ -454,6 +512,29 @@ class ChannelTurnHandler:
 
 def _task_has_pending_review(task: dict[str, Any]) -> bool:
     return isinstance(task.get("pending_review"), dict)
+
+
+def _inbound_turn_request_hash(turn: InboundTurn) -> str:
+    canonical = json.dumps(
+        {
+            "platform": turn.platform,
+            "session_key": turn.session_key,
+            "agent_name": turn.agent_name,
+            "content": turn.content,
+            "metadata": turn.metadata,
+            "fallback_metadata": turn.fallback_metadata,
+            "chat_id": turn.chat_id,
+            "user_id": turn.user_id,
+            "thread_id": turn.thread_id,
+            "attachments": list(turn.attachments or []),
+            "force_new": turn.force_new,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def parse_review_command(text: str) -> dict[str, Any] | None:

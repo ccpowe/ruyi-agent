@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from ruyi_agent.channels.gateway_client import GatewayClientError
 from ruyi_agent.channels.turn import (
     AgentCommandTurn,
     ChannelTurnHandler,
+    ChannelTurnIdempotencyConflictError,
     InboundTurn,
     ResumeCommandTurn,
     ReviewTurn,
@@ -86,18 +89,56 @@ class FakeGatewayClient:
         return task
 
 
-def make_turn(*, force_new: bool = False) -> InboundTurn:
+class LegacyGatewayClient(FakeGatewayClient):
+    """Gateway test double with the pre-idempotency mutation signatures."""
+
+    async def create_task(
+        self,
+        *,
+        agent_name: str,
+        content: str,
+        metadata: dict[str, str],
+        attachments: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        return await super().create_task(
+            agent_name=agent_name,
+            content=content,
+            metadata=metadata,
+            attachments=attachments,
+        )
+
+    async def send_input(
+        self,
+        *,
+        task_id: str,
+        content: str,
+        attachments: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        return await super().send_input(
+            task_id=task_id,
+            content=content,
+            attachments=attachments,
+        )
+
+
+def make_turn(
+    *,
+    force_new: bool = False,
+    idempotency_key: str | None = None,
+    content: str = "hello",
+) -> InboundTurn:
     return InboundTurn(
         platform="test",
         session_key="session-1",
         agent_name="main",
-        content="hello",
+        content=content,
         metadata={"channel_session_key": "session-1"},
         fallback_metadata={"channel": "test", "user_id": "user-1"},
         chat_id="chat-1",
         user_id="user-1",
         attachments=[{"name": "note.txt"}],
         force_new=force_new,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -232,6 +273,132 @@ def test_channel_turn_force_new_ignores_existing_session() -> None:
     assert result.created is True
     assert gateway.sent == []
     assert sessions.get_session("session-1").current_task_id == "task-1"
+    sessions.close()
+
+
+def test_channel_turn_replays_persisted_receipt_before_operation_selection(
+    tmp_path,
+) -> None:
+    gateway = FakeGatewayClient()
+    db_path = tmp_path / "channel_sessions.sqlite3"
+    first_store = ChannelSessionStore(str(db_path))
+    first_handler = ChannelTurnHandler(
+        gateway_client=gateway,
+        session_store=first_store,
+    )
+    turn = make_turn(idempotency_key="feishu:event:event-1")
+
+    first = asyncio.run(first_handler.handle(turn))
+    original_response = dict(first.task)
+    receipt = first_store.get_turn_receipt("feishu:event:event-1")
+    assert receipt is not None
+    assert receipt.operation == "create"
+    assert len(receipt.request_hash) == 64
+    assert receipt.task_id == "task-1"
+    assert receipt.response == original_response
+    first_store.close()
+
+    # Model a retry after the Gateway result was committed and the Task settled,
+    # but before the platform event store was marked processed.
+    gateway.tasks["task-1"] = {
+        "task_id": "task-1",
+        "status": "completed",
+        "run_count": 1,
+    }
+    second_store = ChannelSessionStore(str(db_path))
+    second_handler = ChannelTurnHandler(
+        gateway_client=gateway,
+        session_store=second_store,
+    )
+
+    replay = asyncio.run(second_handler.handle(turn))
+
+    assert replay.kind == "started"
+    assert replay.created is True
+    assert replay.task == original_response
+    assert len(gateway.created) == 1
+    assert gateway.sent == []
+    second_store.close()
+
+
+def test_channel_turn_rejects_key_reuse_for_different_request() -> None:
+    gateway = FakeGatewayClient()
+    sessions = ChannelSessionStore(":memory:")
+    handler = ChannelTurnHandler(gateway_client=gateway, session_store=sessions)
+    key = "feishu:event:event-1"
+
+    asyncio.run(handler.handle(make_turn(idempotency_key=key)))
+
+    with pytest.raises(
+        ChannelTurnIdempotencyConflictError,
+        match="different request",
+    ):
+        asyncio.run(
+            handler.handle(
+                make_turn(idempotency_key=key, content="different content")
+            )
+        )
+
+    assert len(gateway.created) == 1
+    assert gateway.sent == []
+    assert sessions.get_session("session-1").current_task_id == "task-1"
+    sessions.close()
+
+
+def test_channel_turn_receipt_conflict_rolls_back_session_binding() -> None:
+    sessions = ChannelSessionStore(":memory:")
+    sessions.bind_session(
+        session_key="session-1",
+        platform="test",
+        agent_name="main",
+        current_task_id="task-1",
+        turn_idempotency_key="event-1",
+        turn_operation="create",
+        turn_request_hash="hash-1",
+        turn_response={"task_id": "task-1", "status": "running"},
+    )
+
+    with pytest.raises(ValueError, match="receipt conflict"):
+        sessions.bind_session(
+            session_key="session-1",
+            platform="test",
+            agent_name="main",
+            current_task_id="task-2",
+            turn_idempotency_key="event-1",
+            turn_operation="send",
+            turn_request_hash="hash-2",
+            turn_response={"task_id": "task-2", "status": "running"},
+        )
+
+    session = sessions.get_session("session-1")
+    receipt = sessions.get_turn_receipt("event-1")
+    assert session is not None and session.current_task_id == "task-1"
+    assert receipt is not None and receipt.task_id == "task-1"
+    sessions.close()
+
+
+def test_channel_turn_omits_absent_idempotency_key_for_legacy_clients() -> None:
+    gateway = LegacyGatewayClient()
+    sessions = ChannelSessionStore(":memory:")
+    handler = ChannelTurnHandler(gateway_client=gateway, session_store=sessions)
+
+    created = asyncio.run(handler.handle(make_turn()))
+    gateway.tasks[str(created.task["task_id"])] = {
+        **created.task,
+        "status": "completed",
+    }
+    continued = asyncio.run(handler.handle(make_turn()))
+    agent_started = asyncio.run(
+        handler.handle_agent_command(
+            make_agent_turn("/agent background_research investigate")
+        )
+    )
+
+    assert created.created is True
+    assert continued.created is False
+    assert agent_started.kind == "started"
+    assert len(gateway.created) == 2
+    assert len(gateway.sent) == 1
     sessions.close()
 
 

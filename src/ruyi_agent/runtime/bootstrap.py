@@ -29,6 +29,7 @@ from ruyi_agent.config.loader import (
 from ruyi_agent.runtime.delegation.context import validate_node_id
 from ruyi_agent.channels.http.routes import attach_gateway_routes
 from ruyi_agent.gateway.tasks import GatewayTaskModule
+from ruyi_agent.storage.gateway_command_store import GatewayCommandStore
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
 from ruyi_agent.integrations.mcp.registry import MCPRegistry
 from ruyi_agent.storage.task_store import TaskStore
@@ -254,6 +255,7 @@ async def bootstrap_application():
             print(f"[mcp] {status.server_name}: failed, error={status.error}")
 
     route_store: GatewayRouteStore | None = None
+    command_store: GatewayCommandStore | None = None
     task_store: TaskStore | None = None
     mailbox_store: MailboxStore | None = None
     review_audit_store: ReviewAuditStore | None = None
@@ -264,6 +266,7 @@ async def bootstrap_application():
         _ensure_sqlite_parent_dir(checkpoint_db)
         async with AsyncSqliteSaver.from_conn_string(checkpoint_db) as checkpointer:
             route_store = GatewayRouteStore(route_db)
+            command_store = GatewayCommandStore(task_db)
             task_store = TaskStore(task_db)
             mailbox_store = MailboxStore(task_db)
             mailbox = AgentMailbox(mailbox_store)
@@ -320,6 +323,7 @@ async def bootstrap_application():
                 agent_configs=agent_configs,
                 control=worker_control,
                 route_store=route_store,
+                command_store=command_store,
                 unavailable_agents=unavailable_agents,
             )
             print("configured local agents:", sorted(all_local_specs.keys()))
@@ -364,6 +368,8 @@ async def bootstrap_application():
             await worker_control.close()
         if route_store is not None:
             route_store.close()
+        if command_store is not None:
+            command_store.close()
         if task_store is not None:
             task_store.close()
         if mailbox_store is not None:

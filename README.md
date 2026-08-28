@@ -201,6 +201,7 @@ curl -H "Authorization: Bearer $GATEWAY_BEARER_TOKEN" \
 ```bash
 curl -X POST \
   -H "Authorization: Bearer $GATEWAY_BEARER_TOKEN" \
+  -H "Idempotency-Key: create-$(uuidgen)" \
   -H "Content-Type: application/json" \
   http://127.0.0.1:8000/agents/main/tasks \
   -d '{
@@ -209,6 +210,31 @@ curl -X POST \
     },
     "metadata": {
       "source": "readme-example"
+    }
+  }'
+```
+
+创建任务和发送后续输入都支持可选的 `Idempotency-Key`。键必须是 1–255
+个不含空白的可见 ASCII 字符。同一个键和相同请求重试时，Gateway 返回第一次
+成功保存的响应，并设置 `Idempotency-Replayed: true`；同一个键用于不同请求时
+返回 `409 idempotency_key_reused`。当前单一 Bearer Token 下，键在整个 Gateway
+范围内唯一，不按 endpoint 或 task 分区。
+
+标准 `ruyi` runtime 已为本地续写配置持久化 Task Mailbox。若自定义嵌入
+`GatewayTaskModule` 时没有配置持久 Mailbox，带幂等键的本地续写会返回
+`503 idempotency_unavailable`，避免给出无法跨崩溃兑现的保证。
+
+向已有任务发送输入：
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer $GATEWAY_BEARER_TOKEN" \
+  -H "Idempotency-Key: input-$(uuidgen)" \
+  -H "Content-Type: application/json" \
+  http://127.0.0.1:8000/tasks/{task_id}/input \
+  -d '{
+    "input": {
+      "content": "补充约束：只分析运行时边界。"
     }
   }'
 ```

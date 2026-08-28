@@ -23,6 +23,7 @@ class FakeGatewayClient:
         self.tasks: dict[str, dict[str, Any]] = {}
         self.created: list[tuple[str, str, dict[str, str]]] = []
         self.sent: list[tuple[str, str]] = []
+        self.idempotency_keys: list[str | None] = []
         self.agents: list[dict[str, Any]] = [
             {
                 "name": "main",
@@ -76,6 +77,7 @@ class FakeGatewayClient:
         content: str,
         metadata: dict[str, str],
         attachments: list[dict[str, str]] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         del attachments
         self._counter += 1
@@ -90,6 +92,7 @@ class FakeGatewayClient:
             "metadata": metadata,
         }
         self.created.append((agent_name, content, metadata))
+        self.idempotency_keys.append(idempotency_key)
         self.tasks[task_id] = task
         return task
 
@@ -99,6 +102,7 @@ class FakeGatewayClient:
         task_id: str,
         content: str,
         attachments: list[dict[str, str]] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         del attachments
         task = dict(self.tasks[task_id])
@@ -107,6 +111,7 @@ class FakeGatewayClient:
         task["run_count"] = int(task["run_count"]) + 1
         self.tasks[task_id] = task
         self.sent.append((task_id, content))
+        self.idempotency_keys.append(idempotency_key)
         return task
 
     async def download_artifact(self, *, path: str) -> Any:
@@ -783,6 +788,7 @@ def test_event_store_deduplicates_repeated_event_id() -> None:
         event_store.close()
 
     assert len(gateway.created) == 1
+    assert gateway.idempotency_keys == ["feishu:event:same-event"]
 
 
 def test_event_store_allows_unprocessed_claim_after_lease_timeout(tmp_path) -> None:
@@ -1157,4 +1163,3 @@ def test_adapter_sends_published_artifacts_on_terminal_task() -> None:
             "reply_to_message_id": None,
         }
     ]
-

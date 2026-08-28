@@ -99,94 +99,39 @@ class TaskStore:
         self._init_db()
 
     def save_task(self, record: TaskRecord) -> None:
+        """Upsert a task without SQLite's delete-and-reinsert REPLACE semantics."""
+
         with self._lock:
             self._conn.execute(
-                """
-                INSERT OR REPLACE INTO agent_tasks (
-                    task_id,
-                    agent_name,
-                    state,
-                    thread_id,
-                    parent_task_id,
-                    root_task_id,
-                    depth,
-                    created_at,
-                    updated_at,
-                    result,
-                    error,
-                    run_count,
-                    route_kind,
-                    upstream_task_id,
-                    parent_thread_id,
-                    mailbox_suppressed,
-                    mailbox_delivered,
-                    webhook_json,
-                    delegation_root_id,
-                    delegation_max_depth,
-                    delegation_max_tasks_per_root,
-                    delegation_visited_nodes_json,
-                    permission_profile,
-                    effective_skill_names_json,
-                    skill_view_path,
-                    skill_view_hash,
-                    pending_review_json,
-                    artifacts_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record.task_id,
-                    record.agent_name,
-                    record.state,
-                    record.thread_id,
-                    record.parent_task_id,
-                    record.root_task_id,
-                    record.depth,
-                    _serialize_datetime(record.created_at),
-                    _serialize_datetime(record.updated_at),
-                    record.result,
-                    record.error,
-                    record.run_count,
-                    record.route_kind,
-                    record.upstream_task_id,
-                    record.parent_thread_id,
-                    int(record.mailbox_suppressed),
-                    int(record.mailbox_delivered),
-                    (
-                        json.dumps(record.webhook, ensure_ascii=True, sort_keys=True)
-                        if record.webhook is not None
-                        else None
-                    ),
-                    record.delegation_root_id,
-                    record.delegation_max_depth,
-                    record.delegation_max_tasks_per_root,
-                    json.dumps(
-                        list(record.delegation_visited_nodes),
-                        ensure_ascii=True,
-                    ),
-                    record.permission_profile,
-                    json.dumps(
-                        list(record.effective_skill_names),
-                        ensure_ascii=True,
-                    ),
-                    record.skill_view_path,
-                    record.skill_view_hash,
-                    (
-                        json.dumps(
-                            record.pending_review,
-                            ensure_ascii=True,
-                            sort_keys=True,
-                        )
-                        if record.pending_review is not None
-                        else None
-                    ),
-                    json.dumps(
-                        [_artifact_to_dict(item) for item in record.artifacts],
-                        ensure_ascii=True,
-                        sort_keys=True,
-                    ),
-                ),
+                self._insert_sql(upsert=True),
+                self._record_values(record),
             )
             self._conn.commit()
+
+    def insert_task(self, record: TaskRecord) -> None:
+        """Insert a newly allocated task identity and reject duplicates."""
+
+        with self._lock:
+            self._conn.execute(
+                self._insert_sql(upsert=False),
+                self._record_values(record),
+            )
+            self._conn.commit()
+
+    def update_task(self, record: TaskRecord) -> None:
+        """Update an existing task without ever recreating its row."""
+
+        columns = self._write_columns()
+        assignments = ", ".join(f"{column} = ?" for column in columns[1:])
+        values = self._record_values(record)
+        with self._lock:
+            cursor = self._conn.execute(
+                f"UPDATE agent_tasks SET {assignments} WHERE task_id = ?",
+                (*values[1:], record.task_id),
+            )
+            self._conn.commit()
+            if cursor.rowcount != 1:
+                raise KeyError(f"Task does not exist: {record.task_id}")
 
     def get_task(self, task_id: str) -> TaskRecord | None:
         with self._lock:
@@ -336,6 +281,104 @@ class TaskStore:
         }
         if column not in columns:
             self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _insert_sql(self, *, upsert: bool) -> str:
+        columns = self._write_columns()
+        column_list = ", ".join(columns)
+        placeholders = ", ".join("?" for _ in columns)
+        sql = f"INSERT INTO agent_tasks ({column_list}) VALUES ({placeholders})"
+        if not upsert:
+            return sql
+        assignments = ", ".join(
+            f"{column} = excluded.{column}" for column in columns[1:]
+        )
+        return f"{sql} ON CONFLICT(task_id) DO UPDATE SET {assignments}"
+
+    def _write_columns(self) -> tuple[str, ...]:
+        return (
+            "task_id",
+            "agent_name",
+            "state",
+            "thread_id",
+            "parent_task_id",
+            "root_task_id",
+            "depth",
+            "created_at",
+            "updated_at",
+            "result",
+            "error",
+            "run_count",
+            "route_kind",
+            "upstream_task_id",
+            "parent_thread_id",
+            "mailbox_suppressed",
+            "mailbox_delivered",
+            "webhook_json",
+            "delegation_root_id",
+            "delegation_max_depth",
+            "delegation_max_tasks_per_root",
+            "delegation_visited_nodes_json",
+            "permission_profile",
+            "effective_skill_names_json",
+            "skill_view_path",
+            "skill_view_hash",
+            "pending_review_json",
+            "artifacts_json",
+        )
+
+    def _record_values(self, record: TaskRecord) -> tuple[Any, ...]:
+        return (
+            record.task_id,
+            record.agent_name,
+            record.state,
+            record.thread_id,
+            record.parent_task_id,
+            record.root_task_id,
+            record.depth,
+            _serialize_datetime(record.created_at),
+            _serialize_datetime(record.updated_at),
+            record.result,
+            record.error,
+            record.run_count,
+            record.route_kind,
+            record.upstream_task_id,
+            record.parent_thread_id,
+            int(record.mailbox_suppressed),
+            int(record.mailbox_delivered),
+            (
+                json.dumps(record.webhook, ensure_ascii=True, sort_keys=True)
+                if record.webhook is not None
+                else None
+            ),
+            record.delegation_root_id,
+            record.delegation_max_depth,
+            record.delegation_max_tasks_per_root,
+            json.dumps(
+                list(record.delegation_visited_nodes),
+                ensure_ascii=True,
+            ),
+            record.permission_profile,
+            json.dumps(
+                list(record.effective_skill_names),
+                ensure_ascii=True,
+            ),
+            record.skill_view_path,
+            record.skill_view_hash,
+            (
+                json.dumps(
+                    record.pending_review,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+                if record.pending_review is not None
+                else None
+            ),
+            json.dumps(
+                [_artifact_to_dict(item) for item in record.artifacts],
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+        )
 
     def _select_columns(self) -> str:
         return """

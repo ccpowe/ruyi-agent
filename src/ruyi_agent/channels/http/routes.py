@@ -72,6 +72,8 @@ HTTP_STATUS_BY_ERROR = {
     "task_not_found": 404,
     "review_task_mismatch": 409,
     "task_already_running": 409,
+    "idempotency_in_progress": 409,
+    "idempotency_key_reused": 409,
     "attachment_too_large": 413,
     "artifact_too_large": 413,
     "remote_executor_not_implemented": 422,
@@ -80,6 +82,7 @@ HTTP_STATUS_BY_ERROR = {
     "agent_unavailable": 503,
     "attachment_upload_failed": 503,
     "runtime_unavailable": 503,
+    "idempotency_unavailable": 503,
 }
 
 HTTP_STATUS_BY_ERROR_KIND = {
@@ -127,7 +130,8 @@ def attach_gateway_routes(
             exc.kind,
             HTTP_STATUS_BY_ERROR.get(exc.code, 500),
         )
-        return JSONResponse(status_code=status_code, content=payload)
+        headers = {"Retry-After": "1"} if exc.code == "idempotency_in_progress" else None
+        return JSONResponse(status_code=status_code, content=payload, headers=headers)
 
     @app.exception_handler(Exception)
     async def handle_unexpected_error(
@@ -180,18 +184,27 @@ def attach_gateway_routes(
         request: Request,
         agent_name: str,
         payload: CreateTaskRequest,
+        idempotency_key: str | None = Header(
+            default=None,
+            alias="Idempotency-Key",
+        ),
         _: None = Depends(require_bearer),
     ) -> JSONResponse:
-        task = await service_getter(request).create_task(
+        outcome = await service_getter(request).create_task_command(
             agent_name=agent_name,
             input_content=payload.input.content,
             attachments=payload.input.attachments,
             metadata=payload.metadata,
             webhook=payload.webhook,
+            idempotency_key=idempotency_key,
         )
+        task = outcome.task
+        response_headers = {"Location": f"/tasks/{task.task_id}"}
+        if outcome.replayed:
+            response_headers["Idempotency-Replayed"] = "true"
         return JSONResponse(
             status_code=201,
-            headers={"Location": f"/tasks/{task.task_id}"},
+            headers=response_headers,
             content=task.model_dump(mode="json"),
         )
 
@@ -234,14 +247,24 @@ def attach_gateway_routes(
         request: Request,
         task_id: str,
         payload: SendInputRequest,
+        idempotency_key: str | None = Header(
+            default=None,
+            alias="Idempotency-Key",
+        ),
         _: None = Depends(require_bearer),
     ) -> JSONResponse:
-        task = await service_getter(request).send_input(
-            task_id,
-            payload.input.content,
+        outcome = await service_getter(request).send_input_command(
+            task_id=task_id,
+            input_content=payload.input.content,
             attachments=payload.input.attachments,
+            idempotency_key=idempotency_key,
         )
-        return JSONResponse(status_code=202, content=task.model_dump(mode="json"))
+        headers = {"Idempotency-Replayed": "true"} if outcome.replayed else None
+        return JSONResponse(
+            status_code=202,
+            headers=headers,
+            content=outcome.task.model_dump(mode="json"),
+        )
 
     @app.post("/artifacts/download")
     async def download_artifact(

@@ -107,6 +107,7 @@ class A2AClient:
         metadata: dict[str, Any],
         attachments: list[dict[str, Any]] | None = None,
         webhook: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """
         在远程网关创建任务
@@ -144,6 +145,7 @@ class A2AClient:
             "POST",
             f"agents/{remote_ref.remote_agent_name}/tasks",
             json=payload,
+            idempotency_key=idempotency_key,
         )
 
     async def get_task(self, remote_ref: RemoteRef, *, task_id: str) -> dict[str, Any]:
@@ -171,6 +173,7 @@ class A2AClient:
         task_id: str,
         input_content: str,
         attachments: list[dict[str, Any]] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """
         向远程任务发送新输入
@@ -197,6 +200,7 @@ class A2AClient:
             "POST",
             f"tasks/{task_id}/input",
             json={"input": input_payload},
+            idempotency_key=idempotency_key,
         )
 
     async def cancel_task(
@@ -249,6 +253,7 @@ class A2AClient:
         path: str,
         *,
         json: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """
         发送 HTTP 请求并返回 JSON 响应
@@ -280,6 +285,8 @@ class A2AClient:
         4. 远程网关返回错误 → 透传状态码和错误信息
         """
         headers = self._build_headers(remote_ref)
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
 
         # 发送 HTTP 请求
         try:

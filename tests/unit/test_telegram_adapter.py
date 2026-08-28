@@ -46,6 +46,7 @@ class FakeGatewayClient:
         ]
         self.created: list[tuple[str, str, dict[str, str], list[dict[str, str]] | None]] = []
         self.sent: list[tuple[str, str, list[dict[str, str]] | None]] = []
+        self.idempotency_keys: list[str | None] = []
         self.submitted_reviews: list[dict[str, Any]] = []
         self.get_sequences: dict[str, list[dict[str, Any]]] = {}
         self.get_errors: dict[str, GatewayClientError] = {}
@@ -77,6 +78,7 @@ class FakeGatewayClient:
         content: str,
         metadata: dict[str, str],
         attachments: list[dict[str, str]] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         self._counter += 1
         task_id = f"task-{self._counter}"
@@ -90,6 +92,7 @@ class FakeGatewayClient:
             "metadata": metadata,
         }
         self.created.append((agent_name, content, metadata, attachments))
+        self.idempotency_keys.append(idempotency_key)
         self.tasks[task_id] = task
         return task
 
@@ -99,12 +102,14 @@ class FakeGatewayClient:
         task_id: str,
         content: str,
         attachments: list[dict[str, str]] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         task = dict(self.tasks[task_id])
         task["status"] = "running"
         task["run_count"] = int(task["run_count"]) + 1
         self.tasks[task_id] = task
         self.sent.append((task_id, content, attachments))
+        self.idempotency_keys.append(idempotency_key)
         return task
 
     async def download_artifact(self, *, path: str) -> TelegramInboundAttachment:
@@ -576,6 +581,7 @@ def test_poll_once_deduplicates_repeated_update_id() -> None:
     asyncio.run(scenario())
 
     assert len(gateway.created) == 1
+    assert gateway.idempotency_keys == ["telegram:update:10"]
     assert gateway.sent == []
     update_store.close()
 
@@ -1790,7 +1796,13 @@ def test_group_users_are_routed_to_independent_sessions() -> None:
             build_message("first", chat_id=-100, user_id=200, chat_type="group")
         )
         await adapter.handle_message(
-            build_message("second", chat_id=-100, user_id=201, chat_type="group")
+            build_message(
+                "second",
+                update_id=2,
+                chat_id=-100,
+                user_id=201,
+                chat_type="group",
+            )
         )
         gateway.get_sequences["task-1"] = [
             gateway.tasks["task-1"],
@@ -1904,6 +1916,7 @@ def test_supergroup_topics_are_routed_to_independent_sessions() -> None:
         await adapter.handle_message(
             build_message(
                 "second",
+                update_id=2,
                 chat_id=-100,
                 user_id=200,
                 chat_type="supergroup",

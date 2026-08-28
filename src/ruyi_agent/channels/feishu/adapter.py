@@ -990,6 +990,9 @@ class FeishuAdapter:
                 user_id=message.user_id,
                 thread_id=message.thread_id,
                 force_new=force_new,
+                idempotency_key=(
+                    f"feishu:event:{message.event_id or message.message_id}"
+                ),
             ),
             before_continue=before_continue,
         )
@@ -1374,6 +1377,9 @@ class FeishuAdapter:
                 ),
                 metadata_for_session=lambda session_key: (
                     self._build_message_metadata(message, session_key=session_key)
+                ),
+                idempotency_key=(
+                    f"feishu:event:{message.event_id or message.message_id}"
                 ),
             )
         )

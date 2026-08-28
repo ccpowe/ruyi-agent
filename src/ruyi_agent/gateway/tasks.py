@@ -23,10 +23,16 @@ Gateway Task Module - Agent-to-Agent 任务委托与路由
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import hashlib
+import json
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any, Callable
+from typing import Any
 from uuid import uuid4
 
 from ruyi_agent.gateway.errors import GatewayTaskError
@@ -50,7 +56,13 @@ from ruyi_agent.runtime.delegation.async_runtime import (
     PublishedArtifact,
     TaskRecord,
 )
+from ruyi_agent.runtime.delegation.context import DelegationContext
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
+from ruyi_agent.storage.gateway_command_store import (
+    GatewayCommandClaim,
+    GatewayCommandConflictError,
+    GatewayCommandStore,
+)
 
 DEFAULT_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024
 DEFAULT_ARTIFACT_MAX_BYTES = 50 * 1024 * 1024
@@ -62,6 +74,14 @@ SAFE_ATTACHMENT_CHARS = set(
     "0123456789"
     ".-_"
 )
+DEFAULT_GATEWAY_PRINCIPAL = "gateway-bearer"
+COMMAND_WAIT_TIMEOUT_SECONDS = 30.0
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayCommandOutcome:
+    task: TaskResponse
+    replayed: bool
 
 
 class GatewayTaskModule:
@@ -93,6 +113,7 @@ class GatewayTaskModule:
         agent_configs: dict[str, dict[str, Any]],
         control: AgentControl,
         route_store: GatewayRouteStore | None = None,
+        command_store: GatewayCommandStore | None = None,
         remote_event_handlers: list[AgentControl] | None = None,
         attachment_max_bytes: int = DEFAULT_ATTACHMENT_MAX_BYTES,
         artifact_max_bytes: int = DEFAULT_ARTIFACT_MAX_BYTES,
@@ -107,6 +128,7 @@ class GatewayTaskModule:
             route_store=route_store,
             remote_event_handlers=remote_event_handlers,
         )
+        self._command_store = command_store or GatewayCommandStore(":memory:")
         self._attachment_max_bytes = attachment_max_bytes
         self._artifact_max_bytes = artifact_max_bytes
         self._unavailable_agents = dict(unavailable_agents or {})
@@ -139,6 +161,27 @@ class GatewayTaskModule:
         metadata: dict[str, MetadataScalar],
         webhook: dict[str, MetadataScalar] | None = None,
     ) -> TaskResponse:
+        outcome = await self.create_task_command(
+            agent_name=agent_name,
+            input_content=input_content,
+            attachments=attachments,
+            metadata=metadata,
+            webhook=webhook,
+            idempotency_key=None,
+        )
+        return outcome.task
+
+    async def create_task_command(
+        self,
+        *,
+        agent_name: str,
+        input_content: str,
+        attachments: list[AttachmentInput] | None = None,
+        metadata: dict[str, MetadataScalar],
+        webhook: dict[str, MetadataScalar] | None = None,
+        idempotency_key: str | None,
+        principal_id: str = DEFAULT_GATEWAY_PRINCIPAL,
+    ) -> GatewayCommandOutcome:
         """
         创建新任务并路由到指定 agent
 
@@ -163,15 +206,102 @@ class GatewayTaskModule:
         Raises:
             GatewayTaskError: agent 不存在、不是 public、委托深度超限等
         """
+        _validate_idempotency_key(idempotency_key)
+        normalized_attachments = list(attachments or [])
+        if idempotency_key is None:
+            task = await self._create_task_from_request(
+                task_id=str(uuid4()),
+                agent_name=agent_name,
+                input_content=input_content,
+                attachments=normalized_attachments,
+                metadata=metadata,
+                webhook=webhook,
+                idempotency_key=None,
+            )
+            return GatewayCommandOutcome(task=task, replayed=False)
+
+        request_hash = _command_request_hash(
+            operation="create_task",
+            target=agent_name,
+            body={
+                "input": {
+                    "content": input_content,
+                    "attachments": [
+                        item.model_dump(mode="json") for item in normalized_attachments
+                    ],
+                },
+                "metadata": metadata,
+                "webhook": webhook,
+            },
+        )
+        claim = await self._claim_command(
+            principal_id=principal_id,
+            idempotency_key=idempotency_key,
+            operation="create_task",
+            target=agent_name,
+            request_hash=request_hash,
+            proposed_task_id=str(uuid4()),
+        )
+        if claim.status == "replay":
+            return GatewayCommandOutcome(
+                task=TaskResponse.model_validate_json(claim.response_json),
+                replayed=True,
+            )
+        return await self._execute_claimed_command(
+            claim,
+            self._create_task_from_request(
+                task_id=claim.task_id,
+                agent_name=agent_name,
+                input_content=input_content,
+                attachments=normalized_attachments,
+                metadata=metadata,
+                webhook=webhook,
+                idempotency_key=idempotency_key,
+            ),
+        )
+
+    async def _create_task_from_request(
+        self,
+        *,
+        task_id: str,
+        agent_name: str,
+        input_content: str,
+        attachments: list[AttachmentInput],
+        metadata: dict[str, MetadataScalar],
+        webhook: dict[str, MetadataScalar] | None,
+        idempotency_key: str | None,
+    ) -> TaskResponse:
         agent_config = self._get_agent_config(agent_name)
         self._ensure_public(agent_name, agent_config)
         self._ensure_available(agent_name)
-
-        # 从 metadata 中提取委托上下文，验证委托链路合法性
         clean_metadata, delegation_context = self._router.prepare_delegation_metadata(
             metadata
         )
+        return await self._create_task_effect(
+            task_id=task_id,
+            agent_name=agent_name,
+            agent_config=agent_config,
+            input_content=input_content,
+            attachments=attachments,
+            clean_metadata=clean_metadata,
+            webhook=webhook,
+            delegation_context=delegation_context,
+            idempotency_key=idempotency_key,
+        )
 
+    async def _create_task_effect(
+        self,
+        *,
+        task_id: str,
+        agent_name: str,
+        agent_config: dict[str, Any],
+        input_content: str,
+        attachments: list[AttachmentInput],
+        clean_metadata: dict[str, MetadataScalar],
+        webhook: dict[str, MetadataScalar] | None,
+        delegation_context: DelegationContext | None,
+        idempotency_key: str | None,
+    ) -> TaskResponse:
         kind = agent_config["kind"]
         if kind == "remote_ref":
             routed = await self._router.create_task(
@@ -180,18 +310,20 @@ class GatewayTaskModule:
                 input_content=input_content,
                 attachments=[
                     attachment.model_dump(mode="json")
-                    for attachment in (attachments or [])
+                    for attachment in attachments
                 ],
                 metadata=clean_metadata,
                 webhook=webhook,
                 delegation_context=delegation_context,
+                task_id=task_id,
+                idempotency_key=idempotency_key,
             )
             return self._build_task_response(routed.record, routed.route.metadata)
 
         prepared_input = await self._prepare_input_with_attachments(
             input_content,
-            attachments or [],
-            task_id=None,
+            attachments,
+            batch_id=task_id,
         )
         route_metadata = self._metadata_with_attachments(
             clean_metadata,
@@ -206,6 +338,8 @@ class GatewayTaskModule:
             metadata=route_metadata,
             webhook=webhook,
             delegation_context=delegation_context,
+            task_id=task_id,
+            idempotency_key=idempotency_key,
         )
         return self._build_task_response(routed.record, routed.route.metadata)
 
@@ -227,38 +361,214 @@ class GatewayTaskModule:
         input_content: str,
         attachments: list[AttachmentInput] | None = None,
     ) -> TaskResponse:
+        outcome = await self.send_input_command(
+            task_id=task_id,
+            input_content=input_content,
+            attachments=attachments,
+            idempotency_key=None,
+        )
+        return outcome.task
+
+    async def send_input_command(
+        self,
+        *,
+        task_id: str,
+        input_content: str,
+        attachments: list[AttachmentInput] | None = None,
+        idempotency_key: str | None,
+        principal_id: str = DEFAULT_GATEWAY_PRINCIPAL,
+    ) -> GatewayCommandOutcome:
         """
         向运行中的任务发送新输入
 
         用于实现任务的交互式对话。运行中的本地 Task 会把输入放入 Task
         Mailbox，在下一次安全模型调用前注入；已 settled 的 Task 会被唤醒。
         """
+        _validate_idempotency_key(idempotency_key)
+        normalized_attachments = list(attachments or [])
+        if idempotency_key is None:
+            route = await self._router.get_route(task_id)
+            task = await self._send_input_effect(
+                route=route,
+                input_content=input_content,
+                attachments=normalized_attachments,
+                batch_id=str(uuid4()),
+                downstream_idempotency_key=None,
+                mailbox_message_id=None,
+            )
+            return GatewayCommandOutcome(task=task, replayed=False)
+
+        request_hash = _command_request_hash(
+            operation="send_input",
+            target=task_id,
+            body={
+                "input": {
+                    "content": input_content,
+                    "attachments": [
+                        item.model_dump(mode="json") for item in normalized_attachments
+                    ],
+                }
+            },
+        )
+        claim = await self._claim_command(
+            principal_id=principal_id,
+            idempotency_key=idempotency_key,
+            operation="send_input",
+            target=task_id,
+            request_hash=request_hash,
+            proposed_task_id=task_id,
+            proposed_mailbox_message_id=str(uuid4()),
+        )
+        if claim.status == "replay":
+            return GatewayCommandOutcome(
+                task=TaskResponse.model_validate_json(claim.response_json),
+                replayed=True,
+            )
+        return await self._execute_claimed_command(
+            claim,
+            self._send_input_from_request(
+                task_id=task_id,
+                input_content=input_content,
+                attachments=normalized_attachments,
+                batch_id=claim.command_id,
+                external_idempotency_key=idempotency_key,
+                command_id=claim.command_id,
+                mailbox_message_id=claim.mailbox_message_id or claim.command_id,
+            ),
+        )
+
+    async def _send_input_from_request(
+        self,
+        *,
+        task_id: str,
+        input_content: str,
+        attachments: list[AttachmentInput],
+        batch_id: str,
+        external_idempotency_key: str,
+        command_id: str,
+        mailbox_message_id: str,
+    ) -> TaskResponse:
         route = await self._router.get_route(task_id)
+        downstream_key = (
+            external_idempotency_key
+            if route.route_kind == "remote_ref"
+            else f"gateway-input:{command_id}"
+        )
+        return await self._send_input_effect(
+            route=route,
+            input_content=input_content,
+            attachments=attachments,
+            batch_id=batch_id,
+            downstream_idempotency_key=downstream_key,
+            mailbox_message_id=mailbox_message_id,
+        )
+
+    async def _send_input_effect(
+        self,
+        *,
+        route: TaskRouteRecord,
+        input_content: str,
+        attachments: list[AttachmentInput],
+        batch_id: str,
+        downstream_idempotency_key: str | None,
+        mailbox_message_id: str | None,
+    ) -> TaskResponse:
         if route.route_kind == "remote_ref":
             record = await self._router.send_input(
                 route,
                 input_content,
                 attachments=[
                     attachment.model_dump(mode="json")
-                    for attachment in (attachments or [])
+                    for attachment in attachments
                 ],
+                idempotency_key=downstream_idempotency_key,
             )
             return self._build_task_response(record, route.metadata)
 
         prepared_input = await self._prepare_input_with_attachments(
             input_content,
-            attachments or [],
-            task_id=task_id,
+            attachments,
+            batch_id=batch_id,
         )
         route_metadata = self._metadata_with_attachments(
             route.metadata,
             prepared_input.attachment_metadata,
         )
-        record = await self._router.send_input(route, prepared_input.content)
+        record = await self._router.send_input(
+            route,
+            prepared_input.content,
+            idempotency_key=downstream_idempotency_key,
+            mailbox_message_id=mailbox_message_id,
+        )
         if prepared_input.attachment_metadata:
             route.metadata = route_metadata
             await self._router.save_route(route)
         return self._build_task_response(record, route_metadata)
+
+    async def _claim_command(
+        self,
+        *,
+        principal_id: str,
+        idempotency_key: str,
+        operation: str,
+        target: str,
+        request_hash: str,
+        proposed_task_id: str,
+        proposed_mailbox_message_id: str | None = None,
+    ) -> GatewayCommandClaim:
+        deadline = asyncio.get_running_loop().time() + COMMAND_WAIT_TIMEOUT_SECONDS
+        while True:
+            try:
+                claim = await self._command_store.aclaim(
+                    principal_id=principal_id,
+                    idempotency_key=idempotency_key,
+                    operation=operation,
+                    target=target,
+                    request_hash=request_hash,
+                    proposed_task_id=proposed_task_id,
+                    proposed_mailbox_message_id=proposed_mailbox_message_id,
+                )
+            except GatewayCommandConflictError as exc:
+                raise GatewayTaskError(
+                    code="idempotency_key_reused",
+                    message=(
+                        "Idempotency-Key was already used for a different request"
+                    ),
+                ) from exc
+            if claim.status != "busy":
+                return claim
+            if asyncio.get_running_loop().time() >= deadline:
+                raise GatewayTaskError(
+                    code="idempotency_in_progress",
+                    message="A request with this Idempotency-Key is still in progress",
+                )
+            await asyncio.sleep(0.02)
+
+    async def _execute_claimed_command(
+        self,
+        claim: GatewayCommandClaim,
+        effect: Awaitable[TaskResponse],
+    ) -> GatewayCommandOutcome:
+        claim_token = claim.claim_token
+        if claim_token is None:
+            raise RuntimeError("Acquired Gateway command has no claim token")
+        try:
+            task = await effect
+            await self._command_store.acomplete(
+                command_id=claim.command_id,
+                claim_token=claim_token,
+                response_json=task.model_dump_json(),
+            )
+        except BaseException:
+            with suppress(BaseException):
+                await asyncio.shield(
+                    self._command_store.arelease(
+                        command_id=claim.command_id,
+                        claim_token=claim_token,
+                    )
+                )
+            raise
+        return GatewayCommandOutcome(task=task, replayed=False)
 
     async def cancel_task(self, task_id: str) -> TaskResponse:
         """取消正在运行的任务"""
@@ -506,7 +816,7 @@ class GatewayTaskModule:
         content: str,
         attachments: list[AttachmentInput],
         *,
-        task_id: str | None,
+        batch_id: str,
     ) -> PreparedInput:
         if not attachments:
             return PreparedInput(content=content, attachment_metadata=[])
@@ -517,7 +827,6 @@ class GatewayTaskModule:
                 code="runtime_unavailable",
                 message="Runtime workspace root is not configured",
             )
-        batch_id = task_id or str(uuid4())
         upload_items: list[tuple[str, bytes]] = []
         attachment_metadata: list[dict[str, str]] = []
         for index, attachment in enumerate(attachments, start=1):
@@ -814,6 +1123,41 @@ def _sanitize_attachment_name(name: str) -> str:
         for char in basename
     ).strip("._")
     return sanitized or "attachment"
+
+
+def _validate_idempotency_key(idempotency_key: str | None) -> None:
+    if idempotency_key is None:
+        return
+    if not 1 <= len(idempotency_key) <= 255 or any(
+        not 0x21 <= ord(char) <= 0x7E for char in idempotency_key
+    ):
+        raise GatewayTaskError(
+            code="invalid_request",
+            message=(
+                "Idempotency-Key must contain 1-255 visible ASCII characters "
+                "without whitespace"
+            ),
+        )
+
+
+def _command_request_hash(
+    *,
+    operation: str,
+    target: str,
+    body: dict[str, Any],
+) -> str:
+    canonical = json.dumps(
+        {
+            "operation": operation,
+            "target": target,
+            "body": body,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _guess_content_type(filename: str) -> str:

@@ -16,6 +16,14 @@ _Avoid_: bot service, platform service
 The persisted relationship between a channel identity and the active agent or current gateway task.
 _Avoid_: chat state, conversation cache
 
+**Channel Turn Receipt**:
+A durable record that binds a platform event idempotency key to the Gateway Task
+request fingerprint, the mutation selected for that Channel Turn, and its
+response. It lets a retried platform event replay the original outcome without
+selecting create versus continue again from mutable Channel Session or Task
+state, while rejecting reuse for different input.
+_Avoid_: event cache, exactly-once message
+
 **Gateway Task**:
 A long-lived agent session created through the Gateway control plane. It keeps a stable task/thread identity across multiple runs and can later be continued, reviewed, interrupted, or queried by channel turns. Its state describes the current or latest run; a settled run does not close the task.
 _Avoid_: job, request
@@ -23,6 +31,13 @@ _Avoid_: job, request
 **Gateway Task Module**:
 The transport-neutral module that exposes public Agent discovery and Gateway Task creation, continuation, review, cancellation, querying, artifact retrieval, and remote routing. HTTP and Channel code reach Gateway Tasks through adapters and do not own task policy.
 _Avoid_: HTTP service, gateway controller
+
+**Gateway Command**:
+A durable, idempotent mutation intent accepted by the Gateway Task Module. It
+binds one authenticated principal and external idempotency key to one canonical
+create-or-continue request, reserves stable effect identities, and stores the
+successful Gateway Task response for replay.
+_Avoid_: request cache, exactly-once run
 
 **Task Router**:
 The internal Gateway Task module that owns local/remote route persistence, runtime-record recovery, remote refresh, routed task operations, and routing error translation. It does not build transport responses or process attachment contents.
@@ -51,9 +66,13 @@ _Avoid_: default bot, current worker
 
 - A **Channel Adapter** produces **Channel Turns**.
 - A **Channel Turn** reads and updates one **Channel Session**.
+- A successful idempotent **Channel Turn** records a **Channel Turn Receipt**
+  atomically with its **Channel Session** update.
 - A **Channel Session** may point to one current **Gateway Task**.
 - A **Channel Adapter** reaches a **Gateway Task** through the **Gateway Task Module**.
 - The **Gateway Task Module** delegates execution and task state transitions to `AgentControl`.
+- A **Gateway Command** makes Gateway Task creation or continuation safely
+  retryable without claiming exactly-once model or tool side effects.
 - The **Gateway Task Module** delegates local and remote routing policy to the **Task Router**.
 - A **Review Command** resolves a pending review on one **Gateway Task**.
 - A **Task Watch** observes one run of one **Gateway Task**.

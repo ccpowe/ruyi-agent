@@ -4,6 +4,8 @@ import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
+
 from ruyi_agent.gateway.models import TaskRouteRecord
 from ruyi_agent.gateway.routing import TaskRouter
 from ruyi_agent.runtime.delegation.async_runtime import TaskRecord
@@ -100,6 +102,58 @@ async def _create_and_persist_local_route() -> None:
         assert routed.route.route_kind == "local"
         assert routed.route.upstream_task_id == "local-id"
         assert routed.route.metadata == {"source": "test"}
+    finally:
+        store.close()
+
+
+def test_route_store_rejects_identity_rebinding_without_overwrite() -> None:
+    store = GatewayRouteStore(":memory:")
+    original = TaskRouteRecord(
+        task_id="task-1",
+        agent_name="main",
+        metadata={"version": "original"},
+        route_kind="local",
+        upstream_task_id="task-1",
+    )
+    try:
+        store.save_route(original)
+        with pytest.raises(ValueError, match="binding conflict"):
+            store.save_route(
+                TaskRouteRecord(
+                    task_id="task-1",
+                    agent_name="remote",
+                    metadata={"version": "replacement"},
+                    route_kind="remote_ref",
+                    upstream_task_id="upstream-2",
+                )
+            )
+
+        assert store.get_route("task-1") == original
+    finally:
+        store.close()
+
+
+def test_route_store_updates_metadata_for_same_identity_binding() -> None:
+    store = GatewayRouteStore(":memory:")
+    original = TaskRouteRecord(
+        task_id="task-1",
+        agent_name="main",
+        metadata={"version": "original"},
+        route_kind="local",
+        upstream_task_id="task-1",
+    )
+    updated = TaskRouteRecord(
+        task_id="task-1",
+        agent_name="main",
+        metadata={"version": "updated"},
+        route_kind="local",
+        upstream_task_id="task-1",
+        webhook={"url": "https://example.test/hook"},
+    )
+    try:
+        store.save_route(original)
+        store.save_route(updated)
+        assert store.get_route("task-1") == updated
     finally:
         store.close()
 

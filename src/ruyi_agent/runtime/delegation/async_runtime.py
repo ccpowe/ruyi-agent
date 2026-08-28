@@ -160,6 +160,12 @@ class TaskAlreadyRunningError(ValueError):
     pass
 
 
+class DurableTaskMailboxRequiredError(RuntimeError):
+    """Idempotent local input requires a persistent Task Mailbox."""
+
+    pass
+
+
 class MaxDelegationDepthError(ValueError):
     """
     委托深度超过限制
@@ -797,7 +803,7 @@ class TaskManager:
     def _save(self, record: TaskRecord) -> None:
         """把当前任务记录写入持久化存储"""
         if self._store is not None:
-            self._store.save_task(record)
+            self._store.update_task(record)
 
     def _mirror_pending_review_to_root(self, record: TaskRecord) -> None:
         """Mirror a child review onto the root task for channel adapters."""
@@ -904,8 +910,11 @@ class TaskManager:
             skill_view_path=skill_view_path,
             skill_view_hash=skill_view_hash,
         )
+        if task_id in self._tasks:
+            raise ValueError(f"Task already exists: {task_id}")
+        if self._store is not None:
+            self._store.insert_task(record)
         self._tasks[task_id] = record
-        self._save(record)
         return record
 
     def get_task(self, task_id: str) -> TaskRecord:
@@ -2716,11 +2725,50 @@ class AgentControl:
             return await self._refresh_remote_task_with_retries(task_id)
         return record
 
+    def _existing_idempotent_task(
+        self,
+        *,
+        task_id: str,
+        agent_name: str,
+        entry: RegisteredAgent,
+        parent_task_id: str | None,
+        root_task_id: str,
+        depth: int,
+        delegation_context: DelegationContext,
+    ) -> TaskRecord | None:
+        """Return a compatible pre-existing task without overwriting its state."""
+
+        try:
+            record = self._task_manager.get_task(task_id)
+        except UnknownWorkerTaskError:
+            return None
+        expected_route_kind = (
+            "remote_ref" if isinstance(entry, RemoteRefEntry) else "local"
+        )
+        if (
+            record.agent_name != agent_name
+            or record.parent_task_id != parent_task_id
+            or record.root_task_id != root_task_id
+            or record.depth != depth
+            or record.route_kind != expected_route_kind
+            or record.delegation_root_id != delegation_context.root_id
+            or record.delegation_max_depth != delegation_context.max_depth
+            or record.delegation_max_tasks_per_root
+            != delegation_context.max_tasks_per_root
+            or record.delegation_visited_nodes != delegation_context.visited_nodes
+        ):
+            raise ValueError(
+                f"Task '{task_id}' already exists with a different binding"
+            )
+        return record
+
     async def spawn_task(
         self,
         agent_name: str,
         task: str,
         *,
+        task_id: str | None = None,
+        idempotency_key: str | None = None,
         parent_task_id: str | None = None,
         parent_thread_id: str | None = None,
         metadata: dict[str, Any] | None = None,
@@ -2738,6 +2786,8 @@ class AgentControl:
         Args:
             agent_name: 要委托的 agent 目标名称
             task: 任务输入内容
+            task_id: 调用方预留的稳定任务 ID；用于幂等 Gateway create
+            idempotency_key: 透传给 remote_ref Gateway 的幂等键
             parent_task_id: 父任务 ID
             parent_thread_id: 父 agent thread ID，用于 mailbox 回投
             metadata: 传给远端任务的 metadata
@@ -2756,7 +2806,7 @@ class AgentControl:
         """
         # 为什么提供结构化 spawn：Gateway 需要稳定的对象结果，而不是面向模型的描述字符串。
         entry = self._registry.get_entry(agent_name)
-        task_id = str(uuid.uuid4())
+        task_id = task_id or str(uuid.uuid4())
         permission_profile = self._resolve_permission_profile(
             entry=entry,
             parent_task_id=parent_task_id,
@@ -2770,6 +2820,25 @@ class AgentControl:
             self._resolve_task_skill_view(entry, parent_task_id=parent_task_id)
         )
         async with self._get_root_budget_lock(root_task_id):
+            existing = self._existing_idempotent_task(
+                task_id=task_id,
+                agent_name=agent_name,
+                entry=entry,
+                parent_task_id=parent_task_id,
+                root_task_id=root_task_id,
+                depth=depth,
+                delegation_context=task_context,
+            )
+            if existing is not None:
+                if (
+                    isinstance(entry, LocalWorkerEntry)
+                    and existing.state == "pending"
+                    and existing.run_count == 0
+                    and existing.active_run is None
+                ):
+                    self._start_run(task_id, task)
+                    return self._task_manager.get_task(task_id)
+                return existing
             self._enforce_delegation_limits(
                 root_task_id=root_task_id,
                 depth=depth,
@@ -2789,6 +2858,8 @@ class AgentControl:
                 webhook_config = self._build_webhook_config()
                 if webhook_config is not None:
                     create_kwargs["webhook"] = webhook_config
+                if idempotency_key is not None:
+                    create_kwargs["idempotency_key"] = idempotency_key
                 payload = await self._a2a_client.create_task(
                     entry.ref,
                     **create_kwargs,
@@ -2849,6 +2920,8 @@ class AgentControl:
         message: str,
         *,
         attachments: list[dict[str, Any]] | None = None,
+        idempotency_key: str | None = None,
+        mailbox_message_id: str | None = None,
     ) -> TaskRecord:
         """
         向已有任务发送后续输入
@@ -2874,11 +2947,16 @@ class AgentControl:
             if record.state in ACTIVE_TASK_STATES:
                 record = await self._refresh_remote_task_with_retries(task_id)
             entry = self._get_remote_entry_for_task(task_id)
+            send_kwargs: dict[str, Any] = {
+                "task_id": record.upstream_task_id or task_id,
+                "input_content": message,
+                "attachments": attachments,
+            }
+            if idempotency_key is not None:
+                send_kwargs["idempotency_key"] = idempotency_key
             payload = await self._a2a_client.send_input(
                 entry.ref,
-                task_id=record.upstream_task_id or task_id,
-                input_content=message,
-                attachments=attachments,
+                **send_kwargs,
             )
             return self._task_manager.sync_remote_task(task_id, payload)
         if record.state == "waiting_for_human":
@@ -2888,6 +2966,12 @@ class AgentControl:
         if record.state not in ACTIVE_TASK_STATES | RESUMABLE_TASK_STATES:
             raise ValueError(
                 f"Task '{task_id}' cannot receive input in state={record.state}"
+            )
+        if idempotency_key is not None and (
+            self._mailbox is None or not self._mailbox.is_durable
+        ):
+            raise DurableTaskMailboxRequiredError(
+                "Idempotent local input requires a durable Task Mailbox"
             )
         if self._mailbox is None:
             if record.state in ACTIVE_TASK_STATES:
@@ -2902,6 +2986,8 @@ class AgentControl:
             recipient_thread_id=record.thread_id,
             content=message,
             trigger_run=True,
+            idempotency_key=idempotency_key,
+            message_id=mailbox_message_id,
         )
         # Active runs consume this at their next before_model boundary. Settled
         # tasks are resumed immediately; the done callback covers the race where

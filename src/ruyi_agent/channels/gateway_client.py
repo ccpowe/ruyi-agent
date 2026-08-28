@@ -43,6 +43,7 @@ class GatewayTaskClient(Protocol):
         content: str,
         metadata: dict[str, str],
         attachments: list[dict[str, str]] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def send_input(
@@ -51,6 +52,7 @@ class GatewayTaskClient(Protocol):
         task_id: str,
         content: str,
         attachments: list[dict[str, str]] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def download_artifact(self, *, path: str) -> GatewayArtifact: ...
@@ -129,6 +131,7 @@ class GatewayHTTPClient:
         content: str,
         metadata: dict[str, str],
         attachments: list[dict[str, str]] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         input_payload: dict[str, Any] = {"content": content}
         if attachments:
@@ -137,6 +140,7 @@ class GatewayHTTPClient:
             "POST",
             f"/agents/{agent_name}/tasks",
             json={"input": input_payload, "metadata": metadata},
+            idempotency_key=idempotency_key,
         )
 
     async def send_input(
@@ -145,6 +149,7 @@ class GatewayHTTPClient:
         task_id: str,
         content: str,
         attachments: list[dict[str, str]] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         input_payload: dict[str, Any] = {"content": content}
         if attachments:
@@ -153,6 +158,7 @@ class GatewayHTTPClient:
             "POST",
             f"/tasks/{task_id}/input",
             json={"input": input_payload},
+            idempotency_key=idempotency_key,
         )
 
     async def download_artifact(self, *, path: str) -> GatewayArtifact:
@@ -212,11 +218,14 @@ class GatewayHTTPClient:
         *,
         params: dict[str, str] | None = None,
         json: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         headers = {
             "Authorization": f"Bearer {self._bearer_token}",
             "Accept": "application/json",
         }
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
         async with httpx.AsyncClient(
             base_url=self._base_url,
             timeout=self._timeout,
