@@ -136,9 +136,15 @@ def _extract_result_content(result: Any) -> str:
 
 
 def normalize_agent_turn_result(result: Any) -> AgentTurnOutcome:
-    value = getattr(result, "value", None)
-    if value is not None:
-        return normalize_agent_turn_result(value)
+    interrupts = getattr(result, "interrupts", None)
+    if hasattr(result, "value"):
+        value = getattr(result, "value")
+        outcome = normalize_agent_turn_result(value)
+        if not outcome.review_payloads and interrupts:
+            outcome.review_payloads = extract_review_payloads(
+                {"__interrupt__": interrupts}
+            )
+        return outcome
     review_payloads = extract_review_payloads(result)
     unresolved_tool_calls = has_unresolved_tool_calls(result)
     return AgentTurnOutcome(

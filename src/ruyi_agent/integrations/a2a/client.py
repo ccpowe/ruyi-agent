@@ -20,12 +20,30 @@ A2A Client - Agent-to-Agent 协议客户端
 
 from __future__ import annotations
 
+import asyncio
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
 
 from ruyi_agent.config.loader import RemoteRef
+from ruyi_agent.gateway.sse import (
+    GatewayTaskEvent,
+    MAX_SSE_ERROR_READ_SECONDS,
+    MAX_SSE_HANDSHAKE_SECONDS,
+    SSEProtocolError,
+    decode_sse_error_json,
+    has_identity_content_encoding,
+    iter_gateway_task_events,
+    iter_utf8_sse_lines,
+    read_bounded_sse_error_body,
+)
+from ruyi_agent.runtime.task_events import (
+    MAX_SHORT_EVENT_TEXT_LENGTH,
+    normalize_task_event_text,
+)
 
 
 class A2AClientError(Exception):
@@ -186,6 +204,107 @@ class A2AClient:
             f"tasks/{task_id}/messages",
             params=params,
         )
+
+    @asynccontextmanager
+    async def open_task_event_stream(
+        self,
+        remote_ref: RemoteRef,
+        *,
+        task_id: str,
+        run_count: int,
+        last_event_id: str | None,
+    ) -> AsyncIterator[AsyncIterator[GatewayTaskEvent]]:
+        """Open a downstream Task SSE stream and keep its response alive."""
+
+        headers = self._build_headers(remote_ref)
+        headers["Accept"] = "text/event-stream"
+        headers["Accept-Encoding"] = "identity"
+        if last_event_id is not None:
+            headers["Last-Event-ID"] = last_event_id
+        timeout = httpx.Timeout(self._timeout, read=None)
+        async with httpx.AsyncClient(
+            base_url=remote_ref.url,
+            timeout=timeout,
+            headers=headers,
+            transport=self._transports.get(remote_ref.url),
+        ) as client:
+            response_context = client.stream(
+                "GET",
+                f"tasks/{task_id}/events",
+                params={"run_count": str(run_count)},
+            )
+            try:
+                async with asyncio.timeout(
+                    min(
+                        max(self._timeout, 0.001),
+                        MAX_SSE_HANDSHAKE_SECONDS,
+                    )
+                ):
+                    response = await response_context.__aenter__()
+            except (TimeoutError, httpx.HTTPError) as exc:
+                raise A2AClientError(
+                    status_code=502,
+                    code="upstream_gateway_error",
+                    message=f"Remote Task event stream failed for '{remote_ref.name}'",
+                ) from exc
+            try:
+                try:
+                    if response.status_code != 200:
+                        if not has_identity_content_encoding(
+                            response.headers.get("content-encoding", "")
+                        ):
+                            raise A2AClientError(
+                                status_code=502,
+                                code="upstream_gateway_error",
+                                message=(
+                                    f"Remote gateway for '{remote_ref.name}' "
+                                    "returned an invalid Task event error"
+                                ),
+                            )
+                        chunks = (
+                            response.aiter_bytes()
+                            if response.is_stream_consumed
+                            else response.aiter_raw()
+                        )
+                        body = await read_bounded_sse_error_body(
+                            chunks,
+                            timeout_seconds=min(
+                                max(self._timeout, 0.001),
+                                MAX_SSE_ERROR_READ_SECONDS,
+                            ),
+                        )
+                        raise _task_event_response_error(
+                            remote_ref,
+                            response,
+                            body,
+                        )
+                    content_type = response.headers.get("content-type", "")
+                    if content_type.partition(";")[0].strip().lower() != (
+                        "text/event-stream"
+                    ) or not has_identity_content_encoding(
+                        response.headers.get("content-encoding", "")
+                    ):
+                        raise A2AClientError(
+                            status_code=502,
+                            code="upstream_gateway_error",
+                            message=(
+                                f"Remote gateway for '{remote_ref.name}' returned "
+                                "an invalid Task event stream"
+                            ),
+                        )
+                except A2AClientError:
+                    raise
+                except (httpx.HTTPError, SSEProtocolError) as exc:
+                    raise A2AClientError(
+                        status_code=502,
+                        code="upstream_gateway_error",
+                        message=(
+                            f"Remote Task event stream failed for '{remote_ref.name}'"
+                        ),
+                    ) from exc
+                yield _iter_remote_task_events(response, remote_ref)
+            finally:
+                await response_context.__aexit__(None, None, None)
 
     async def send_input(
         self,
@@ -455,3 +574,90 @@ class A2AClient:
         # 添加 Authorization header
         headers["Authorization"] = f"Bearer {token}"
         return headers
+
+
+async def _iter_remote_task_events(
+    response: httpx.Response,
+    remote_ref: RemoteRef,
+) -> AsyncIterator[GatewayTaskEvent]:
+    try:
+        chunks = (
+            response.aiter_bytes()
+            if response.is_stream_consumed
+            else response.aiter_raw()
+        )
+        lines = iter_utf8_sse_lines(chunks)
+        async for event in iter_gateway_task_events(lines):
+            yield event
+            if event.event_type == "stream.end":
+                return
+        raise SSEProtocolError("Remote Task event stream ended without stream.end")
+    except (httpx.HTTPError, SSEProtocolError) as exc:
+        raise A2AClientError(
+            status_code=502,
+            code="upstream_gateway_error",
+            message=f"Remote Task event stream failed for '{remote_ref.name}'",
+        ) from exc
+
+
+def _task_event_response_error(
+    remote_ref: RemoteRef,
+    response: httpx.Response,
+    body: bytes,
+) -> A2AClientError:
+    try:
+        payload = decode_sse_error_json(body)
+    except SSEProtocolError:
+        payload = None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    raw_message = error.get("message") if isinstance(error, dict) else None
+    message = (
+        normalize_task_event_text(raw_message)[:MAX_SHORT_EVENT_TEXT_LENGTH]
+        if isinstance(raw_message, str)
+        else None
+    )
+    if (
+        response.status_code == 400
+        and code == "invalid_request"
+        and isinstance(message, str)
+    ) or (
+        response.status_code == 409
+        and code == "task_run_mismatch"
+        and isinstance(message, str)
+    ):
+        return A2AClientError(
+            status_code=response.status_code,
+            code=code,
+            message=message,
+            details=(
+                _task_run_mismatch_details(error.get("details"))
+                if response.status_code == 409
+                else None
+            ),
+        )
+    return A2AClientError(
+        status_code=502,
+        code="upstream_gateway_error",
+        message=f"Remote Task event stream failed for '{remote_ref.name}'",
+    )
+
+
+def _task_run_mismatch_details(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, dict):
+        return None
+    requested = value.get("requested_run_count")
+    current = value.get("current_run_count")
+    if (
+        not isinstance(requested, int)
+        or isinstance(requested, bool)
+        or requested < 0
+        or not isinstance(current, int)
+        or isinstance(current, bool)
+        or current < 0
+    ):
+        return None
+    return {
+        "requested_run_count": requested,
+        "current_run_count": current,
+    }

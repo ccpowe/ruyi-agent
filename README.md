@@ -264,6 +264,28 @@ LangChain 消息 dump 或不可变审计日志。它不包含 system prompt、�
 结果正文仍属于任务数据，可能包含敏感内容。Remote Task 会把查询和不透明游标代理
 到下游 Gateway；旧版本下游不支持该接口时会明确返回上游错误，不会伪装成空记录。
 
+订阅某一轮任务的实时事件：
+
+```bash
+curl -N \
+  -H "Authorization: Bearer $GATEWAY_BEARER_TOKEN" \
+  -H "Accept: text/event-stream" \
+  'http://127.0.0.1:8000/tasks/{task_id}/events?run_count={run_count}'
+```
+
+`run_count` 必填，并把连接固定在任务的某一轮。首次连接先收到带不透明 `id`
+的 `task.snapshot`，随后可能收到无 `id`、不持久化的 `assistant.delta`，以及带
+`id` 的生命周期事件；每条流最终以无 `id` 的 `stream.end` 结束。断线重连时把
+最后收到的 `id` 原样放入 `Last-Event-ID` 请求头。完整消息恢复仍使用
+`/tasks/{task_id}/messages`，不能依赖可能因慢客户端而丢弃或截短的 delta。
+过大的持久化公开字段会在写入事件账本前按编码字节预算截短，并附带对应的
+`*_truncated: true` 标记，确保该事件在首次连接和游标重放时始终可传输。
+
+事件流沿用 Gateway Bearer Token，token 不接受 query 参数。浏览器原生
+`EventSource` 不能设置 `Authorization` 请求头，因此浏览器端应使用带请求头的
+`fetch`/`ReadableStream`，或通过已认证的同源后端代理。Remote Task 会验证并代理
+下游 SSE，游标保持不透明且逐层原样传递。
+
 提交 HITL 审批：
 
 ```bash

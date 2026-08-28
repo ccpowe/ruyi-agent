@@ -28,8 +28,8 @@ import base64
 import binascii
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
-from contextlib import suppress
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
@@ -59,6 +59,7 @@ from ruyi_agent.runtime.delegation.async_runtime import (
     PublishedArtifact,
     TaskRecord,
 )
+from ruyi_agent.runtime.task_events import TaskStreamEvent
 from ruyi_agent.runtime.delegation.context import DelegationContext
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
 from ruyi_agent.storage.gateway_command_store import (
@@ -402,6 +403,33 @@ class GatewayTaskModule:
             ],
             next_cursor=page.next_cursor,
         )
+
+    @asynccontextmanager
+    async def open_task_event_stream(
+        self,
+        task_id: str,
+        *,
+        run_count: int,
+        last_event_id: str | None,
+    ) -> AsyncIterator[AsyncIterator[TaskStreamEvent]]:
+        """Open one authenticated adapter-neutral fixed-run Task event stream."""
+
+        if (
+            not isinstance(run_count, int)
+            or isinstance(run_count, bool)
+            or run_count < 0
+        ):
+            raise GatewayTaskError(
+                code="invalid_request",
+                message="Query parameter 'run_count' must be a non-negative integer",
+            )
+        route = await self._router.get_route(task_id)
+        async with self._router.open_task_event_stream(
+            route,
+            run_count=run_count,
+            last_event_id=last_event_id,
+        ) as events:
+            yield events
 
     async def send_input(
         self,

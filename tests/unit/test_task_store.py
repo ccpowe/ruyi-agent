@@ -124,3 +124,51 @@ def test_task_store_update_requires_existing_identity(tmp_path) -> None:
         assert loaded.result == "done"
     finally:
         store.close()
+
+
+def test_task_store_rolls_back_task_update_when_event_append_fails(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = TaskStore(str(tmp_path / "tasks.sqlite"))
+    record = TaskRecord(
+        task_id="task-1",
+        agent_name="main",
+        state="running",
+        thread_id="task-1",
+        parent_task_id=None,
+        root_task_id="task-1",
+        depth=0,
+        created_at=datetime(2026, 8, 28, tzinfo=UTC),
+        updated_at=datetime(2026, 8, 28, tzinfo=UTC),
+        run_count=1,
+    )
+    try:
+        store.insert_task(record)
+        record.state = "completed"
+        record.result = "must roll back"
+
+        def fail_append(**kwargs):
+            del kwargs
+            raise RuntimeError("event append failed")
+
+        monkeypatch.setattr(store, "_append_task_event_locked", fail_append)
+        with pytest.raises(RuntimeError, match="event append failed"):
+            store.update_task_with_event(
+                record,
+                event_type="task.completed",
+                event_data={"status": "completed"},
+                event_created_at=record.updated_at,
+            )
+
+        loaded = store.get_task(record.task_id)
+        assert loaded is not None
+        assert loaded.state == "running"
+        assert loaded.result is None
+        assert store.list_task_events(
+            task_id=record.task_id,
+            run_count=1,
+            after_event_id=0,
+        ) == []
+    finally:
+        store.close()

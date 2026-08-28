@@ -47,6 +47,13 @@ media blocks, and provider metadata. It is conversation state, not an immutable
 request or audit log.
 _Avoid_: raw message dump, event log, run history
 
+**Task Event Stream**:
+An authenticated, fixed-run SSE view of one Gateway Task. It starts from a
+current snapshot or resumes from an opaque durable lifecycle cursor, may carry
+best-effort public assistant text deltas while the run is live, and ends when
+that run settles, requests review, or is superseded.
+_Avoid_: raw model stream, complete message history, workflow event bus
+
 **Task Router**:
 The internal Gateway Task module that owns local/remote route persistence, runtime-record recovery, remote refresh, routed task operations, and routing error translation. It does not build transport responses or process attachment contents.
 _Avoid_: route helper, remote task utility
@@ -84,6 +91,9 @@ _Avoid_: default bot, current worker
 - A **Task Message Transcript** projects one durable checkpoint of a **Gateway
   Task** and is independently paged from the latest Task status.
 - The **Gateway Task Module** delegates local and remote routing policy to the **Task Router**.
+- A **Task Event Stream** observes one run without owning or cancelling its
+  execution; durable lifecycle recovery and complete conversation recovery are
+  separate from transient text deltas.
 - A **Review Command** resolves a pending review on one **Gateway Task**.
 - A **Task Watch** observes one run of one **Gateway Task**.
 - A **Task Mailbox** delivers input to one **Gateway Task** without defining

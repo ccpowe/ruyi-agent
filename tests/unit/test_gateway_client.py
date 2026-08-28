@@ -4,11 +4,46 @@ import asyncio
 from typing import Any
 
 import httpx
+import pytest
 
 from ruyi_agent.channels.gateway_client import (
+    GatewayClientError,
     GatewayHTTPClient,
     _filename_from_content_disposition,
 )
+from ruyi_agent.gateway.sse import MAX_SSE_ERROR_BODY_BYTES
+
+
+class NeverRespondingTransport(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        del request
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class HangingErrorStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def __aiter__(self):
+        yield b'{"error":{"code":"invalid_request"'
+        await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class ErrorStreamTransport(httpx.AsyncBaseTransport):
+    def __init__(self, stream: httpx.AsyncByteStream) -> None:
+        self.stream = stream
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            400,
+            headers={"content-type": "application/json"},
+            stream=self.stream,
+        )
 
 
 class FakeGatewayHTTPClient(GatewayHTTPClient):
@@ -174,3 +209,256 @@ def test_gateway_http_client_returns_complete_message_page() -> None:
         "cursor": "current-page",
         "limit": "7",
     }
+
+
+def test_gateway_http_client_streams_task_events_and_forwards_cursor() -> None:
+    requests: list[httpx.Request] = []
+    body = (
+        'id: opaque-cursor\n'
+        'event: task.completed\n'
+        'data: {"task_id":"task-1","run_count":2,'
+        '"created_at":"2026-08-28T12:00:00+00:00",'
+        '"status":"completed","last_result":"done","error":null,'
+        '"updated_at":"2026-08-28T12:00:00+00:00",'
+        '"pending_review":null,"artifacts":[]}\n\n'
+        'event: stream.end\n'
+        'data: {"task_id":"task-1","run_count":2,'
+        '"created_at":"2026-08-28T12:00:01+00:00",'
+        '"reason":"completed"}\n\n'
+    ).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream; charset=utf-8"},
+            content=body,
+        )
+
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def scenario():
+        async with client.stream_task_events(
+            task_id="task-1",
+            run_count=2,
+            last_event_id="previous-cursor",
+        ) as events:
+            return [event async for event in events]
+
+    events = asyncio.run(scenario())
+    assert [event.event_type for event in events] == [
+        "task.completed",
+        "stream.end",
+    ]
+    assert events[0].event_id == "opaque-cursor"
+    assert events[0].data["last_result"] == "done"
+    assert requests[0].headers["authorization"] == "Bearer token"
+    assert requests[0].headers["last-event-id"] == "previous-cursor"
+    assert requests[0].headers["accept"] == "text/event-stream"
+    assert requests[0].headers["accept-encoding"] == "identity"
+    assert dict(requests[0].url.params) == {"run_count": "2"}
+
+
+def test_gateway_http_client_rejects_non_sse_success_response() -> None:
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"status": "completed"})
+        ),
+    )
+
+    async def scenario() -> None:
+        async with client.stream_task_events(task_id="task-1", run_count=1):
+            raise AssertionError("invalid stream must fail before yielding")
+
+    with pytest.raises(GatewayClientError) as exc_info:
+        asyncio.run(scenario())
+    assert exc_info.value.status_code == 502
+
+
+def test_gateway_http_client_rejects_content_encoded_sse() -> None:
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={
+                    "content-type": "text/event-stream",
+                    "content-encoding": "gzip",
+                },
+                content=b"compressed bytes are not parsed",
+            )
+        ),
+    )
+
+    async def scenario() -> None:
+        async with client.stream_task_events(task_id="task-1", run_count=1):
+            raise AssertionError("encoded stream must fail before yielding")
+
+    with pytest.raises(GatewayClientError) as exc_info:
+        asyncio.run(scenario())
+    assert exc_info.value.status_code == 502
+
+
+def test_gateway_http_client_bounds_the_stream_handshake() -> None:
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        timeout=0.01,
+        transport=NeverRespondingTransport(),
+    )
+
+    async def scenario() -> None:
+        async with client.stream_task_events(task_id="task-1", run_count=1):
+            raise AssertionError("a hanging handshake must not yield")
+
+    with pytest.raises(GatewayClientError) as exc_info:
+        asyncio.run(scenario())
+    assert exc_info.value.status_code == 502
+
+
+def test_gateway_http_client_bounds_a_hanging_error_body() -> None:
+    stream = HangingErrorStream()
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        timeout=0.01,
+        transport=ErrorStreamTransport(stream),
+    )
+
+    async def scenario() -> None:
+        async with client.stream_task_events(task_id="task-1", run_count=1):
+            raise AssertionError("a hanging error body must not yield")
+
+    with pytest.raises(GatewayClientError) as exc_info:
+        asyncio.run(scenario())
+    assert exc_info.value.status_code == 502
+    assert stream.closed is True
+
+
+def test_gateway_http_client_rejects_oversized_error_body() -> None:
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                400,
+                content=b"x" * (MAX_SSE_ERROR_BODY_BYTES + 1),
+            )
+        ),
+    )
+
+    async def scenario() -> None:
+        async with client.stream_task_events(task_id="task-1", run_count=1):
+            raise AssertionError("an oversized error body must not yield")
+
+    with pytest.raises(GatewayClientError) as exc_info:
+        asyncio.run(scenario())
+    assert exc_info.value.status_code == 502
+
+
+def test_gateway_http_client_sanitizes_error_text() -> None:
+    body = (
+        b'{"error":{"code":"invalid\\ud800request",'
+        b'"message":"bad\\ud800message"}}'
+    )
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(400, content=body)
+        ),
+    )
+
+    async def scenario() -> None:
+        async with client.stream_task_events(task_id="task-1", run_count=1):
+            raise AssertionError("an error response must not yield")
+
+    with pytest.raises(GatewayClientError) as exc_info:
+        asyncio.run(scenario())
+    assert exc_info.value.code == "invalid\ufffdrequest"
+    assert exc_info.value.message == "bad\ufffdmessage"
+
+
+def test_gateway_http_client_maps_deep_error_json_to_client_error() -> None:
+    body = (
+        b'{"error":'
+        + (b"[" * 10_000)
+        + b"0"
+        + (b"]" * 10_000)
+        + b"}"
+    )
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(400, content=body)
+        ),
+    )
+
+    async def scenario() -> None:
+        async with client.stream_task_events(task_id="task-1", run_count=1):
+            raise AssertionError("deep JSON must not yield")
+
+    with pytest.raises(GatewayClientError) as exc_info:
+        asyncio.run(scenario())
+    assert exc_info.value.status_code == 502
+
+
+def test_gateway_http_client_requires_stream_end_before_clean_eof() -> None:
+    body = b'event: assistant.delta\ndata: {"content":"partial"}\n\n'
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=body,
+            )
+        ),
+    )
+
+    async def scenario() -> None:
+        async with client.stream_task_events(
+            task_id="task-1",
+            run_count=1,
+        ) as events:
+            assert (await anext(events)).event_type == "assistant.delta"
+            await anext(events)
+
+    with pytest.raises(GatewayClientError) as exc_info:
+        asyncio.run(scenario())
+    assert exc_info.value.status_code == 502
+
+
+def test_gateway_http_client_discards_unterminated_stream_end() -> None:
+    body = b'event: stream.end\ndata: {"reason":"completed"}'
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=body,
+            )
+        ),
+    )
+
+    async def scenario() -> None:
+        async with client.stream_task_events(
+            task_id="task-1",
+            run_count=1,
+        ) as events:
+            await anext(events)
+
+    with pytest.raises(GatewayClientError) as exc_info:
+        asyncio.run(scenario())
+    assert exc_info.value.status_code == 502

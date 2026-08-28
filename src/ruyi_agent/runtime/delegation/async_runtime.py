@@ -36,6 +36,7 @@ import asyncio
 import inspect
 import logging
 import uuid
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from collections.abc import Mapping, Sequence
@@ -44,7 +45,7 @@ from typing import Any
 import httpx
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
-from langgraph.types import Command
+from langgraph.types import Command, GraphOutput
 from pydantic import BaseModel, Field
 
 from ruyi_agent.integrations.a2a.client import A2AClient, A2AClientError
@@ -65,6 +66,17 @@ from ruyi_agent.runtime.message_history import (
     TaskMessageSnapshot,
     TaskMessageStateReader,
 )
+from ruyi_agent.runtime.task_events import (
+    TaskEventLedger,
+    TaskEventSubscription,
+    TaskEventsUnavailableError,
+    assistant_delta_from_stream_part,
+    artifact_event_data,
+    lifecycle_event_data,
+    lifecycle_event_type,
+    normalize_task_event_text,
+    public_task_event_fingerprint,
+)
 from ruyi_agent.storage.task_store import TaskStore, task_record_for_restart
 from ruyi_agent.control_plane.permissions import PermissionPolicy
 from ruyi_agent.storage.review_audit import ReviewAuditStore
@@ -73,6 +85,7 @@ from ruyi_agent.runtime.skills.sync import SkillSyncer
 from ruyi_agent.runtime.skills.types import SkillEntry
 
 logger = logging.getLogger(__name__)
+_MISSING_STREAM_VALUE = object()
 
 # 显式把已登记的目标写进 tool description，
 # 这样模型在调用 spawn_agent 时能拿到合法名称，也能区分本地 worker 和远端引用。
@@ -223,6 +236,26 @@ def _now() -> datetime:
     """返回当前 UTC 时间"""
     # 为什么抽成单独时间入口：任务状态和测试都依赖统一时间语义，避免时间来源散落各处。
     return datetime.now(UTC)
+
+
+def _validate_remote_task_state(
+    task_id: str,
+    payload: dict[str, Any],
+) -> tuple[str, int]:
+    status = payload.get("status")
+    if (
+        not isinstance(status, str)
+        or status not in ACTIVE_TASK_STATES | SETTLED_TASK_STATES
+    ):
+        raise ValueError(f"Remote task '{task_id}' returned invalid status")
+    run_count = payload.get("run_count")
+    if (
+        not isinstance(run_count, int)
+        or isinstance(run_count, bool)
+        or run_count < 0
+    ):
+        raise ValueError(f"Remote task '{task_id}' returned invalid run_count")
+    return status, run_count
 
 
 def _flatten_exception_messages(exc: BaseException) -> list[str]:
@@ -732,6 +765,11 @@ class TaskManager:
         # 为什么有 task manager：异步子任务的状态、结果、取消和等待必须由一个中心层统一管理。
         self._tasks: dict[str, TaskRecord] = {}
         self._store = store
+        self._event_ledger = TaskEventLedger(store) if store is not None else None
+
+    @property
+    def event_ledger(self) -> TaskEventLedger | None:
+        return self._event_ledger
 
     def load_by_parent_thread_id(self, parent_thread_id: str) -> None:
         """
@@ -749,7 +787,7 @@ class TaskManager:
             record = task_record_for_restart(stored)
             self._tasks[record.task_id] = record
             if record.state != stored.state or record.error != stored.error:
-                self._save(record)
+                self._save_lifecycle(record)
 
     def load_task_for_parent_thread(
         self,
@@ -777,7 +815,7 @@ class TaskManager:
         record = task_record_for_restart(stored)
         self._tasks[record.task_id] = record
         if record.state != stored.state or record.error != stored.error:
-            self._save(record)
+            self._save_lifecycle(record)
         return record
 
     def load_task_by_id(self, task_id: str) -> TaskRecord | None:
@@ -798,7 +836,7 @@ class TaskManager:
         record = task_record_for_restart(stored)
         self._tasks[record.task_id] = record
         if record.state != stored.state or record.error != stored.error:
-            self._save(record)
+            self._save_lifecycle(record)
         return record
 
     def _has_live_active_run(self, record: TaskRecord) -> bool:
@@ -809,6 +847,18 @@ class TaskManager:
         if self._store is not None:
             self._store.update_task(record)
 
+    def _save_lifecycle(self, record: TaskRecord) -> None:
+        """Atomically persist one public lifecycle transition and its event."""
+
+        if self._event_ledger is not None:
+            self._event_ledger.update_task(
+                record,
+                event_type=lifecycle_event_type(record),
+                event_data=lifecycle_event_data(record),
+            )
+            return
+        self._save(record)
+
     def _mirror_pending_review_to_root(self, record: TaskRecord) -> None:
         """Mirror a child review onto the root task for channel adapters."""
         if record.root_task_id == record.task_id:
@@ -818,13 +868,24 @@ class TaskManager:
             root = self.load_task_by_id(record.root_task_id)
         if root is None:
             return
+        previous_fingerprint = public_task_event_fingerprint(root)
         payload = dict(record.pending_review or {})
         if not payload:
             return
         payload["source_task_id"] = record.task_id
         root.pending_review = payload
         root.updated_at = _now()
-        self._save(root)
+        if (
+            self._event_ledger is not None
+            and public_task_event_fingerprint(root) != previous_fingerprint
+        ):
+            self._event_ledger.update_task(
+                root,
+                event_type="task.review_requested",
+                event_data=lifecycle_event_data(root),
+            )
+        else:
+            self._save(root)
 
     def _clear_mirrored_pending_review_from_root(self, record: TaskRecord) -> None:
         """Clear the mirrored root review once the child review is resolved."""
@@ -838,9 +899,20 @@ class TaskManager:
         pending_review = root.pending_review or {}
         if pending_review.get("source_task_id") != record.task_id:
             return
+        previous_fingerprint = public_task_event_fingerprint(root)
         root.pending_review = None
         root.updated_at = _now()
-        self._save(root)
+        if (
+            self._event_ledger is not None
+            and public_task_event_fingerprint(root) != previous_fingerprint
+        ):
+            self._event_ledger.update_task(
+                root,
+                event_type=lifecycle_event_type(root),
+                event_data=lifecycle_event_data(root),
+            )
+        else:
+            self._save(root)
 
     def create_task_record(
         self,
@@ -916,7 +988,13 @@ class TaskManager:
         )
         if task_id in self._tasks:
             raise ValueError(f"Task already exists: {task_id}")
-        if self._store is not None:
+        if self._event_ledger is not None:
+            self._event_ledger.insert_task(
+                record,
+                event_type="task.created",
+                event_data=lifecycle_event_data(record),
+            )
+        elif self._store is not None:
             self._store.insert_task(record)
         self._tasks[task_id] = record
         return record
@@ -964,7 +1042,7 @@ class TaskManager:
             record = task_record_for_restart(stored)
             self._tasks[record.task_id] = record
             if record.state != stored.state or record.error != stored.error:
-                self._save(record)
+                self._save_lifecycle(record)
         return self.list_tasks()
 
     def find_by_review_id(self, review_id: str) -> TaskRecord | None:
@@ -1040,14 +1118,21 @@ class TaskManager:
         self._clear_mirrored_pending_review_from_root(record)
         record.pending_review = None
         record.error = None
-        self._save(record)
+        self._save_lifecycle(record)
 
     def add_artifact(self, task_id: str, artifact: PublishedArtifact) -> None:
         """Append a published artifact manifest to a task."""
         record = self.get_task(task_id)
         record.artifacts.append(artifact)
         record.updated_at = _now()
-        self._save(record)
+        if self._event_ledger is not None:
+            self._event_ledger.update_task(
+                record,
+                event_type="task.artifact_published",
+                event_data=artifact_event_data(record, artifact),
+            )
+        else:
+            self._save(record)
 
     def mark_mailbox_delivered(self, task_id: str) -> None:
         """记录当前 run 的 mailbox 消息已经成功入队。"""
@@ -1077,7 +1162,7 @@ class TaskManager:
         record.active_run = None
         record.pending_review = pending_review
         record.error = None
-        self._save(record)
+        self._save_lifecycle(record)
         self._mirror_pending_review_to_root(record)
 
     def mark_completed(self, task_id: str, result: str) -> None:
@@ -1091,13 +1176,13 @@ class TaskManager:
         # 为什么单独标记 completed：wait/check 依赖稳定的本轮状态和结果。
         record = self.get_task(task_id)
         record.state = "completed"
-        record.result = result
+        record.result = normalize_task_event_text(result)
         record.error = None
         record.updated_at = _now()
         record.active_run = None
         self._clear_mirrored_pending_review_from_root(record)
         record.pending_review = None
-        self._save(record)
+        self._save_lifecycle(record)
 
     def mark_failed(self, task_id: str, error: str) -> None:
         """
@@ -1110,12 +1195,12 @@ class TaskManager:
         # 为什么单独标记 failed：失败应保留为结构化状态，而不是只在日志中消失。
         record = self.get_task(task_id)
         record.state = "failed"
-        record.error = error
+        record.error = normalize_task_event_text(error)
         record.updated_at = _now()
         record.active_run = None
         self._clear_mirrored_pending_review_from_root(record)
         record.pending_review = None
-        self._save(record)
+        self._save_lifecycle(record)
 
     def mark_cancelled(self, task_id: str) -> None:
         """
@@ -1133,7 +1218,7 @@ class TaskManager:
         self._clear_mirrored_pending_review_from_root(record)
         record.pending_review = None
         record.error = None
-        self._save(record)
+        self._save_lifecycle(record)
 
     def mark_interrupted(self, task_id: str, error: str) -> None:
         """
@@ -1144,13 +1229,13 @@ class TaskManager:
         """
         record = self.get_task(task_id)
         record.state = "interrupted"
-        record.error = error
+        record.error = normalize_task_event_text(error)
         record.updated_at = _now()
         record.active_run = None
         record.cancel_requested = False
         self._clear_mirrored_pending_review_from_root(record)
         record.pending_review = None
-        self._save(record)
+        self._save_lifecycle(record)
 
     def sync_remote_task(self, task_id: str, payload: dict[str, Any]) -> TaskRecord:
         """
@@ -1168,21 +1253,20 @@ class TaskManager:
         """
         # 为什么集中同步远端状态：CLI 和 wait/check/send_input/cancel 都需要一致地映射远端任务视图。
         record = self.get_task(task_id)
-        status = payload.get("status")
-        if not isinstance(status, str) or not status:
-            raise ValueError(f"Remote task '{task_id}' returned invalid status")
-
-        run_count = payload.get("run_count")
-        if not isinstance(run_count, int):
-            raise ValueError(f"Remote task '{task_id}' returned invalid run_count")
+        previous_fingerprint = public_task_event_fingerprint(record)
+        status, run_count = _validate_remote_task_state(task_id, payload)
 
         last_result = payload.get("last_result")
         error = payload.get("error")
         pending_review = payload.get("pending_review")
         record.state = status
-        record.result = last_result if isinstance(last_result, str) else None
+        record.result = (
+            normalize_task_event_text(last_result)
+            if isinstance(last_result, str)
+            else None
+        )
         record.error = (
-            error
+            normalize_task_event_text(error)
             if status in {"failed", "interrupted"} and isinstance(error, str)
             else None
         )
@@ -1203,7 +1287,10 @@ class TaskManager:
             self._mirror_pending_review_to_root(record)
         else:
             self._clear_mirrored_pending_review_from_root(record)
-        self._save(record)
+        if public_task_event_fingerprint(record) != previous_fingerprint:
+            self._save_lifecycle(record)
+        else:
+            self._save(record)
         return record
 
     def find_by_upstream_task_id(self, upstream_task_id: str) -> TaskRecord | None:
@@ -1350,12 +1437,17 @@ class AgentControl:
         artifact: dict[str, Any],
     ) -> dict[str, Any]:
         record = self._task_manager.get_task(task_id)
+        caption = _artifact_optional_string(artifact, "caption")
         published = PublishedArtifact(
             artifact_id=f"art_{uuid.uuid4().hex}",
             path=_artifact_string(artifact, "path"),
-            name=_artifact_string(artifact, "name"),
-            caption=_artifact_optional_string(artifact, "caption"),
-            content_type=_artifact_string(artifact, "content_type"),
+            name=normalize_task_event_text(_artifact_string(artifact, "name")),
+            caption=(
+                normalize_task_event_text(caption) if caption is not None else None
+            ),
+            content_type=normalize_task_event_text(
+                _artifact_string(artifact, "content_type")
+            ),
             size=_artifact_int(artifact, "size"),
             run_count=record.run_count,
         )
@@ -1494,13 +1586,55 @@ class AgentControl:
         agent = self._get_or_create_agent(record.agent_name)
         run_config = self._build_agent_run_config(record)
         try:
-            result = await agent.ainvoke(
-                payload,
-                config=run_config,
-                version="v2",
-            )
-            # ainvoke returns only after LangGraph has completed and checkpointed
-            # the graph step, so durable mailbox claims can now be acknowledged.
+            astream = getattr(agent, "astream", None)
+            if callable(astream):
+                latest: Any = _MISSING_STREAM_VALUE
+                interrupts: list[Any] = []
+                async for part in astream(
+                    payload,
+                    config=run_config,
+                    stream_mode=["messages", "values"],
+                    version="v2",
+                ):
+                    delta = assistant_delta_from_stream_part(part)
+                    if delta is not None:
+                        ledger = self._task_manager.event_ledger
+                        if ledger is not None:
+                            ledger.publish_assistant_delta(
+                                task_id=task_id,
+                                run_count=record.run_count,
+                                content=delta,
+                            )
+                    if isinstance(part, dict) and part.get("type") == "values":
+                        if "data" in part:
+                            latest = part["data"]
+                        raw_interrupts = part.get("interrupts")
+                        if isinstance(raw_interrupts, (tuple, list)):
+                            interrupts.extend(raw_interrupts)
+                if latest is _MISSING_STREAM_VALUE:
+                    aget_state = getattr(agent, "aget_state", None)
+                    if not callable(aget_state):
+                        raise RuntimeError(
+                            "Agent stream completed without values or readable state"
+                        )
+                    snapshot = await aget_state(run_config)
+                    latest = getattr(snapshot, "values", _MISSING_STREAM_VALUE)
+                    if latest is _MISSING_STREAM_VALUE:
+                        raise RuntimeError(
+                            "Agent stream completed without values or readable state"
+                        )
+                    raw_interrupts = getattr(snapshot, "interrupts", ())
+                    if isinstance(raw_interrupts, (tuple, list)):
+                        interrupts.extend(raw_interrupts)
+                result = GraphOutput(value=latest, interrupts=tuple(interrupts))
+            else:
+                result = await agent.ainvoke(
+                    payload,
+                    config=run_config,
+                    version="v2",
+                )
+            # Complete stream consumption (or the compatibility fallback) only
+            # returns after LangGraph has checkpointed the graph step.
             if self._mailbox is not None:
                 self._mailbox.acknowledge_task(task_id, record.thread_id)
         except asyncio.CancelledError as exc:
@@ -1646,14 +1780,16 @@ class AgentControl:
 
     async def close(self) -> None:
         """Stop runtime-owned background maintenance tasks."""
-        if self._mailbox_recovery_task is None:
-            return
-        self._mailbox_recovery_task.cancel()
-        try:
-            await self._mailbox_recovery_task
-        except asyncio.CancelledError:
-            pass
-        self._mailbox_recovery_task = None
+        if self._mailbox_recovery_task is not None:
+            self._mailbox_recovery_task.cancel()
+            try:
+                await self._mailbox_recovery_task
+            except asyncio.CancelledError:
+                pass
+            self._mailbox_recovery_task = None
+        ledger = self._task_manager.event_ledger
+        if ledger is not None:
+            ledger.close()
 
     def _resume_run(self, task_id: str, decisions: list[dict[str, Any]]) -> None:
         record = self._task_manager.get_task(task_id)
@@ -2564,6 +2700,29 @@ class AgentControl:
         """
         return self._task_manager.get_task(task_id)
 
+    def open_local_task_event_stream(
+        self,
+        task_id: str,
+        *,
+        run_count: int,
+        last_event_id: str | None,
+    ) -> TaskEventSubscription:
+        """Open one fixed-run stream without taking ownership of the Agent run."""
+
+        record = self._task_manager.get_task(task_id)
+        if record.route_kind != "local":
+            raise ValueError(f"Task '{task_id}' is not a local task")
+        ledger = self._task_manager.event_ledger
+        if ledger is None:
+            raise TaskEventsUnavailableError(
+                f"Task events for '{task_id}' require durable Task storage"
+            )
+        return ledger.open_stream(
+            task_id=task_id,
+            run_count=run_count,
+            last_event_id=last_event_id,
+        )
+
     async def get_local_task_message_snapshot(
         self,
         task_id: str,
@@ -2598,6 +2757,26 @@ class AgentControl:
             task_id=record.upstream_task_id or task_id,
             cursor=cursor,
             limit=limit,
+        )
+
+    def open_remote_task_event_stream(
+        self,
+        task_id: str,
+        *,
+        run_count: int,
+        last_event_id: str | None,
+    ) -> AbstractAsyncContextManager[Any]:
+        """Open the downstream SSE client boundary for a remote-ref Task."""
+
+        record = self._task_manager.get_task(task_id)
+        if record.route_kind != "remote_ref":
+            raise ValueError(f"Task '{task_id}' is not a remote_ref task")
+        entry = self._get_remote_entry_for_task(task_id)
+        return self._a2a_client.open_task_event_stream(
+            entry.ref,
+            task_id=record.upstream_task_id or task_id,
+            run_count=run_count,
+            last_event_id=last_event_id,
         )
 
     def list_task_records(self) -> list[TaskRecord]:
@@ -2910,6 +3089,7 @@ class AgentControl:
                     raise ValueError(
                         f"Remote ref '{agent_name}' returned no task_id from remote gateway."
                     )
+                _validate_remote_task_state(task_id, payload)
                 self._registry.register_task(
                     task_id,
                     agent_name=agent_name,

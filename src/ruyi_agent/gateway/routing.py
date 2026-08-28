@@ -5,11 +5,13 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from ruyi_agent.gateway.errors import GatewayTaskError
+from ruyi_agent.gateway.sse import SSEProtocolError, task_stream_event_from_gateway
 from ruyi_agent.gateway.models import MetadataScalar, TaskRouteRecord
 from ruyi_agent.integrations.a2a.client import A2AClientError
 from ruyi_agent.runtime.delegation.async_runtime import (
@@ -36,10 +38,26 @@ from ruyi_agent.runtime.message_history import (
     project_task_messages,
     task_message_page_from_payload,
 )
+from ruyi_agent.runtime.task_events import (
+    InvalidTaskEventCursorError,
+    TaskEventsUnavailableError,
+    TaskRunMismatchError,
+    TaskStreamEvent,
+)
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
 
 TASK_MESSAGE_CURSOR_VERSION = 1
 MAX_TASK_MESSAGE_CURSOR_LENGTH = 4096
+_FULL_STATE_TASK_EVENT_TYPES = {
+    "task.snapshot",
+    "task.created",
+    "task.running",
+    "task.review_requested",
+    "task.completed",
+    "task.failed",
+    "task.cancelled",
+    "task.interrupted",
+}
 
 
 @dataclass(slots=True)
@@ -285,6 +303,142 @@ class TaskRouter:
             next_cursor=next_cursor,
         )
 
+    @asynccontextmanager
+    async def open_task_event_stream(
+        self,
+        route: TaskRouteRecord,
+        *,
+        run_count: int,
+        last_event_id: str | None,
+    ) -> AsyncIterator[AsyncIterator[TaskStreamEvent]]:
+        """Open one local durable stream or a sanitized downstream proxy."""
+
+        record = self.ensure_record(route)
+        if route.route_kind == "remote_ref":
+            try:
+                downstream_context = self._control.open_remote_task_event_stream(
+                    route.task_id,
+                    run_count=run_count,
+                    last_event_id=last_event_id,
+                )
+                async with downstream_context as downstream:
+
+                    async def project_remote() -> AsyncIterator[TaskStreamEvent]:
+                        first_event = True
+                        pending_error: TaskStreamEvent | None = None
+                        has_full_state = False
+                        known_end_reason: str | None = None
+                        try:
+                            async for event in downstream:
+                                projected = task_stream_event_from_gateway(
+                                    event,
+                                    expected_task_id=route.upstream_task_id,
+                                    public_task_id=route.task_id,
+                                    run_count=run_count,
+                                )
+                                if first_event:
+                                    first_event = False
+                                    if (
+                                        last_event_id is None
+                                        and projected.event_type != "task.snapshot"
+                                    ):
+                                        raise SSEProtocolError(
+                                            "Fresh remote Task stream did not start "
+                                            "with a snapshot"
+                                        )
+                                    if (
+                                        last_event_id is not None
+                                        and projected.event_type == "task.snapshot"
+                                    ):
+                                        raise SSEProtocolError(
+                                            "Resumed remote Task stream unexpectedly "
+                                            "started with a snapshot"
+                                        )
+                                elif projected.event_type == "task.snapshot":
+                                    raise SSEProtocolError(
+                                        "Remote Task stream contains an unexpected "
+                                        "additional snapshot"
+                                    )
+                                if pending_error is not None:
+                                    if (
+                                        projected.event_type != "stream.end"
+                                        or projected.data.get("reason") != "error"
+                                    ):
+                                        raise SSEProtocolError(
+                                            "Remote stream.error was not followed by "
+                                            "stream.end(reason=error)"
+                                        )
+                                    yield pending_error
+                                    pending_error = None
+                                    yield projected
+                                    continue
+                                if projected.event_type == "stream.error":
+                                    pending_error = projected
+                                    continue
+                                if projected.event_type in _FULL_STATE_TASK_EVENT_TYPES:
+                                    has_full_state = True
+                                    known_end_reason = _public_state_end_reason(
+                                        projected.data
+                                    )
+                                if (
+                                    projected.event_type == "stream.end"
+                                    and projected.data.get("reason") == "error"
+                                ):
+                                    raise SSEProtocolError(
+                                        "Remote stream.end(reason=error) has no "
+                                        "preceding stream.error"
+                                    )
+                                if projected.event_type == "stream.end":
+                                    reason = projected.data.get("reason")
+                                    if (
+                                        has_full_state
+                                        and reason != "superseded"
+                                        and reason != known_end_reason
+                                    ):
+                                        raise SSEProtocolError(
+                                            "Remote stream.end reason contradicts "
+                                            "the latest Task state"
+                                        )
+                                yield projected
+                        except SSEProtocolError as exc:
+                            raise GatewayTaskError(
+                                kind="upstream_failure",
+                                code="upstream_gateway_error",
+                                message="Remote Gateway returned an invalid Task event",
+                            ) from exc
+
+                    yield project_remote()
+                return
+            except A2AClientError as exc:
+                raise _remote_task_events_error(exc) from exc
+
+        try:
+            subscription = self._control.open_local_task_event_stream(
+                record.task_id,
+                run_count=run_count,
+                last_event_id=last_event_id,
+            )
+        except InvalidTaskEventCursorError as exc:
+            raise GatewayTaskError(
+                code="invalid_request",
+                message="Header 'Last-Event-ID' is invalid",
+            ) from exc
+        except TaskRunMismatchError as exc:
+            raise GatewayTaskError(
+                code="task_run_mismatch",
+                message=str(exc),
+                details={"requested_run_count": exc.requested, "current_run_count": exc.current},
+            ) from exc
+        except TaskEventsUnavailableError as exc:
+            raise GatewayTaskError(
+                code="task_events_unavailable",
+                message=f"Task events for '{route.task_id}' are unavailable",
+            ) from exc
+        try:
+            yield subscription
+        finally:
+            await subscription.aclose()
+
     async def send_input(
         self,
         route: TaskRouteRecord,
@@ -436,6 +590,15 @@ class TaskRouter:
         return route
 
 
+def _public_state_end_reason(data: dict[str, Any]) -> str | None:
+    if data.get("pending_review") or data.get("status") == "waiting_for_human":
+        return "review_required"
+    status = data.get("status")
+    if status in {"completed", "failed", "cancelled", "interrupted"}:
+        return str(status)
+    return None
+
+
 def _task_not_found(task_id: str) -> GatewayTaskError:
     return GatewayTaskError(
         code="task_not_found",
@@ -456,6 +619,20 @@ def _remote_message_history_error(exc: A2AClientError) -> GatewayTaskError:
     if exc.status_code == 400 and exc.code == "invalid_request":
         return GatewayTaskError(
             code="invalid_request",
+            message=exc.message,
+            details=exc.details,
+        )
+    return _remote_gateway_error(exc)
+
+
+def _remote_task_events_error(exc: A2AClientError) -> GatewayTaskError:
+    if (
+        exc.status_code == 400 and exc.code == "invalid_request"
+    ) or (
+        exc.status_code == 409 and exc.code == "task_run_mismatch"
+    ):
+        return GatewayTaskError(
+            code=exc.code,
             message=exc.message,
             details=exc.details,
         )

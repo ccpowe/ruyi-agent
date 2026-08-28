@@ -3,13 +3,26 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from dataclasses import replace
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ruyi_agent.runtime.delegation.async_runtime import TaskRecord
+
+
+@dataclass(frozen=True, slots=True)
+class StoredTaskEvent:
+    """One durable, ordered public lifecycle event for a Gateway Task."""
+
+    event_id: int
+    task_id: str
+    run_count: int
+    event_type: str
+    created_at: datetime
+    data: dict[str, Any]
 
 
 def _serialize_datetime(value: datetime) -> str:
@@ -23,6 +36,34 @@ def _parse_datetime(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed
+
+
+def _serialize_event_data(value: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    decoded = json.loads(encoded)
+    if not isinstance(decoded, dict):
+        raise TypeError("Task event data must encode to a JSON object")
+    return encoded
+
+
+def _row_to_task_event(row: tuple[Any, ...]) -> StoredTaskEvent:
+    data = json.loads(row[5])
+    if not isinstance(data, dict):
+        raise ValueError("Stored Task event data is not a JSON object")
+    return StoredTaskEvent(
+        event_id=int(row[0]),
+        task_id=str(row[1]),
+        run_count=int(row[2]),
+        event_type=str(row[3]),
+        created_at=_parse_datetime(str(row[4])),
+        data=data,
+    )
 
 
 def _artifact_to_dict(value: Any) -> dict[str, Any]:
@@ -118,6 +159,36 @@ class TaskStore:
             )
             self._conn.commit()
 
+    def insert_task_with_event(
+        self,
+        record: TaskRecord,
+        *,
+        event_type: str,
+        event_data: dict[str, Any],
+        event_created_at: datetime,
+    ) -> StoredTaskEvent:
+        """Insert a Task and its first lifecycle event atomically."""
+
+        encoded_data = _serialize_event_data(event_data)
+        with self._lock:
+            try:
+                self._conn.execute(
+                    self._insert_sql(upsert=False),
+                    self._record_values(record),
+                )
+                event = self._append_task_event_locked(
+                    task_id=record.task_id,
+                    run_count=record.run_count,
+                    event_type=event_type,
+                    encoded_data=encoded_data,
+                    event_created_at=event_created_at,
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return event
+
     def update_task(self, record: TaskRecord) -> None:
         """Update an existing task without ever recreating its row."""
 
@@ -132,6 +203,162 @@ class TaskStore:
             self._conn.commit()
             if cursor.rowcount != 1:
                 raise KeyError(f"Task does not exist: {record.task_id}")
+
+    def update_task_with_event(
+        self,
+        record: TaskRecord,
+        *,
+        event_type: str,
+        event_data: dict[str, Any],
+        event_created_at: datetime,
+    ) -> StoredTaskEvent:
+        """Update a Task and append its public lifecycle event atomically."""
+
+        encoded_data = _serialize_event_data(event_data)
+        columns = self._write_columns()
+        assignments = ", ".join(f"{column} = ?" for column in columns[1:])
+        values = self._record_values(record)
+        with self._lock:
+            try:
+                cursor = self._conn.execute(
+                    f"UPDATE agent_tasks SET {assignments} WHERE task_id = ?",
+                    (*values[1:], record.task_id),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"Task does not exist: {record.task_id}")
+                event = self._append_task_event_locked(
+                    task_id=record.task_id,
+                    run_count=record.run_count,
+                    event_type=event_type,
+                    encoded_data=encoded_data,
+                    event_created_at=event_created_at,
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return event
+
+    def append_task_event(
+        self,
+        *,
+        task_id: str,
+        run_count: int,
+        event_type: str,
+        event_data: dict[str, Any],
+        event_created_at: datetime,
+    ) -> StoredTaskEvent:
+        """Append an event without changing the already-persisted Task row."""
+
+        encoded_data = _serialize_event_data(event_data)
+        with self._lock:
+            try:
+                if not self._task_exists_locked(task_id):
+                    raise KeyError(f"Task does not exist: {task_id}")
+                event = self._append_task_event_locked(
+                    task_id=task_id,
+                    run_count=run_count,
+                    event_type=event_type,
+                    encoded_data=encoded_data,
+                    event_created_at=event_created_at,
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return event
+
+    def get_task_event(self, event_id: int) -> StoredTaskEvent | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT event_id, task_id, run_count, event_type, created_at, data_json
+                FROM agent_task_events
+                WHERE event_id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+        return _row_to_task_event(row) if row is not None else None
+
+    def list_task_events(
+        self,
+        *,
+        task_id: str,
+        run_count: int,
+        after_event_id: int,
+        limit: int = 100,
+    ) -> list[StoredTaskEvent]:
+        if limit <= 0:
+            raise ValueError("Task event limit must be positive")
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT event_id, task_id, run_count, event_type, created_at, data_json
+                FROM agent_task_events
+                WHERE task_id = ? AND run_count = ? AND event_id > ?
+                ORDER BY event_id ASC
+                LIMIT ?
+                """,
+                (task_id, run_count, after_event_id, limit),
+            ).fetchall()
+        return [_row_to_task_event(row) for row in rows]
+
+    def get_task_with_event_anchor(
+        self,
+        *,
+        task_id: str,
+        run_count: int,
+        build_anchor: Callable[[TaskRecord], tuple[str, dict[str, Any], datetime]],
+    ) -> tuple[TaskRecord, StoredTaskEvent, bool]:
+        """Read a Task and idempotently ensure its run has a durable anchor.
+
+        This is the upgrade reconciliation used by a first SSE subscription for
+        Tasks created before the event ledger existed. The persisted Task row,
+        anchor check, optional insert, and high-water read share one SQLite lock
+        and transaction view.
+        """
+
+        with self._lock:
+            try:
+                task_row = self._conn.execute(
+                    f"""
+                    SELECT
+                        {self._select_columns()}
+                    FROM agent_tasks
+                    WHERE task_id = ?
+                    """,
+                    (task_id,),
+                ).fetchone()
+                if task_row is None:
+                    raise KeyError(f"Task does not exist: {task_id}")
+                record = self._row_to_task_record(task_row)
+                if record.run_count != run_count:
+                    raise ValueError(
+                        f"Task run mismatch: expected {run_count}, current {record.run_count}"
+                    )
+
+                event_row = self._latest_task_event_row_locked(
+                    task_id=task_id,
+                    run_count=run_count,
+                )
+                created = False
+                if event_row is None:
+                    event_type, event_data, event_created_at = build_anchor(record)
+                    event = self._append_task_event_locked(
+                        task_id=task_id,
+                        run_count=run_count,
+                        event_type=event_type,
+                        encoded_data=_serialize_event_data(event_data),
+                        event_created_at=event_created_at,
+                    )
+                    created = True
+                else:
+                    event = _row_to_task_event(event_row)
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return record, event, created
 
     def get_task(self, task_id: str) -> TaskRecord | None:
         with self._lock:
@@ -242,6 +469,24 @@ class TaskStore:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_task_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    run_count INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    data_json TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agent_task_events_task_run_event
+                ON agent_task_events(task_id, run_count, event_id)
+                """
+            )
             self._ensure_column(
                 table="agent_tasks",
                 column="permission_profile",
@@ -273,6 +518,69 @@ class TaskStore:
                 definition="TEXT NOT NULL DEFAULT '[]'",
             )
             self._conn.commit()
+
+    def _task_exists_locked(self, task_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM agent_tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return row is not None
+
+    def _append_task_event_locked(
+        self,
+        *,
+        task_id: str,
+        run_count: int,
+        event_type: str,
+        encoded_data: str,
+        event_created_at: datetime,
+    ) -> StoredTaskEvent:
+        cursor = self._conn.execute(
+            """
+            INSERT INTO agent_task_events (
+                task_id,
+                run_count,
+                event_type,
+                created_at,
+                data_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                run_count,
+                event_type,
+                _serialize_datetime(event_created_at),
+                encoded_data,
+            ),
+        )
+        event_id = cursor.lastrowid
+        if not isinstance(event_id, int):
+            raise RuntimeError("SQLite did not allocate a Task event id")
+        return StoredTaskEvent(
+            event_id=event_id,
+            task_id=task_id,
+            run_count=run_count,
+            event_type=event_type,
+            created_at=event_created_at,
+            data=json.loads(encoded_data),
+        )
+
+    def _latest_task_event_row_locked(
+        self,
+        *,
+        task_id: str,
+        run_count: int,
+    ) -> tuple[Any, ...] | None:
+        return self._conn.execute(
+            """
+            SELECT event_id, task_id, run_count, event_type, created_at, data_json
+            FROM agent_task_events
+            WHERE task_id = ? AND run_count = ?
+            ORDER BY event_id DESC
+            LIMIT 1
+            """,
+            (task_id, run_count),
+        ).fetchone()
 
     def _ensure_column(self, *, table: str, column: str, definition: str) -> None:
         columns = {

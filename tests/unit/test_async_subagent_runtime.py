@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI
 import httpx
 import pytest
+from langchain_core.messages import AIMessage, AIMessageChunk
 
 import ruyi_agent.runtime.delegation.async_runtime as async_subagent_runtime
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
@@ -53,6 +54,77 @@ class FakeAgentFactory:
 
     def __call__(self, **kwargs):
         agent = FakeAgent()
+        self.created.append(agent)
+        return agent
+
+
+class StreamingAgent:
+    def __init__(self, *, omit_values: bool = False, fail: bool = False) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.omit_values = omit_values
+        self.fail = fail
+        self.stream_calls: list[dict] = []
+        self.invoke_calls = 0
+        self.state_calls = 0
+
+    async def astream(self, payload, *, config, stream_mode, version):
+        self.stream_calls.append(
+            {
+                "payload": payload,
+                "config": config,
+                "stream_mode": stream_mode,
+                "version": version,
+            }
+        )
+        self.started.set()
+        await self.release.wait()
+        yield {
+            "type": "messages",
+            "ns": (),
+            "data": (
+                AIMessageChunk(content="live "),
+                {
+                    "provider": "hidden",
+                    "langgraph_node": "model",
+                    "langgraph_path": ("__pregel_pull", "model"),
+                },
+            ),
+        }
+        if self.fail:
+            raise RuntimeError("stream exploded")
+        if not self.omit_values:
+            yield {
+                "type": "values",
+                "data": {"messages": [AIMessage(content="stream done")]},
+                "interrupts": (),
+            }
+
+    async def ainvoke(self, payload, *, config, version):
+        del payload, config, version
+        self.invoke_calls += 1
+        raise AssertionError("ainvoke must not run after astream is available")
+
+    async def aget_state(self, config):
+        del config
+        self.state_calls += 1
+
+        class Snapshot:
+            values = {"messages": [AIMessage(content="snapshot done")]}
+            interrupts = ()
+
+        return Snapshot()
+
+
+class StreamingAgentFactory:
+    def __init__(self, *, omit_values: bool = False, fail: bool = False) -> None:
+        self.omit_values = omit_values
+        self.fail = fail
+        self.created: list[StreamingAgent] = []
+
+    def __call__(self, **kwargs):
+        del kwargs
+        agent = StreamingAgent(omit_values=self.omit_values, fail=self.fail)
         self.created.append(agent)
         return agent
 
@@ -790,6 +862,137 @@ def test_spawn_wait_and_check_agent_lifecycle(monkeypatch: pytest.MonkeyPatch) -
     assert configurable["delegation_depth"] == 1
 
 
+def test_local_runtime_consumes_astream_and_publishes_safe_deltas(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    factory = StreamingAgentFactory()
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+
+    async def scenario() -> tuple[
+        async_subagent_runtime.TaskRecord,
+        list[object],
+        StreamingAgent,
+    ]:
+        store = TaskStore(str(tmp_path / "tasks.sqlite"))
+        control = async_subagent_runtime.AgentControl(
+            build_specs(),
+            checkpointer=object(),
+            backend=object(),
+            task_store=store,
+        )
+        try:
+            record = await control.spawn_task("background_research", "stream this")
+            run_task = record.active_run
+            while not factory.created:
+                await asyncio.sleep(0)
+            agent = factory.created[0]
+            await agent.started.wait()
+            stream = control.open_local_task_event_stream(
+                record.task_id,
+                run_count=record.run_count,
+                last_event_id=None,
+            )
+            events: list[object] = [await anext(stream)]
+            agent.release.set()
+            events.extend([await anext(stream), await anext(stream), await anext(stream)])
+            if run_task is not None:
+                await run_task
+            await stream.aclose()
+            return control.get_task_record(record.task_id), events, agent
+        finally:
+            await control.close()
+            store.close()
+
+    record, events, agent = asyncio.run(scenario())
+
+    assert record.state == "completed"
+    assert record.result == "stream done"
+    assert [event.event_type for event in events] == [
+        "task.snapshot",
+        "assistant.delta",
+        "task.completed",
+        "stream.end",
+    ]
+    assert events[1].data == {"content": "live "}
+    assert agent.stream_calls[0]["stream_mode"] == ["messages", "values"]
+    assert agent.stream_calls[0]["version"] == "v2"
+    assert agent.invoke_calls == 0
+
+
+def test_local_runtime_uses_checkpoint_when_stream_has_no_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    factory = StreamingAgentFactory(omit_values=True)
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+
+    async def scenario() -> tuple[async_subagent_runtime.TaskRecord, StreamingAgent]:
+        store = TaskStore(str(tmp_path / "tasks.sqlite"))
+        control = async_subagent_runtime.AgentControl(
+            build_specs(),
+            checkpointer=object(),
+            backend=object(),
+            task_store=store,
+        )
+        try:
+            record = await control.spawn_task("background_research", "stream this")
+            run_task = record.active_run
+            while not factory.created:
+                await asyncio.sleep(0)
+            agent = factory.created[0]
+            await agent.started.wait()
+            agent.release.set()
+            if run_task is not None:
+                await run_task
+            return control.get_task_record(record.task_id), agent
+        finally:
+            await control.close()
+            store.close()
+
+    record, agent = asyncio.run(scenario())
+    assert record.state == "completed"
+    assert record.result == "snapshot done"
+    assert agent.state_calls >= 1
+    assert agent.invoke_calls == 0
+
+
+def test_local_runtime_does_not_invoke_again_after_stream_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    factory = StreamingAgentFactory(fail=True)
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+
+    async def scenario() -> tuple[async_subagent_runtime.TaskRecord, StreamingAgent]:
+        store = TaskStore(str(tmp_path / "tasks.sqlite"))
+        control = async_subagent_runtime.AgentControl(
+            build_specs(),
+            checkpointer=object(),
+            backend=object(),
+            task_store=store,
+        )
+        try:
+            record = await control.spawn_task("background_research", "stream this")
+            run_task = record.active_run
+            while not factory.created:
+                await asyncio.sleep(0)
+            agent = factory.created[0]
+            await agent.started.wait()
+            agent.release.set()
+            if run_task is not None:
+                await run_task
+            return control.get_task_record(record.task_id), agent
+        finally:
+            await control.close()
+            store.close()
+
+    record, agent = asyncio.run(scenario())
+    assert record.state == "failed"
+    assert "stream exploded" in (record.error or "")
+    assert agent.invoke_calls == 0
+
+
 def test_register_artifact_attaches_manifest_to_task_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1032,6 +1235,68 @@ def test_submit_review_prefers_waiting_child_over_root_mirror(
     assert child.state == "completed"
     assert child.result == "done: needs review"
     assert root.pending_review is None
+
+
+def test_cleared_root_review_is_replayable_from_durable_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    factory = ContentAwareInterruptingAgentFactory()
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+
+    async def scenario():
+        store = TaskStore(str(tmp_path / "tasks.sqlite"))
+        control = async_subagent_runtime.AgentControl(
+            build_specs(),
+            checkpointer=object(),
+            backend=object(),
+            task_store=store,
+        )
+        try:
+            root = await control.spawn_task("background_research", "root task")
+            if root.active_run is not None:
+                await root.active_run
+            child = await control.spawn_task(
+                "background_research",
+                "needs review",
+                parent_task_id=root.task_id,
+                parent_thread_id=root.thread_id,
+            )
+            if child.active_run is not None:
+                await child.active_run
+
+            root = control.get_task_record(root.task_id)
+            assert root.pending_review is not None
+            fresh = control.open_local_task_event_stream(
+                root.task_id,
+                run_count=root.run_count,
+                last_event_id=None,
+            )
+            snapshot = await anext(fresh)
+            assert snapshot.data["pending_review"] is not None
+            assert snapshot.event_id is not None
+            await fresh.aclose()
+
+            await control.submit_review_decision(
+                child.pending_review["review_id"],
+                [{"type": "approve"}],
+                wait=True,
+            )
+            replay = control.open_local_task_event_stream(
+                root.task_id,
+                run_count=root.run_count,
+                last_event_id=snapshot.event_id,
+            )
+            return await anext(replay), await anext(replay)
+        finally:
+            await control.close()
+            store.close()
+
+    cleared, ended = asyncio.run(scenario())
+    assert cleared.event_type == "task.completed"
+    assert cleared.data["pending_review"] is None
+    assert ended.event_type == "stream.end"
+    assert ended.data == {"reason": "completed"}
 
 
 def test_submit_review_decision_default_does_not_wait_for_resumed_run(

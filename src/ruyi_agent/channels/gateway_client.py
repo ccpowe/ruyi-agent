@@ -1,11 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
+
+from ruyi_agent.gateway.sse import (
+    GatewayTaskEvent,
+    MAX_SSE_ERROR_READ_SECONDS,
+    MAX_SSE_HANDSHAKE_SECONDS,
+    SSEProtocolError,
+    decode_sse_error_json,
+    has_identity_content_encoding,
+    iter_gateway_task_events,
+    iter_utf8_sse_lines,
+    read_bounded_sse_error_body,
+)
+from ruyi_agent.runtime.task_events import (
+    MAX_SHORT_EVENT_TEXT_LENGTH,
+    normalize_task_event_text,
+)
 
 
 @dataclass(slots=True)
@@ -214,6 +233,135 @@ class GatewayHTTPClient:
             params=params,
         )
 
+    @asynccontextmanager
+    async def stream_task_events(
+        self,
+        *,
+        task_id: str,
+        run_count: int,
+        last_event_id: str | None = None,
+    ) -> AsyncIterator[AsyncIterator[GatewayTaskEvent]]:
+        """Open an opt-in Task SSE stream without expanding adapter protocols."""
+
+        headers = {
+            "Authorization": f"Bearer {self._bearer_token}",
+            "Accept": "text/event-stream",
+            "Accept-Encoding": "identity",
+        }
+        if last_event_id is not None:
+            headers["Last-Event-ID"] = last_event_id
+        timeout = httpx.Timeout(self._timeout, read=None)
+        async with httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=timeout,
+            headers=headers,
+            transport=self._transport,
+        ) as client:
+            response_context = client.stream(
+                "GET",
+                f"/tasks/{task_id}/events",
+                params={"run_count": str(run_count)},
+            )
+            try:
+                async with asyncio.timeout(
+                    min(
+                        max(self._timeout, 0.001),
+                        MAX_SSE_HANDSHAKE_SECONDS,
+                    )
+                ):
+                    response = await response_context.__aenter__()
+            except (TimeoutError, httpx.HTTPError) as exc:
+                raise GatewayClientError(
+                    status_code=502,
+                    code="gateway_error",
+                    message="Gateway Task event stream failed",
+                ) from exc
+            try:
+                try:
+                    if response.status_code != 200:
+                        if not has_identity_content_encoding(
+                            response.headers.get("content-encoding", "")
+                        ):
+                            raise GatewayClientError(
+                                status_code=502,
+                                code="gateway_error",
+                                message="Gateway returned an invalid Task event error",
+                            )
+                        chunks = (
+                            response.aiter_bytes()
+                            if response.is_stream_consumed
+                            else response.aiter_raw()
+                        )
+                        body = await read_bounded_sse_error_body(
+                            chunks,
+                            timeout_seconds=min(
+                                max(self._timeout, 0.001),
+                                MAX_SSE_ERROR_READ_SECONDS,
+                            ),
+                        )
+                        try:
+                            payload = decode_sse_error_json(body)
+                        except SSEProtocolError as exc:
+                            raise GatewayClientError(
+                                status_code=502,
+                                code="gateway_error",
+                                message="Gateway returned invalid JSON",
+                            ) from exc
+                        if not isinstance(payload, dict):
+                            raise GatewayClientError(
+                                status_code=502,
+                                code="gateway_error",
+                                message="Gateway returned invalid payload",
+                            )
+                        error = payload.get("error")
+                        if isinstance(error, dict):
+                            raw_code = error.get("code")
+                            raw_message = error.get("message")
+                            raise GatewayClientError(
+                                status_code=response.status_code,
+                                code=(
+                                    normalize_task_event_text(raw_code)[
+                                        :MAX_SHORT_EVENT_TEXT_LENGTH
+                                    ]
+                                    if isinstance(raw_code, str)
+                                    else "gateway_error"
+                                ),
+                                message=(
+                                    normalize_task_event_text(raw_message)[
+                                        :MAX_SHORT_EVENT_TEXT_LENGTH
+                                    ]
+                                    if isinstance(raw_message, str)
+                                    else "Gateway request failed"
+                                ),
+                            )
+                        raise GatewayClientError(
+                            status_code=response.status_code,
+                            code="gateway_error",
+                            message="Gateway request failed",
+                        )
+                    content_type = response.headers.get("content-type", "")
+                    if content_type.partition(";")[0].strip().lower() != (
+                        "text/event-stream"
+                    ) or not has_identity_content_encoding(
+                        response.headers.get("content-encoding", "")
+                    ):
+                        raise GatewayClientError(
+                            status_code=502,
+                            code="gateway_error",
+                            message="Gateway returned an invalid Task event stream",
+                        )
+                except GatewayClientError:
+                    raise
+                except (httpx.HTTPError, SSEProtocolError) as exc:
+                    raise GatewayClientError(
+                        status_code=502,
+                        code="gateway_error",
+                        message="Gateway Task event stream failed",
+                    ) from exc
+                yield _iter_task_events(response)
+            finally:
+                await response_context.__aexit__(None, None, None)
+
     async def submit_review_decision(
         self,
         *,
@@ -315,3 +463,26 @@ class GatewayHTTPClient:
                 message="Gateway returned invalid payload",
             )
         return payload
+
+
+async def _iter_task_events(
+    response: httpx.Response,
+) -> AsyncIterator[GatewayTaskEvent]:
+    try:
+        chunks = (
+            response.aiter_bytes()
+            if response.is_stream_consumed
+            else response.aiter_raw()
+        )
+        lines = iter_utf8_sse_lines(chunks)
+        async for event in iter_gateway_task_events(lines):
+            yield event
+            if event.event_type == "stream.end":
+                return
+        raise SSEProtocolError("Gateway Task event stream ended without stream.end")
+    except (httpx.HTTPError, SSEProtocolError) as exc:
+        raise GatewayClientError(
+            status_code=502,
+            code="gateway_error",
+            message="Gateway Task event stream failed",
+        ) from exc

@@ -9,8 +9,9 @@ from ruyi_agent.runtime.agent_turn import (
 
 
 class GraphOutput:
-    def __init__(self, value):
+    def __init__(self, value, interrupts=()):
         self.value = value
+        self.interrupts = interrupts
 
 
 class Interrupt:
@@ -49,6 +50,22 @@ def test_normalize_agent_turn_result_extracts_content_from_graph_output_value() 
     assert outcome.review_payloads == []
     assert outcome.has_unresolved_tool_calls is False
     assert not hasattr(outcome, "raw_result")
+
+
+def test_normalize_agent_turn_result_reads_v2_graph_output_interrupts() -> None:
+    payload = {
+        "action_requests": [{"name": "execute", "args": {"command": "pwd"}}],
+        "review_configs": [
+            {"action_name": "execute", "allowed_decisions": ["approve", "reject"]}
+        ],
+    }
+    outcome = normalize_agent_turn_result(
+        GraphOutput(
+            {"messages": [{"role": "assistant", "content": ""}]},
+            interrupts=(Interrupt(payload),),
+        )
+    )
+    assert outcome.review_payloads == [payload]
 
 
 def test_normalize_agent_turn_result_uses_last_assistant_message() -> None:
