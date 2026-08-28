@@ -198,6 +198,22 @@ class GatewayHTTPClient:
     async def get_task(self, *, task_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/tasks/{task_id}")
 
+    async def list_task_messages(
+        self,
+        *,
+        task_id: str,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        params = {"limit": str(limit)}
+        if cursor is not None:
+            params["cursor"] = cursor
+        return await self._request(
+            "GET",
+            f"/tasks/{task_id}/messages",
+            params=params,
+        )
+
     async def submit_review_decision(
         self,
         *,

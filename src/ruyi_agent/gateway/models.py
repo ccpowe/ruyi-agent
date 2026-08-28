@@ -79,6 +79,29 @@ class TaskResponse(BaseModel):
     artifacts: list["PublishedArtifactResponse"] = Field(default_factory=list)
 
 
+class TaskMessageToolCallResponse(BaseModel):
+    tool_call_id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+class TaskMessageResponse(BaseModel):
+    sequence: int
+    message_id: str
+    role: Literal["user", "assistant", "tool"]
+    content: str
+    name: str | None = None
+    tool_call_id: str | None = None
+    tool_calls: list[TaskMessageToolCallResponse] = Field(default_factory=list)
+    status: Literal["success", "error"] | None = None
+
+
+class TaskMessageListResponse(BaseModel):
+    task_id: str
+    items: list[TaskMessageResponse]
+    next_cursor: str | None
+
+
 class PublishedArtifactResponse(BaseModel):
     artifact_id: str
     path: str

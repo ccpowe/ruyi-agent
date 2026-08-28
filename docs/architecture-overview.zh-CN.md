@@ -56,7 +56,7 @@ Root Gateway Task
   └── Subagent Task B
 ```
 
-Gateway 会为 public Root Task 的 Subagent 自动恢复并持久化 Route，继承 Root Task 的 Channel metadata。Subagent 因此可以通过现有 `GET /tasks/{task_id}`、`POST /tasks/{task_id}/input` 和 `/resume <task_id>` 独立进入和继续。未归属于 Gateway Root Route 的内部 Task 不会被自动暴露。
+Gateway 会为 public Root Task 的 Subagent 自动恢复并持久化 Route，继承 Root Task 的 Channel metadata。Subagent 因此可以通过现有 `GET /tasks/{task_id}`、`GET /tasks/{task_id}/messages`、`POST /tasks/{task_id}/input` 和 `/resume <task_id>` 独立进入和继续。未归属于 Gateway Root Route 的内部 Task 不会被自动暴露。
 
 ## Gateway Task Module
 
@@ -64,6 +64,7 @@ Gateway 会为 public Root Task 的 Subagent 自动恢复并持久化 Route，�
 
 - 公开 Agent 查询与可用性判断。
 - Task 创建、读取、列表、继续和取消。
+- Task Message Transcript 快照分页查询。
 - Review 查询与提交。
 - Attachment 输入处理。
 - Artifact 查询与下载。
@@ -79,6 +80,7 @@ Gateway 会为 public Root Task 的 Subagent 自动恢复并持久化 Route，�
 - Task Route 查询与更新。
 - Remote TaskRecord 在重启后的重建。
 - Remote 状态刷新。
+- Local checkpoint transcript 分页与 Remote transcript 透明代理。
 - Routed `send_input`、`cancel` 和 review submission。
 - Delegation 与运行时异常转换。
 - Remote Webhook 投递。
@@ -95,6 +97,7 @@ Gateway 会为 public Root Task 的 Subagent 自动恢复并持久化 Route，�
 - TaskRecord 持久化与恢复。
 - Subagent 工具和任务树限制。
 - Remote Ref 执行。
+- 通过轻量只读 state graph 恢复 Local Task 的精确消息 checkpoint。
 - Task Mailbox 持久化投递、安全模型边界注入与空闲 Task 唤醒。
 - Permission Review 恢复。
 
@@ -137,14 +140,14 @@ Permission Middleware 根据 profile 决定工具调用是直接允许还是进�
 
 | Store | 职责 |
 |---|---|
-| LangGraph Checkpointer | Agent 执行现场和中断恢复 |
+| LangGraph Checkpointer | Agent 执行现场、中断恢复和 Local Task Message Transcript 真源 |
 | TaskStore | Gateway Task 生命周期 |
 | GatewayRouteStore | Local/Remote Route 和 upstream 映射 |
 | ChannelSessionStore | 平台身份、Active Agent 和当前 Task |
 | ReviewAuditStore | 审批审计 |
 | TelegramUpdateStore / FeishuEventStore | 入站事件去重 |
 
-重启后，已完成 Task 可继续查询；Local 活跃 Run 被规范化为可解释的中断状态；Remote Task 可根据 Route 重建本地 TaskRecord 并刷新远端状态。
+重启后，已完成 Task 可继续查询；Local 活跃 Run 被规范化为可解释的中断状态；Remote Task 可根据 Route 重建本地 TaskRecord 并刷新远端状态。Message Transcript 首次查询先固定最新完整 checkpoint，后续游标始终读取同一 checkpoint；Remote Task 的游标由下游 Gateway 拥有并原样透传。
 
 ## 启动模式
 

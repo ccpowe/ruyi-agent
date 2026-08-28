@@ -61,6 +61,10 @@ from ruyi_agent.runtime.delegation.context import (
 )
 from ruyi_agent.runtime.agent_turn import normalize_agent_turn
 from ruyi_agent.runtime.agent_factory import create_runtime_agent
+from ruyi_agent.runtime.message_history import (
+    TaskMessageSnapshot,
+    TaskMessageStateReader,
+)
 from ruyi_agent.storage.task_store import TaskStore, task_record_for_restart
 from ruyi_agent.control_plane.permissions import PermissionPolicy
 from ruyi_agent.storage.review_audit import ReviewAuditStore
@@ -1306,6 +1310,7 @@ class AgentControl:
         self._registry = AgentRegistry(specs, remote_refs)
         self._task_manager = TaskManager(task_store)
         self._checkpointer = checkpointer
+        self._message_state_reader = TaskMessageStateReader(checkpointer)
         self._backend = backend
         self._compiled_agents: dict[str, Any] = {}
         self._a2a_client = a2a_client or A2AClient()
@@ -2558,6 +2563,42 @@ class AgentControl:
             对应的任务记录
         """
         return self._task_manager.get_task(task_id)
+
+    async def get_local_task_message_snapshot(
+        self,
+        task_id: str,
+        *,
+        checkpoint_id: str | None = None,
+    ) -> TaskMessageSnapshot:
+        """Reconstruct one exact local Task conversation checkpoint."""
+
+        record = self._task_manager.get_task(task_id)
+        if record.route_kind != "local":
+            raise ValueError(f"Task '{task_id}' is not a local task")
+        return await self._message_state_reader.read(
+            thread_id=record.thread_id,
+            checkpoint_id=checkpoint_id,
+        )
+
+    async def list_remote_task_messages(
+        self,
+        task_id: str,
+        *,
+        cursor: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Request one opaque message-history page for a remote-ref Task."""
+
+        record = self._task_manager.get_task(task_id)
+        if record.route_kind != "remote_ref":
+            raise ValueError(f"Task '{task_id}' is not a remote_ref task")
+        entry = self._get_remote_entry_for_task(task_id)
+        return await self._a2a_client.list_task_messages(
+            entry.ref,
+            task_id=record.upstream_task_id or task_id,
+            cursor=cursor,
+            limit=limit,
+        )
 
     def list_task_records(self) -> list[TaskRecord]:
         """

@@ -39,6 +39,14 @@ create-or-continue request, reserves stable effect identities, and stores the
 successful Gateway Task response for replay.
 _Avoid_: request cache, exactly-once run
 
+**Task Message Transcript**:
+An oldest-first, snapshot-consistent public textual projection of the canonical
+user, assistant, and tool messages in one durable Gateway Task checkpoint. It
+preserves tool-call linkage while excluding system prompts, hidden reasoning,
+media blocks, and provider metadata. It is conversation state, not an immutable
+request or audit log.
+_Avoid_: raw message dump, event log, run history
+
 **Task Router**:
 The internal Gateway Task module that owns local/remote route persistence, runtime-record recovery, remote refresh, routed task operations, and routing error translation. It does not build transport responses or process attachment contents.
 _Avoid_: route helper, remote task utility
@@ -73,6 +81,8 @@ _Avoid_: default bot, current worker
 - The **Gateway Task Module** delegates execution and task state transitions to `AgentControl`.
 - A **Gateway Command** makes Gateway Task creation or continuation safely
   retryable without claiming exactly-once model or tool side effects.
+- A **Task Message Transcript** projects one durable checkpoint of a **Gateway
+  Task** and is independently paged from the latest Task status.
 - The **Gateway Task Module** delegates local and remote routing policy to the **Task Router**.
 - A **Review Command** resolves a pending review on one **Gateway Task**.
 - A **Task Watch** observes one run of one **Gateway Task**.

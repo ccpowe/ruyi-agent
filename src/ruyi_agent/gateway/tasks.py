@@ -46,6 +46,9 @@ from ruyi_agent.gateway.models import (
     ReviewListResponse,
     ReviewResponse,
     TaskListResponse,
+    TaskMessageListResponse,
+    TaskMessageResponse,
+    TaskMessageToolCallResponse,
     TaskResponse,
     TaskRouteRecord,
     TaskWebhookEvent,
@@ -354,6 +357,51 @@ class GatewayTaskModule:
         route = await self._router.get_route(task_id)
         record = await self._router.get_record(route)
         return self._build_task_response(record, route.metadata)
+
+    async def list_task_messages(
+        self,
+        task_id: str,
+        *,
+        cursor: str | None,
+        limit: int,
+    ) -> TaskMessageListResponse:
+        """Return one snapshot-consistent page of the public textual transcript."""
+
+        if limit <= 0 or limit > 100:
+            raise GatewayTaskError(
+                code="invalid_request",
+                message="Query parameter 'limit' must be between 1 and 100",
+            )
+        route = await self._router.get_route(task_id)
+        page = await self._router.list_task_messages(
+            route,
+            cursor=cursor,
+            limit=limit,
+        )
+        return TaskMessageListResponse(
+            task_id=page.task_id,
+            items=[
+                TaskMessageResponse(
+                    sequence=item.sequence,
+                    message_id=item.message_id,
+                    role=item.role,
+                    content=item.content,
+                    name=item.name,
+                    tool_call_id=item.tool_call_id,
+                    tool_calls=[
+                        TaskMessageToolCallResponse(
+                            tool_call_id=call.tool_call_id,
+                            name=call.name,
+                            arguments=dict(call.arguments),
+                        )
+                        for call in item.tool_calls
+                    ],
+                    status=item.status,
+                )
+                for item in page.items
+            ],
+            next_cursor=page.next_cursor,
+        )
 
     async def send_input(
         self,

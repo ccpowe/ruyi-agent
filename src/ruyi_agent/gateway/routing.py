@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -25,7 +29,17 @@ from ruyi_agent.runtime.delegation.context import (
     DelegationLoopError,
     InvalidDelegationContextError,
 )
+from ruyi_agent.runtime.message_history import (
+    TaskMessageHistoryUnavailableError,
+    TaskMessagePage,
+    TaskMessageSnapshotNotFoundError,
+    project_task_messages,
+    task_message_page_from_payload,
+)
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
+
+TASK_MESSAGE_CURSOR_VERSION = 1
+MAX_TASK_MESSAGE_CURSOR_LENGTH = 4096
 
 
 @dataclass(slots=True)
@@ -195,6 +209,82 @@ class TaskRouter:
         except ValueError as exc:
             raise _upstream_payload_error(str(exc)) from exc
 
+    async def list_task_messages(
+        self,
+        route: TaskRouteRecord,
+        *,
+        cursor: str | None,
+        limit: int,
+    ) -> TaskMessagePage:
+        """Return one stable local snapshot page or proxy an opaque remote page."""
+
+        self.ensure_record(route)
+        if route.route_kind == "remote_ref":
+            try:
+                payload = await self._control.list_remote_task_messages(
+                    route.task_id,
+                    cursor=cursor,
+                    limit=limit,
+                )
+            except A2AClientError as exc:
+                raise _remote_message_history_error(exc) from exc
+            except ValueError as exc:
+                raise _upstream_payload_error(str(exc)) from exc
+            try:
+                page = task_message_page_from_payload(payload)
+            except ValueError as exc:
+                raise _upstream_payload_error(str(exc)) from exc
+            if page.task_id != route.upstream_task_id:
+                raise _upstream_payload_error(
+                    "Remote Gateway returned a message page for the wrong task"
+                )
+            return TaskMessagePage(
+                task_id=route.task_id,
+                items=page.items,
+                next_cursor=page.next_cursor,
+            )
+
+        checkpoint_id, offset = _decode_task_message_cursor(
+            cursor,
+            task_id=route.task_id,
+        )
+        try:
+            snapshot = await self._control.get_local_task_message_snapshot(
+                route.task_id,
+                checkpoint_id=checkpoint_id,
+            )
+        except TaskMessageSnapshotNotFoundError as exc:
+            raise _invalid_message_cursor() from exc
+        except TaskMessageHistoryUnavailableError as exc:
+            raise GatewayTaskError(
+                code="task_history_unavailable",
+                message=f"Message history for task '{route.task_id}' is unavailable",
+            ) from exc
+
+        items = project_task_messages(route.task_id, snapshot.messages)
+        if cursor is not None and offset >= len(items):
+            raise _invalid_message_cursor()
+        page_items = items[offset : offset + limit]
+        next_cursor = None
+        if offset + limit < len(items):
+            if snapshot.checkpoint_id is None:
+                raise GatewayTaskError(
+                    code="task_history_unavailable",
+                    message=(
+                        f"Message history for task '{route.task_id}' has no snapshot"
+                    ),
+                )
+            next_cursor = _encode_task_message_cursor(
+                task_id=route.task_id,
+                checkpoint_id=snapshot.checkpoint_id,
+                offset=offset + limit,
+            )
+        return TaskMessagePage(
+            task_id=route.task_id,
+            items=page_items,
+            next_cursor=next_cursor,
+        )
+
     async def send_input(
         self,
         route: TaskRouteRecord,
@@ -362,6 +452,16 @@ def _remote_gateway_error(exc: A2AClientError) -> GatewayTaskError:
     )
 
 
+def _remote_message_history_error(exc: A2AClientError) -> GatewayTaskError:
+    if exc.status_code == 400 and exc.code == "invalid_request":
+        return GatewayTaskError(
+            code="invalid_request",
+            message=exc.message,
+            details=exc.details,
+        )
+    return _remote_gateway_error(exc)
+
+
 def _delegation_depth_error(
     current_depth: int,
     max_depth: int,
@@ -391,4 +491,75 @@ def _upstream_payload_error(message: str) -> GatewayTaskError:
     return GatewayTaskError(
         code="upstream_gateway_error",
         message=message,
+    )
+
+
+def _encode_task_message_cursor(
+    *,
+    task_id: str,
+    checkpoint_id: str,
+    offset: int,
+) -> str:
+    payload = json.dumps(
+        {
+            "checkpoint_id": checkpoint_id,
+            "offset": offset,
+            "task_id": task_id,
+            "version": TASK_MESSAGE_CURSOR_VERSION,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_task_message_cursor(
+    cursor: str | None,
+    *,
+    task_id: str,
+) -> tuple[str | None, int]:
+    if cursor is None:
+        return None, 0
+    if not cursor or len(cursor) > MAX_TASK_MESSAGE_CURSOR_LENGTH:
+        raise _invalid_message_cursor()
+    try:
+        padding = b"=" * (-len(cursor) % 4)
+        raw = base64.b64decode(
+            cursor.encode("ascii") + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, binascii.Error, UnicodeError) as exc:
+        raise _invalid_message_cursor() from exc
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "checkpoint_id",
+        "offset",
+        "task_id",
+        "version",
+    }:
+        raise _invalid_message_cursor()
+    version = payload.get("version")
+    checkpoint_id = payload.get("checkpoint_id")
+    bound_task_id = payload.get("task_id")
+    offset = payload.get("offset")
+    if (
+        version != TASK_MESSAGE_CURSOR_VERSION
+        or isinstance(version, bool)
+        or not isinstance(checkpoint_id, str)
+        or not checkpoint_id
+        or len(checkpoint_id) > 512
+        or bound_task_id != task_id
+        or not isinstance(offset, int)
+        or isinstance(offset, bool)
+        or offset < 0
+    ):
+        raise _invalid_message_cursor()
+    return checkpoint_id, offset
+
+
+def _invalid_message_cursor() -> GatewayTaskError:
+    return GatewayTaskError(
+        code="invalid_request",
+        message="Query parameter 'cursor' is invalid",
     )

@@ -129,3 +129,48 @@ def test_gateway_http_client_sends_idempotency_header_for_mutations() -> None:
         "channel-event-1",
         "channel-event-2",
     ]
+
+
+def test_gateway_http_client_returns_complete_message_page() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "task_id": "task-1",
+                "items": [
+                    {
+                        "sequence": 1,
+                        "message_id": "message-2",
+                        "role": "assistant",
+                        "content": "answer",
+                        "tool_calls": [],
+                    }
+                ],
+                "next_cursor": "next-page",
+            },
+        )
+
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(handler),
+    )
+
+    page = asyncio.run(
+        client.list_task_messages(
+            task_id="task-1",
+            cursor="current-page",
+            limit=7,
+        )
+    )
+
+    assert page["next_cursor"] == "next-page"
+    assert len(page["items"]) == 1
+    assert requests[0].url.path == "/tasks/task-1/messages"
+    assert dict(requests[0].url.params) == {
+        "cursor": "current-page",
+        "limit": "7",
+    }

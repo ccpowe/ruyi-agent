@@ -22,6 +22,7 @@ from ruyi_agent.gateway.models import (
     ReviewListResponse,
     ReviewResponse,
     TaskListResponse,
+    TaskMessageListResponse,
     TaskResponse,
     TaskWebhookEvent,
 )
@@ -82,6 +83,7 @@ HTTP_STATUS_BY_ERROR = {
     "agent_unavailable": 503,
     "attachment_upload_failed": 503,
     "runtime_unavailable": 503,
+    "task_history_unavailable": 503,
     "idempotency_unavailable": 503,
 }
 
@@ -215,6 +217,23 @@ def attach_gateway_routes(
         _: None = Depends(require_bearer),
     ) -> TaskResponse:
         return await service_getter(request).get_task(task_id)
+
+    @app.get(
+        "/tasks/{task_id}/messages",
+        response_model=TaskMessageListResponse,
+    )
+    async def list_task_messages(
+        request: Request,
+        task_id: str,
+        _: None = Depends(require_bearer),
+    ) -> TaskMessageListResponse:
+        limit_raw = request.query_params.get("limit")
+        limit = 20 if limit_raw is None else _parse_limit(limit_raw)
+        return await service_getter(request).list_task_messages(
+            task_id,
+            cursor=request.query_params.get("cursor"),
+            limit=limit,
+        )
 
     @app.get("/reviews", response_model=ReviewListResponse)
     async def list_reviews(

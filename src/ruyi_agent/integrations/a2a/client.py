@@ -17,6 +17,7 @@ A2A Client - Agent-to-Agent 协议客户端
 数据流：
   本地网关 → A2AClient → HTTP 请求 → 远程网关 → 远程 Agent
 """
+
 from __future__ import annotations
 
 import os
@@ -166,6 +167,26 @@ class A2AClient:
         """
         return await self._request_json(remote_ref, "GET", f"tasks/{task_id}")
 
+    async def list_task_messages(
+        self,
+        remote_ref: RemoteRef,
+        *,
+        task_id: str,
+        cursor: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Fetch one opaque page of the remote Task's public transcript."""
+
+        params = {"limit": str(limit)}
+        if cursor is not None:
+            params["cursor"] = cursor
+        return await self._request_json(
+            remote_ref,
+            "GET",
+            f"tasks/{task_id}/messages",
+            params=params,
+        )
+
     async def send_input(
         self,
         remote_ref: RemoteRef,
@@ -252,6 +273,7 @@ class A2AClient:
         method: str,
         path: str,
         *,
+        params: dict[str, str] | None = None,
         json: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
@@ -296,7 +318,12 @@ class A2AClient:
                 headers=headers,
                 transport=self._transports.get(remote_ref.url),
             ) as client:
-                response = await client.request(method, path, json=json)
+                response = await client.request(
+                    method,
+                    path,
+                    params=params,
+                    json=json,
+                )
         except httpx.HTTPError as exc:
             # 网络错误：连接失败、超时、DNS 解析失败等
             raise A2AClientError(

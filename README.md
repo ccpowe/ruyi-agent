@@ -246,6 +246,24 @@ curl -H "Authorization: Bearer $GATEWAY_BEARER_TOKEN" \
   http://127.0.0.1:8000/tasks/{task_id}
 ```
 
+分页查询任务的公开文本消息记录（按最旧到最新排列）：
+
+```bash
+curl -H "Authorization: Bearer $GATEWAY_BEARER_TOKEN" \
+  'http://127.0.0.1:8000/tasks/{task_id}/messages?limit=20'
+```
+
+响应包含 `task_id`、`items` 和不透明的 `next_cursor`。继续分页时原样传回
+`cursor`；游标固定第一次查询选中的持久 checkpoint，所以分页期间新增输入不会
+造成重复或漏项。每条消息公开 `sequence`、`message_id`、`role`、文本
+`content`，以及适用的 tool call/result 关联字段。
+
+这里的“消息记录”是 Agent 当前规范会话状态的公开文本投影，不是原始
+LangChain 消息 dump 或不可变审计日志。它不包含 system prompt、隐藏推理、媒体
+块和 provider metadata，也没有推测性的逐消息时间或 `run_count`。工具参数和工具
+结果正文仍属于任务数据，可能包含敏感内容。Remote Task 会把查询和不透明游标代理
+到下游 Gateway；旧版本下游不支持该接口时会明确返回上游错误，不会伪装成空记录。
+
 提交 HITL 审批：
 
 ```bash
