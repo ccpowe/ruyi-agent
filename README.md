@@ -189,6 +189,23 @@ ruyi --all
 export GATEWAY_BEARER_TOKEN=dev-token
 ```
 
+浏览器调试台位于：
+
+```text
+http://127.0.0.1:8000/debug/team
+```
+
+首次访问会跳转到服务端登录页。Gateway Token 只通过登录表单的 POST body
+提交；服务端验证后签发最长 8 小时的 `HttpOnly`、`SameSite=Strict` 浏览器
+会话，调试台不再把 Gateway Token 保存到 `localStorage`，也不接受 query
+参数中的 token。退出调试台或轮换 `GATEWAY_BEARER_TOKEN` 会使浏览器重新
+登录。
+
+调试台在 HTTP 下只允许 `localhost` 和 loopback IP；非本机部署必须使用
+HTTPS。TLS 若在反向代理终止，必须只信任受控代理，并让 ASGI scope 获得正确的
+`https` scheme；应用不会直接相信客户端传入的 `X-Forwarded-Proto`。这些浏览器
+会话只代表当前全局 Gateway principal，不提供用户级或租户级权限隔离。
+
 列出 public agent：
 
 ```bash

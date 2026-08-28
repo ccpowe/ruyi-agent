@@ -1584,22 +1584,286 @@ def test_gateway_requires_bearer_token(monkeypatch: pytest.MonkeyPatch) -> None:
     assert response.json()["error"]["code"] == "unauthorized"
 
 
-def test_team_console_shell_is_served_without_embedding_gateway_token(
+def test_team_console_requires_a_browser_session_for_shell_and_assets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app, _ = build_app(monkeypatch)
-    with TestClient(app) as client:
-        page = client.get("/debug/team")
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        page = client.get("/debug/team", follow_redirects=False)
         styles = client.get("/debug/team/app.css")
         script = client.get("/debug/team/app.js")
 
+    assert page.status_code == 303
+    assert page.headers["location"] == "/debug/team/login"
+    assert page.headers["cache-control"] == "no-store"
+    assert styles.status_code == 401
+    assert styles.headers["cache-control"] == "no-store"
+    assert styles.headers["www-authenticate"].startswith("Bearer ")
+    assert script.status_code == 401
+    assert script.headers["cache-control"] == "no-store"
+
+
+def test_team_console_login_issues_protected_session_and_removes_stored_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = build_app(monkeypatch)
+    browser_headers = {
+        "Origin": "http://127.0.0.1",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        login_page = client.get("/debug/team/login")
+        invalid = client.post(
+            "/debug/team/login",
+            data={"token": "do-not-reflect-this"},
+            headers=browser_headers,
+            follow_redirects=False,
+        )
+        logged_in = client.post(
+            "/debug/team/login",
+            data={"token": "secret-token"},
+            headers=browser_headers,
+            follow_redirects=False,
+        )
+        page = client.get("/debug/team")
+        styles = client.get("/debug/team/app.css")
+        script = client.get("/debug/team/app.js")
+        console_headers = {
+            "X-Ruyi-Team-Console": "1",
+            "Sec-Fetch-Site": "same-origin",
+            "Referer": "http://127.0.0.1/debug/team",
+        }
+        agents = client.get("/agents", headers=console_headers)
+        error = client.get("/agents/does-not-exist", headers=console_headers)
+        invalid_payload = client.post(
+            "/agents/main/tasks",
+            json={},
+            headers=console_headers,
+        )
+        missing_marker = client.get(
+            "/agents",
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        invalid_bearer = client.get(
+            "/agents",
+            headers={**console_headers, "Authorization": "Bearer wrong"},
+        )
+
+    assert login_page.status_code == 200
+    assert login_page.headers["cache-control"] == "no-store"
+    assert "form-action 'self'" in login_page.headers["content-security-policy"]
+    assert "secret-token" not in login_page.text
+    assert invalid.status_code == 401
+    assert "do-not-reflect-this" not in invalid.text
+    assert "set-cookie" not in invalid.headers
+    assert logged_in.status_code == 303
+    assert logged_in.headers["location"] == "/debug/team"
+    set_cookie = logged_in.headers["set-cookie"]
+    assert "ruyi_team_console_session=" in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "Max-Age=28800" in set_cookie
+    assert "Path=/" in set_cookie
+    assert "SameSite=strict" in set_cookie
+    assert "Secure" not in set_cookie
     assert page.status_code == 200
     assert "RUYI / ARCHITECTURE DESK" in page.text
-    assert "dev-token" not in page.text
+    assert page.headers["cache-control"] == "no-store"
+    assert "script-src 'self'" in page.headers["content-security-policy"]
     assert styles.status_code == 200
-    assert "--paper" in styles.text
+    assert styles.headers["cache-control"] == "no-store"
+    assert "fonts.googleapis.com" not in styles.text
     assert script.status_code == 200
-    assert 'api("/agents")' in script.text
+    assert 'localStorage.removeItem("ruyi.gatewayToken")' in script.text
+    assert '"X-Ruyi-Team-Console": "1"' in script.text
+    assert agents.status_code == 200
+    assert agents.headers["cache-control"] == "no-store"
+    assert error.status_code == 404
+    assert error.headers["cache-control"] == "no-store"
+    assert invalid_payload.status_code == 422
+    assert invalid_payload.headers["cache-control"] == "no-store"
+    assert missing_marker.status_code == 401
+    assert invalid_bearer.status_code == 401
+
+
+def test_team_console_logout_clears_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = build_app(monkeypatch)
+    login_headers = {
+        "Origin": "http://localhost",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    console_headers = {
+        "X-Ruyi-Team-Console": "1",
+        "Origin": "http://localhost",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    with TestClient(app, base_url="http://localhost") as client:
+        client.post(
+            "/debug/team/login",
+            data={"token": "secret-token"},
+            headers=login_headers,
+        )
+        logout = client.post(
+            "/debug/team/logout",
+            headers=console_headers,
+            follow_redirects=False,
+        )
+        page = client.get("/debug/team", follow_redirects=False)
+
+    assert logout.status_code == 303
+    assert logout.headers["location"] == "/debug/team/login"
+    assert "Max-Age=0" in logout.headers["set-cookie"]
+    assert "HttpOnly" in logout.headers["set-cookie"]
+    assert page.status_code == 303
+
+
+def test_team_console_login_rejects_cross_site_query_and_oversized_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = build_app(monkeypatch)
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        missing_source = client.post(
+            "/debug/team/login",
+            data={"token": "secret-token"},
+            follow_redirects=False,
+        )
+        cross_site = client.post(
+            "/debug/team/login",
+            data={"token": "secret-token"},
+            headers={
+                "Origin": "https://attacker.example",
+                "Sec-Fetch-Site": "cross-site",
+            },
+            follow_redirects=False,
+        )
+        query_token = client.get(
+            "/debug/team/login?token=secret-token",
+            follow_redirects=False,
+        )
+        oversized = client.post(
+            "/debug/team/login",
+            content=b"token=" + (b"x" * 9_000),
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "http://127.0.0.1",
+                "Sec-Fetch-Site": "same-origin",
+            },
+            follow_redirects=False,
+        )
+        wrong_media_type = client.post(
+            "/debug/team/login",
+            json={"token": "secret-token"},
+            headers={
+                "Origin": "http://127.0.0.1",
+                "Sec-Fetch-Site": "same-origin",
+            },
+            follow_redirects=False,
+        )
+        malformed_encoding = client.post(
+            "/debug/team/login",
+            content="token=%ZZ",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "http://127.0.0.1",
+                "Sec-Fetch-Site": "same-origin",
+            },
+            follow_redirects=False,
+        )
+        duplicate_token = client.post(
+            "/debug/team/login",
+            content="token=secret-token&token=secret-token",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "http://127.0.0.1",
+                "Sec-Fetch-Site": "same-origin",
+            },
+            follow_redirects=False,
+        )
+
+    assert missing_source.status_code == 403
+    assert cross_site.status_code == 403
+    assert query_token.status_code == 400
+    assert "secret-token" not in query_token.text
+    assert oversized.status_code == 413
+    assert wrong_media_type.status_code == 415
+    assert malformed_encoding.status_code == 400
+    assert duplicate_token.status_code == 400
+
+
+def test_team_console_cookie_security_uses_asgi_scheme_not_forwarded_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = build_app(monkeypatch)
+    with TestClient(app, base_url="http://gateway.example") as plaintext:
+        rejected = plaintext.post(
+            "/debug/team/login",
+            data={"token": "secret-token"},
+            headers={
+                "Origin": "http://gateway.example",
+                "Sec-Fetch-Site": "same-origin",
+                "X-Forwarded-Proto": "https",
+            },
+            follow_redirects=False,
+        )
+    with TestClient(app, base_url="https://gateway.example") as tls_client:
+        accepted = tls_client.post(
+            "/debug/team/login",
+            data={"token": "secret-token"},
+            headers={
+                "Origin": "https://gateway.example",
+                "Sec-Fetch-Site": "same-origin",
+            },
+            follow_redirects=False,
+        )
+
+    assert rejected.status_code == 400
+    assert "set-cookie" not in rejected.headers
+    assert accepted.status_code == 303
+    assert "Secure" in accepted.headers["set-cookie"]
+
+
+def test_team_console_cookie_authenticated_unexpected_error_is_not_cached() -> None:
+    class ExplodingService:
+        def list_agents(self) -> None:
+            raise RuntimeError("sensitive internal failure")
+
+    app = create_gateway_app(
+        service=ExplodingService(),  # type: ignore[arg-type]
+        bearer_token="secret-token",
+    )
+    browser_headers = {
+        "Origin": "http://127.0.0.1",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        raise_server_exceptions=False,
+    ) as client:
+        client.post(
+            "/debug/team/login",
+            data={"token": "secret-token"},
+            headers=browser_headers,
+        )
+        response = client.get(
+            "/agents",
+            headers={
+                "X-Ruyi-Team-Console": "1",
+                "Referer": "http://127.0.0.1/debug/team",
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+
+    assert response.status_code == 500
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "error": {
+            "code": "internal_error",
+            "message": "Internal gateway error",
+        }
+    }
+    assert "sensitive internal failure" not in response.text
 
 
 def test_get_agents_returns_public_targets_only(

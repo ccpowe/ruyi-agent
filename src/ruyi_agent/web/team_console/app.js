@@ -1,17 +1,16 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
+localStorage.removeItem("ruyi.gatewayToken");
+
 const state = {
-  token: localStorage.getItem("ruyi.gatewayToken") || "",
   rootId: localStorage.getItem("ruyi.teamRootId") || "",
   tasks: new Map(),
   selectedTaskId: null,
   poller: null,
 };
 
-const tokenInput = $("#token");
 const rootInput = $("#root-id");
-tokenInput.value = state.token;
 rootInput.value = state.rootId;
 
 function now() { return new Date().toLocaleTimeString([], {hour12: false}); }
@@ -31,13 +30,17 @@ function setConnection(label, type = "neutral") {
 }
 
 async function api(path, options = {}) {
-  const token = tokenInput.value.trim();
-  const headers = {"Content-Type": "application/json", ...(options.headers || {})};
-  if (token) headers.Authorization = `Bearer ${token}`;
-  const response = await fetch(path, {...options, headers});
+  const headers = {"X-Ruyi-Team-Console": "1", ...(options.headers || {})};
+  if (options.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
+  const response = await fetch(path, {...options, headers, credentials: "same-origin"});
   let payload;
   try { payload = await response.json(); } catch { payload = await response.text(); }
   logEvent(response.ok ? "HTTP" : "ERROR", `${options.method || "GET"} ${path} → ${response.status}`, payload);
+  if (response.status === 401) {
+    localStorage.removeItem("ruyi.gatewayToken");
+    window.location.replace("/debug/team/login");
+    throw new Error("调试台会话已失效");
+  }
   if (!response.ok) {
     const message = payload?.error?.message || payload?.detail || `HTTP ${response.status}`;
     throw new Error(typeof message === "string" ? message : JSON.stringify(message));
@@ -94,10 +97,22 @@ async function refresh() {
 }
 function startPolling() { clearInterval(state.poller); refresh(); state.poller = setInterval(refresh, 2500); }
 
-$("#connect").addEventListener("click", async () => {
-  state.token = tokenInput.value.trim(); localStorage.setItem("ruyi.gatewayToken", state.token);
+async function connect() {
   try { const agents = await api("/agents"); setConnection(`在线 · ${agents.items.length} agents`, "completed"); if (state.rootId) startPolling(); }
-  catch (error) { setConnection("认证失败", "failed"); toast(error.message); }
+  catch (error) { setConnection("连接失败", "failed"); toast(error.message); }
+}
+
+$("#logout").addEventListener("click", async () => {
+  try {
+    await fetch("/debug/team/logout", {
+      method: "POST",
+      headers: {"X-Ruyi-Team-Console": "1"},
+      credentials: "same-origin",
+    });
+  } finally {
+    localStorage.removeItem("ruyi.gatewayToken");
+    window.location.replace("/debug/team/login");
+  }
 });
 
 $("#start-form").addEventListener("submit", async event => {
@@ -143,4 +158,4 @@ $("#session-form").addEventListener("submit", async event => {
 });
 
 $("#clear-events").addEventListener("click", () => $("#event-log").replaceChildren());
-if (state.token) $("#connect").click();
+connect();
