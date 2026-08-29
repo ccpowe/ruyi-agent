@@ -43,22 +43,30 @@ class TaskStore:
     """
 
     def __init__(self, db_path: str) -> None:
-        self._database = TaskDatabase(db_path)
-        initialize_task_database(self._database)
-        self._tasks = TaskRepository(self._database)
-        self._events = TaskEventRepository(self._database)
-        self._settled_outbox = SettledOutboxRepository(self._database)
-        self._lifecycle = TaskLifecycleUnitOfWork(
-            self._database,
-            self._tasks,
-            self._events,
-            self._settled_outbox,
-        )
-        self._reviews = TaskReviewUnitOfWork(
-            self._database,
-            self._tasks,
-            self._settled_outbox,
-        )
+        database = TaskDatabase(db_path)
+        try:
+            initialize_task_database(database)
+            self._database = database
+            self._tasks = TaskRepository(self._database)
+            self._events = TaskEventRepository(self._database)
+            self._settled_outbox = SettledOutboxRepository(self._database)
+            self._lifecycle = TaskLifecycleUnitOfWork(
+                self._database,
+                self._tasks,
+                self._events,
+                self._settled_outbox,
+            )
+            self._reviews = TaskReviewUnitOfWork(
+                self._database,
+                self._tasks,
+                self._settled_outbox,
+            )
+        except BaseException:
+            try:
+                database.close()
+            except BaseException:
+                pass
+            raise
 
     @property
     def db_path(self) -> str:

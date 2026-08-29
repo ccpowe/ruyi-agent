@@ -10,6 +10,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from ruyi_agent.storage.task_database import (
+    configure_connection_for_initialization,
+    database_initialization_lock,
+)
+
 
 CommandClaimStatus = Literal["acquired", "busy", "replay", "terminal"]
 
@@ -55,8 +60,16 @@ class GatewayCommandStore:
             uri=db_path.startswith("file:"),
         )
         self._conn.row_factory = sqlite3.Row
-        self._init_db()
-        self._recover_interrupted_claims()
+        try:
+            with database_initialization_lock(self._db_path):
+                self._init_db()
+                self._recover_interrupted_claims()
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                pass
+            raise
 
     def claim(
         self,
@@ -402,9 +415,10 @@ class GatewayCommandStore:
 
     def _init_db(self) -> None:
         with self._lock:
-            self._conn.execute("PRAGMA busy_timeout = 30000")
-            if self._db_path != ":memory:":
-                self._conn.execute("PRAGMA journal_mode = WAL")
+            configure_connection_for_initialization(
+                self._conn,
+                db_path=self._db_path,
+            )
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 _initialize_gateway_command_schema(self._conn)

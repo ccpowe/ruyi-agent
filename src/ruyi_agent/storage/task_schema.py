@@ -4,7 +4,10 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 
-from ruyi_agent.storage.task_database import TaskDatabase
+from ruyi_agent.storage.task_database import (
+    TaskDatabase,
+    configure_connection_for_initialization,
+)
 
 
 REMOTE_TASK_PUBLIC_ERROR = "Remote Gateway Task failed"
@@ -14,19 +17,21 @@ REMOTE_PUBLIC_PROJECTION_MIGRATION = "remote_public_projection_v1"
 def initialize_task_database(database: TaskDatabase) -> None:
     """Create the current schema and run compatible, idempotent migrations."""
 
-    with database.locked_connection() as connection:
-        connection.execute("PRAGMA busy_timeout = 30000")
-        connection.execute("PRAGMA foreign_keys = ON")
-        if database.db_path != ":memory:":
-            connection.execute("PRAGMA journal_mode = WAL")
-    with database.transaction(immediate=True) as connection:
-        _create_tables(connection)
-        _ensure_legacy_columns(connection)
-        sanitize_legacy_remote_public_projections(connection)
-        backfill_pending_reviews(connection)
-        _backfill_pending_review_cursor_order(connection)
-        _backfill_pending_review_ingest_sequences(connection)
-        _create_indexes(connection)
+    with database.initialization():
+        with database.locked_connection() as connection:
+            configure_connection_for_initialization(
+                connection,
+                db_path=database.db_path,
+                foreign_keys=True,
+            )
+        with database.transaction(immediate=True) as connection:
+            _create_tables(connection)
+            _ensure_legacy_columns(connection)
+            sanitize_legacy_remote_public_projections(connection)
+            backfill_pending_reviews(connection)
+            _backfill_pending_review_cursor_order(connection)
+            _backfill_pending_review_ingest_sequences(connection)
+            _create_indexes(connection)
 
 
 def _create_tables(connection: sqlite3.Connection) -> None:

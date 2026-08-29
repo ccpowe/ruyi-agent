@@ -5,11 +5,12 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Callable
+from typing import Callable, cast
 
 import pytest
 
 import ruyi_agent.storage.gateway_command_store as gateway_command_store_module
+import ruyi_agent.storage.task_database as task_database_module
 import ruyi_agent.storage.task_schema as task_schema_module
 from ruyi_agent.storage.gateway_command_store import GatewayCommandStore
 from ruyi_agent.storage.task_database import TaskDatabase
@@ -18,7 +19,7 @@ from ruyi_agent.storage.task_store import TaskStore
 
 NOW = "2026-08-30T00:00:00+00:00"
 THREAD_COUNT = 12
-REPEAT_COUNT = 3
+STRESS_ROUND_COUNT = 60
 
 
 def _create_legacy_task_database(db_path: Path) -> None:
@@ -157,22 +158,52 @@ def _create_legacy_command_database(db_path: Path) -> None:
         connection.close()
 
 
-def _open_stores_concurrently(factory: Callable[[], object]) -> None:
+def _open_stores_concurrently(
+    factory: Callable[[], object],
+    *,
+    repeat_count: int = 1,
+) -> None:
     barrier = threading.Barrier(THREAD_COUNT)
+    failure_lock = threading.Lock()
+    first_failure: list[BaseException] = []
+
+    def record_failure(exc: BaseException) -> None:
+        with failure_lock:
+            if not first_failure:
+                first_failure.append(exc)
+        barrier.abort()
 
     def open_repeatedly(_index: int) -> None:
-        for _ in range(REPEAT_COUNT):
-            barrier.wait(timeout=30)
-            store = factory()
-            try:
-                count = getattr(store, "count_commands", None)
-                if count is not None:
-                    assert count() == 1
-            finally:
-                getattr(store, "close")()
+        try:
+            for _ in range(repeat_count):
+                try:
+                    barrier.wait(timeout=30)
+                except threading.BrokenBarrierError as exc:
+                    with failure_lock:
+                        already_failed = bool(first_failure)
+                    if already_failed:
+                        return
+                    record_failure(exc)
+                    return
+                store = factory()
+                try:
+                    count = getattr(store, "count_commands", None)
+                    if count is not None:
+                        assert count() == 1
+                finally:
+                    getattr(store, "close")()
+        except BaseException as exc:
+            record_failure(exc)
 
     with ThreadPoolExecutor(max_workers=THREAD_COUNT) as executor:
-        list(executor.map(open_repeatedly, range(THREAD_COUNT)))
+        futures = [
+            executor.submit(open_repeatedly, index) for index in range(THREAD_COUNT)
+        ]
+        for future in futures:
+            future.result()
+
+    if first_failure:
+        raise first_failure[0]
 
 
 def _column_names(connection: sqlite3.Connection, table: str) -> list[str]:
@@ -189,13 +220,54 @@ def _index_names(connection: sqlite3.Connection, table: str) -> set[str]:
     }
 
 
+def test_wal_negotiation_retries_only_locked_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LockedThenReadyConnection:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def execute(self, statement: str) -> None:
+            assert statement == "PRAGMA journal_mode = WAL"
+            self.calls += 1
+            if self.calls < 3:
+                raise sqlite3.OperationalError("database is locked")
+
+    connection = LockedThenReadyConnection()
+    delays: list[float] = []
+    monkeypatch.setattr(task_database_module.time, "sleep", delays.append)
+
+    task_database_module._enable_write_ahead_log(cast(sqlite3.Connection, connection))
+
+    assert connection.calls == 3
+    assert delays == [0.005, 0.01]
+
+
+def test_wal_negotiation_preserves_non_lock_sqlite_error() -> None:
+    class BrokenConnection:
+        calls = 0
+
+        def execute(self, statement: str) -> None:
+            assert statement == "PRAGMA journal_mode = WAL"
+            self.calls += 1
+            raise sqlite3.OperationalError("disk I/O error")
+
+    connection = BrokenConnection()
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        task_database_module._enable_write_ahead_log(
+            cast(sqlite3.Connection, connection)
+        )
+
+    assert connection.calls == 1
+
+
 def test_legacy_task_schema_initializes_concurrently_without_partial_migration(
     tmp_path: Path,
 ) -> None:
-    db_path = tmp_path / "legacy-tasks.sqlite"
-    _create_legacy_task_database(db_path)
-
-    _open_stores_concurrently(lambda: TaskStore(str(db_path)))
+    for round_index in range(STRESS_ROUND_COUNT):
+        db_path = tmp_path / f"legacy-tasks-{round_index}.sqlite"
+        _create_legacy_task_database(db_path)
+        _open_stores_concurrently(lambda: TaskStore(str(db_path)))
 
     connection = sqlite3.connect(db_path)
     try:
@@ -262,10 +334,10 @@ def test_legacy_task_schema_initializes_concurrently_without_partial_migration(
 def test_legacy_command_schema_initializes_concurrently_without_duplicate_columns(
     tmp_path: Path,
 ) -> None:
-    db_path = tmp_path / "legacy-commands.sqlite"
-    _create_legacy_command_database(db_path)
-
-    _open_stores_concurrently(lambda: GatewayCommandStore(str(db_path)))
+    for round_index in range(STRESS_ROUND_COUNT):
+        db_path = tmp_path / f"legacy-commands-{round_index}.sqlite"
+        _create_legacy_command_database(db_path)
+        _open_stores_concurrently(lambda: GatewayCommandStore(str(db_path)))
 
     connection = sqlite3.connect(db_path)
     try:
@@ -297,6 +369,102 @@ def test_legacy_command_schema_initializes_concurrently_without_duplicate_column
     assert any(int(row[2]) == 1 for row in indexes)
     assert command == ("pending", None, None, 0, 1)
     assert integrity == ("ok",)
+
+
+def test_task_store_constructor_preserves_first_concurrent_failure_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "task-constructor-failure.sqlite"
+    _create_legacy_task_database(db_path)
+    original_create_indexes = task_schema_module._create_indexes
+    original_close = TaskDatabase.close
+    injection_lock = threading.Lock()
+    close_lock = threading.Lock()
+    should_fail = True
+    close_count = 0
+
+    def fail_first_initialization(connection: sqlite3.Connection) -> None:
+        nonlocal should_fail
+        original_create_indexes(connection)
+        with injection_lock:
+            if should_fail:
+                should_fail = False
+                connection.execute("SELECT * FROM sentinel_task_initialization_failure")
+
+    def track_close(database: TaskDatabase) -> None:
+        nonlocal close_count
+        original_close(database)
+        with close_lock:
+            close_count += 1
+
+    monkeypatch.setattr(
+        task_schema_module,
+        "_create_indexes",
+        fail_first_initialization,
+    )
+    monkeypatch.setattr(TaskDatabase, "close", track_close)
+
+    with pytest.raises(
+        sqlite3.OperationalError,
+        match="no such table: sentinel_task_initialization_failure",
+    ):
+        _open_stores_concurrently(
+            lambda: TaskStore(str(db_path)),
+            repeat_count=1,
+        )
+
+    assert close_count == THREAD_COUNT
+
+
+def test_command_store_constructor_preserves_first_concurrent_failure_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "command-constructor-failure.sqlite"
+    _create_legacy_command_database(db_path)
+    original_initialize = (
+        gateway_command_store_module._initialize_gateway_command_schema
+    )
+    original_close = GatewayCommandStore.close
+    injection_lock = threading.Lock()
+    close_lock = threading.Lock()
+    should_fail = True
+    close_count = 0
+
+    def fail_first_initialization(connection: sqlite3.Connection) -> None:
+        nonlocal should_fail
+        original_initialize(connection)
+        with injection_lock:
+            if should_fail:
+                should_fail = False
+                connection.execute(
+                    "SELECT * FROM sentinel_command_initialization_failure"
+                )
+
+    def track_close(store: GatewayCommandStore) -> None:
+        nonlocal close_count
+        original_close(store)
+        with close_lock:
+            close_count += 1
+
+    monkeypatch.setattr(
+        gateway_command_store_module,
+        "_initialize_gateway_command_schema",
+        fail_first_initialization,
+    )
+    monkeypatch.setattr(GatewayCommandStore, "close", track_close)
+
+    with pytest.raises(
+        sqlite3.OperationalError,
+        match="no such table: sentinel_command_initialization_failure",
+    ):
+        _open_stores_concurrently(
+            lambda: GatewayCommandStore(str(db_path)),
+            repeat_count=1,
+        )
+
+    assert close_count == THREAD_COUNT
 
 
 def test_task_schema_migration_rolls_back_as_one_transaction(
