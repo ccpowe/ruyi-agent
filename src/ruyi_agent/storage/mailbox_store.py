@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ruyi_agent.storage.settled_outbox import SettledOutboxIntent
+from ruyi_agent.storage.task_schema import sanitize_legacy_remote_public_projections
 
 
 class MailboxStore:
@@ -444,6 +445,7 @@ class MailboxStore:
                 )
                 """
             )
+            sanitize_legacy_remote_public_projections(self._conn)
             self._conn.commit()
 
     def _resolve_settled_message_locked(self, intent: SettledOutboxIntent) -> None:

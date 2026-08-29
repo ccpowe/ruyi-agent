@@ -6,6 +6,10 @@ import sqlite3
 from ruyi_agent.storage.task_database import TaskDatabase
 
 
+REMOTE_TASK_PUBLIC_ERROR = "Remote Gateway Task failed"
+REMOTE_PUBLIC_PROJECTION_MIGRATION = "remote_public_projection_v1"
+
+
 def initialize_task_database(database: TaskDatabase) -> None:
     """Create the current schema and run compatible, idempotent migrations."""
 
@@ -16,7 +20,9 @@ def initialize_task_database(database: TaskDatabase) -> None:
             connection.execute("PRAGMA journal_mode = WAL")
         _create_tables(connection)
         _ensure_legacy_columns(connection)
+        sanitize_legacy_remote_public_projections(connection)
         backfill_pending_reviews(connection)
+        _backfill_pending_review_cursor_order(connection)
         _backfill_pending_review_ingest_sequences(connection)
         _create_indexes(connection)
         connection.commit()
@@ -79,6 +85,7 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             ingest_sequence INTEGER,
+            cursor_order_updated_at TEXT,
             FOREIGN KEY(task_id) REFERENCES agent_tasks(task_id)
         )
         """
@@ -195,6 +202,12 @@ def _ensure_legacy_columns(connection: sqlite3.Connection) -> None:
         column="ingest_sequence",
         definition="INTEGER",
     )
+    _ensure_column(
+        connection,
+        table="agent_task_pending_reviews",
+        column="cursor_order_updated_at",
+        definition="TEXT",
+    )
 
 
 def _ensure_column(
@@ -209,6 +222,303 @@ def _ensure_column(
     }
     if column not in columns:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def sanitize_legacy_remote_public_projections(
+    connection: sqlite3.Connection,
+) -> None:
+    """Idempotently remove pre-trust-boundary remote data from public storage.
+
+    The migration runs on every open so a database that was only partly upgraded,
+    or whose mailbox table was created after ``TaskStore``, is repaired before a
+    notification lease can be acquired. ``upstream_task_id`` remains the private
+    routing binding; every public Task and notification identity uses ``task_id``.
+    """
+
+    tables = _table_names(connection)
+    if "agent_tasks" not in tables:
+        return
+    remote_rows = connection.execute(
+        """
+        SELECT task_id, upstream_task_id, state, run_count, error,
+               pending_review_json
+        FROM agent_tasks
+        WHERE route_kind = 'remote_ref'
+        """
+    ).fetchall()
+    if not remote_rows:
+        _record_remote_projection_migration(connection, tables=tables)
+        return
+
+    remote_errors: dict[str, str] = {}
+    for (
+        task_id_value,
+        _upstream_task_id,
+        _state,
+        _run_count,
+        error,
+        pending_review_json,
+    ) in remote_rows:
+        task_id = str(task_id_value)
+        if error is not None:
+            remote_errors[task_id] = str(error)
+        connection.execute(
+            """
+            UPDATE agent_tasks
+            SET thread_id = task_id,
+                error = CASE
+                    WHEN error IS NULL THEN NULL
+                    ELSE ?
+                END,
+                pending_review_json = ?
+            WHERE task_id = ? AND route_kind = 'remote_ref'
+            """,
+            (
+                REMOTE_TASK_PUBLIC_ERROR,
+                _public_pending_review_json(pending_review_json, task_id=task_id),
+                task_id,
+            ),
+        )
+
+    if "agent_task_pending_reviews" in tables:
+        _sanitize_remote_pending_reviews(connection)
+    if "agent_task_events" in tables:
+        _sanitize_remote_task_events(connection)
+    if "agent_task_settled_outbox" in tables:
+        _sanitize_remote_settled_outbox(
+            connection,
+            remote_errors=remote_errors,
+        )
+    if "agent_mailbox_messages" in tables:
+        _sanitize_remote_mailbox_messages(
+            connection,
+            remote_errors=remote_errors,
+        )
+    _record_remote_projection_migration(connection, tables=tables)
+
+
+def _sanitize_remote_pending_reviews(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT review.review_id, review.task_id, review.payload_json
+        FROM agent_task_pending_reviews AS review
+        JOIN agent_tasks AS task ON task.task_id = review.task_id
+        WHERE task.route_kind = 'remote_ref'
+        """
+    ).fetchall()
+    for review_id, task_id_value, payload_json in rows:
+        task_id = str(task_id_value)
+        connection.execute(
+            """
+            UPDATE agent_task_pending_reviews
+            SET payload_json = ?
+            WHERE review_id = ?
+            """,
+            (
+                _public_pending_review_json(payload_json, task_id=task_id),
+                review_id,
+            ),
+        )
+
+
+def _sanitize_remote_task_events(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT event.event_id, event.task_id, event.data_json
+        FROM agent_task_events AS event
+        JOIN agent_tasks AS task ON task.task_id = event.task_id
+        WHERE task.route_kind = 'remote_ref'
+        """
+    ).fetchall()
+    for event_id, task_id_value, data_json in rows:
+        task_id = str(task_id_value)
+        public_json = _public_remote_event_json(data_json, task_id=task_id)
+        connection.execute(
+            "UPDATE agent_task_events SET data_json = ? WHERE event_id = ?",
+            (public_json, event_id),
+        )
+
+
+def _sanitize_remote_settled_outbox(
+    connection: sqlite3.Connection,
+    *,
+    remote_errors: dict[str, str],
+) -> None:
+    rows = connection.execute(
+        """
+        SELECT outbox.outbox_key, outbox.task_id, outbox.run_count,
+               outbox.content, outbox.status, task.state, task.run_count
+        FROM agent_task_settled_outbox AS outbox
+        JOIN agent_tasks AS task ON task.task_id = outbox.task_id
+        WHERE task.route_kind = 'remote_ref'
+          AND outbox.status != 'delivered'
+        """
+    ).fetchall()
+    for (
+        outbox_key,
+        task_id_value,
+        outbox_run_count,
+        content,
+        status,
+        task_state,
+        task_run_count,
+    ) in rows:
+        task_id = str(task_id_value)
+        public_content = _public_remote_settlement_content(
+            content=str(content),
+            old_error=remote_errors.get(task_id),
+            task_state=str(task_state),
+            is_current_run=int(outbox_run_count) == int(task_run_count),
+        )
+        connection.execute(
+            """
+            UPDATE agent_task_settled_outbox
+            SET content = ?,
+                status = CASE WHEN status = 'claimed' THEN 'pending' ELSE status END,
+                claimed_at = NULL, claim_expires_at = NULL,
+                claimed_by = NULL, claim_token = NULL, last_error = NULL
+            WHERE outbox_key = ? AND status = ?
+            """,
+            (public_content, outbox_key, status),
+        )
+
+
+def _sanitize_remote_mailbox_messages(
+    connection: sqlite3.Connection,
+    *,
+    remote_errors: dict[str, str],
+) -> None:
+    rows = connection.execute(
+        """
+        SELECT message.message_id, message.child_task_id,
+               message.child_run_count, message.content, message.status,
+               task.task_id, task.state, task.run_count
+        FROM agent_mailbox_messages AS message
+        JOIN agent_tasks AS task
+          ON message.child_task_id IN (task.task_id, task.upstream_task_id)
+        WHERE task.route_kind = 'remote_ref'
+          AND message.status IN ('pending', 'claimed', 'retracted')
+        """
+    ).fetchall()
+    for (
+        message_id,
+        _stored_child_task_id,
+        child_run_count,
+        content,
+        status,
+        task_id_value,
+        task_state,
+        task_run_count,
+    ) in rows:
+        task_id = str(task_id_value)
+        public_content = _public_remote_settlement_content(
+            content=str(content),
+            old_error=remote_errors.get(task_id),
+            task_state=str(task_state),
+            is_current_run=(
+                child_run_count is not None
+                and int(child_run_count) == int(task_run_count)
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE agent_mailbox_messages
+            SET sender_task_id = ?, child_task_id = ?, content = ?,
+                status = CASE WHEN status = 'claimed' THEN 'pending' ELSE status END,
+                claimed_at = NULL, claim_expires_at = NULL,
+                claimed_by = NULL, claim_token = NULL
+            WHERE message_id = ? AND status = ?
+            """,
+            (task_id, task_id, public_content, message_id, status),
+        )
+
+
+def _public_remote_settlement_content(
+    *,
+    content: str,
+    old_error: str | None,
+    task_state: str,
+    is_current_run: bool,
+) -> str:
+    if old_error is not None and content == old_error:
+        return REMOTE_TASK_PUBLIC_ERROR
+    if is_current_run and task_state in {"failed", "interrupted"}:
+        return REMOTE_TASK_PUBLIC_ERROR
+    return content
+
+
+def _public_remote_event_json(value: object, *, task_id: str) -> str:
+    try:
+        payload = json.loads(value) if isinstance(value, str) else None
+    except json.JSONDecodeError:
+        return json.dumps({}, ensure_ascii=True, sort_keys=True)
+    if not isinstance(payload, dict):
+        return json.dumps({}, ensure_ascii=True, sort_keys=True)
+    if payload.get("error") is not None:
+        payload["error"] = REMOTE_TASK_PUBLIC_ERROR
+        payload.pop("error_truncated", None)
+    if "task_id" in payload:
+        payload["task_id"] = task_id
+    if "thread_id" in payload:
+        payload["thread_id"] = task_id
+    if "pending_review" in payload:
+        payload["pending_review"] = _public_pending_review(
+            payload.get("pending_review"),
+            task_id=task_id,
+        )
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True)
+
+
+def _public_pending_review_json(value: object, *, task_id: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        payload = json.loads(value) if isinstance(value, str) else None
+    except json.JSONDecodeError:
+        return None
+    public = _public_pending_review(payload, task_id=task_id)
+    if public is None:
+        return None
+    return json.dumps(public, ensure_ascii=True, sort_keys=True)
+
+
+def _public_pending_review(
+    value: object,
+    *,
+    task_id: str,
+) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    public = dict(value)
+    if "source_task_id" in public:
+        public["source_task_id"] = task_id
+    return public
+
+
+def _record_remote_projection_migration(
+    connection: sqlite3.Connection,
+    *,
+    tables: set[str],
+) -> None:
+    if "agent_storage_migrations" not in tables:
+        return
+    connection.execute(
+        """
+        INSERT INTO agent_storage_migrations (name, cursor, completed)
+        VALUES (?, '', 1)
+        ON CONFLICT(name) DO UPDATE SET completed = 1
+        """,
+        (REMOTE_PUBLIC_PROJECTION_MIGRATION,),
+    )
+
+
+def _table_names(connection: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
 
 
 def backfill_pending_reviews(connection: sqlite3.Connection) -> None:
@@ -354,4 +664,16 @@ def _backfill_pending_review_ingest_sequences(
             last_sequence = MAX(last_sequence, excluded.last_sequence)
         """,
         (high_water,),
+    )
+
+
+def _backfill_pending_review_cursor_order(connection: sqlite3.Connection) -> None:
+    """Freeze the legacy v2 ordering timestamp without changing existing values."""
+
+    connection.execute(
+        """
+        UPDATE agent_task_pending_reviews
+        SET cursor_order_updated_at = updated_at
+        WHERE cursor_order_updated_at IS NULL OR cursor_order_updated_at = ''
+        """
     )
