@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from ruyi_agent.task_models import MetadataScalar, TaskRouteRecord
+from ruyi_agent.task_models import MetadataScalar, TaskRouteRecord as TaskRouteRecord
 
 
 @dataclass(slots=True)

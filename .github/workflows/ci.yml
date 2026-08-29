@@ -30,6 +30,9 @@ jobs:
       - name: Compile Python sources
         run: uv run python -m compileall -q src scripts tests
 
+      - name: Lint Python sources
+        run: uv run ruff check src tests scripts
+
       - name: Run test suite
         run: >
           uv run pytest

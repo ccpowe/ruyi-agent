@@ -412,6 +412,12 @@ model = "gpt-5.6-sol"
 uv run pytest
 ```
 
+运行基础静态检查：
+
+```bash
+uv run ruff check src tests scripts
+```
+
 构建 wheel 和 sdist：
 
 ```bash
