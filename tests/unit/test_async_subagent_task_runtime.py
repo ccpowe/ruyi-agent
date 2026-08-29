@@ -528,7 +528,7 @@ def test_failed_remote_create_keeps_explainable_record_and_retries_same_slot(
         assert failed is not None
         assert failed.state == "failed"
         assert failed.upstream_task_id is None
-        assert "before upstream binding" in (failed.error or "")
+        assert failed.error == "Remote Gateway Task creation failed"
         assert store.count_tasks_under_root("stable-remote") == 1
 
         return await control.spawn_task(
