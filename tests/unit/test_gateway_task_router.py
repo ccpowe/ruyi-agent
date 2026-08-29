@@ -155,8 +155,10 @@ class FailingReservationStore:
     def __init__(self) -> None:
         self.reserve_calls = 0
 
-    async def areserve_route(self, route: TaskRouteRecord) -> TaskRouteRecord:
-        del route
+    async def areserve_route(
+        self, route: TaskRouteRecord, **kwargs: object
+    ) -> TaskRouteRecord:
+        del route, kwargs
         self.reserve_calls += 1
         raise sqlite3.OperationalError("route database unavailable")
 
@@ -236,10 +238,12 @@ def test_route_store_rejects_identity_rebinding_without_overwrite() -> None:
                     upstream_task_id="upstream-2",
                 )
             )
+        degraded = store.transition_route("task-1", route_state="uncertain")
+        assert degraded.route_state == "uncertain"
         with pytest.raises(ValueError, match="cannot transition"):
-            store.transition_route("task-1", route_state="uncertain")
+            store.transition_route("task-1", route_state="active")
 
-        assert store.get_route("task-1") == original
+        assert store.get_route("task-1") == degraded
     finally:
         store.close()
 
@@ -532,8 +536,13 @@ def test_restart_after_effect_before_binding_activates_without_duplicate_effect(
             route_kind=route_kind,  # type: ignore[arg-type]
             upstream_task_id="gateway-id",
             route_state="pending",
-        )
+        ),
+        create_key_scope="external",
+        create_replay_policy=(
+            "ruyi_gateway_v1" if route_kind == "remote_ref" else "local_task_identity"
+        ),
     )
+    first_store.mark_create_effect_started("gateway-id")
     first_store.close()
 
     control = IdempotentRecordingControl()
@@ -562,7 +571,7 @@ def test_restart_after_effect_before_binding_activates_without_duplicate_effect(
         assert routed.route.upstream_task_id == (
             "upstream-id" if route_kind == "remote_ref" else "gateway-id"
         )
-        assert control.spawn_calls == 1
+        assert control.spawn_calls == (1 if route_kind == "remote_ref" else 0)
         assert control.effect_calls == 0
 
     try:

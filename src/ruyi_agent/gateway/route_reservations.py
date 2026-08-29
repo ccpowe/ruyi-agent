@@ -3,10 +3,30 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING
 
 from ruyi_agent.gateway.errors import GatewayTaskError
 from ruyi_agent.task_models import TaskRecord, TaskRouteRecord, TaskRouteKind
+
+if TYPE_CHECKING:
+    from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
+
+
+def create_evidence_policy(
+    route_kind: TaskRouteKind,
+    *,
+    external_key: bool,
+    remote_replay_safe: bool,
+) -> tuple[str, str]:
+    """Return durable key scope and replay policy without persisting a secret."""
+
+    key_scope = (
+        "external" if external_key else "generated" if remote_replay_safe else "none"
+    )
+    if route_kind == "local":
+        return key_scope, "local_task_identity"
+    return key_scope, "ruyi_gateway_v1" if remote_replay_safe else "never"
 
 
 def reservation_record(route: TaskRouteRecord) -> TaskRecord:
@@ -113,3 +133,76 @@ def has_active_route_binding(route: TaskRouteRecord) -> bool:
     return route.route_state == "active" and (
         route.route_kind != "remote_ref" or bool(route.upstream_task_id)
     )
+
+
+async def reconcile_pending_create(
+    route: TaskRouteRecord,
+    *,
+    route_store: GatewayRouteStore,
+    get_local_record: Callable[[str], TaskRecord],
+    live_interruption: bool = False,
+) -> TaskRouteRecord:
+    """Classify a pending create without ever invoking its effect."""
+
+    reconcilable_local = route.route_kind == "local" and route.route_state == "active"
+    if route.route_state != "pending" and not reconcilable_local:
+        return route
+    evidence = await route_store.aget_create_evidence(route.task_id)
+    if route.route_kind == "remote_ref":
+        if evidence is not None and evidence.permits_remote_replay:
+            return route
+        no_effect = evidence is not None and evidence.effect_boundary == "reserved"
+        return await _settle_interrupted_route(
+            route,
+            route_store=route_store,
+            effect_exists=False,
+            no_effect=no_effect,
+        )
+
+    record: TaskRecord | None
+    try:
+        record = get_local_record(route.task_id)
+    except (KeyError, ValueError):
+        record = None
+    except Exception:
+        record = None
+    effect_exists = record is not None and has_durable_create_effect(
+        record,
+        route_kind="local",
+    )
+    if reconcilable_local and effect_exists:
+        return route
+    no_effect = live_interruption or (
+        evidence is not None and evidence.effect_boundary == "reserved"
+    )
+    return await _settle_interrupted_route(
+        route,
+        route_store=route_store,
+        effect_exists=effect_exists,
+        no_effect=no_effect,
+    )
+
+
+async def _settle_interrupted_route(
+    route: TaskRouteRecord,
+    *,
+    route_store: GatewayRouteStore,
+    effect_exists: bool,
+    no_effect: bool,
+) -> TaskRouteRecord:
+    state = "active" if effect_exists else "failed" if no_effect else "uncertain"
+    error = None
+    if state == "failed":
+        error = "Gateway Task creation did not start"
+    elif state == "uncertain":
+        error = "Gateway Task creation was interrupted"
+    try:
+        return await route_store.atransition_route(
+            route.task_id,
+            route_state=state,
+            upstream_task_id=route.task_id if effect_exists else route.upstream_task_id,
+            route_error=error,
+        )
+    except Exception:
+        durable = await route_store.aget_route(route.task_id)
+        return durable or route

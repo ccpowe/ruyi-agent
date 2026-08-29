@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 from asyncio import to_thread
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,14 +16,39 @@ from ruyi_agent.task_models import (
 
 _ROUTE_COLUMNS = (
     "task_id, agent_name, metadata_json, route_kind, upstream_task_id, "
-    "webhook_json, route_state, route_error, created_at, updated_at"
+    "webhook_json, route_state, route_error, created_at, updated_at, "
+    "create_key_scope, create_replay_policy, create_effect_boundary"
 )
 _ALLOWED_ROUTE_TRANSITIONS: dict[TaskRouteState, frozenset[TaskRouteState]] = {
     "pending": frozenset({"pending", "active", "failed", "uncertain"}),
-    "active": frozenset({"active"}),
+    "active": frozenset({"active", "uncertain"}),
     "failed": frozenset({"failed"}),
     "uncertain": frozenset({"uncertain"}),
 }
+
+_CREATE_KEY_SCOPES = frozenset({"none", "external", "generated", "legacy_unknown"})
+_CREATE_REPLAY_POLICIES = frozenset(
+    {"never", "local_task_identity", "ruyi_gateway_v1", "legacy_unknown"}
+)
+_CREATE_EFFECT_BOUNDARIES = frozenset({"reserved", "started", "legacy_unknown"})
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayCreateEvidence:
+    """Non-secret facts needed to classify an interrupted create safely."""
+
+    task_id: str
+    key_scope: str
+    replay_policy: str
+    effect_boundary: str
+
+    @property
+    def permits_remote_replay(self) -> bool:
+        return (
+            self.key_scope == "external"
+            and self.replay_policy == "ruyi_gateway_v1"
+            and self.effect_boundary == "started"
+        )
 
 
 class GatewayRouteStore:
@@ -145,9 +171,20 @@ class GatewayRouteStore:
     async def asave_route(self, route: TaskRouteRecord) -> None:
         await to_thread(self.save_route, route)
 
-    def reserve_route(self, route: TaskRouteRecord) -> TaskRouteRecord:
+    def reserve_route(
+        self,
+        route: TaskRouteRecord,
+        *,
+        create_key_scope: str = "legacy_unknown",
+        create_replay_policy: str = "legacy_unknown",
+    ) -> TaskRouteRecord:
         """Persist a stable Gateway identity before starting its effect."""
 
+        self._validate_create_evidence(
+            key_scope=create_key_scope,
+            replay_policy=create_replay_policy,
+            effect_boundary="reserved",
+        )
         reservation = TaskRouteRecord(
             task_id=route.task_id,
             agent_name=route.agent_name,
@@ -158,21 +195,145 @@ class GatewayRouteStore:
             route_state="pending",
         )
         with self._lock:
-            existing = self.get_route(route.task_id)
-            if existing is not None:
-                if (
-                    existing.agent_name != reservation.agent_name
-                    or existing.route_kind != reservation.route_kind
-                ):
-                    raise ValueError(
-                        f"Gateway route binding conflict for task '{route.task_id}'"
-                    )
-                return existing
-            self.save_route(reservation)
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    f"SELECT {_ROUTE_COLUMNS} FROM gateway_task_routes "
+                    "WHERE task_id = ?",
+                    (route.task_id,),
+                ).fetchone()
+                if row is not None:
+                    existing = self._row_to_route(row)
+                    if (
+                        existing.agent_name != reservation.agent_name
+                        or existing.route_kind != reservation.route_kind
+                    ):
+                        raise ValueError(
+                            f"Gateway route binding conflict for task '{route.task_id}'"
+                        )
+                    self._conn.commit()
+                    return existing
+                now = datetime.now(UTC)
+                reservation.created_at = now
+                reservation.updated_at = now
+                self._conn.execute(
+                    """
+                    INSERT INTO gateway_task_routes (
+                        task_id, agent_name, metadata_json, route_kind,
+                        upstream_task_id, webhook_json, route_state, route_error,
+                        created_at, updated_at, create_key_scope,
+                        create_replay_policy, create_effect_boundary
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved')
+                    """,
+                    (
+                        reservation.task_id,
+                        reservation.agent_name,
+                        json.dumps(
+                            reservation.metadata, ensure_ascii=True, sort_keys=True
+                        ),
+                        reservation.route_kind,
+                        reservation.upstream_task_id,
+                        (
+                            json.dumps(
+                                reservation.webhook,
+                                ensure_ascii=True,
+                                sort_keys=True,
+                            )
+                            if reservation.webhook is not None
+                            else None
+                        ),
+                        reservation.route_state,
+                        reservation.route_error,
+                        reservation.created_at.isoformat(),
+                        reservation.updated_at.isoformat(),
+                        create_key_scope,
+                        create_replay_policy,
+                    ),
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
         return reservation
 
-    async def areserve_route(self, route: TaskRouteRecord) -> TaskRouteRecord:
-        return await to_thread(self.reserve_route, route)
+    async def areserve_route(
+        self,
+        route: TaskRouteRecord,
+        *,
+        create_key_scope: str = "legacy_unknown",
+        create_replay_policy: str = "legacy_unknown",
+    ) -> TaskRouteRecord:
+        return await to_thread(
+            self.reserve_route,
+            route,
+            create_key_scope=create_key_scope,
+            create_replay_policy=create_replay_policy,
+        )
+
+    def mark_create_effect_started(self, task_id: str) -> GatewayCreateEvidence:
+        """Commit the last local boundary before invoking the create effect."""
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE gateway_task_routes
+                    SET create_effect_boundary = 'started', updated_at = ?
+                    WHERE task_id = ? AND route_state = 'pending'
+                        AND create_effect_boundary IN ('reserved', 'started')
+                    """,
+                    (datetime.now(UTC).isoformat(), task_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError(
+                        f"Gateway route '{task_id}' cannot start its create effect"
+                    )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        evidence = self.get_create_evidence(task_id)
+        if evidence is None:  # pragma: no cover - protected by the transaction
+            raise KeyError(task_id)
+        return evidence
+
+    async def amark_create_effect_started(
+        self,
+        task_id: str,
+    ) -> GatewayCreateEvidence:
+        return await to_thread(self.mark_create_effect_started, task_id)
+
+    def get_create_evidence(self, task_id: str) -> GatewayCreateEvidence | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT create_key_scope, create_replay_policy,
+                    create_effect_boundary
+                FROM gateway_task_routes
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        self._validate_create_evidence(
+            key_scope=str(row[0]),
+            replay_policy=str(row[1]),
+            effect_boundary=str(row[2]),
+        )
+        return GatewayCreateEvidence(
+            task_id=task_id,
+            key_scope=str(row[0]),
+            replay_policy=str(row[1]),
+            effect_boundary=str(row[2]),
+        )
+
+    async def aget_create_evidence(
+        self,
+        task_id: str,
+    ) -> GatewayCreateEvidence | None:
+        return await to_thread(self.get_create_evidence, task_id)
 
     def transition_route(
         self,
@@ -320,6 +481,11 @@ class GatewayRouteStore:
                     "route_error": "TEXT",
                     "created_at": "TEXT",
                     "updated_at": "TEXT",
+                    "create_key_scope": "TEXT NOT NULL DEFAULT 'legacy_unknown'",
+                    "create_replay_policy": ("TEXT NOT NULL DEFAULT 'legacy_unknown'"),
+                    "create_effect_boundary": (
+                        "TEXT NOT NULL DEFAULT 'legacy_unknown'"
+                    ),
                 }
                 for column, declaration in additions.items():
                     if column not in columns:
@@ -351,6 +517,7 @@ class GatewayRouteStore:
                 }
                 if int(columns["upstream_task_id"][3]) != 0:
                     self._rebuild_route_table()
+                self._normalize_create_evidence()
                 self._conn.execute(
                     """
                     UPDATE gateway_task_routes
@@ -376,6 +543,29 @@ class GatewayRouteStore:
                         AND upstream_task_id = task_id
                     """
                 )
+                self._conn.execute(
+                    """
+                    UPDATE gateway_task_routes
+                    SET route_state = 'failed',
+                        route_error = 'Gateway Task creation did not start'
+                    WHERE route_state = 'pending'
+                        AND create_effect_boundary = 'reserved'
+                    """
+                )
+                self._conn.execute(
+                    """
+                    UPDATE gateway_task_routes
+                    SET route_state = 'uncertain',
+                        route_error = 'Remote Task creation was interrupted'
+                    WHERE route_kind = 'remote_ref'
+                        AND route_state = 'pending'
+                        AND NOT (
+                            create_key_scope = 'external'
+                            AND create_replay_policy = 'ruyi_gateway_v1'
+                            AND create_effect_boundary = 'started'
+                        )
+                    """
+                )
                 self._conn.commit()
             except BaseException:
                 self._conn.rollback()
@@ -395,7 +585,20 @@ class GatewayRouteStore:
                     CHECK (route_state IN ('pending', 'active', 'failed', 'uncertain')),
                 route_error TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                create_key_scope TEXT NOT NULL DEFAULT 'legacy_unknown'
+                    CHECK (create_key_scope IN (
+                        'none', 'external', 'generated', 'legacy_unknown'
+                    )),
+                create_replay_policy TEXT NOT NULL DEFAULT 'legacy_unknown'
+                    CHECK (create_replay_policy IN (
+                        'never', 'local_task_identity', 'ruyi_gateway_v1',
+                        'legacy_unknown'
+                    )),
+                create_effect_boundary TEXT NOT NULL DEFAULT 'legacy_unknown'
+                    CHECK (create_effect_boundary IN (
+                        'reserved', 'started', 'legacy_unknown'
+                    ))
             )
             """
         )
@@ -454,6 +657,50 @@ class GatewayRouteStore:
     def _validate_route_state(self, route_state: object) -> None:
         if route_state not in TASK_ROUTE_STATES:
             raise ValueError(f"Invalid Gateway route state: {route_state!r}")
+
+    def _normalize_create_evidence(self) -> None:
+        self._conn.execute(
+            """
+            UPDATE gateway_task_routes
+            SET create_key_scope = 'legacy_unknown'
+            WHERE create_key_scope IS NULL OR create_key_scope NOT IN (
+                'none', 'external', 'generated', 'legacy_unknown'
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            UPDATE gateway_task_routes
+            SET create_replay_policy = 'legacy_unknown'
+            WHERE create_replay_policy IS NULL OR create_replay_policy NOT IN (
+                'never', 'local_task_identity', 'ruyi_gateway_v1',
+                'legacy_unknown'
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            UPDATE gateway_task_routes
+            SET create_effect_boundary = 'legacy_unknown'
+            WHERE create_effect_boundary IS NULL OR create_effect_boundary NOT IN (
+                'reserved', 'started', 'legacy_unknown'
+            )
+            """
+        )
+
+    def _validate_create_evidence(
+        self,
+        *,
+        key_scope: str,
+        replay_policy: str,
+        effect_boundary: str,
+    ) -> None:
+        if key_scope not in _CREATE_KEY_SCOPES:
+            raise ValueError(f"Invalid create key scope: {key_scope!r}")
+        if replay_policy not in _CREATE_REPLAY_POLICIES:
+            raise ValueError(f"Invalid create replay policy: {replay_policy!r}")
+        if effect_boundary not in _CREATE_EFFECT_BOUNDARIES:
+            raise ValueError(f"Invalid create effect boundary: {effect_boundary!r}")
 
     def _validate_active_binding(self, route: TaskRouteRecord) -> None:
         if (

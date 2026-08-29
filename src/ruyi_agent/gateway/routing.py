@@ -25,8 +25,10 @@ from ruyi_agent.gateway.public_errors import (
     public_upstream_payload_error,
 )
 from ruyi_agent.gateway.route_reservations import (
+    create_evidence_policy,
     has_active_route_binding as _has_active_route_binding,
     has_durable_create_effect as _has_durable_create_effect,
+    reconcile_pending_create,
     reservation_record,
     route_persistence_error,
     shield_durable_cleanup,
@@ -149,6 +151,15 @@ class TaskRouter:
         before_effect: Callable[[], Awaitable[None]] | None = None,
     ) -> RoutedTask:
         gateway_task_id = task_id or str(uuid4())
+        remote_replay_safe = (
+            route_kind == "remote_ref"
+            and self.remote_create_idempotency_guaranteed(agent_name)
+        )
+        key_scope, replay_policy = create_evidence_policy(
+            route_kind,
+            external_key=idempotency_key is not None,
+            remote_replay_safe=remote_replay_safe,
+        )
         reservation = TaskRouteRecord(
             task_id=gateway_task_id,
             agent_name=agent_name,
@@ -159,7 +170,12 @@ class TaskRouter:
             route_state="pending",
         )
         try:
-            reservation = await self._route_store.areserve_route(reservation)
+            reservation = await self._route_store.areserve_route(
+                reservation,
+                create_key_scope=key_scope,
+                create_replay_policy=replay_policy,
+            )
+            evidence = await self._route_store.aget_create_evidence(gateway_task_id)
         except Exception as exc:
             raise route_persistence_error(
                 gateway_task_id,
@@ -168,6 +184,8 @@ class TaskRouter:
                 retryable=True,
                 effect_outcome="not_started",
             ) from exc
+        if evidence is None or evidence.effect_boundary != "reserved":
+            reservation = await self._reconcile_pending_create(reservation)
         if reservation.route_state == "active":
             return RoutedTask(
                 record=await self.get_record(reservation),
@@ -227,6 +245,31 @@ class TaskRouter:
                     retryable=False,
                     effect_outcome="not_started",
                 ) from exc
+            except BaseException:
+                await shield_durable_cleanup(
+                    self._reconcile_pending_create(reservation, live_interruption=True)
+                )
+                raise
+        try:
+            await self._route_store.amark_create_effect_started(gateway_task_id)
+        except Exception as exc:
+            durable_route = await self._fail_reservation(
+                reservation,
+                "Gateway create effect boundary could not be persisted",
+                uncertain=False,
+            )
+            raise route_persistence_error(
+                gateway_task_id,
+                route_state=durable_route.route_state if durable_route else "unknown",
+                queryable=durable_route is not None,
+                retryable=False,
+                effect_outcome="not_started",
+            ) from exc
+        except BaseException:
+            await shield_durable_cleanup(
+                self._reconcile_pending_create(reservation, live_interruption=True)
+            )
+            raise
         try:
             record = await self._control.spawn_task(
                 agent_name,
@@ -261,13 +304,9 @@ class TaskRouter:
                 effect_outcome=effect_outcome,
             ) from exc
         except BaseException:
-            if route_kind == "remote_ref" and not (
-                idempotency_key is not None
-                and self.remote_create_idempotency_guaranteed(agent_name)
-            ):
-                await shield_durable_cleanup(
-                    self._mark_cancelled_remote_create_uncertain(reservation)
-                )
+            await shield_durable_cleanup(
+                self._reconcile_pending_create(reservation, live_interruption=True)
+            )
             raise
 
         if route_kind == "remote_ref" and not record.upstream_task_id:
@@ -342,21 +381,22 @@ class TaskRouter:
             ) from exc
         return RoutedTask(
             record=(
-                public_remote_record(record)
-                if route_kind == "remote_ref"
-                else record
+                public_remote_record(record) if route_kind == "remote_ref" else record
             ),
             route=route,
         )
 
-    async def _mark_cancelled_remote_create_uncertain(
+    async def _reconcile_pending_create(
         self,
-        reservation: TaskRouteRecord,
-    ) -> None:
-        await self._fail_reservation(
-            reservation,
-            "Remote Task creation was interrupted after its effect boundary",
-            uncertain=True,
+        route: TaskRouteRecord,
+        *,
+        live_interruption: bool = False,
+    ) -> TaskRouteRecord:
+        return await reconcile_pending_create(
+            route,
+            route_store=self._route_store,
+            get_local_record=self._control.get_task_record,
+            live_interruption=live_interruption,
         )
 
     async def _fail_reservation(
@@ -389,7 +429,7 @@ class TaskRouter:
     async def get_route(self, task_id: str) -> TaskRouteRecord:
         route = await self._route_store.aget_route(task_id)
         if route is not None:
-            return route
+            return await self._reconcile_pending_create(route)
         try:
             record = self._control.get_task_record(task_id)
         except UnknownWorkerTaskError as exc:
@@ -408,7 +448,10 @@ class TaskRouter:
             if await self._route_store.aget_route(record.task_id) is not None:
                 continue
             await self._recover_descendant_route(record, visited=set())
-        return await self._route_store.alist_routes()
+        return [
+            await self._reconcile_pending_create(route)
+            for route in await self._route_store.alist_routes()
+        ]
 
     async def save_route(self, route: TaskRouteRecord) -> None:
         await self._route_store.asave_route(route)
@@ -483,9 +526,7 @@ class TaskRouter:
             return self.ensure_record(route)
         self.ensure_record(route)
         try:
-            return public_remote_record(
-                await self._control.refresh_task(route.task_id)
-            )
+            return public_remote_record(await self._control.refresh_task(route.task_id))
         except UnknownWorkerTaskError as exc:
             raise _task_not_found(route.task_id) from exc
         except A2AClientError as exc:
@@ -741,9 +782,7 @@ class TaskRouter:
             record = await self._control.send_task_input(
                 route.task_id,
                 input_content,
-                attachments=(
-                    attachments if route.route_kind == "remote_ref" else None
-                ),
+                attachments=(attachments if route.route_kind == "remote_ref" else None),
                 idempotency_key=idempotency_key,
                 mailbox_message_id=mailbox_message_id,
             )
@@ -953,6 +992,5 @@ def _public_state_end_reason(data: dict[str, Any]) -> str | None:
 
 def _task_not_found(task_id: str) -> GatewayTaskError:
     return GatewayTaskError(
-        code="task_not_found",
-        message=f"Task '{task_id}' does not exist",
+        code="task_not_found", message=f"Task '{task_id}' does not exist"
     )

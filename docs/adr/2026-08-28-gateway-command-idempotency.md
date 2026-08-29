@@ -70,6 +70,18 @@ was supplied: the internally generated downstream key protects only that one
 attempt and is not a public retry handle. A command release cannot turn such an
 effect-started claim back into executable `pending` state.
 
+The route database independently records the non-secret facts required to make
+that crash decision before dispatch: whether the key came from the external
+request (`external`, `generated`, or `none`), the create replay policy
+(`local_task_identity`, `ruyi_gateway_v1`, or `never`), and whether execution is
+only reserved or has crossed the create-effect boundary. The key value itself
+is not duplicated in the route database. A remote route may remain `pending`
+after interruption only for the exact combination `external` +
+`ruyi_gateway_v1` + `started`; generated keys, absent keys, unknown legacy
+evidence, and non-capable remotes become terminal `uncertain`. A reservation
+known not to have crossed the boundary becomes `failed` with a not-started
+outcome.
+
 The official Gateway HTTP client accepts idempotency keys. Telegram uses its
 `update_id`, and Feishu uses its `event_id` (falling back to `message_id`) as the
 stable Channel Turn key. A successful ordinary Channel Turn stores a durable
@@ -108,6 +120,15 @@ single-process owner of a Gateway database. Multiple live Gateway processes
 must not share that SQLite command database; a future multi-replica design needs
 leased claims or an external coordinator.
 
+Route recovery is read-only with respect to execution. Startup migration,
+`GET`, listing, and input routing may classify a stranded route, but never call
+the create effect. For local creates, a durable Task record with an initial run
+is sufficient to activate the reserved identity without calling `spawn_task`;
+an in-process cancellation with no such record is `failed/not_started`, while
+a crash with missing or pre-evidence facts is conservatively `uncertain`.
+Pre-evidence route databases are migrated with `legacy_unknown` facts so their
+absence can never be mistaken for permission to replay.
+
 Successful command records are retained with the task database and have no
 automatic expiration in this version. Clients must treat keys as non-reusable.
 
@@ -136,3 +157,7 @@ two-Gateway end-to-end flow that drops committed create and input responses.
 They also cover replay after a Channel Session binding survives while the
 platform processed marker does not, and compatibility with Channel clients that
 do not accept the new optional keyword when no key is supplied.
+Route-specific crash tests additionally kill a child process while a no-key
+remote HTTP create is inside its effect, reopen exact pre-evidence SQLite
+schemas, and cancel a local HTTP create at an injected zero-effect boundary.
+They assert that restart, query, and input rejection do not dispatch a create.

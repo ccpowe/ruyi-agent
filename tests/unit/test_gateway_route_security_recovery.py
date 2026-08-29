@@ -198,6 +198,13 @@ def test_declared_safe_cancelled_create_replays_same_downstream_key_after_restar
     asyncio.run(cancel_request())
     [reserved] = first_routes.list_routes()
     assert reserved.route_state == "pending"
+    evidence = first_routes.get_create_evidence(reserved.task_id)
+    assert evidence is not None
+    assert (evidence.key_scope, evidence.replay_policy, evidence.effect_boundary) == (
+        "external",
+        "ruyi_gateway_v1",
+        "started",
+    )
     first_routes.close()
     first_commands.close()
 
