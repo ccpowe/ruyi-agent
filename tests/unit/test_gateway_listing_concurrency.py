@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -497,11 +500,128 @@ def test_review_cursor_retries_unscanned_owner_after_transient_failure() -> None
     assert first.next_cursor is not None
 
     router.failed_task_ids.clear()
-    recovered = asyncio.run(
-        service.list_reviews(cursor=first.next_cursor, limit=3)
-    )
+    recovered = asyncio.run(service.list_reviews(cursor=first.next_cursor, limit=3))
     assert [item.review_id for item in recovered.items] == ["review-1", "review-0"]
     assert recovered.next_cursor is None
+
+
+def test_review_cursor_resumes_exact_review_after_its_timestamp_changes() -> None:
+    now = datetime(2026, 8, 29, tzinfo=UTC)
+    pending_reviews = [
+        PendingReviewRecord(
+            review_id=f"review-{index}",
+            task_id=f"task-{index}",
+            root_task_id=f"task-{index}",
+            payload={"action_requests": [], "review_configs": []},
+            created_at=now + timedelta(seconds=index),
+            updated_at=now + timedelta(seconds=index),
+        )
+        for index in range(3)
+    ]
+    routes = [route(index) for index in range(3)]
+    records = {
+        f"task-{index}": record(index, state="waiting_for_human") for index in range(3)
+    }
+    router = ListingRouter(
+        routes,
+        records,
+        pending_reviews=pending_reviews,
+        failed_task_ids={"task-1"},
+    )
+    service = service_with_router(router)
+
+    first = asyncio.run(service.list_reviews(cursor=None, limit=3))
+    assert [item.review_id for item in first.items] == ["review-2"]
+    assert first.next_cursor is not None
+
+    router.failed_task_ids.clear()
+    router.pending_reviews = [
+        replace(item, updated_at=now + timedelta(minutes=5))
+        if item.review_id == "review-1"
+        else item
+        for item in pending_reviews
+    ]
+    recovered = asyncio.run(service.list_reviews(cursor=first.next_cursor, limit=3))
+
+    assert "review-1" in {item.review_id for item in recovered.items}
+    assert "review-0" in {item.review_id for item in recovered.items}
+
+
+def test_review_cursor_uses_sort_key_fallback_only_if_resume_review_disappears() -> (
+    None
+):
+    now = datetime(2026, 8, 29, tzinfo=UTC)
+    pending_reviews = [
+        PendingReviewRecord(
+            review_id=f"review-{index}",
+            task_id=f"task-{index}",
+            root_task_id=f"task-{index}",
+            payload={"action_requests": [], "review_configs": []},
+            created_at=now + timedelta(seconds=index),
+            updated_at=now + timedelta(seconds=index),
+        )
+        for index in range(3)
+    ]
+    router = ListingRouter(
+        [route(index) for index in range(3)],
+        {
+            f"task-{index}": record(index, state="waiting_for_human")
+            for index in range(3)
+        },
+        pending_reviews=pending_reviews,
+    )
+    service = service_with_router(router)
+
+    first = asyncio.run(service.list_reviews(cursor=None, limit=1))
+    assert [item.review_id for item in first.items] == ["review-2"]
+    assert first.next_cursor is not None
+
+    router.pending_reviews = [
+        item for item in pending_reviews if item.review_id != "review-1"
+    ]
+    resumed = asyncio.run(service.list_reviews(cursor=first.next_cursor, limit=2))
+
+    assert [item.review_id for item in resumed.items] == ["review-0"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {
+            "version": True,
+            "resume_review_id": "review-1",
+            "fallback_updated_at": "2026-08-29T00:00:00+00:00",
+        },
+        {
+            "version": 2,
+            "resume_review_id": "",
+            "fallback_updated_at": "2026-08-29T00:00:00+00:00",
+        },
+        {
+            "version": 2,
+            "resume_review_id": "review-1",
+            "fallback_updated_at": "2026-08-29T00:00:00",
+        },
+        {
+            "version": 2,
+            "resume_review_id": "review-1",
+            "fallback_updated_at": "2026-08-29T00:00:00+00:00",
+            "extra": 1,
+        },
+        2**63,
+    ],
+)
+def test_review_cursor_rejects_malformed_schema(payload: object) -> None:
+    cursor = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode()
+    ).decode()
+    service = service_with_router(ListingRouter([], {}))
+
+    with pytest.raises(GatewayTaskError) as caught:
+        asyncio.run(service.list_reviews(cursor=cursor, limit=10))
+
+    assert caught.value.code == "invalid_request"
 
 
 def test_review_page_refills_when_refresh_resolves_a_phantom_review() -> None:
@@ -572,4 +692,10 @@ def test_list_task_reviews_refreshes_child_owners_and_omits_stale_ones() -> None
 
     assert [item.review_id for item in response.items] == ["review-1"]
     assert set(router.called) == {"task-0", "task-1", "task-2", "task-4"}
-    assert set(router.get_route_calls) == {"task-0", "task-1", "task-2", "task-3", "task-4"}
+    assert set(router.get_route_calls) == {
+        "task-0",
+        "task-1",
+        "task-2",
+        "task-3",
+        "task-4",
+    }

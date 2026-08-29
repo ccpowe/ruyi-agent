@@ -14,6 +14,7 @@ from uuid import uuid4
 from ruyi_agent.gateway.application import GatewayApplicationContext
 from ruyi_agent.gateway.errors import GatewayTaskError
 from ruyi_agent.gateway.models import AttachmentInput, TaskResponse
+from ruyi_agent.gateway.route_reservations import shield_durable_cleanup
 from ruyi_agent.gateway.task_service import GatewayTaskService
 from ruyi_agent.storage.gateway_command_store import (
     GatewayCommandClaim,
@@ -73,7 +74,9 @@ class GatewayCommandService:
             body={
                 "input": {
                     "content": input_content,
-                    "attachments": [item.model_dump(mode="json") for item in normalized],
+                    "attachments": [
+                        item.model_dump(mode="json") for item in normalized
+                    ],
                 },
                 "metadata": metadata,
                 "webhook": webhook,
@@ -92,13 +95,18 @@ class GatewayCommandService:
         if claim.status == "terminal":
             raise await self._terminal_error(claim, create_command=True)
 
+        create_replay_safe = self._tasks.create_effect_replay_safe(agent_name)
+        create_boundary_started = False
+
         async def mark_create_effect_started() -> None:
+            nonlocal create_boundary_started
             if claim.claim_token is None:
                 raise RuntimeError("Acquired Gateway command has no claim token")
+            create_boundary_started = True
             await self._context.command_store.amark_effect_started(
                 command_id=claim.command_id,
                 claim_token=claim.claim_token,
-                replay_safe=self._tasks.create_effect_replay_safe(agent_name),
+                replay_safe=create_replay_safe,
             )
 
         return await self._execute(
@@ -113,8 +121,9 @@ class GatewayCommandService:
                 idempotency_key=idempotency_key,
                 before_effect=mark_create_effect_started,
             ),
-            replay_safe=True,
+            replay_safe=create_replay_safe,
             effect_boundary_is_managed=True,
+            effect_boundary_started=lambda: create_boundary_started,
         )
 
     async def send_input(
@@ -146,7 +155,9 @@ class GatewayCommandService:
             body={
                 "input": {
                     "content": input_content,
-                    "attachments": [item.model_dump(mode="json") for item in normalized],
+                    "attachments": [
+                        item.model_dump(mode="json") for item in normalized
+                    ],
                 }
             },
         )
@@ -247,6 +258,7 @@ class GatewayCommandService:
         *,
         replay_safe: bool,
         effect_boundary_is_managed: bool = False,
+        effect_boundary_started: Callable[[], bool] | None = None,
     ) -> GatewayCommandOutcome:
         if claim.claim_token is None:
             raise RuntimeError("Acquired Gateway command has no claim token")
@@ -266,7 +278,7 @@ class GatewayCommandService:
         except GatewayTaskError as exc:
             if _is_terminal_command_error(exc):
                 with suppress(BaseException):
-                    await asyncio.shield(
+                    await shield_durable_cleanup(
                         self._context.command_store.afail(
                             command_id=claim.command_id,
                             claim_token=claim.claim_token,
@@ -275,7 +287,7 @@ class GatewayCommandService:
                     )
             else:
                 with suppress(BaseException):
-                    await asyncio.shield(
+                    await shield_durable_cleanup(
                         self._context.command_store.arelease(
                             command_id=claim.command_id,
                             claim_token=claim.claim_token,
@@ -283,13 +295,36 @@ class GatewayCommandService:
                     )
             raise
         except BaseException:
-            with suppress(BaseException):
-                await asyncio.shield(
-                    self._context.command_store.arelease(
-                        command_id=claim.command_id,
-                        claim_token=claim.claim_token,
-                    )
+            unsafe_started = (
+                not replay_safe
+                and effect_boundary_started is not None
+                and effect_boundary_started()
+            )
+            if unsafe_started:
+                uncertain = GatewayTaskError(
+                    code="idempotency_outcome_uncertain",
+                    message=(
+                        "The Gateway command may have reached a non-idempotent "
+                        "downstream service"
+                    ),
+                    details={
+                        "task_id": claim.task_id,
+                        "create_retryable": False,
+                        "effect_outcome": "uncertain",
+                    },
                 )
+                with suppress(BaseException):
+                    await shield_durable_cleanup(
+                        self._terminalize_unsafe_create(claim, uncertain)
+                    )
+            else:
+                with suppress(BaseException):
+                    await shield_durable_cleanup(
+                        self._context.command_store.arelease(
+                            command_id=claim.command_id,
+                            claim_token=claim.claim_token,
+                        )
+                    )
             raise
         return GatewayCommandOutcome(task=task, replayed=False)
 
@@ -324,14 +359,32 @@ class GatewayCommandService:
                 details["effect_outcome"] = "completed"
             else:
                 details.setdefault("effect_outcome", "uncertain")
-        if route.route_kind == "remote_ref":
-            details.setdefault("downstream_idempotency_guaranteed", False)
-            details["upstream_task_id"] = route.upstream_task_id
         return GatewayTaskError(
             kind=error.kind,
             code=error.code,
             message=error.message,
             details=details,
+        )
+
+    async def _terminalize_unsafe_create(
+        self,
+        claim: GatewayCommandClaim,
+        error: GatewayTaskError,
+    ) -> None:
+        try:
+            route = await self._context.router.get_route(claim.task_id)
+            await self._context.router.mark_create_outcome_uncertain(
+                route,
+                error.message,
+            )
+        except Exception:
+            pass
+        if claim.claim_token is None:
+            raise RuntimeError("Acquired Gateway command has no claim token")
+        await self._context.command_store.afail(
+            command_id=claim.command_id,
+            claim_token=claim.claim_token,
+            error_json=_dump_gateway_error(error),
         )
 
     def _replayed_outcome(self, claim: GatewayCommandClaim) -> GatewayCommandOutcome:

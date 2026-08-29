@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from typing import Literal
 
 import pytest
 
@@ -459,7 +460,10 @@ def build_specs() -> dict[str, LocalWorkerSpec]:
     }
 
 
-def build_test_remote_refs() -> dict[str, RemoteRef]:
+def build_test_remote_refs(
+    *,
+    create_idempotency: Literal["none", "ruyi_gateway_v1"] = "none",
+) -> dict[str, RemoteRef]:
     return {
         "remote_code_wiki": RemoteRef(
             name="remote_code_wiki",
@@ -467,6 +471,7 @@ def build_test_remote_refs() -> dict[str, RemoteRef]:
             url="https://example.com/a2a",
             remote_agent_name="code_wiki",
             auth={"type": "bearer", "token_env": "REMOTE_CODE_WIKI_TOKEN"},
+            create_idempotency=create_idempotency,
         )
     }
 
@@ -494,7 +499,10 @@ def build_local_agent_config(
     }
 
 
-def build_agent_configs() -> dict[str, dict[str, object]]:
+def build_agent_configs(
+    *,
+    remote_create_idempotency: Literal["none", "ruyi_gateway_v1"] = "none",
+) -> dict[str, dict[str, object]]:
     return {
         "main": build_local_agent_config(
             "main",
@@ -514,6 +522,7 @@ def build_agent_configs() -> dict[str, dict[str, object]]:
             "url": "https://example.com/a2a",
             "remote_agent_name": "code_wiki",
             "auth": {"type": "bearer", "token_env": "REMOTE_CODE_WIKI_TOKEN"},
+            "create_idempotency": remote_create_idempotency,
         },
     }
 
@@ -529,12 +538,13 @@ def build_app(
     backend: object | None = None,
     workspace_root: str = "/workspace",
     unavailable_agents: dict[str, str] | None = None,
+    remote_create_idempotency: Literal["none", "ruyi_gateway_v1"] = "none",
 ) -> tuple[object, DelayedAgentFactory]:
     factory = DelayedAgentFactory(delay=delay)
     monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
-        build_test_remote_refs(),
+        build_test_remote_refs(create_idempotency=remote_create_idempotency),
         checkpointer=object(),
         backend=backend or MemoryBackend(root=workspace_root),
         a2a_client=a2a_client,
@@ -544,7 +554,9 @@ def build_app(
     factory.control = control
     service = GatewayTaskModule(
         main_agent_name="main",
-        agent_configs=build_agent_configs(),
+        agent_configs=build_agent_configs(
+            remote_create_idempotency=remote_create_idempotency
+        ),
         control=control,
         route_store=route_store,
         command_store=command_store,

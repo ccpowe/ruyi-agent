@@ -11,6 +11,7 @@ from ruyi_agent.config.agent_models import (
     BearerAuthConfig,
     LocalAgentConfig,
     RemoteAgentConfig,
+    RemoteCreateIdempotency,
     SkillSelection,
 )
 from ruyi_agent.config.system_tools import validate_system_tool_names
@@ -45,7 +46,10 @@ REMOTE_AGENT_REQUIRED_FIELDS = {
     "url",
     "remote_agent_name",
 }
-REMOTE_AGENT_ALLOWED_FIELDS = REMOTE_AGENT_REQUIRED_FIELDS | {"auth"}
+REMOTE_AGENT_ALLOWED_FIELDS = REMOTE_AGENT_REQUIRED_FIELDS | {
+    "auth",
+    "create_idempotency",
+}
 
 
 def parse_skill_selection(raw: object) -> SkillSelection:
@@ -132,9 +136,7 @@ def _parse_local_agent(
         allowed=LOCAL_AGENT_ALLOWED_FIELDS,
     )
     public = _boolean(config["public"], path=_field(agent_name, "public"))
-    configured_name = _non_empty_string(
-        config["name"], path=_field(agent_name, "name")
-    )
+    configured_name = _non_empty_string(config["name"], path=_field(agent_name, "name"))
     if configured_name != agent_name:
         _raise_name_mismatch(agent_name, configured_name)
     permission_profile = config.get("permission_profile")
@@ -156,7 +158,9 @@ def _parse_local_agent(
     return LocalAgentConfig(
         name=configured_name,
         public=public,
-        description=_string(config["description"], path=_field(agent_name, "description")),
+        description=_string(
+            config["description"], path=_field(agent_name, "description")
+        ),
         system_prompt=_string(
             config["system_prompt"], path=_field(agent_name, "system_prompt")
         ),
@@ -190,21 +194,38 @@ def _parse_remote_agent(
         required=REMOTE_AGENT_REQUIRED_FIELDS,
         allowed=REMOTE_AGENT_ALLOWED_FIELDS,
     )
-    configured_name = _non_empty_string(
-        config["name"], path=_field(agent_name, "name")
-    )
+    configured_name = _non_empty_string(config["name"], path=_field(agent_name, "name"))
     if configured_name != agent_name:
         _raise_name_mismatch(agent_name, configured_name)
     return RemoteAgentConfig(
         name=configured_name,
         public=_boolean(config["public"], path=_field(agent_name, "public")),
-        description=_string(config["description"], path=_field(agent_name, "description")),
+        description=_string(
+            config["description"], path=_field(agent_name, "description")
+        ),
         url=_remote_url(config["url"], agent_name=agent_name),
         remote_agent_name=_non_empty_string(
             config["remote_agent_name"],
             path=_field(agent_name, "remote_agent_name"),
         ),
         auth=_parse_remote_auth(config.get("auth"), agent_name=agent_name),
+        create_idempotency=_remote_create_idempotency(
+            config.get("create_idempotency", "none"),
+            agent_name=agent_name,
+        ),
+    )
+
+
+def _remote_create_idempotency(
+    raw: object,
+    *,
+    agent_name: str,
+) -> RemoteCreateIdempotency:
+    if raw in {"none", "ruyi_gateway_v1"}:
+        return cast("RemoteCreateIdempotency", raw)
+    raise ValueError(
+        f"{_field(agent_name, 'create_idempotency')} must be "
+        "'none' or 'ruyi_gateway_v1'."
     )
 
 
@@ -331,10 +352,7 @@ def _boolean(value: object, *, path: str) -> bool:
 def _string_tuple(value: object, *, path: str) -> tuple[str, ...]:
     if not isinstance(value, list):
         raise ValueError(f"{path} must be a list of strings.")
-    return tuple(
-        _non_empty_string(item, path=f"{path} item")
-        for item in value
-    )
+    return tuple(_non_empty_string(item, path=f"{path} item") for item in value)
 
 
 def _remote_url(value: object, *, agent_name: str) -> str:
@@ -345,6 +363,5 @@ def _remote_url(value: object, *, agent_name: str) -> str:
 
 def _raise_name_mismatch(agent_name: str, configured_name: str) -> None:
     raise ValueError(
-        f"Agent key '{agent_name}' must match its configured name "
-        f"'{configured_name}'."
+        f"Agent key '{agent_name}' must match its configured name '{configured_name}'."
     )

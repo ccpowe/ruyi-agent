@@ -44,12 +44,15 @@ class GatewayTaskService:
     def create_effect_replay_safe(self, agent_name: str) -> bool:
         """Return whether a create can be replayed after losing its response.
 
-        Local creation is durably keyed by the supplied task identity.  The
-        remote-ref contract accepts an Idempotency-Key but does not advertise a
-        capability guarantee, so a response-lost create must remain terminal.
+        Local creation is durably keyed by the supplied task identity. A remote
+        create is replay-safe only when its typed runtime reference declares the
+        verified ``ruyi_gateway_v1`` downstream contract.
         """
 
-        return self._agents.get_config(agent_name).kind != "remote_ref"
+        config = self._agents.get_config(agent_name)
+        return config.kind != "remote_ref" or (
+            self._context.router.remote_create_idempotency_guaranteed(agent_name)
+        )
 
     async def create_effect(
         self,
@@ -66,8 +69,8 @@ class GatewayTaskService:
         config = self._agents.get_config(agent_name)
         self._agents.ensure_public(agent_name, config)
         self._agents.ensure_available(agent_name)
-        clean_metadata, delegation = (
-            self._context.router.prepare_delegation_metadata(metadata)
+        clean_metadata, delegation = self._context.router.prepare_delegation_metadata(
+            metadata
         )
         return await self._create_routed_task(
             task_id=task_id,

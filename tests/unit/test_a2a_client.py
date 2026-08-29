@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
 
 import httpx
 import pytest
@@ -23,13 +24,18 @@ class HangingSuccessStream(httpx.AsyncByteStream):
         self.closed = True
 
 
-def _remote_ref(*, auth: dict[str, str] | None = None) -> RemoteRef:
+def _remote_ref(
+    *,
+    auth: dict[str, str] | None = None,
+    create_idempotency: Literal["none", "ruyi_gateway_v1"] = "none",
+) -> RemoteRef:
     return RemoteRef(
         name="remote",
         description="remote",
         url="https://remote.test/a2a",
         remote_agent_name="worker",
         auth=auth,
+        create_idempotency=create_idempotency,
     )
 
 
@@ -115,6 +121,36 @@ def test_a2a_client_preserves_task_http_contract(
         "limit": "7",
     }
     assert requests[4].read() == b'{"decisions":[{"type":"approve"}]}'
+
+
+def test_declared_create_idempotency_requires_and_forwards_a_key() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201, json={"task_id": "task-1"})
+
+    remote_ref = _remote_ref(create_idempotency="ruyi_gateway_v1")
+    client = A2AClient(transports={remote_ref.url: httpx.MockTransport(handler)})
+
+    async def scenario() -> None:
+        with pytest.raises(ValueError, match="requires an Idempotency-Key"):
+            await client.create_task(
+                remote_ref,
+                input_content="unsafe",
+                metadata={},
+            )
+        await client.create_task(
+            remote_ref,
+            input_content="safe",
+            metadata={},
+            idempotency_key="gateway-create-1",
+        )
+
+    asyncio.run(scenario())
+
+    assert len(requests) == 1
+    assert requests[0].headers["idempotency-key"] == "gateway-create-1"
 
 
 def test_a2a_client_preserves_error_mapping() -> None:

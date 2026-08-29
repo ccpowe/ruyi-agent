@@ -87,7 +87,7 @@ def _local_spec(name: str) -> LocalWorkerSpec:
     )
 
 
-def test_remote_gateway_lost_create_response_is_terminal_without_capability(
+def test_declared_ruyi_gateway_replays_lost_create_response_safely(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -146,6 +146,7 @@ def test_remote_gateway_lost_create_response_is_terminal_without_capability(
         url="https://node-b.test/a2a",
         remote_agent_name="code_wiki",
         auth={"type": "bearer", "token_env": "REMOTE_E2E_TOKEN"},
+        create_idempotency="ruyi_gateway_v1",
     )
     upstream_db = str(tmp_path / "upstream-tasks.sqlite")
     upstream_task_store = TaskStore(upstream_db)
@@ -176,6 +177,9 @@ def test_remote_gateway_lost_create_response_is_terminal_without_capability(
                 "public": True,
                 "name": "remote_code_wiki",
                 "description": "remote worker",
+                "url": "https://node-b.test/a2a",
+                "remote_agent_name": "code_wiki",
+                "create_idempotency": "ruyi_gateway_v1",
             },
         },
         control=upstream_control,
@@ -215,15 +219,14 @@ def test_remote_gateway_lost_create_response_is_terminal_without_capability(
             )
 
             assert lost_create.status_code == 502
-            assert repeated_create.status_code == 502
-            assert restarted_semantics.status_code == 502
-            assert repeated_create.json() == lost_create.json()
-            assert restarted_semantics.json() == lost_create.json()
+            assert repeated_create.status_code == 201
+            assert restarted_semantics.status_code == 201
+            assert restarted_semantics.json() == repeated_create.json()
             details = lost_create.json()["error"]["details"]
-            assert details["route_state"] == "uncertain"
-            assert details["create_retryable"] is False
-            assert details["downstream_idempotency_guaranteed"] is False
-            proxy_task_id = str(details["task_id"])
+            assert details["route_state"] == "pending"
+            assert details["create_retryable"] is True
+            proxy_task_id = str(repeated_create.json()["task_id"])
+            assert details["task_id"] == proxy_task_id
 
             downstream_records = downstream_control.list_persisted_task_records()
             assert len(downstream_records) == 1
@@ -235,14 +238,19 @@ def test_remote_gateway_lost_create_response_is_terminal_without_capability(
                 "Authorization": "Bearer upstream-secret",
                 "Idempotency-Key": "external-input-1",
             }
-            rejected_input = await client.post(
+            lost_input = await client.post(
+                f"/tasks/{proxy_task_id}/input",
+                headers=input_headers,
+                json={"input": {"content": "second"}},
+            )
+            recovered_input = await client.post(
                 f"/tasks/{proxy_task_id}/input",
                 headers=input_headers,
                 json={"input": {"content": "second"}},
             )
 
-            assert rejected_input.status_code == 409
-            assert rejected_input.json()["error"]["code"] == "task_route_unavailable"
+            assert lost_input.status_code == 502
+            assert recovered_input.status_code == 202
             downstream_record = downstream_control.list_persisted_task_records()[0]
             if downstream_control.get_live_run(downstream_record.task_id) is not None:
                 await downstream_control.get_live_run(downstream_record.task_id)
@@ -251,14 +259,17 @@ def test_remote_gateway_lost_create_response_is_terminal_without_capability(
     try:
         proxy_task_id, downstream_task_id = asyncio.run(scenario())
         assert dropping_transport.dropped_create is True
-        assert dropping_transport.dropped_input is False
+        assert dropping_transport.dropped_input is True
         assert upstream_command_store.count_commands() == 2
-        assert downstream_command_store.count_commands() == 1
+        assert downstream_command_store.count_commands() == 2
         assert len(upstream_control.list_persisted_task_records()) == 1
         assert len(downstream_control.list_persisted_task_records()) == 1
-        assert upstream_control.get_task_record(proxy_task_id).upstream_task_id is None
-        assert downstream_control.get_task_record(downstream_task_id).run_count == 1
-        assert agents["code_wiki"].inputs == ["first"]
+        assert (
+            upstream_control.get_task_record(proxy_task_id).upstream_task_id
+            == downstream_task_id
+        )
+        assert downstream_control.get_task_record(downstream_task_id).run_count == 2
+        assert agents["code_wiki"].inputs == ["first", "second"]
     finally:
         upstream_command_store.close()
         upstream_route_store.close()

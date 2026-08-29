@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable
+
 from ruyi_agent.gateway.errors import GatewayTaskError
-from ruyi_agent.task_models import TaskRecord, TaskRouteRecord
+from ruyi_agent.task_models import TaskRecord, TaskRouteRecord, TaskRouteKind
 
 
 def reservation_record(route: TaskRouteRecord) -> TaskRecord:
@@ -20,8 +23,7 @@ def reservation_record(route: TaskRouteRecord) -> TaskRecord:
         depth=1,
         created_at=route.created_at,
         updated_at=route.updated_at,
-        error=route.route_error
-        or f"Gateway route reservation is {route.route_state}",
+        error=route.route_error or f"Gateway route reservation is {route.route_state}",
         route_kind=route.route_kind,
         upstream_task_id=None,
         webhook=dict(route.webhook) if route.webhook is not None else None,
@@ -36,9 +38,10 @@ def with_route_identity(
     retryable: bool,
     route_state: str | None = None,
     effect_outcome: str,
-    downstream_idempotency_guaranteed: bool | None = None,
 ) -> GatewayTaskError:
-    details = dict(error.details or {})
+    # Downstream error payloads are not part of the public Gateway identity.
+    # Rebuild details from the durable route so an upstream Task id cannot leak.
+    details: dict[str, object] = {}
     queryable = route is not None
     durable_state = route.route_state if route is not None else route_state or "unknown"
     details.update(
@@ -51,13 +54,6 @@ def with_route_identity(
             **({"task_url": f"/tasks/{task_id}"} if queryable else {}),
         }
     )
-    if downstream_idempotency_guaranteed is not None:
-        details["downstream_idempotency_guaranteed"] = (
-            downstream_idempotency_guaranteed
-        )
-        details["upstream_task_id"] = (
-            route.upstream_task_id if route is not None else None
-        )
     return GatewayTaskError(
         code=error.code,
         message=error.message,
@@ -85,4 +81,32 @@ def route_persistence_error(
             "effect_outcome": effect_outcome,
             **({"task_url": f"/tasks/{task_id}"} if queryable else {}),
         },
+    )
+
+
+async def shield_durable_cleanup(cleanup: Awaitable[None]) -> None:
+    """Finish a durability update before propagating request cancellation."""
+
+    cleanup_task = asyncio.ensure_future(cleanup)
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            continue
+    await cleanup_task
+
+
+def has_durable_create_effect(
+    record: TaskRecord,
+    *,
+    route_kind: TaskRouteKind,
+) -> bool:
+    if route_kind == "remote_ref":
+        return bool(record.upstream_task_id)
+    return record.run_count > 0 and record.state != "pending"
+
+
+def has_active_route_binding(route: TaskRouteRecord) -> bool:
+    return route.route_state == "active" and (
+        route.route_kind != "remote_ref" or bool(route.upstream_task_id)
     )

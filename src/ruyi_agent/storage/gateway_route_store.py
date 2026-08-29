@@ -39,6 +39,7 @@ class GatewayRouteStore:
 
     def save_route(self, route: TaskRouteRecord) -> None:
         self._validate_route_state(route.route_state)
+        self._validate_active_binding(route)
         route.updated_at = datetime.now(UTC)
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -99,9 +100,10 @@ class GatewayRouteStore:
                             f"Gateway route binding conflict for task '{route.task_id}'"
                         )
                     existing_state = str(existing[3])
-                    if route.route_state not in _ALLOWED_ROUTE_TRANSITIONS[
-                        existing_state
-                    ]:
+                    if (
+                        route.route_state
+                        not in _ALLOWED_ROUTE_TRANSITIONS[existing_state]
+                    ):
                         raise ValueError(
                             f"Gateway route '{route.task_id}' cannot transition "
                             f"from {existing_state} to {route.route_state}"
@@ -197,9 +199,7 @@ class GatewayRouteStore:
                     and route.upstream_task_id is None
                 )
             ):
-                raise ValueError(
-                    f"Gateway route binding conflict for task '{task_id}'"
-                )
+                raise ValueError(f"Gateway route binding conflict for task '{task_id}'")
             route.upstream_task_id = upstream_task_id or route.upstream_task_id
             route.route_state = route_state
             route.route_error = route_error
@@ -307,9 +307,7 @@ class GatewayRouteStore:
                         "RENAME TO gateway_task_routes"
                     )
                 self._create_route_table("gateway_task_routes")
-                self._conn.execute(
-                    "DROP TABLE IF EXISTS gateway_task_routes_migrating"
-                )
+                self._conn.execute("DROP TABLE IF EXISTS gateway_task_routes_migrating")
                 columns = {
                     str(row[1]): row
                     for row in self._conn.execute(
@@ -356,6 +354,22 @@ class GatewayRouteStore:
                 self._conn.execute(
                     """
                     UPDATE gateway_task_routes
+                    SET route_state = 'uncertain',
+                        route_error = COALESCE(
+                            route_error,
+                            'Remote route has no durable upstream binding'
+                        )
+                    WHERE route_kind = 'remote_ref'
+                        AND route_state = 'active'
+                        AND (
+                            upstream_task_id IS NULL
+                            OR trim(upstream_task_id) = ''
+                        )
+                    """
+                )
+                self._conn.execute(
+                    """
+                    UPDATE gateway_task_routes
                     SET upstream_task_id = NULL
                     WHERE route_kind = 'remote_ref'
                         AND route_state != 'active'
@@ -397,9 +411,7 @@ class GatewayRouteStore:
             """
         )
         self._conn.execute("DROP TABLE gateway_task_routes")
-        self._conn.execute(
-            f"ALTER TABLE {temporary} RENAME TO gateway_task_routes"
-        )
+        self._conn.execute(f"ALTER TABLE {temporary} RENAME TO gateway_task_routes")
 
     def _row_to_route(
         self,
@@ -424,7 +436,7 @@ class GatewayRouteStore:
             webhook = None
         route_state = str(row[6])
         self._validate_route_state(route_state)
-        return TaskRouteRecord(
+        route = TaskRouteRecord(
             task_id=row[0],
             agent_name=row[1],
             metadata=metadata,
@@ -436,10 +448,22 @@ class GatewayRouteStore:
             created_at=datetime.fromisoformat(row[8]),
             updated_at=datetime.fromisoformat(row[9]),
         )
+        self._validate_active_binding(route)
+        return route
 
     def _validate_route_state(self, route_state: object) -> None:
         if route_state not in TASK_ROUTE_STATES:
             raise ValueError(f"Invalid Gateway route state: {route_state!r}")
+
+    def _validate_active_binding(self, route: TaskRouteRecord) -> None:
+        if (
+            route.route_state == "active"
+            and route.route_kind == "remote_ref"
+            and not route.upstream_task_id
+        ):
+            raise ValueError(
+                f"Active remote Gateway route '{route.task_id}' has no upstream binding"
+            )
 
     def close(self) -> None:
         with self._lock:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import multiprocessing
 import time
 from pathlib import Path
 
@@ -64,6 +65,150 @@ class RejectedRemoteA2AClient(StaticRemoteA2AClient):
             code="invalid_request",
             message="remote rejected create",
         )
+
+
+class CancelledRemoteA2AClient(StaticRemoteA2AClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.effect_started = asyncio.Event()
+
+    async def create_task(self, remote_ref, *, input_content, metadata, **kwargs):
+        del remote_ref, metadata, kwargs
+        self.created_inputs.append(input_content)
+        self.effect_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+def _leave_started_active_create_in_killed_process(
+    route_path: str,
+    command_path: str,
+    ready,
+) -> None:
+    routes = GatewayRouteStore(route_path)
+    commands = GatewayCommandStore(command_path)
+    routes.save_route(
+        TaskRouteRecord(
+            task_id="reserved-before-process-loss",
+            agent_name="remote_code_wiki",
+            metadata={},
+            route_kind="remote_ref",
+            upstream_task_id="private-upstream-task",
+            route_state="active",
+        )
+    )
+    claim = commands.claim(
+        principal_id="gateway-bearer",
+        idempotency_key="process-loss-create",
+        operation="create_task",
+        target="remote_code_wiki",
+        request_hash=command_request_hash(
+            operation="create_task",
+            target="remote_code_wiki",
+            body={
+                "input": {"content": "unknown outcome", "attachments": []},
+                "metadata": {},
+                "webhook": None,
+            },
+        ),
+        proposed_task_id="reserved-before-process-loss",
+    )
+    assert claim.claim_token is not None
+    commands.mark_effect_started(
+        command_id=claim.command_id,
+        claim_token=claim.claim_token,
+        replay_safe=False,
+    )
+    ready.set()
+    multiprocessing.Event().wait()
+
+
+def test_review_cursor_malicious_base64_json_returns_http_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = build_app(monkeypatch)
+    cursor = base64.urlsafe_b64encode(
+        b'{"fallback_updated_at":"2026-08-29T00:00:00",'
+        b'"resume_review_id":"review-1","version":2}'
+    ).decode()
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/reviews?cursor={cursor}",
+            headers=auth_headers(),
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_cancelled_remote_http_create_is_terminal_across_restart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    remote = CancelledRemoteA2AClient()
+    route_path = str(tmp_path / "cancelled-routes.sqlite")
+    command_path = str(tmp_path / "cancelled-commands.sqlite")
+    headers = {**auth_headers(), "Idempotency-Key": "cancelled-create"}
+    body = {"input": {"content": "create once"}, "metadata": {}}
+    first_routes = GatewayRouteStore(route_path)
+    first_commands = GatewayCommandStore(command_path)
+    first_app, _ = build_app(
+        monkeypatch,
+        a2a_client=remote,  # type: ignore[arg-type]
+        route_store=first_routes,
+        command_store=first_commands,
+    )
+
+    async def cancel_request() -> None:
+        transport = httpx.ASGITransport(app=first_app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://gateway.test",
+        ) as client:
+            request = asyncio.create_task(
+                client.post(
+                    "/agents/remote_code_wiki/tasks",
+                    headers=headers,
+                    json=body,
+                )
+            )
+            await asyncio.wait_for(remote.effect_started.wait(), timeout=1)
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+
+    asyncio.run(cancel_request())
+    first_routes.close()
+    first_commands.close()
+
+    second_routes = GatewayRouteStore(route_path)
+    second_commands = GatewayCommandStore(command_path)
+    second_app, _ = build_app(
+        monkeypatch,
+        a2a_client=remote,  # type: ignore[arg-type]
+        route_store=second_routes,
+        command_store=second_commands,
+    )
+    try:
+        with TestClient(second_app) as client:
+            replay = client.post(
+                "/agents/remote_code_wiki/tasks",
+                headers=headers,
+                json=body,
+            )
+            task_id = replay.json()["error"]["details"]["task_id"]
+            queried = client.get(f"/tasks/{task_id}", headers=auth_headers())
+
+        assert replay.status_code == 409
+        assert replay.json()["error"]["code"] == "idempotency_outcome_uncertain"
+        assert replay.json()["error"]["details"]["route_state"] == "uncertain"
+        assert queried.status_code == 200
+        assert queried.json()["status"] == "interrupted"
+        assert remote.created_inputs == ["create once"]
+    finally:
+        second_routes.close()
+        second_commands.close()
 
 
 def test_remote_ref_forwards_via_a2a(
@@ -201,6 +346,30 @@ def test_public_remote_ref_create_injects_delegation_context_metadata(
     assert metadata[VISITED_NODES_FIELD] == '["node-a"]'
 
 
+def test_declared_remote_create_capability_generates_downstream_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote = StaticRemoteA2AClient()
+    app, _ = build_app(
+        monkeypatch,
+        a2a_client=remote,  # type: ignore[arg-type]
+        remote_create_idempotency="ruyi_gateway_v1",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/agents/remote_code_wiki/tasks",
+            headers=auth_headers(),
+            json={"input": {"content": "safe create"}, "metadata": {}},
+        )
+
+    assert response.status_code == 201
+    assert len(remote.created_idempotency_keys) == 1
+    assert remote.created_idempotency_keys[0] == (
+        f"gateway-create:{response.json()['task_id']}"
+    )
+
+
 def test_public_remote_ref_maps_unhashable_status_to_upstream_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -227,8 +396,6 @@ def test_public_remote_ref_maps_unhashable_status_to_upstream_error(
         "task_queryable": True,
         "create_retryable": False,
         "effect_outcome": "uncertain",
-        "downstream_idempotency_guaranteed": False,
-        "upstream_task_id": None,
     }
     with TestClient(app) as client:
         query = client.get(f"/tasks/{task_id}", headers=auth_headers())
@@ -298,8 +465,6 @@ def test_remote_response_lost_is_terminal_across_restart_and_queryable(
             "task_queryable": True,
             "create_retryable": False,
             "effect_outcome": "uncertain",
-            "downstream_idempotency_guaranteed": False,
-            "upstream_task_id": None,
         }
         assert queried.status_code == 200
         assert queried.json()["status"] == "interrupted"
@@ -318,42 +483,17 @@ def test_process_restart_terminalizes_started_remote_create_without_replay(
     command_path = str(tmp_path / "commands.sqlite")
     task_id = "reserved-before-process-loss"
     idempotency_key = "process-loss-create"
-    first_routes = GatewayRouteStore(route_path)
-    first_commands = GatewayCommandStore(command_path)
-    first_routes.reserve_route(
-        TaskRouteRecord(
-            task_id=task_id,
-            agent_name="remote_code_wiki",
-            metadata={},
-            route_kind="remote_ref",
-            upstream_task_id=None,
-            route_state="pending",
-        )
+    process_context = multiprocessing.get_context("fork")
+    ready = process_context.Event()
+    writer = process_context.Process(
+        target=_leave_started_active_create_in_killed_process,
+        args=(route_path, command_path, ready),
     )
-    claim = first_commands.claim(
-        principal_id="gateway-bearer",
-        idempotency_key=idempotency_key,
-        operation="create_task",
-        target="remote_code_wiki",
-        request_hash=command_request_hash(
-            operation="create_task",
-            target="remote_code_wiki",
-            body={
-                "input": {"content": "unknown outcome", "attachments": []},
-                "metadata": {},
-                "webhook": None,
-            },
-        ),
-        proposed_task_id=task_id,
-    )
-    assert claim.claim_token is not None
-    first_commands.mark_effect_started(
-        command_id=claim.command_id,
-        claim_token=claim.claim_token,
-        replay_safe=False,
-    )
-    first_routes.close()
-    first_commands.close()
+    writer.start()
+    assert ready.wait(timeout=5)
+    writer.kill()
+    writer.join(timeout=5)
+    assert writer.exitcode is not None and writer.exitcode != 0
 
     remote = StaticRemoteA2AClient()
     second_routes = GatewayRouteStore(route_path)
@@ -388,16 +528,15 @@ def test_process_restart_terminalizes_started_remote_create_without_replay(
                     "task_id": task_id,
                     "task_url": f"/tasks/{task_id}",
                     "task_queryable": True,
-                    "route_state": "uncertain",
+                    "route_state": "active",
                     "create_retryable": False,
-                    "effect_outcome": "uncertain",
-                    "downstream_idempotency_guaranteed": False,
-                    "upstream_task_id": None,
+                    "effect_outcome": "completed",
                 },
             }
         }
         assert queried.status_code == 200
-        assert queried.json()["status"] == "interrupted"
+        assert queried.json()["status"] == "completed"
+        assert "private-upstream-task" not in response.text
         assert remote.created_inputs == []
     finally:
         second_routes.close()
@@ -432,12 +571,10 @@ def test_concurrent_remote_response_lost_reuses_one_terminal_identity(
     responses = asyncio.run(scenario())
 
     assert {response.status_code for response in responses} == {502}
-    assert len(
-        {
-            response.json()["error"]["details"]["task_id"]
-            for response in responses
-        }
-    ) == 1
+    assert (
+        len({response.json()["error"]["details"]["task_id"] for response in responses})
+        == 1
+    )
     assert remote.created_inputs == ["create once"]
 
 
@@ -487,6 +624,7 @@ def test_remote_command_completion_crash_reuses_active_route_without_create(
         a2a_client=remote,  # type: ignore[arg-type]
         route_store=first_routes,
         command_store=first_commands,
+        remote_create_idempotency="ruyi_gateway_v1",
     )
     with TestClient(first_app, raise_server_exceptions=False) as client:
         failed = client.post(
@@ -504,6 +642,7 @@ def test_remote_command_completion_crash_reuses_active_route_without_create(
         a2a_client=remote,  # type: ignore[arg-type]
         route_store=second_routes,
         command_store=second_commands,
+        remote_create_idempotency="ruyi_gateway_v1",
     )
     try:
         with TestClient(second_app) as client:

@@ -292,6 +292,7 @@ class GatewayCommandStore:
                 SET state = 'pending', claim_token = NULL, effect_started = 0,
                     updated_at = ?
                 WHERE command_id = ? AND state = 'processing' AND claim_token = ?
+                    AND NOT (effect_started = 1 AND replay_safe = 0)
                 """,
                 (now, command_id, claim_token),
             )
@@ -302,9 +303,7 @@ class GatewayCommandStore:
 
     def count_commands(self) -> int:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) FROM gateway_commands"
-            ).fetchone()
+            row = self._conn.execute("SELECT COUNT(*) FROM gateway_commands").fetchone()
         return int(row[0]) if row is not None else 0
 
     def close(self) -> None:

@@ -7,6 +7,7 @@ from typing import Literal, TypeAlias
 
 
 SkillSelection: TypeAlias = Literal["inherit", "none"] | tuple[str, ...]
+RemoteCreateIdempotency: TypeAlias = Literal["none", "ruyi_gateway_v1"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +81,7 @@ class RemoteAgentConfig:
     url: str
     remote_agent_name: str
     auth: BearerAuthConfig | None = None
+    create_idempotency: RemoteCreateIdempotency = "none"
     kind: Literal["remote_ref"] = field(default="remote_ref", init=False)
 
     def __getitem__(self, key: str) -> object:
@@ -93,6 +95,7 @@ class RemoteAgentConfig:
             "url": self.url,
             "remote_agent_name": self.remote_agent_name,
             "auth": self.auth,
+            "create_idempotency": self.create_idempotency,
         }
         try:
             return fields[key]

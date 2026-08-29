@@ -76,9 +76,7 @@ def test_load_mcp_server_configs_returns_mcp_section(tmp_path: Path) -> None:
 
     configs = config_loader.load_mcp_server_configs(config_path)
 
-    assert configs == {
-        "exa": {"transport": "http", "url": "https://exa.invalid/mcp"}
-    }
+    assert configs == {"exa": {"transport": "http", "url": "https://exa.invalid/mcp"}}
 
 
 def test_default_config_loaders_read_from_ruyi_config_dir(
@@ -96,16 +94,16 @@ def test_default_config_loaders_read_from_ruyi_config_dir(
 
     configs = config_loader.load_mcp_server_configs()
 
-    assert configs == {
-        "local": {"transport": "stdio", "command": "local-mcp"}
-    }
+    assert configs == {"local": {"transport": "stdio", "command": "local-mcp"}}
 
 
-def test_load_agent_configs_returns_main_agent_and_agents_section(tmp_path: Path) -> None:
+def test_load_agent_configs_returns_main_agent_and_agents_section(
+    tmp_path: Path,
+) -> None:
     # 为什么测 agent 配置读取：运行时需要同时知道入口 main agent 和完整 agent 映射。
     config_path = tmp_path / "agents.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 'main_agent = "main"',
                 "",
@@ -139,7 +137,7 @@ def test_load_agent_configs_rejects_name_that_differs_from_agent_key(
 ) -> None:
     config_path = tmp_path / "agents.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 'main_agent = "main"',
                 "",
@@ -284,7 +282,7 @@ def test_load_agent_configs_validates_remote_url_and_auth(
 def test_load_permission_config_parses_profiles(tmp_path: Path) -> None:
     config_path = tmp_path / "permissions.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 'default_profile = "standard"',
                 "",
@@ -329,7 +327,9 @@ def test_to_backend_paths_handles_backend_root() -> None:
     assert paths == ["/data/AGENTS.md", "/data/skills"]
 
 
-def test_build_chat_model_from_config_builds_openai_compatible_model(monkeypatch) -> None:
+def test_build_chat_model_from_config_builds_openai_compatible_model(
+    monkeypatch,
+) -> None:
     calls: list[dict[str, object]] = []
     built_model = object()
 
@@ -648,7 +648,7 @@ def test_build_chat_model_from_config_rejects_unknown_provider() -> None:
 def test_load_llm_provider_configs_parses_providers(tmp_path: Path) -> None:
     config_path = tmp_path / "llm_providers.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 "[providers.deepseek]",
                 'kind = "deepseek"',
@@ -726,7 +726,7 @@ def test_load_llm_provider_configs_keeps_blank_optional_codex_fields_compatible(
 def test_load_llm_provider_configs_rejects_unexpected_fields(tmp_path: Path) -> None:
     config_path = tmp_path / "llm_providers.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 "[providers.deepseek]",
                 'kind = "openai"',
@@ -747,7 +747,7 @@ def test_load_llm_provider_configs_rejects_invalid_init_kwargs_type(
 ) -> None:
     config_path = tmp_path / "llm_providers.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 "[providers.kimi]",
                 'kind = "moonshot"',
@@ -767,7 +767,7 @@ def test_load_llm_provider_configs_rejects_reserved_init_kwargs(
 ) -> None:
     config_path = tmp_path / "llm_providers.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 "[providers.kimi]",
                 'kind = "moonshot"',
@@ -787,7 +787,7 @@ def test_load_llm_provider_configs_rejects_reserved_init_kwargs(
 def test_load_llm_provider_configs_requires_api_key_env(tmp_path: Path) -> None:
     config_path = tmp_path / "llm_providers.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 "[providers.openrouter]",
                 'kind = "openrouter"',
@@ -803,7 +803,7 @@ def test_load_llm_provider_configs_requires_api_key_env(tmp_path: Path) -> None:
 def test_load_agent_configs_rejects_legacy_model_fields(tmp_path: Path) -> None:
     config_path = tmp_path / "agents.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 'main_agent = "main"',
                 "",
@@ -940,6 +940,7 @@ def test_build_local_worker_spec_keeps_special_skill_modes(monkeypatch) -> None:
     assert specs["inherit"].skills == "inherit"
     assert specs["none"].skills == "none"
 
+
 def test_build_local_worker_spec_rejects_non_worker_kind() -> None:
     # 为什么测 kind 校验：避免错误配置在更深层才暴露成难排查的问题。
     registry = FakeRegistry([])
@@ -1007,9 +1008,7 @@ def test_build_all_local_specs_isolates_unavailable_agent(monkeypatch) -> None:
     )
 
     assert specs == {"main": healthy_spec}
-    assert errors == {
-        "broken": "Environment variable 'BROKEN_API_KEY' is not set"
-    }
+    assert errors == {"broken": "Environment variable 'BROKEN_API_KEY' is not set"}
 
 
 def test_build_remote_ref_returns_remote_spec() -> None:
@@ -1023,6 +1022,7 @@ def test_build_remote_ref_returns_remote_spec() -> None:
             "url": "https://example.com/a2a",
             "remote_agent_name": "code_wiki",
             "auth": {"type": "bearer", "token_env": "REMOTE_CODE_WIKI_TOKEN"},
+            "create_idempotency": "ruyi_gateway_v1",
         }
     }
 
@@ -1036,6 +1036,28 @@ def test_build_remote_ref_returns_remote_spec() -> None:
         type="bearer",
         token_env="REMOTE_CODE_WIKI_TOKEN",
     )
+    assert remote_ref.create_idempotency == "ruyi_gateway_v1"
+    assert remote_ref.create_idempotency_guaranteed is True
+
+
+def test_remote_ref_create_idempotency_defaults_conservative_and_is_validated() -> None:
+    base = {
+        "kind": "remote_ref",
+        "public": False,
+        "name": "remote",
+        "description": "remote helper",
+        "url": "https://example.com/a2a",
+        "remote_agent_name": "worker",
+    }
+
+    conservative = config_loader.coerce_agent_configs({"remote": base})["remote"]
+    assert isinstance(conservative, config_loader.RemoteAgentConfig)
+    assert conservative.create_idempotency == "none"
+
+    with pytest.raises(ValueError, match="create_idempotency.*must be"):
+        config_loader.coerce_agent_configs(
+            {"remote": {**base, "create_idempotency": "assumed"}}
+        )
 
 
 def test_build_local_worker_spec_resolves_tools_and_backend_paths(monkeypatch) -> None:
@@ -1097,9 +1119,7 @@ def test_build_local_worker_spec_resolves_tools_and_backend_paths(monkeypatch) -
 
 
 def test_build_all_local_worker_specs_builds_every_local_agent(monkeypatch) -> None:
-    monkeypatch.setattr(
-        model_providers, "init_chat_model", lambda *_a, **_k: object()
-    )
+    monkeypatch.setattr(model_providers, "init_chat_model", lambda *_a, **_k: object())
     registry = FakeRegistry([object()])
     agent_configs = {
         "main": {
@@ -1211,7 +1231,7 @@ def test_load_agent_configs_rejects_remote_ref_with_local_only_fields(
 ) -> None:
     config_path = tmp_path / "agents.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 'main_agent = "main"',
                 "",
@@ -1251,7 +1271,7 @@ def test_load_agent_configs_requires_main_agent_to_point_to_local_agent(
 ) -> None:
     config_path = tmp_path / "agents.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 'main_agent = "remote_code_wiki"',
                 "",
@@ -1288,7 +1308,7 @@ def test_load_agent_configs_requires_main_agent_to_point_to_local_agent(
 def test_load_agent_configs_rejects_self_worker(tmp_path: Path) -> None:
     config_path = tmp_path / "agents.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 'main_agent = "main"',
                 "",
@@ -1317,7 +1337,7 @@ def test_load_agent_configs_rejects_self_worker(tmp_path: Path) -> None:
 def test_load_agent_configs_rejects_local_worker_cycle(tmp_path: Path) -> None:
     config_path = tmp_path / "agents.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 'main_agent = "main"',
                 "",
@@ -1362,7 +1382,7 @@ def test_load_agent_configs_allows_local_to_remote_ref_worker(
 ) -> None:
     config_path = tmp_path / "agents.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 'main_agent = "main"',
                 "",
@@ -1404,7 +1424,7 @@ def test_load_agent_configs_rejects_longer_local_worker_cycle(
 ) -> None:
     config_path = tmp_path / "agents.toml"
     config_path.write_text(
-        '\n'.join(
+        "\n".join(
             [
                 'main_agent = "main"',
                 "",

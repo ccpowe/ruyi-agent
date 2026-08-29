@@ -26,19 +26,21 @@ def _record(
     parent_task_id: str | None = None,
     root_task_id: str | None = None,
     depth: int = 1,
+    state: str = "completed",
+    run_count: int = 1,
 ) -> TaskRecord:
     now = datetime.now(UTC)
     return TaskRecord(
         task_id=task_id,
         agent_name=agent_name,
-        state="completed",
+        state=state,  # type: ignore[arg-type]
         thread_id=task_id,
         parent_task_id=parent_task_id,
         root_task_id=root_task_id or task_id,
         depth=depth,
         created_at=now,
         updated_at=now,
-        run_count=1,
+        run_count=run_count,
         route_kind=route_kind,
         upstream_task_id=upstream_task_id,
     )
@@ -54,8 +56,7 @@ class RecordingControl:
         del task
         is_remote = "metadata" in kwargs
         task_id = str(
-            kwargs.get("task_id")
-            or ("remote-local-id" if is_remote else "local-id")
+            kwargs.get("task_id") or ("remote-local-id" if is_remote else "local-id")
         )
         record = _record(
             task_id,
@@ -165,7 +166,9 @@ class FlakyActivationStore(GatewayRouteStore):
         super().__init__(":memory:")
         self.active_failures = 1
 
-    async def atransition_route(self, task_id: str, **kwargs: object) -> TaskRouteRecord:
+    async def atransition_route(
+        self, task_id: str, **kwargs: object
+    ) -> TaskRouteRecord:
         if kwargs.get("route_state") == "active" and self.active_failures:
             self.active_failures -= 1
             raise sqlite3.OperationalError("activation commit failed")
@@ -173,7 +176,9 @@ class FlakyActivationStore(GatewayRouteStore):
 
 
 class UnavailableFallbackStore(GatewayRouteStore):
-    async def atransition_route(self, task_id: str, **kwargs: object) -> TaskRouteRecord:
+    async def atransition_route(
+        self, task_id: str, **kwargs: object
+    ) -> TaskRouteRecord:
         del task_id, kwargs
         raise sqlite3.OperationalError("transition unavailable")
 
@@ -352,8 +357,6 @@ def test_remote_effect_failure_retains_queryable_route_identity(
                 "effect_outcome": (
                     "uncertain" if expected_state == "uncertain" else "not_started"
                 ),
-                "downstream_idempotency_guaranteed": False,
-                "upstream_task_id": None,
             }
             with pytest.raises(GatewayTaskError) as unavailable:
                 await router.cancel(route)
@@ -393,8 +396,6 @@ def test_create_error_reports_actual_unknown_fallback_persistence_state() -> Non
                 "task_queryable": False,
                 "create_retryable": False,
                 "effect_outcome": "uncertain",
-                "downstream_idempotency_guaranteed": False,
-                "upstream_task_id": None,
             }
             assert store.get_route("gateway-id") is not None
         finally:
@@ -464,7 +465,9 @@ def test_local_record_without_durable_run_never_promotes_uncertain_route() -> No
     asyncio.run(scenario())
 
 
-def test_effect_then_activation_failure_recovers_same_identity_without_respawn() -> None:
+def test_effect_then_activation_failure_recovers_same_identity_without_respawn() -> (
+    None
+):
     async def scenario() -> None:
         control = RecordingControl()
         spawn_calls = 0
@@ -649,17 +652,66 @@ def test_route_store_repairs_partial_migration_and_empty_timestamps_each_open(
                 columns = check.execute(
                     "PRAGMA table_info(gateway_task_routes)"
                 ).fetchall()
-                assert next(row for row in columns if row[1] == "upstream_task_id")[3] == 0
+                assert (
+                    next(row for row in columns if row[1] == "upstream_task_id")[3] == 0
+                )
                 assert check.execute(
                     "SELECT created_at, updated_at FROM gateway_task_routes"
                 ).fetchone() == (
                     route.created_at.isoformat(),
                     route.updated_at.isoformat(),
                 )
-                assert check.execute(
-                    "SELECT name FROM sqlite_master WHERE name = "
-                    "'gateway_task_routes_migrating'"
-                ).fetchone() is None
+                assert (
+                    check.execute(
+                        "SELECT name FROM sqlite_master WHERE name = "
+                        "'gateway_task_routes_migrating'"
+                    ).fetchone()
+                    is None
+                )
+        finally:
+            store.close()
+
+
+def test_route_migration_never_keeps_remote_without_binding_active(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "remote-null-routes.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        """
+        CREATE TABLE gateway_task_routes (
+            task_id TEXT PRIMARY KEY,
+            agent_name TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            route_kind TEXT NOT NULL,
+            upstream_task_id TEXT,
+            webhook_json TEXT,
+            route_state TEXT NOT NULL,
+            route_error TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO gateway_task_routes VALUES (
+            'remote-child', 'remote', '{}', 'remote_ref', NULL, NULL,
+            'active', NULL, NULL, ''
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    for _ in range(2):
+        store = GatewayRouteStore(str(db_path))
+        try:
+            route = store.get_route("remote-child")
+            assert route is not None
+            assert route.route_state == "uncertain"
+            assert route.upstream_task_id is None
+            assert route.route_error == "Remote route has no durable upstream binding"
         finally:
             store.close()
 
@@ -706,9 +758,7 @@ async def _discover_only_gateway_descendants() -> None:
         depth=2,
     )
     orphan = _record("orphan-id")
-    control.records = {
-        record.task_id: record for record in (root, child, orphan)
-    }
+    control.records = {record.task_id: record for record in (root, child, orphan)}
     store = GatewayRouteStore(":memory:")
     store.save_route(
         TaskRouteRecord(
@@ -730,3 +780,67 @@ async def _discover_only_gateway_descendants() -> None:
         assert child_route.metadata == {"channel_user": "alice"}
     finally:
         store.close()
+
+
+@pytest.mark.parametrize(
+    ("child_kind", "child_upstream", "child_state", "run_count", "root_state"),
+    [
+        ("remote_ref", None, "completed", 1, "active"),
+        ("local", None, "pending", 0, "active"),
+        ("remote_ref", "upstream-child", "completed", 1, "uncertain"),
+    ],
+)
+def test_descendant_recovery_requires_active_ancestor_and_durable_binding(
+    child_kind: str,
+    child_upstream: str | None,
+    child_state: str,
+    run_count: int,
+    root_state: str,
+) -> None:
+    async def scenario() -> None:
+        control = RecordingControl()
+        root = _record("root-id")
+        child = _record(
+            "child-id",
+            agent_name="remote" if child_kind == "remote_ref" else "worker",
+            route_kind=child_kind,
+            upstream_task_id=child_upstream,
+            parent_task_id=root.task_id,
+            root_task_id=root.task_id,
+            depth=2,
+            state=child_state,
+            run_count=run_count,
+        )
+        control.records = {root.task_id: root, child.task_id: child}
+        store = GatewayRouteStore(":memory:")
+        store.save_route(
+            TaskRouteRecord(
+                task_id=root.task_id,
+                agent_name=root.agent_name,
+                metadata={},
+                route_kind="local",
+                upstream_task_id=root.task_id,
+                route_state=root_state,  # type: ignore[arg-type]
+                route_error="ancestor unavailable" if root_state != "active" else None,
+            )
+        )
+        try:
+            router = TaskRouter(control=control, route_store=store)  # type: ignore[arg-type]
+            recovered = await router.get_route(child.task_id)
+
+            assert recovered.route_state == "uncertain"
+            assert recovered.upstream_task_id == (
+                child_upstream if child_kind == "remote_ref" else child.task_id
+            )
+            record = await router.get_record(recovered)
+            assert record.state == "interrupted"
+            assert control.ensure_calls == []
+            assert control.refresh_calls == []
+            with pytest.raises(GatewayTaskError, match="cannot be routed safely"):
+                await router.cancel(recovered)
+            with pytest.raises(GatewayTaskError, match="cannot be routed safely"):
+                await router.send_input(recovered, "never dispatch")
+        finally:
+            store.close()
+
+    asyncio.run(scenario())

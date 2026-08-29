@@ -154,6 +154,11 @@ class A2AClient:
             task_id = response["task_id"]
         """
         input_payload: dict[str, Any] = {"content": input_content}
+        if remote_ref.create_idempotency_guaranteed and idempotency_key is None:
+            raise ValueError(
+                "A remote_ref declaring ruyi_gateway_v1 create idempotency "
+                "requires an Idempotency-Key"
+            )
         if attachments:
             input_payload["attachments"] = attachments
         payload: dict[str, Any] = {"input": input_payload, "metadata": metadata}

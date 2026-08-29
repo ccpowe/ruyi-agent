@@ -43,6 +43,9 @@ permission_profile = "standard"
 # description = "Remote research worker exposed by another gateway."
 # url = "https://example.com"
 # remote_agent_name = "background_research"
+# The default is "none". Set this only for an official Ruyi Gateway that
+# implements the durable Idempotency-Key create contract described by the ADR.
+# create_idempotency = "ruyi_gateway_v1"
 #
 # [agents.remote_research.auth]
 # type = "bearer"

@@ -45,15 +45,23 @@ The key contract is:
 - create reserves a random `task_id`;
 - local input reserves a command-specific Task Mailbox `message_id` and
   `idempotency_key`;
-- remote create/input forwards the original external key to the downstream
-  Ruyi Gateway.
+- remote create/input forwards a stable key to the downstream Ruyi Gateway.
+  Create replay is enabled only when the typed `remote_ref` declaration sets
+  `create_idempotency = "ruyi_gateway_v1"`; omission means `"none"` and is
+  deliberately conservative. The A2A client verifies that a declared-capable
+  create actually carries a key.
 
-Execution is a replayable saga rather than a distributed transaction. If a
-process fails after an effect but before saving the command response, a retry
-drives the same stable identity again. Task creation rejects duplicate identity
-inserts, route persistence rejects identity rebinding, Task Mailbox publication
-deduplicates the reserved message, and downstream Ruyi Gateways replay the
-forwarded key.
+Execution is a saga rather than a distributed transaction. If a process fails
+after an effect but before saving the command response, local effects and
+declared-capable remote creates can drive the same stable identity again. Task
+creation rejects duplicate identity inserts, route persistence rejects identity
+rebinding, Task Mailbox publication deduplicates the reserved message, and an
+official Ruyi Gateway replays the forwarded key. An unknown or explicitly
+non-capable remote create is never replayed after its effect boundary: request
+cancellation and process recovery durably terminalize the command as
+`idempotency_outcome_uncertain`, while retaining only the public Gateway Task
+identity and route state. A command release cannot turn such an effect-started
+claim back into executable `pending` state.
 
 The official Gateway HTTP client accepts idempotency keys. Telegram uses its
 `update_id`, and Feishu uses its `event_id` (falling back to `message_id`) as the
@@ -80,15 +88,18 @@ This does **not** claim exactly-once model calls, tool calls, webhook delivery,
 or arbitrary effects performed inside an Agent run. A process crash can leave a
 Task interrupted even though its identity was created only once. Remote
 at-most-once behavior requires the downstream service to honor the forwarded
-idempotency contract.
+idempotency contract and the operator to declare the verified
+`ruyi_gateway_v1` capability. Unknown remotes default to no replay. Public error
+metadata never exposes the downstream Task identity.
 
 ## Recovery and Deployment Constraint
 
-On startup, the command store changes claims left in `processing` back to
-`pending`. This is correct for the current single-process owner of a Gateway
-database. Multiple live Gateway processes must not share that SQLite command
-database; a future multi-replica design needs leased claims or an external
-coordinator.
+On startup, the command store changes replay-safe claims left in `processing`
+back to `pending`. A non-replay-safe claim whose durable effect marker was set
+becomes terminal uncertain instead. This is correct for the current
+single-process owner of a Gateway database. Multiple live Gateway processes
+must not share that SQLite command database; a future multi-replica design needs
+leased claims or an external coordinator.
 
 Successful command records are retained with the task database and have no
 automatic expiration in this version. Clients must treat keys as non-reusable.
@@ -111,8 +122,9 @@ automatic expiration in this version. Clients must treat keys as non-reusable.
 ## Verification
 
 Tests cover concurrent identical requests, conflicting key reuse, restart claim
-recovery, failure after effect but before command completion, durable Mailbox
-deduplication, stable Task/route identity, client header propagation, and a
+recovery, cancellation and failure after the effect boundary, durable Mailbox
+deduplication, stable Task/route identity, capability validation and client
+header propagation, conservative unknown-remotes, and a declared-capable
 two-Gateway end-to-end flow that drops committed create and input responses.
 They also cover replay after a Channel Session binding survives while the
 platform processed marker does not, and compatibility with Channel clients that

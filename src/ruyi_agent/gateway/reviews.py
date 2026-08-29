@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import binascii
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -98,9 +97,7 @@ class GatewayReviewService:
                     blocked = True
                     break
                 scan_index += 1
-                pending = self._context.router.get_pending_review(
-                    original.review_id
-                )
+                pending = self._context.router.get_pending_review(original.review_id)
                 if pending is None or pending.task_id != original.task_id:
                     continue
                 route = refreshed.routes_by_id.get(pending.task_id)
@@ -226,38 +223,86 @@ class GatewayReviewService:
         if cursor is None:
             return 0
         try:
-            payload = json.loads(
-                base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
-            )
-            if not isinstance(payload, dict) or payload.get("version") != 1:
+            payload = _decode_review_cursor_payload(cursor)
+            if type(payload) is int:
+                if payload < 0 or payload > 2**63 - 1:
+                    raise ValueError
+                return payload
+            if not isinstance(payload, dict):
                 raise ValueError
-            resume_key = (
-                datetime.fromisoformat(str(payload["updated_at"])),
-                str(payload["review_id"]),
+            if set(payload) == {"review_id", "updated_at", "version"}:
+                if type(payload["version"]) is not int or payload["version"] != 1:
+                    raise ValueError
+                review_id = payload["review_id"]
+                raw_updated_at = payload["updated_at"]
+            elif set(payload) == {
+                "fallback_updated_at",
+                "resume_review_id",
+                "version",
+            }:
+                if type(payload["version"]) is not int or payload["version"] != 2:
+                    raise ValueError
+                review_id = payload["resume_review_id"]
+                raw_updated_at = payload["fallback_updated_at"]
+            else:
+                raise ValueError
+            if (
+                not isinstance(review_id, str)
+                or not 1 <= len(review_id) <= 512
+                or not isinstance(raw_updated_at, str)
+                or not 1 <= len(raw_updated_at) <= 128
+            ):
+                raise ValueError
+            fallback_updated_at = datetime.fromisoformat(raw_updated_at)
+            if (
+                fallback_updated_at.tzinfo is None
+                or fallback_updated_at.utcoffset() is None
+            ):
+                raise ValueError
+            for index, record in enumerate(records):
+                if record.review_id == review_id:
+                    return index
+            fallback_key = (fallback_updated_at, review_id)
+            return next(
+                (
+                    index
+                    for index, record in enumerate(records)
+                    if (record.updated_at, record.review_id) < fallback_key
+                ),
+                len(records),
             )
-        except (KeyError, TypeError, ValueError, binascii.Error, UnicodeError):
-            # Accept cursors produced by the original offset implementation.
-            return self._listings.decode_cursor(cursor)
-        return next(
-            (
-                index
-                for index, record in enumerate(records)
-                if (record.updated_at, record.review_id) <= resume_key
-            ),
-            len(records),
-        )
+        except Exception as exc:
+            raise GatewayTaskError(
+                code="invalid_request",
+                message="Query parameter 'cursor' is invalid",
+            ) from exc
 
     def _encode_review_cursor(self, record: PendingReviewRecord) -> str:
         payload = json.dumps(
             {
-                "review_id": record.review_id,
-                "updated_at": record.updated_at.isoformat(),
-                "version": 1,
+                "fallback_updated_at": record.updated_at.isoformat(),
+                "resume_review_id": record.review_id,
+                "version": 2,
             },
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
         return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _decode_review_cursor_payload(cursor: str) -> object:
+    if not 1 <= len(cursor) <= 4096:
+        raise ValueError
+    encoded = cursor.encode("ascii")
+    padding = b"=" * (-len(encoded) % 4)
+    decoded = base64.b64decode(
+        encoded + padding,
+        altchars=b"-_",
+        validate=True,
+    )
+    if len(decoded) > 2048:
+        raise ValueError
+    return json.loads(decoded.decode("utf-8"))
 
 
 @dataclass(frozen=True, slots=True)

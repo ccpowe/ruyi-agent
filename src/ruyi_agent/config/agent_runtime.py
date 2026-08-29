@@ -11,6 +11,7 @@ from ruyi_agent.config.agent_models import (
     BearerAuthConfig,
     LocalAgentConfig,
     RemoteAgentConfig,
+    RemoteCreateIdempotency,
 )
 from ruyi_agent.config.agent_parser import coerce_agent_configs
 from ruyi_agent.config.provider_models import LLMProviderSpec
@@ -48,6 +49,7 @@ class RemoteRef:
     url: str
     remote_agent_name: str
     auth: BearerAuthConfig | None = None
+    create_idempotency: RemoteCreateIdempotency = "none"
 
     def __post_init__(self) -> None:
         # Programmatic callers historically passed the former raw auth dictionary.
@@ -57,6 +59,14 @@ class RemoteRef:
             if auth_type != "bearer" or not isinstance(token_env, str) or not token_env:
                 raise ValueError("RemoteRef auth must define bearer type and token_env")
             self.auth = BearerAuthConfig(type="bearer", token_env=token_env)
+        if self.create_idempotency not in {"none", "ruyi_gateway_v1"}:
+            raise ValueError(
+                "RemoteRef create_idempotency must be 'none' or 'ruyi_gateway_v1'"
+            )
+
+    @property
+    def create_idempotency_guaranteed(self) -> bool:
+        return self.create_idempotency == "ruyi_gateway_v1"
 
 
 def to_backend_paths(paths: Sequence[str], base_dir: str) -> list[str]:
@@ -83,6 +93,7 @@ def build_remote_ref(
         url=config.url,
         remote_agent_name=config.remote_agent_name,
         auth=config.auth,
+        create_idempotency=config.create_idempotency,
     )
 
 
@@ -188,9 +199,7 @@ def select_public_local_worker_specs(
 ) -> dict[str, LocalWorkerSpec]:
     configs = coerce_agent_configs(agent_configs)
     return {
-        name: spec
-        for name, spec in all_local_specs.items()
-        if configs[name].public
+        name: spec for name, spec in all_local_specs.items() if configs[name].public
     }
 
 

@@ -130,6 +130,31 @@ def test_gateway_command_store_does_not_replay_unsafe_started_effect(tmp_path) -
         second.close()
 
 
+def test_release_cannot_requeue_an_unsafe_started_effect(tmp_path) -> None:
+    path = str(tmp_path / "gateway.sqlite")
+    first = GatewayCommandStore(path)
+    acquired = _claim(first)
+    assert acquired.claim_token is not None
+    first.mark_effect_started(
+        command_id=acquired.command_id,
+        claim_token=acquired.claim_token,
+        replay_safe=False,
+    )
+
+    first.release(
+        command_id=acquired.command_id,
+        claim_token=acquired.claim_token,
+    )
+    assert _claim(first).status == "busy"
+    first.close()
+
+    second = GatewayCommandStore(path)
+    try:
+        assert _claim(second).status == "terminal"
+    finally:
+        second.close()
+
+
 def test_gateway_command_store_replays_exact_terminal_error(tmp_path) -> None:
     store = GatewayCommandStore(str(tmp_path / "gateway.sqlite"))
     try:

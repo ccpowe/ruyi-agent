@@ -59,7 +59,10 @@ from ruyi_agent.runtime.delegation.task_manager import TaskManager
 from ruyi_agent.runtime.delegation.task_runtime import TaskRuntime
 from ruyi_agent.runtime.delegation.tools import DelegationTools
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
-from ruyi_agent.runtime.message_history import TaskMessageSnapshot, TaskMessageStateReader
+from ruyi_agent.runtime.message_history import (
+    TaskMessageSnapshot,
+    TaskMessageStateReader,
+)
 from ruyi_agent.runtime.skills.sync import SkillSyncer
 from ruyi_agent.runtime.skills.types import SkillEntry
 from ruyi_agent.runtime.task_events import TaskEventSubscription
@@ -181,7 +184,9 @@ class AgentControl:
     def register_artifact(
         self, *, task_id: str, artifact: dict[str, Any]
     ) -> dict[str, Any]:
-        return self._local_executor.register_artifact(task_id=task_id, artifact=artifact)
+        return self._local_executor.register_artifact(
+            task_id=task_id, artifact=artifact
+        )
 
     def _resolve_task_skill_view(
         self, entry: RegisteredAgent, *, parent_task_id: str | None
@@ -203,9 +208,7 @@ class AgentControl:
         *,
         payload: dict[str, Any] | None = None,
     ) -> None:
-        self._local_executor._audit_task_review(
-            event_type, record, payload=payload
-        )
+        self._local_executor._audit_task_review(event_type, record, payload=payload)
 
     async def _run_agent_payload(self, task_id: str, payload: Any) -> None:
         await self._local_executor._run_agent_payload(task_id, payload)
@@ -243,9 +246,7 @@ class AgentControl:
         self._local_executor._resume_run(task_id, decisions)
 
     # Delegation policy boundary.
-    def _extract_parent_thread_id(
-        self, config: RunnableConfig | None
-    ) -> str | None:
+    def _extract_parent_thread_id(self, config: RunnableConfig | None) -> str | None:
         return self._delegation_policy._extract_parent_thread_id(config)
 
     def _extract_parent_task_record(
@@ -531,6 +532,15 @@ class AgentControl:
             attachments=attachments,
             webhook=webhook,
             delegation_context=delegation_context,
+        )
+
+    def remote_create_idempotency_guaranteed(self, agent_name: str) -> bool:
+        """Return the declared create replay contract for a remote target."""
+
+        entry = self._registry.get_entry(agent_name)
+        return (
+            isinstance(entry, RemoteRefEntry)
+            and entry.ref.create_idempotency_guaranteed
         )
 
     async def send_task_input(
