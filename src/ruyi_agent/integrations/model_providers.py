@@ -9,6 +9,7 @@ from langchain.chat_models import init_chat_model
 
 from ruyi_agent.config.provider_models import (
     LLMProviderSpec,
+    mutable_provider_init_kwargs,
     validate_provider_init_kwargs,
 )
 
@@ -63,7 +64,7 @@ def _build_provider_kwargs(
     getenv: Callable[[str], str | None],
 ) -> dict[str, Any]:
     validate_provider_init_kwargs(provider.name, provider.init_kwargs)
-    kwargs: dict[str, Any] = dict(provider.init_kwargs)
+    kwargs = mutable_provider_init_kwargs(provider)
     api_key = _resolve_api_key_from_provider(provider, getenv=getenv)
     if api_key:
         kwargs["api_key"] = api_key

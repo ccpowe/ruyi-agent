@@ -61,7 +61,9 @@ def parse_skill_selection(raw: object) -> SkillSelection:
         )
     if isinstance(raw, list):
         return tuple(
-            _non_empty_string(item, path="Agent config field 'skills' list item")
+            _non_empty_string(
+                item, path="Agent config field 'skills' list item"
+            ).strip()
             for item in raw
         )
     raise ValueError(
