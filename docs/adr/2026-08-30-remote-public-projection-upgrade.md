@@ -35,6 +35,12 @@ For every persisted `remote_ref` Task:
 - Every not-yet-delivered settled outbox/mailbox projection is brought into
   agreement with the sanitized Task projection.
 
+A delivered outbox may still anchor the Task, run, Agent, recipient, and status
+identity of a separately pending legacy mailbox row. Its historical `content`
+is never copied into that mailbox row: every undelivered mailbox projection is
+independently rebuilt from its own content and the authoritative Task
+state/error boundary.
+
 Claimed affected rows have their lease tokens cleared and return to `pending`.
 This fences an intent object claimed before the upgrade: its stale token can no
 longer commit a raw mailbox message. Suppressed/retracted rows remain
@@ -58,6 +64,11 @@ cleared, its content becomes the static remote failure, and its state becomes
 `retracted`. Any directly linked undelivered outbox is `suppressed`; both leases
 are fenced. Isolation is per message and does not block runtime startup. A
 retracted row is never adopted later as a legacy outbox delivery.
+
+The repair resolves every outbox linked by either mailbox `message_id` or
+`idempotency_key` before handling an already-retracted mailbox row. This also
+fences a partial earlier repair whose Task and Agent identities were already
+cleared but whose outbox was left claimable.
 
 A single linked local outbox is authoritative local ownership, even when its
 public Task ID collides with a remote Task's upstream ID. The remote migration

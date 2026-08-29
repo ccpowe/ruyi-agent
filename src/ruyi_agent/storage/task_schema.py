@@ -400,7 +400,7 @@ def _sanitize_remote_mailbox_messages(
                settled_status, content, status
         FROM agent_mailbox_messages
         WHERE status IN ('pending', 'claimed', 'retracted')
-          AND child_task_id IS NOT NULL AND child_run_count IS NOT NULL
+          AND child_run_count IS NOT NULL
           AND settled_status IN ('completed', 'failed', 'cancelled', 'interrupted')
         """
     ).fetchall()
@@ -408,11 +408,6 @@ def _sanitize_remote_mailbox_messages(
     for row in rows:
         message = _legacy_mailbox_message(row)
         candidates = _legacy_remote_task_candidates(connection, message=message)
-        if not candidates:
-            continue
-        if message["status"] == "retracted":
-            _isolate_legacy_remote_mailbox(connection, message=message)
-            continue
         (
             binding,
             linked_outbox_keys,
@@ -425,7 +420,9 @@ def _sanitize_remote_mailbox_messages(
         )
         if authoritative_local:
             continue
-        if binding is None:
+        if not candidates and not linked_outbox_keys:
+            continue
+        if message["status"] == "retracted" or binding is None:
             _isolate_legacy_remote_mailbox(
                 connection,
                 message=message,
@@ -486,7 +483,7 @@ def _legacy_mailbox_message(row: tuple[object, ...]) -> dict[str, object]:
         "recipient_thread_id": str(row[3]),
         "sender_task_id": str(row[4]) if row[4] is not None else None,
         "sender_agent_name": str(row[5]) if row[5] is not None else None,
-        "child_task_id": str(row[6]),
+        "child_task_id": str(row[6]) if row[6] is not None else None,
         "child_agent_name": str(row[7]) if row[7] is not None else None,
         "child_run_count": int(row[8]),
         "settled_status": str(row[9]),
@@ -585,16 +582,12 @@ def _resolve_legacy_remote_mailbox_binding(
             f"settled:{message['recipient_thread_id']}:{task_id}:{run_count}"
         )
     )
-    content = (
-        str(outbox[7])
-        if outbox is not None
-        else _public_remote_settlement_content(
-            content=str(message["content"]),
-            old_error=remote_errors.get(task_id),
-            settled_status=str(message["settled_status"]),
-            task_state=str(task["state"]),
-            is_current_run=run_count == int(task["run_count"]),
-        )
+    content = _public_remote_settlement_content(
+        content=str(message["content"]),
+        old_error=remote_errors.get(task_id),
+        settled_status=str(message["settled_status"]),
+        task_state=str(task["state"]),
+        is_current_run=run_count == int(task["run_count"]),
     )
     return (
         {

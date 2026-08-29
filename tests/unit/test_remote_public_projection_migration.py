@@ -640,6 +640,224 @@ def test_remote_projection_upgrade_is_idempotent_and_preserves_frozen_v2_order(
     assert migrations["completed"] == 1
 
 
+def test_delivered_outbox_only_anchors_pending_mailbox_identity_and_not_content(
+    tmp_path,
+) -> None:
+    db_path = str(tmp_path / "delivered-outbox-pending-mailbox.sqlite")
+    _create_baseline_database(db_path)
+    private_outbox_content = f"delivered raw {PRIVATE_TASK_ID} via {PRIVATE_URL}"
+    private_mailbox_content = f"pending raw {PRIVATE_TASK_ID} via {PRIVATE_URL}"
+    outbox_key = f"settled:parent-thread:{PUBLIC_TASK_ID}:1"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            """
+            UPDATE agent_task_settled_outbox
+            SET content = ?, status = 'delivered', delivered_at = ?,
+                claimed_at = NULL, claim_expires_at = NULL,
+                claimed_by = NULL, claim_token = NULL
+            WHERE message_id = 'outbox-message'
+            """,
+            (private_outbox_content, NOW),
+        )
+        connection.execute(
+            """
+            UPDATE agent_mailbox_messages
+            SET content = ?, status = 'pending', claimed_at = NULL,
+                claim_expires_at = NULL, claimed_by = NULL, claim_token = NULL
+            WHERE message_id = 'outbox-message'
+            """,
+            (private_mailbox_content,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    first = TaskStore(db_path)
+    first.close()
+    task_store = TaskStore(db_path)
+    mailbox_store = MailboxStore(db_path)
+    mailbox = AgentMailbox(mailbox_store)
+    try:
+        mailbox_before = _database_row(
+            db_path,
+            """
+            SELECT * FROM agent_mailbox_messages
+            WHERE message_id = 'outbox-message'
+            """,
+        )
+        outbox = {
+            str(row["outbox_key"]): row
+            for row in task_store.list_settled_outbox()
+        }[outbox_key]
+        claimable_outbox = task_store.claim_settled_outbox()
+        claimed_mailbox = mailbox.claim(
+            recipient_task_id="parent-task",
+            recipient_thread_id="parent-thread",
+        )
+    finally:
+        mailbox_store.close()
+        task_store.close()
+
+    assert outbox["status"] == "delivered"
+    assert outbox["content"] == private_outbox_content
+    assert claimable_outbox == []
+    assert mailbox_before["status"] == "pending"
+    assert mailbox_before["idempotency_key"] == outbox_key
+    assert mailbox_before["sender_task_id"] == PUBLIC_TASK_ID
+    assert mailbox_before["child_task_id"] == PUBLIC_TASK_ID
+    assert mailbox_before["content"] == PUBLIC_ERROR
+    assert len(claimed_mailbox) == 1
+    assert claimed_mailbox[0].sender_task_id == PUBLIC_TASK_ID
+    assert claimed_mailbox[0].child_task_id == PUBLIC_TASK_ID
+    assert claimed_mailbox[0].content == PUBLIC_ERROR
+    downstream_projection = json.dumps(
+        {
+            "mailbox_before": dict(mailbox_before),
+            "claimed_mailbox": claimed_mailbox,
+        },
+        default=str,
+    )
+    assert private_outbox_content not in downstream_projection
+    assert private_mailbox_content not in downstream_projection
+    assert PRIVATE_TASK_ID not in downstream_projection
+    assert PRIVATE_URL not in downstream_projection
+
+
+def test_retracted_mailbox_fences_every_linked_remote_outbox_on_each_reopen(
+    tmp_path,
+) -> None:
+    db_path = str(tmp_path / "retracted-linked-outbox.sqlite")
+    _create_current_collision_database(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        for task_id, upstream_task_id, run_count in (
+            ("proxy-retracted-a", "private-retracted-a", 2),
+            ("proxy-retracted-b", "private-retracted-b", 3),
+            ("proxy-partial", "private-partial", 4),
+        ):
+            _insert_collision_task(
+                connection,
+                task_id=task_id,
+                upstream_task_id=upstream_task_id,
+                agent_name="remote_retracted",
+                run_count=run_count,
+            )
+        message_link_key = _insert_collision_outbox(
+            connection,
+            message_id="retracted-linked-message",
+            task_id="proxy-retracted-a",
+            agent_name="remote_retracted",
+            run_count=2,
+        )
+        key_link_key = _insert_collision_outbox(
+            connection,
+            message_id="different-outbox-message",
+            task_id="proxy-retracted-b",
+            agent_name="remote_retracted",
+            run_count=3,
+        )
+        _insert_collision_message(
+            connection,
+            message_id="retracted-linked-message",
+            stored_task_id="private-retracted-a",
+            agent_name="remote_retracted",
+            run_count=2,
+            idempotency_key=key_link_key,
+        )
+        connection.execute(
+            """
+            UPDATE agent_mailbox_messages
+            SET status = 'retracted'
+            WHERE message_id = 'retracted-linked-message'
+            """
+        )
+
+        partial_key = _insert_collision_outbox(
+            connection,
+            message_id="partially-isolated-message",
+            task_id="proxy-partial",
+            agent_name="remote_retracted",
+            run_count=4,
+        )
+        _insert_collision_message(
+            connection,
+            message_id="partially-isolated-message",
+            stored_task_id="private-partial",
+            agent_name="remote_retracted",
+            run_count=4,
+            idempotency_key=partial_key,
+        )
+        connection.execute(
+            """
+            UPDATE agent_mailbox_messages
+            SET idempotency_key = NULL, sender_task_id = NULL,
+                sender_agent_name = NULL, child_task_id = NULL,
+                child_agent_name = NULL, status = 'retracted'
+            WHERE message_id = 'partially-isolated-message'
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    first = TaskStore(db_path)
+    first_outboxes = {
+        str(row["outbox_key"]): row for row in first.list_settled_outbox()
+    }
+    first.close()
+    task_store = TaskStore(db_path)
+    mailbox_store = MailboxStore(db_path)
+    mailbox = AgentMailbox(mailbox_store)
+    try:
+        second_outboxes = {
+            str(row["outbox_key"]): row
+            for row in task_store.list_settled_outbox()
+        }
+        mailbox_rows = {
+            str(row["message_id"]): row
+            for row in _database_rows(
+                db_path,
+                "SELECT * FROM agent_mailbox_messages ORDER BY message_id",
+            )
+        }
+        claimable_outbox = task_store.claim_settled_outbox()
+        retryable_suppression = task_store.list_suppressed_settled_outbox()
+        claimed_mailbox = mailbox.claim(
+            recipient_task_id="parent-task",
+            recipient_thread_id="parent-thread",
+        )
+    finally:
+        mailbox_store.close()
+        task_store.close()
+
+    for key in (message_link_key, key_link_key, partial_key):
+        first_row = first_outboxes[key]
+        second_row = second_outboxes[key]
+        assert first_row["status"] == "suppressed"
+        assert second_row["status"] == "suppressed"
+        assert first_row["claim_token"] is None
+        assert second_row["claim_token"] is None
+        assert first_row["claimed_by"] is None
+        assert second_row["claimed_by"] is None
+        assert first_row["claim_expires_at"] is None
+        assert second_row["claim_expires_at"] is None
+        assert first_row["retracted_at"] is not None
+        assert second_row["retracted_at"] == first_row["retracted_at"]
+    for message_id in ("retracted-linked-message", "partially-isolated-message"):
+        message = mailbox_rows[message_id]
+        assert message["status"] == "retracted"
+        assert message["idempotency_key"] is None
+        assert message["sender_task_id"] is None
+        assert message["sender_agent_name"] is None
+        assert message["child_task_id"] is None
+        assert message["child_agent_name"] is None
+        assert message["claim_token"] is None
+    assert claimable_outbox == []
+    assert retryable_suppression == []
+    assert claimed_mailbox == []
+
+
 def test_shared_upstream_uses_outbox_binding_and_isolates_unanchored_ambiguity(
     tmp_path,
 ) -> None:
