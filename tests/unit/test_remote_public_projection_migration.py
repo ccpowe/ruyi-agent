@@ -641,6 +641,7 @@ def test_remote_projection_upgrade_is_idempotent_and_preserves_frozen_v2_order(
 
 
 def test_delivered_outbox_only_anchors_pending_mailbox_identity_and_not_content(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
     db_path = str(tmp_path / "delivered-outbox-pending-mailbox.sqlite")
@@ -648,6 +649,12 @@ def test_delivered_outbox_only_anchors_pending_mailbox_identity_and_not_content(
     private_outbox_content = f"delivered raw {PRIVATE_TASK_ID} via {PRIVATE_URL}"
     private_mailbox_content = f"pending raw {PRIVATE_TASK_ID} via {PRIVATE_URL}"
     outbox_key = f"settled:parent-thread:{PUBLIC_TASK_ID}:1"
+    CapturingAsyncClient.calls.clear()
+    monkeypatch.setattr(
+        async_subagent_runtime.httpx,
+        "AsyncClient",
+        CapturingAsyncClient,
+    )
     connection = sqlite3.connect(db_path)
     try:
         connection.execute(
@@ -678,6 +685,15 @@ def test_delivered_outbox_only_anchors_pending_mailbox_identity_and_not_content(
     task_store = TaskStore(db_path)
     mailbox_store = MailboxStore(db_path)
     mailbox = AgentMailbox(mailbox_store)
+    control = async_subagent_runtime.AgentControl(
+        {},
+        build_test_remote_refs(),
+        checkpointer=object(),
+        backend=object(),
+        a2a_client=object(),  # type: ignore[arg-type]
+        task_store=task_store,
+        mailbox=mailbox,
+    )
     try:
         mailbox_before = _database_row(
             db_path,
@@ -695,7 +711,9 @@ def test_delivered_outbox_only_anchors_pending_mailbox_identity_and_not_content(
             recipient_task_id="parent-task",
             recipient_thread_id="parent-thread",
         )
+        asyncio.run(control._send_settled_webhook(PUBLIC_TASK_ID))  # noqa: SLF001
     finally:
+        asyncio.run(control.close())
         mailbox_store.close()
         task_store.close()
 
@@ -711,10 +729,16 @@ def test_delivered_outbox_only_anchors_pending_mailbox_identity_and_not_content(
     assert claimed_mailbox[0].sender_task_id == PUBLIC_TASK_ID
     assert claimed_mailbox[0].child_task_id == PUBLIC_TASK_ID
     assert claimed_mailbox[0].content == PUBLIC_ERROR
+    assert len(CapturingAsyncClient.calls) == 1
+    webhook_payload = CapturingAsyncClient.calls[0]["json"]
+    assert isinstance(webhook_payload, dict)
+    assert webhook_payload["task_id"] == PUBLIC_TASK_ID
+    assert webhook_payload["error"] == PUBLIC_ERROR
     downstream_projection = json.dumps(
         {
             "mailbox_before": dict(mailbox_before),
             "claimed_mailbox": claimed_mailbox,
+            "caller_webhook": CapturingAsyncClient.calls,
         },
         default=str,
     )
