@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,8 @@ class FakeGatewayClient:
         self.artifacts: dict[str, TelegramInboundAttachment] = {}
         self.task_artifacts: dict[tuple[str, str], TelegramInboundAttachment] = {}
         self.list_calls: list[dict[str, str]] = []
+        self.create_attempts = 0
+        self.create_failures = 0
         self._counter = 0
 
     async def list_agents(self) -> list[dict[str, Any]]:
@@ -80,6 +83,10 @@ class FakeGatewayClient:
         attachments: list[dict[str, str]] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        self.create_attempts += 1
+        if self.create_failures > 0:
+            self.create_failures -= 1
+            raise RuntimeError("create failed")
         self._counter += 1
         task_id = f"task-{self._counter}"
         task = {
@@ -586,10 +593,76 @@ def test_poll_once_deduplicates_repeated_update_id() -> None:
     update_store.close()
 
 
-def test_poll_once_advances_offset_when_reply_send_fails() -> None:
+def test_update_store_migrates_old_schema_and_reclaims_expired_lease(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "telegram_updates.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE telegram_processed_updates (
+                update_id INTEGER PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                processed_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO telegram_processed_updates (
+                update_id, chat_id, message_id, first_seen_at, processed_at
+            ) VALUES (10, '100', '300', '2026-01-01T00:00:00+00:00', NULL)
+            """
+        )
+
+    update = build_message("hello", update_id=10)
+    store = TelegramUpdateStore(str(db_path), claim_timeout_seconds=0)
+    try:
+        with sqlite3.connect(db_path) as conn:
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(telegram_processed_updates)"
+                ).fetchall()
+            }
+        assert "claimed_at" in columns
+
+        first_claim = store.claim_update_result(update)
+        assert first_claim.status == "claimed"
+        assert first_claim.claimed_at is not None
+
+        reclaimed = store.claim_update_result(update)
+        assert reclaimed.status == "claimed"
+        assert reclaimed.claimed_at is not None
+        assert store.mark_processed(10, claimed_at=reclaimed.claimed_at)
+        assert store.claim_update_result(update).status == "processed"
+        assert not store.claim_update(update)
+    finally:
+        store.close()
+
+
+def test_update_store_release_makes_unprocessed_update_claimable() -> None:
+    update = build_message("hello", update_id=10)
+    store = TelegramUpdateStore(":memory:")
+    try:
+        claim = store.claim_update_result(update)
+        assert claim.status == "claimed"
+        assert claim.claimed_at is not None
+        assert store.claim_update_result(update).status == "busy"
+
+        assert store.release_claim(10, claimed_at=claim.claimed_at)
+        reclaimed = store.claim_update_result(update)
+        assert reclaimed.status == "claimed"
+    finally:
+        store.close()
+
+
+def test_poll_once_retries_when_gateway_fails_before_effect() -> None:
     gateway = FakeGatewayClient()
+    gateway.create_failures = 1
     telegram = FakeTelegramClient()
-    telegram.fail_all_messages = True
     telegram.updates = [build_message("hello", update_id=10)]
     update_store = TelegramUpdateStore(":memory:")
     adapter = TelegramAdapter(
@@ -600,11 +673,126 @@ def test_poll_once_advances_offset_when_reply_send_fails() -> None:
         task_poll_interval=0.0,
     )
 
-    offset = asyncio.run(adapter.poll_once(offset=None))
+    async def scenario() -> None:
+        offset = await adapter.poll_once(offset=None)
+        assert offset is None
+        offset = await adapter.poll_once(offset=offset)
+        assert offset == 11
+        gateway.tasks["task-1"] = {
+            **gateway.tasks["task-1"],
+            "status": "completed",
+            "last_result": "done",
+        }
+        await adapter.wait_for_watchers()
 
-    assert offset == 11
+    try:
+        asyncio.run(scenario())
+    finally:
+        update_store.close()
+
+    assert gateway.create_attempts == 2
     assert len(gateway.created) == 1
-    update_store.close()
+
+
+def test_poll_once_reuses_turn_receipt_after_reply_failure_and_restart(
+    tmp_path: Path,
+) -> None:
+    gateway = FakeGatewayClient()
+    telegram = FakeTelegramClient()
+    telegram.fail_all_messages = True
+    telegram.updates = [build_message("hello", update_id=10)]
+    update_db_path = tmp_path / "telegram_updates.sqlite3"
+    session_db_path = tmp_path / "channel_sessions.sqlite3"
+    first_update_store = TelegramUpdateStore(str(update_db_path))
+    first_session_store = ChannelSessionStore(str(session_db_path))
+    first_adapter = TelegramAdapter(
+        gateway_client=gateway,
+        telegram_client=telegram,
+        default_agent_name="main",
+        update_store=first_update_store,
+        session_store=first_session_store,
+        task_poll_interval=0.0,
+    )
+
+    try:
+        offset = asyncio.run(first_adapter.poll_once(offset=None))
+        assert offset is None
+    finally:
+        first_update_store.close()
+        first_session_store.close()
+
+    telegram.fail_all_messages = False
+    second_update_store = TelegramUpdateStore(str(update_db_path))
+    second_session_store = ChannelSessionStore(str(session_db_path))
+    second_adapter = TelegramAdapter(
+        gateway_client=gateway,
+        telegram_client=telegram,
+        default_agent_name="main",
+        update_store=second_update_store,
+        session_store=second_session_store,
+        task_poll_interval=0.0,
+    )
+    try:
+        offset = asyncio.run(second_adapter.poll_once(offset=offset))
+        assert offset == 11
+    finally:
+        second_update_store.close()
+        second_session_store.close()
+
+    assert gateway.create_attempts == 1
+    assert len(gateway.created) == 1
+    assert gateway.idempotency_keys == ["telegram:update:10"]
+
+
+def test_poll_once_stops_batch_without_advancing_past_failed_update() -> None:
+    gateway = FakeGatewayClient()
+    gateway.create_failures = 1
+    telegram = FakeTelegramClient()
+    first = build_message("/start", update_id=10)
+    failed = build_message("second", update_id=11)
+    skipped = build_message("third", update_id=12)
+    telegram.updates = [first, failed, skipped]
+    update_store = TelegramUpdateStore(":memory:")
+    adapter = TelegramAdapter(
+        gateway_client=gateway,
+        telegram_client=telegram,
+        default_agent_name="main",
+        update_store=update_store,
+        task_poll_interval=0.0,
+    )
+
+    try:
+        offset = asyncio.run(adapter.poll_once(offset=10))
+        assert offset == 11
+        assert gateway.create_attempts == 1
+        assert update_store.claim_update_result(first).status == "processed"
+        assert update_store.claim_update(skipped)
+    finally:
+        update_store.close()
+
+
+def test_poll_once_does_not_advance_past_update_with_live_claim() -> None:
+    gateway = FakeGatewayClient()
+    telegram = FakeTelegramClient()
+    update = build_message("hello", update_id=10)
+    telegram.updates = [update]
+    update_store = TelegramUpdateStore(":memory:")
+    claim = update_store.claim_update_result(update)
+    assert claim.status == "claimed"
+    adapter = TelegramAdapter(
+        gateway_client=gateway,
+        telegram_client=telegram,
+        default_agent_name="main",
+        update_store=update_store,
+        task_poll_interval=0.0,
+    )
+
+    try:
+        offset = asyncio.run(adapter.poll_once(offset=10))
+        assert offset == 10
+        assert gateway.create_attempts == 0
+    finally:
+        update_store.close()
 
 
 def test_format_telegram_markdown_v2_converts_common_markdown() -> None:
@@ -1030,31 +1218,44 @@ def test_adapter_continues_session_store_task_without_listing() -> None:
     assert "done: follow up" in telegram.sent_messages[1]["text"]
 
 
-def test_adapter_rejects_message_when_existing_task_is_running() -> None:
+def test_adapter_restores_watcher_when_existing_task_is_running() -> None:
     gateway = FakeGatewayClient()
     telegram = FakeTelegramClient()
-    gateway.list_items = [
-        {
-            "task_id": "task-7",
-            "agent_name": "main",
-            "status": "running",
-            "last_result": None,
-            "error": None,
-            "run_count": 1,
-            "metadata": {"channel": "telegram", "chat_id": "100", "user_id": "200"},
-        }
-    ]
+    running_task = {
+        "task_id": "task-7",
+        "agent_name": "main",
+        "status": "running",
+        "last_result": None,
+        "error": None,
+        "run_count": 1,
+        "metadata": {"channel": "telegram", "chat_id": "100", "user_id": "200"},
+    }
+    gateway.tasks["task-7"] = running_task
+    gateway.list_items = [running_task]
     adapter = TelegramAdapter(
         gateway_client=gateway,
         telegram_client=telegram,
         default_agent_name="main",
+        task_poll_interval=0.0,
+        terminal_review_grace_checks=0,
     )
 
-    asyncio.run(adapter.handle_message(build_message("hello again")))
+    async def scenario() -> None:
+        await adapter.handle_message(build_message("hello again"))
+        assert adapter._has_active_watcher(task_id="task-7", run_count=1)
+        gateway.tasks["task-7"] = {
+            **running_task,
+            "status": "completed",
+            "last_result": "done after watcher recovery",
+        }
+        await adapter.wait_for_watchers()
+
+    asyncio.run(scenario())
 
     assert gateway.created == []
     assert gateway.sent == []
     assert "当前任务仍在处理中" in telegram.sent_messages[0]["text"]
+    assert "done after watcher recovery" in telegram.sent_messages[1]["text"]
 
 
 def test_adapter_reports_pending_review_instead_of_sending_input() -> None:
