@@ -12,6 +12,10 @@ from ruyi_agent.storage.task_event_repository import (
     serialize_event_data,
 )
 from ruyi_agent.storage.task_repository import TaskRepository
+from ruyi_agent.storage.settled_outbox import (
+    SettledOutboxIntent,
+    SettledOutboxRepository,
+)
 from ruyi_agent.task_models import TaskRecord
 
 
@@ -26,10 +30,12 @@ class TaskLifecycleUnitOfWork:
         database: TaskDatabase,
         tasks: TaskRepository,
         events: TaskEventRepository,
+        settled_outbox: SettledOutboxRepository,
     ) -> None:
         self._database = database
         self._tasks = tasks
         self._events = events
+        self._settled_outbox = settled_outbox
 
     def insert_with_event(
         self,
@@ -61,17 +67,24 @@ class TaskLifecycleUnitOfWork:
         event_data: dict[str, Any],
         event_created_at: datetime,
         append_event: AppendEvent,
+        settled_outbox_intent: SettledOutboxIntent | None = None,
     ) -> StoredTaskEvent:
         encoded_data = serialize_event_data(event_data)
         with self._database.transaction() as connection:
             self._tasks.update_locked(connection, record)
-            return append_event(
+            event = append_event(
                 task_id=record.task_id,
                 run_count=record.run_count,
                 event_type=event_type,
                 encoded_data=encoded_data,
                 event_created_at=event_created_at,
             )
+            if settled_outbox_intent is not None:
+                self._settled_outbox.insert_locked(
+                    connection,
+                    settled_outbox_intent,
+                )
+            return event
 
     def append_event(
         self,

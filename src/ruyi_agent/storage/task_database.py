@@ -23,6 +23,7 @@ class TaskDatabase:
             db_path,
             check_same_thread=False,
             timeout=30.0,
+            uri=db_path.startswith("file:"),
         )
 
     @contextmanager

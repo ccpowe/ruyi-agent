@@ -35,6 +35,7 @@ from ruyi_agent.runtime.task_event_projection import (
 )
 
 from ruyi_agent.storage.task_store import StoredTaskEvent, TaskStore
+from ruyi_agent.storage.settled_outbox import SettledOutboxIntent
 from ruyi_agent.task_models import PendingReviewRecord, TaskRecord
 
 
@@ -99,6 +100,7 @@ class TaskEventLedger:
         *,
         event_type: TaskLifecycleEventType,
         event_data: dict[str, Any],
+        settled_outbox_intent: SettledOutboxIntent | None = None,
     ) -> StoredTaskEvent:
         ensure_durable_event_data_fits(event_data)
         with self._lock:
@@ -107,6 +109,7 @@ class TaskEventLedger:
                 event_type=event_type,
                 event_data=event_data,
                 event_created_at=record.updated_at,
+                settled_outbox_intent=settled_outbox_intent,
             )
             subscribers = self._commit_durable_locked(event)
         self._wake_subscribers(subscribers)
@@ -119,6 +122,7 @@ class TaskEventLedger:
         pending_review: PendingReviewRecord | None,
         root_record: TaskRecord | None,
         events: list[tuple[TaskRecord, TaskLifecycleEventType, dict[str, Any]]],
+        settled_outbox_intent: SettledOutboxIntent | None = None,
     ) -> list[StoredTaskEvent]:
         """Commit a review transition and publish its durable Task events."""
 
@@ -138,6 +142,7 @@ class TaskEventLedger:
                     )
                     for event_record, event_type, event_data in events
                 ],
+                settled_outbox_intent=settled_outbox_intent,
             )
             subscribers = [
                 subscriber

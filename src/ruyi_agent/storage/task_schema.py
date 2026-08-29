@@ -81,6 +81,33 @@ def _create_tables(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_task_settled_outbox (
+            outbox_key TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL UNIQUE,
+            task_id TEXT NOT NULL,
+            run_count INTEGER NOT NULL,
+            recipient_task_id TEXT,
+            recipient_thread_id TEXT NOT NULL,
+            child_agent_name TEXT NOT NULL,
+            settled_status TEXT NOT NULL,
+            content TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            claimed_at TEXT,
+            claim_expires_at TEXT,
+            claimed_by TEXT,
+            claim_token TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            delivered_at TEXT,
+            retracted_at TEXT,
+            UNIQUE(task_id, run_count),
+            FOREIGN KEY(task_id) REFERENCES agent_tasks(task_id)
+        )
+        """
+    )
 
 
 def _create_indexes(connection: sqlite3.Connection) -> None:
@@ -100,6 +127,12 @@ def _create_indexes(connection: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_agent_tasks_root_task_id
         ON agent_tasks(root_task_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_task_settled_outbox_delivery
+        ON agent_task_settled_outbox(status, claim_expires_at, created_at)
         """
     )
 

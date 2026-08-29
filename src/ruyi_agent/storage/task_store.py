@@ -15,6 +15,10 @@ from ruyi_agent.storage.task_repository import (
     TaskRepository,
     TaskRootBudgetExceededError,
 )
+from ruyi_agent.storage.settled_outbox import (
+    SettledOutboxIntent,
+    SettledOutboxRepository,
+)
 from ruyi_agent.storage.task_review_uow import TaskReviewUnitOfWork
 from ruyi_agent.storage.task_schema import initialize_task_database
 from ruyi_agent.storage.task_unit_of_work import TaskLifecycleUnitOfWork
@@ -42,12 +46,22 @@ class TaskStore:
         initialize_task_database(self._database)
         self._tasks = TaskRepository(self._database)
         self._events = TaskEventRepository(self._database)
+        self._settled_outbox = SettledOutboxRepository(self._database)
         self._lifecycle = TaskLifecycleUnitOfWork(
             self._database,
             self._tasks,
             self._events,
+            self._settled_outbox,
         )
-        self._reviews = TaskReviewUnitOfWork(self._database, self._tasks)
+        self._reviews = TaskReviewUnitOfWork(
+            self._database,
+            self._tasks,
+            self._settled_outbox,
+        )
+
+    @property
+    def db_path(self) -> str:
+        return self._database.db_path
 
     def save_task(self, record: TaskRecord) -> None:
         """Upsert a task without SQLite's delete-and-reinsert semantics."""
@@ -89,6 +103,7 @@ class TaskStore:
         event_type: str,
         event_data: dict[str, Any],
         event_created_at: datetime,
+        settled_outbox_intent: SettledOutboxIntent | None = None,
     ) -> StoredTaskEvent:
         """Update a Task and append its public lifecycle event atomically."""
 
@@ -98,6 +113,7 @@ class TaskStore:
             event_data=event_data,
             event_created_at=event_created_at,
             append_event=self._append_task_event_locked,
+            settled_outbox_intent=settled_outbox_intent,
         )
 
     def update_review_transition(
@@ -107,6 +123,7 @@ class TaskStore:
         pending_review: PendingReviewRecord | None,
         root_record: TaskRecord | None,
         events: list[tuple[TaskRecord, str, dict[str, Any], datetime]],
+        settled_outbox_intent: SettledOutboxIntent | None = None,
     ) -> list[StoredTaskEvent]:
         """Atomically persist review ownership, projections, and events."""
 
@@ -116,7 +133,53 @@ class TaskStore:
             root_record=root_record,
             events=events,
             append_event=self._append_task_event_locked,
+            settled_outbox_intent=settled_outbox_intent,
         )
+
+    def reconcile_settled_outbox(self) -> int:
+        """Create intents missing from Task rows written before this schema."""
+
+        return self._settled_outbox.reconcile_legacy_settlements()
+
+    def claim_settled_outbox(
+        self,
+        *,
+        limit: int = 100,
+        lease_seconds: float = 30.0,
+    ) -> list[SettledOutboxIntent]:
+        return self._settled_outbox.claim_pending(
+            limit=limit,
+            lease_seconds=lease_seconds,
+        )
+
+    def release_settled_outbox_claim(
+        self,
+        intent: SettledOutboxIntent,
+        *,
+        error: str,
+    ) -> bool:
+        return self._settled_outbox.release_claim(intent, error=error)
+
+    def suppress_settled_delivery(self, record: TaskRecord) -> None:
+        """Atomically suppress the current Task run and fence its outbox claim."""
+
+        with self._database.transaction(immediate=True) as connection:
+            self._tasks.update_locked(connection, record)
+            self._settled_outbox.suppress_for_task_run_locked(
+                connection,
+                task_id=record.task_id,
+                run_count=record.run_count,
+            )
+
+    def list_suppressed_settled_outbox(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[SettledOutboxIntent]:
+        return self._settled_outbox.list_suppressed_unretracted(limit=limit)
+
+    def list_settled_outbox(self) -> list[dict[str, object]]:
+        return self._settled_outbox.list_all()
 
     def append_task_event(
         self,

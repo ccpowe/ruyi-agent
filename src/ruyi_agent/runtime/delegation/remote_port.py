@@ -98,10 +98,14 @@ class RemoteTaskPort:
                 record.task_id,
                 f"Remote task allocation failed before upstream binding: {exc}",
             )
+            self._control._maybe_publish_settled_message(record.task_id)
             raise
         record.upstream_task_id = upstream_task_id
         record.thread_id = upstream_task_id
-        return self._control._task_manager.sync_remote_task(record.task_id, payload)
+        synced = self._control._task_manager.sync_remote_task(record.task_id, payload)
+        if self._control._is_settled_record(synced):
+            self._control._maybe_publish_settled_message(synced.task_id)
+        return synced
 
     async def submit_review_decision(
         self,

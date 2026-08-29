@@ -37,6 +37,10 @@ from ruyi_agent.storage.task_store import (
     TaskStore,
     task_record_for_restart,
 )
+from ruyi_agent.storage.settled_outbox import (
+    SettledOutboxIntent,
+    build_settled_outbox_intent,
+)
 from ruyi_agent.task_models import (
     PendingReviewRecord,
     PublishedArtifact,
@@ -64,12 +68,18 @@ class TaskManager:
         _tasks: 以 task_id 索引的任务记录表
     """
 
-    def __init__(self, store: TaskStore | None = None) -> None:
+    def __init__(
+        self,
+        store: TaskStore | None = None,
+        *,
+        settled_outbox_enabled: bool = False,
+    ) -> None:
         """初始化空任务表"""
         # 为什么有 task manager：异步子任务的状态、结果、取消和等待必须由一个中心层统一管理。
         self._tasks: dict[str, TaskRecord] = {}
         self._live_runs = LiveRunRegistry()
         self._store = store
+        self._settled_outbox_enabled = settled_outbox_enabled and store is not None
         self._event_ledger = TaskEventLedger(store) if store is not None else None
         self._pending_reviews: dict[str, PendingReviewRecord] = {
             review.review_id: review
@@ -178,9 +188,47 @@ class TaskManager:
                 record,
                 event_type=lifecycle_event_type(record),
                 event_data=lifecycle_event_data(record),
+                settled_outbox_intent=self._settled_outbox_intent(record),
             )
             return
         self._save(record)
+
+    @property
+    def settled_outbox_enabled(self) -> bool:
+        return self._settled_outbox_enabled
+
+    def _settled_outbox_intent(
+        self,
+        record: TaskRecord,
+    ) -> SettledOutboxIntent | None:
+        if not self._settled_outbox_enabled:
+            return None
+        return build_settled_outbox_intent(record)
+
+    def reconcile_settled_outbox(self) -> int:
+        if not self._settled_outbox_enabled or self._store is None:
+            return 0
+        return self._store.reconcile_settled_outbox()
+
+    def claim_settled_outbox(self) -> list[SettledOutboxIntent]:
+        if not self._settled_outbox_enabled or self._store is None:
+            return []
+        return self._store.claim_settled_outbox()
+
+    def release_settled_outbox_claim(
+        self,
+        intent: SettledOutboxIntent,
+        *,
+        error: str,
+    ) -> bool:
+        if not self._settled_outbox_enabled or self._store is None:
+            return False
+        return self._store.release_settled_outbox_claim(intent, error=error)
+
+    def list_suppressed_settled_outbox(self) -> list[SettledOutboxIntent]:
+        if not self._settled_outbox_enabled or self._store is None:
+            return []
+        return self._store.list_suppressed_settled_outbox()
 
     def list_pending_reviews(
         self,
@@ -294,6 +342,7 @@ class TaskManager:
                     else None
                 ),
                 events=events,
+                settled_outbox_intent=self._settled_outbox_intent(record),
             )
         else:
             self._save(record)
@@ -583,11 +632,22 @@ class TaskManager:
         record.mailbox_delivered = True
         self._save(record)
 
+    def observe_mailbox_delivered(self, task_id: str, *, run_count: int) -> None:
+        """Mirror a delivery already committed by the outbox transaction."""
+
+        record = self.get_task(task_id)
+        if record.run_count == run_count:
+            record.mailbox_delivered = True
+
     def mark_mailbox_suppressed(self, task_id: str) -> None:
         """记录当前 run 的 mailbox 消息不再需要投递。"""
         record = self.get_task(task_id)
-        record.mailbox_suppressed = True
-        self._save(record)
+        with self._review_memory_transaction(record):
+            record.mailbox_suppressed = True
+            if self._settled_outbox_enabled and self._store is not None:
+                self._store.suppress_settled_delivery(record)
+            else:
+                self._save(record)
 
     def mark_waiting_for_human(
         self,
@@ -746,6 +806,7 @@ class TaskManager:
         record = self.get_task(task_id)
         current_review = self._review_for_task(task_id)
         previous_fingerprint = public_task_event_fingerprint(record)
+        previous_run_count = record.run_count
         status, run_count = _validate_remote_task_state(task_id, payload)
 
         last_result = payload.get("last_result")
@@ -766,6 +827,9 @@ class TaskManager:
             dict(pending_review) if isinstance(pending_review, dict) else None
         )
         record.run_count = run_count
+        if run_count != previous_run_count:
+            record.mailbox_suppressed = False
+            record.mailbox_delivered = False
         record.created_at = _parse_task_timestamp(
             payload.get("created_at"),
             fallback=record.created_at,

@@ -13,6 +13,10 @@ from ruyi_agent.storage.task_codecs import (
 from ruyi_agent.storage.task_database import TaskDatabase
 from ruyi_agent.storage.task_event_repository import StoredTaskEvent, serialize_event_data
 from ruyi_agent.storage.task_repository import TaskRepository
+from ruyi_agent.storage.settled_outbox import (
+    SettledOutboxIntent,
+    SettledOutboxRepository,
+)
 from ruyi_agent.task_models import PendingReviewRecord, TaskRecord
 
 
@@ -22,9 +26,15 @@ AppendEvent = Callable[..., StoredTaskEvent]
 class TaskReviewUnitOfWork:
     """Own the atomic Task, Pending Review, root projection, and event write."""
 
-    def __init__(self, database: TaskDatabase, tasks: TaskRepository) -> None:
+    def __init__(
+        self,
+        database: TaskDatabase,
+        tasks: TaskRepository,
+        settled_outbox: SettledOutboxRepository,
+    ) -> None:
         self._database = database
         self._tasks = tasks
+        self._settled_outbox = settled_outbox
 
     def update_transition(
         self,
@@ -34,6 +44,7 @@ class TaskReviewUnitOfWork:
         root_record: TaskRecord | None,
         events: list[tuple[TaskRecord, str, dict[str, Any], datetime]],
         append_event: AppendEvent,
+        settled_outbox_intent: SettledOutboxIntent | None = None,
     ) -> list[StoredTaskEvent]:
         if pending_review is not None and pending_review.task_id != record.task_id:
             raise ValueError("Pending review owner does not match Task record")
@@ -46,7 +57,7 @@ class TaskReviewUnitOfWork:
             self._replace_review_locked(connection, record.task_id, pending_review)
             if root_record is not None and root_record.task_id != record.task_id:
                 self._tasks.update_locked(connection, root_record)
-            return [
+            stored_events = [
                 append_event(
                     task_id=event_record.task_id,
                     run_count=event_record.run_count,
@@ -56,6 +67,12 @@ class TaskReviewUnitOfWork:
                 )
                 for event_record, event_type, encoded_data, created_at in encoded_events
             ]
+            if settled_outbox_intent is not None:
+                self._settled_outbox.insert_locked(
+                    connection,
+                    settled_outbox_intent,
+                )
+            return stored_events
 
     def get(self, review_id: str) -> PendingReviewRecord | None:
         with self._database.locked_connection() as connection:

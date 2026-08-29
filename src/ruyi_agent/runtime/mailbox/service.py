@@ -35,6 +35,7 @@ import uuid
 from typing import TypeAlias
 
 from ruyi_agent.storage.mailbox_store import MailboxStore
+from ruyi_agent.storage.settled_outbox import SettledOutboxIntent
 from ruyi_agent.task_models import SETTLED_TASK_STATES, TaskState, parse_task_state
 
 
@@ -110,6 +111,9 @@ class AgentMailbox:
 
         return self._store is not None
 
+    def shares_database(self, db_path: str) -> bool:
+        return self._store is not None and self._store.shares_database(db_path)
+
     def publish_settled(
         self,
         *,
@@ -147,7 +151,6 @@ class AgentMailbox:
             # 为什么要去重：本地同步、远端 webhook 或状态轮询可能重复发布同一轮结果。
             if key in self._seen_message_keys:
                 return None
-            self._seen_message_keys.add(key)
             message = InterAgentMessage(
                 message_id=str(uuid.uuid4()),
                 recipient_thread_id=recipient_thread_id,
@@ -170,11 +173,45 @@ class AgentMailbox:
                         ),
                     )
                 )
+                # A duplicate durable row is also authoritative evidence that
+                # this process may safely suppress another identical attempt.
+                self._seen_message_keys.add(key)
                 return message if published else None
             self._messages_by_recipient.setdefault(recipient_thread_id, []).append(
                 message
             )
+            self._seen_message_keys.add(key)
             return message
+
+    def publish_claimed_settled_outbox(
+        self,
+        intent: SettledOutboxIntent,
+    ) -> bool:
+        """Publish a claimed durable intent through its fenced transaction."""
+
+        if self._store is None:
+            raise RuntimeError("Settled outbox delivery requires a durable mailbox")
+        delivered = self._store.publish_claimed_settled_outbox(intent)
+        if delivered:
+            with self._lock:
+                self._seen_message_keys.add(
+                    (
+                        intent.recipient_thread_id,
+                        intent.task_id,
+                        intent.run_count,
+                    )
+                )
+        return delivered
+
+    def retract_settled_outbox(self, intent: SettledOutboxIntent) -> bool:
+        if self._store is None:
+            return False
+        return self._store.retract_settled_outbox(intent)
+
+    def pending_trigger_recipient_task_ids(self) -> list[str]:
+        if self._store is None:
+            return []
+        return self._store.list_pending_trigger_recipient_task_ids()
 
     def publish_input(
         self,

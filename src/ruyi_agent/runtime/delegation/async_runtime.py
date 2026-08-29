@@ -116,7 +116,15 @@ class AgentControl:
             raise ValueError("max_tasks_per_root must be at least 1")
 
         self._registry = AgentRegistry(specs, remote_refs, unavailable_agents)
-        self._task_manager = TaskManager(task_store)
+        settled_outbox_enabled = (
+            task_store is not None
+            and mailbox is not None
+            and mailbox.shares_database(task_store.db_path)
+        )
+        self._task_manager = TaskManager(
+            task_store,
+            settled_outbox_enabled=settled_outbox_enabled,
+        )
         self._checkpointer = checkpointer
         self._message_state_reader = TaskMessageStateReader(checkpointer)
         self._backend = backend
@@ -214,13 +222,16 @@ class AgentControl:
         return await self._local_executor._ensure_task_awake(task_id)
 
     async def wake_pending_mailbox_tasks(self) -> None:
+        await self._settled_notifier.reconcile()
         await self._local_executor.wake_pending_mailbox_tasks()
 
     def start_mailbox_recovery(self) -> None:
+        self._settled_notifier.start()
         self._local_executor.start_mailbox_recovery()
 
     async def close(self) -> None:
         await self._local_executor.close()
+        await self._settled_notifier.close()
 
     def _resume_run(self, task_id: str, decisions: list[dict[str, Any]]) -> None:
         self._local_executor._resume_run(task_id, decisions)
