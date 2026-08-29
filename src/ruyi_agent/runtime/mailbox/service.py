@@ -208,6 +208,11 @@ class AgentMailbox:
             return False
         return self._store.retract_settled_outbox(intent)
 
+    def settled_outbox_needs_wake(self, intent: SettledOutboxIntent) -> bool:
+        if self._store is None:
+            return False
+        return self._store.settled_outbox_needs_wake(intent)
+
     def pending_trigger_recipient_task_ids(self) -> list[str]:
         if self._store is None:
             return []

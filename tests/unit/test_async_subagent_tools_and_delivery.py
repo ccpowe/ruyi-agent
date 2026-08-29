@@ -342,7 +342,8 @@ def test_mailbox_delivery_flags_are_persisted(
     monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
     db_path = tmp_path / "tasks.sqlite"
     task_store = TaskStore(str(db_path))
-    mailbox = AgentMailbox()
+    mailbox_store = MailboxStore(str(db_path))
+    mailbox = AgentMailbox(mailbox_store)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         build_test_remote_refs(),
@@ -370,6 +371,7 @@ def test_mailbox_delivery_flags_are_persisted(
         return delivered.task_id, suppressed.task_id
 
     delivered_task_id, suppressed_task_id = asyncio.run(scenario())
+    mailbox_store.close()
     task_store.close()
 
     reopened_store = TaskStore(str(db_path))

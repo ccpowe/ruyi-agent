@@ -38,6 +38,7 @@ from ruyi_agent.storage.task_store import (
     task_record_for_restart,
 )
 from ruyi_agent.storage.settled_outbox import (
+    LegacySettlementMigrationBatch,
     SettledOutboxIntent,
     build_settled_outbox_intent,
 )
@@ -209,6 +210,11 @@ class TaskManager:
         if not self._settled_outbox_enabled or self._store is None:
             return 0
         return self._store.reconcile_settled_outbox()
+
+    def reconcile_settled_outbox_batch(self) -> LegacySettlementMigrationBatch:
+        if not self._settled_outbox_enabled or self._store is None:
+            return LegacySettlementMigrationBatch(inserted=0, completed=True)
+        return self._store.reconcile_settled_outbox_batch()
 
     def claim_settled_outbox(self) -> list[SettledOutboxIntent]:
         if not self._settled_outbox_enabled or self._store is None:

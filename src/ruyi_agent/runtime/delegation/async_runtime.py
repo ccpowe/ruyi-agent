@@ -116,11 +116,17 @@ class AgentControl:
             raise ValueError("max_tasks_per_root must be at least 1")
 
         self._registry = AgentRegistry(specs, remote_refs, unavailable_agents)
-        settled_outbox_enabled = (
+        if (
             task_store is not None
             and mailbox is not None
-            and mailbox.shares_database(task_store.db_path)
-        )
+            and not mailbox.shares_database(task_store.db_path)
+        ):
+            raise RuntimeError(
+                "Durable Task settlement requires TaskStore and MailboxStore "
+                "to share one SQLite database; separate databases, an in-memory "
+                "AgentMailbox, and independent ':memory:' connections are unsafe"
+            )
+        settled_outbox_enabled = task_store is not None and mailbox is not None
         self._task_manager = TaskManager(
             task_store,
             settled_outbox_enabled=settled_outbox_enabled,

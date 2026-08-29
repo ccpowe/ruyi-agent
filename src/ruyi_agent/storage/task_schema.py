@@ -108,6 +108,15 @@ def _create_tables(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_storage_migrations (
+            name TEXT PRIMARY KEY,
+            cursor TEXT NOT NULL DEFAULT '',
+            completed INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
 
 
 def _create_indexes(connection: sqlite3.Connection) -> None:
@@ -133,6 +142,12 @@ def _create_indexes(connection: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_agent_task_settled_outbox_delivery
         ON agent_task_settled_outbox(status, claim_expires_at, created_at)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_task_settled_outbox_task_run_status
+        ON agent_task_settled_outbox(task_id, run_count, status)
         """
     )
 

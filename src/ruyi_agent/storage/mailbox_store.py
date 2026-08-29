@@ -91,62 +91,24 @@ class MailboxStore:
             try:
                 claimed = self._conn.execute(
                     """
-                    SELECT 1 FROM agent_task_settled_outbox
-                    WHERE outbox_key = ? AND status = 'claimed' AND claim_token = ?
+                    SELECT 1
+                    FROM agent_task_settled_outbox AS outbox
+                    WHERE outbox.outbox_key = ? AND outbox.status = 'claimed'
+                      AND outbox.claim_token = ?
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM agent_tasks AS task
+                          WHERE task.task_id = outbox.task_id
+                            AND task.run_count = outbox.run_count
+                            AND task.mailbox_suppressed = 1
+                      )
                     """,
                     (intent.outbox_key, intent.claim_token),
                 ).fetchone()
                 if claimed is None:
                     self._conn.commit()
                     return False
-                self._conn.execute(
-                    """
-                    INSERT OR IGNORE INTO agent_mailbox_messages (
-                        message_id, idempotency_key, recipient_task_id,
-                        recipient_thread_id, sender_task_id, sender_agent_name,
-                        child_task_id, child_agent_name, child_run_count,
-                        settled_status, content, trigger_run, status, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?)
-                    """,
-                    (
-                        intent.message_id,
-                        intent.outbox_key,
-                        intent.recipient_task_id,
-                        intent.recipient_thread_id,
-                        intent.task_id,
-                        intent.child_agent_name,
-                        intent.task_id,
-                        intent.child_agent_name,
-                        intent.run_count,
-                        intent.settled_status,
-                        intent.content,
-                        intent.created_at.isoformat(),
-                    ),
-                )
-                stored_message = self._conn.execute(
-                    """
-                    SELECT message_id, recipient_task_id, recipient_thread_id,
-                           child_task_id, child_agent_name, child_run_count,
-                           settled_status, content
-                    FROM agent_mailbox_messages
-                    WHERE idempotency_key = ?
-                    """,
-                    (intent.outbox_key,),
-                ).fetchone()
-                expected_message = (
-                    intent.message_id,
-                    intent.recipient_task_id,
-                    intent.recipient_thread_id,
-                    intent.task_id,
-                    intent.child_agent_name,
-                    intent.run_count,
-                    intent.settled_status,
-                    intent.content,
-                )
-                if stored_message is None or tuple(stored_message) != expected_message:
-                    raise RuntimeError(
-                        "Settled mailbox idempotency identity conflicts with outbox intent"
-                    )
+                self._resolve_settled_message_locked(intent)
                 delivered_at = datetime.now(UTC).isoformat()
                 cursor = self._conn.execute(
                     """
@@ -214,19 +176,38 @@ class MailboxStore:
                 self._conn.rollback()
                 raise
 
+    def settled_outbox_needs_wake(self, intent: SettledOutboxIntent) -> bool:
+        """Return whether the adopted mailbox row still needs recipient work."""
+
+        with self._lock:
+            suppression = self._authoritative_suppression_clause_locked("message")
+            row = self._conn.execute(
+                f"""
+                SELECT 1 FROM agent_mailbox_messages AS message
+                WHERE message.idempotency_key = ? AND message.status = 'pending'
+                  AND message.trigger_run = 1
+                  {suppression}
+                LIMIT 1
+                """,
+                (intent.outbox_key,),
+            ).fetchone()
+        return row is not None
+
     def list_pending_trigger_recipient_task_ids(self) -> list[str]:
         """List Task identities whose durable input still needs a wakeup."""
 
         now = datetime.now(UTC)
         with self._lock:
             self._release_expired_claims_locked(now)
+            suppression = self._authoritative_suppression_clause_locked("message")
             rows = self._conn.execute(
-                """
-                SELECT DISTINCT recipient_task_id
-                FROM agent_mailbox_messages
-                WHERE recipient_task_id IS NOT NULL AND trigger_run = 1
-                  AND status = 'pending'
-                ORDER BY recipient_task_id
+                f"""
+                SELECT DISTINCT message.recipient_task_id
+                FROM agent_mailbox_messages AS message
+                WHERE message.recipient_task_id IS NOT NULL
+                  AND message.trigger_run = 1 AND message.status = 'pending'
+                  {suppression}
+                ORDER BY message.recipient_task_id
                 """
             ).fetchall()
         return [str(row[0]) for row in rows]
@@ -245,36 +226,41 @@ class MailboxStore:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._release_expired_claims_locked(now, commit=False)
+                suppression = self._authoritative_suppression_clause_locked("message")
                 if recipient_task_id:
                     rows = self._conn.execute(
-                    """
-                    SELECT * FROM agent_mailbox_messages
-                    WHERE status = 'pending'
-                      AND (recipient_task_id = ? OR (
-                           recipient_task_id IS NULL AND recipient_thread_id = ?))
-                    ORDER BY created_at, message_id
-                    """,
-                    (recipient_task_id, recipient_thread_id),
+                        f"""
+                        SELECT message.* FROM agent_mailbox_messages AS message
+                        WHERE message.status = 'pending'
+                          AND (message.recipient_task_id = ? OR (
+                               message.recipient_task_id IS NULL
+                               AND message.recipient_thread_id = ?))
+                          {suppression}
+                        ORDER BY message.created_at, message.message_id
+                        """,
+                        (recipient_task_id, recipient_thread_id),
                     ).fetchall()
                 else:
                     rows = self._conn.execute(
-                    """
-                    SELECT * FROM agent_mailbox_messages
-                    WHERE status = 'pending' AND recipient_thread_id = ?
-                    ORDER BY created_at, message_id
-                    """,
-                    (recipient_thread_id,),
+                        f"""
+                        SELECT message.* FROM agent_mailbox_messages AS message
+                        WHERE message.status = 'pending'
+                          AND message.recipient_thread_id = ?
+                          {suppression}
+                        ORDER BY message.created_at, message.message_id
+                        """,
+                        (recipient_thread_id,),
                     ).fetchall()
                 ids = [row["message_id"] for row in rows]
                 if ids:
                     placeholders = ",".join("?" for _ in ids)
                     self._conn.execute(
-                    f"""
-                    UPDATE agent_mailbox_messages
-                    SET status = 'claimed', claimed_at = ?, claim_expires_at = ?,
-                        claimed_by = ?, claim_token = ?
-                    WHERE message_id IN ({placeholders}) AND status = 'pending'
-                    """,
+                        f"""
+                        UPDATE agent_mailbox_messages
+                        SET status = 'claimed', claimed_at = ?, claim_expires_at = ?,
+                            claimed_by = ?, claim_token = ?
+                        WHERE message_id IN ({placeholders}) AND status = 'pending'
+                        """,
                         (
                             now.isoformat(),
                             expires_at.isoformat(),
@@ -350,7 +336,8 @@ class MailboxStore:
             self._conn.execute(
                 """
                 UPDATE agent_mailbox_messages
-                SET status = 'retracted', claim_expires_at = NULL
+                SET status = 'retracted', claimed_at = NULL,
+                    claim_expires_at = NULL, claimed_by = NULL, claim_token = NULL
                 WHERE recipient_thread_id = ? AND child_task_id = ?
                   AND child_run_count = ? AND status IN ('pending', 'claimed')
                 """,
@@ -362,11 +349,13 @@ class MailboxStore:
         now = datetime.now(UTC)
         with self._lock:
             self._release_expired_claims_locked(now)
+            suppression = self._authoritative_suppression_clause_locked("message")
             row = self._conn.execute(
-                """
-                SELECT 1 FROM agent_mailbox_messages
-                WHERE recipient_task_id = ? AND trigger_run = 1
-                  AND status = 'pending'
+                f"""
+                SELECT 1 FROM agent_mailbox_messages AS message
+                WHERE message.recipient_task_id = ? AND message.trigger_run = 1
+                  AND message.status = 'pending'
+                  {suppression}
                 LIMIT 1
                 """,
                 (recipient_task_id,),
@@ -447,7 +436,158 @@ class MailboxStore:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agent_mailbox_settled_run_status
+                ON agent_mailbox_messages (
+                    child_task_id, child_run_count, status, idempotency_key
+                )
+                """
+            )
             self._conn.commit()
+
+    def _resolve_settled_message_locked(self, intent: SettledOutboxIntent) -> None:
+        """Bind a true legacy row or insert the deterministic mailbox identity."""
+
+        keyed = self._conn.execute(
+            "SELECT * FROM agent_mailbox_messages WHERE idempotency_key = ?",
+            (intent.outbox_key,),
+        ).fetchall()
+        if keyed:
+            if len(keyed) != 1:
+                raise RuntimeError("Settled mailbox idempotency key is not unique")
+            self._validate_settled_message_identity(keyed[0], intent)
+            return
+
+        legacy = self._conn.execute(
+            """
+            SELECT * FROM agent_mailbox_messages
+            WHERE idempotency_key IS NULL
+              AND recipient_thread_id = ?
+              AND child_task_id = ? AND child_run_count = ?
+            ORDER BY created_at, message_id
+            """,
+            (intent.recipient_thread_id, intent.task_id, intent.run_count),
+        ).fetchall()
+        if legacy:
+            if len(legacy) != 1:
+                raise RuntimeError(
+                    "Multiple legacy mailbox rows conflict with one settled intent"
+                )
+            self._validate_settled_message_identity(legacy[0], intent)
+            self._conn.execute(
+                """
+                UPDATE agent_mailbox_messages
+                SET idempotency_key = ?
+                WHERE message_id = ? AND idempotency_key IS NULL
+                """,
+                (intent.outbox_key, legacy[0]["message_id"]),
+            )
+            return
+
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO agent_mailbox_messages (
+                    message_id, idempotency_key, recipient_task_id,
+                    recipient_thread_id, sender_task_id, sender_agent_name,
+                    child_task_id, child_agent_name, child_run_count,
+                    settled_status, content, trigger_run, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?)
+                """,
+                (
+                    intent.message_id,
+                    intent.outbox_key,
+                    intent.recipient_task_id,
+                    intent.recipient_thread_id,
+                    intent.task_id,
+                    intent.child_agent_name,
+                    intent.task_id,
+                    intent.child_agent_name,
+                    intent.run_count,
+                    intent.settled_status,
+                    intent.content,
+                    intent.created_at.isoformat(),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise RuntimeError(
+                "Settled mailbox identity conflicts with an unrelated message"
+            ) from exc
+
+    @staticmethod
+    def _validate_settled_message_identity(
+        row: sqlite3.Row,
+        intent: SettledOutboxIntent,
+    ) -> None:
+        stored = (
+            row["recipient_task_id"],
+            row["recipient_thread_id"],
+            row["sender_task_id"],
+            row["sender_agent_name"],
+            row["child_task_id"],
+            row["child_agent_name"],
+            row["child_run_count"],
+            row["settled_status"],
+            row["content"],
+            int(row["trigger_run"]),
+        )
+        expected = (
+            intent.recipient_task_id,
+            intent.recipient_thread_id,
+            intent.task_id,
+            intent.child_agent_name,
+            intent.task_id,
+            intent.child_agent_name,
+            intent.run_count,
+            intent.settled_status,
+            intent.content,
+            1,
+        )
+        if stored != expected or row["status"] not in {
+            "pending",
+            "claimed",
+            "delivered",
+        }:
+            raise RuntimeError(
+                "Settled mailbox logical identity conflicts with outbox intent"
+            )
+
+    def _authoritative_suppression_clause_locked(self, alias: str) -> str:
+        tables = {
+            str(row[0])
+            for row in self._conn.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table'
+                  AND name IN ('agent_tasks', 'agent_task_settled_outbox')
+                """
+            ).fetchall()
+        }
+        clauses: list[str] = []
+        if "agent_tasks" in tables:
+            clauses.append(
+                f"""
+                AND NOT EXISTS (
+                    SELECT 1 FROM agent_tasks AS task
+                    WHERE task.task_id = {alias}.child_task_id
+                      AND task.run_count = {alias}.child_run_count
+                      AND task.mailbox_suppressed = 1
+                )
+                """
+            )
+        if "agent_task_settled_outbox" in tables:
+            clauses.append(
+                f"""
+                AND NOT EXISTS (
+                    SELECT 1 FROM agent_task_settled_outbox AS suppressed_outbox
+                    WHERE suppressed_outbox.task_id = {alias}.child_task_id
+                      AND suppressed_outbox.run_count = {alias}.child_run_count
+                      AND suppressed_outbox.status = 'suppressed'
+                )
+                """
+            )
+        return "\n".join(clauses)
 
     def _ensure_column(self, column: str, definition: str) -> None:
         columns = {

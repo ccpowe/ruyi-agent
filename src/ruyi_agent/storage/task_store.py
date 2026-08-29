@@ -16,6 +16,7 @@ from ruyi_agent.storage.task_repository import (
     TaskRootBudgetExceededError,
 )
 from ruyi_agent.storage.settled_outbox import (
+    LegacySettlementMigrationBatch,
     SettledOutboxIntent,
     SettledOutboxRepository,
 )
@@ -136,10 +137,17 @@ class TaskStore:
             settled_outbox_intent=settled_outbox_intent,
         )
 
-    def reconcile_settled_outbox(self) -> int:
-        """Create intents missing from Task rows written before this schema."""
+    def reconcile_settled_outbox(self, *, limit: int = 250) -> int:
+        """Advance one bounded legacy page and return newly created intents."""
 
-        return self._settled_outbox.reconcile_legacy_settlements()
+        return self.reconcile_settled_outbox_batch(limit=limit).inserted
+
+    def reconcile_settled_outbox_batch(
+        self,
+        *,
+        limit: int = 250,
+    ) -> LegacySettlementMigrationBatch:
+        return self._settled_outbox.reconcile_legacy_settlements(limit=limit)
 
     def claim_settled_outbox(
         self,
@@ -166,6 +174,11 @@ class TaskStore:
         with self._database.transaction(immediate=True) as connection:
             self._tasks.update_locked(connection, record)
             self._settled_outbox.suppress_for_task_run_locked(
+                connection,
+                task_id=record.task_id,
+                run_count=record.run_count,
+            )
+            self._settled_outbox.retract_mailbox_for_task_run_locked(
                 connection,
                 task_id=record.task_id,
                 run_count=record.run_count,

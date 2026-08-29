@@ -27,6 +27,14 @@ class SettledOutboxIntent:
     claim_token: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class LegacySettlementMigrationBatch:
+    """One bounded, restartable legacy settlement migration step."""
+
+    inserted: int
+    completed: bool
+
+
 def settled_outbox_key(
     *,
     recipient_thread_id: str,
@@ -80,8 +88,8 @@ class SettledOutboxRepository:
     def insert_locked(
         connection: sqlite3.Connection,
         intent: SettledOutboxIntent,
-    ) -> None:
-        connection.execute(
+    ) -> bool:
+        cursor = connection.execute(
             """
             INSERT OR IGNORE INTO agent_task_settled_outbox (
                 outbox_key, message_id, task_id, run_count, recipient_task_id,
@@ -103,30 +111,111 @@ class SettledOutboxRepository:
             ),
         )
 
-    def reconcile_legacy_settlements(self) -> int:
-        """Create missing intents for pre-outbox settled Task rows."""
+        rows = connection.execute(
+            """
+            SELECT outbox_key, message_id, task_id, run_count,
+                   recipient_task_id, recipient_thread_id, child_agent_name,
+                   settled_status, content
+            FROM agent_task_settled_outbox
+            WHERE outbox_key = ? OR message_id = ?
+               OR (task_id = ? AND run_count = ?)
+            """,
+            (
+                intent.outbox_key,
+                intent.message_id,
+                intent.task_id,
+                intent.run_count,
+            ),
+        ).fetchall()
+        expected = (
+            intent.outbox_key,
+            intent.message_id,
+            intent.task_id,
+            intent.run_count,
+            intent.recipient_task_id,
+            intent.recipient_thread_id,
+            intent.child_agent_name,
+            intent.settled_status,
+            intent.content,
+        )
+        if len(rows) != 1 or tuple(rows[0]) != expected:
+            raise RuntimeError(
+                "Settled outbox identity conflicts with the existing Task run intent"
+            )
+        return cursor.rowcount == 1
 
+    def reconcile_legacy_settlements(
+        self,
+        *,
+        limit: int = 250,
+    ) -> LegacySettlementMigrationBatch:
+        """Advance the indexed, durable migration watermark by one bounded page."""
+
+        if limit < 1:
+            raise ValueError("Legacy settlement migration limit must be positive")
         inserted = 0
         with self._database.transaction(immediate=True) as connection:
+            migration = connection.execute(
+                """
+                SELECT cursor, completed
+                FROM agent_storage_migrations
+                WHERE name = 'settled_outbox_v1'
+                """
+            ).fetchone()
+            if migration is not None and bool(migration[1]):
+                return LegacySettlementMigrationBatch(inserted=0, completed=True)
+            cursor = str(migration[0]) if migration is not None else ""
             rows = connection.execute(
                 f"""
                 SELECT {TASK_SELECT_COLUMNS}
                 FROM agent_tasks
-                WHERE state IN ('completed', 'failed', 'cancelled', 'interrupted')
-                  AND parent_thread_id IS NOT NULL
-                  AND mailbox_suppressed = 0
-                  AND mailbox_delivered = 0
-                ORDER BY updated_at, task_id
-                """
+                WHERE task_id > ?
+                ORDER BY task_id
+                LIMIT ?
+                """,
+                (cursor, limit),
             ).fetchall()
             for row in rows:
-                intent = build_settled_outbox_intent(row_to_task_record(row))
+                record = row_to_task_record(row)
+                if record.mailbox_suppressed:
+                    self.suppress_for_task_run_locked(
+                        connection,
+                        task_id=record.task_id,
+                        run_count=record.run_count,
+                    )
+                    self.retract_mailbox_for_task_run_locked(
+                        connection,
+                        task_id=record.task_id,
+                        run_count=record.run_count,
+                    )
+                    continue
+                if record.mailbox_delivered:
+                    self._confirm_delivered_for_task_run_locked(
+                        connection,
+                        task_id=record.task_id,
+                        run_count=record.run_count,
+                    )
+                    continue
+                intent = build_settled_outbox_intent(record)
                 if intent is None:
                     continue
-                before = connection.total_changes
-                self.insert_locked(connection, intent)
-                inserted += connection.total_changes - before
-        return inserted
+                inserted += int(self.insert_locked(connection, intent))
+            completed = len(rows) < limit
+            next_cursor = str(rows[-1][0]) if rows else cursor
+            connection.execute(
+                """
+                INSERT INTO agent_storage_migrations (name, cursor, completed)
+                VALUES ('settled_outbox_v1', ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    cursor = excluded.cursor,
+                    completed = excluded.completed
+                """,
+                (next_cursor, int(completed)),
+            )
+        return LegacySettlementMigrationBatch(
+            inserted=inserted,
+            completed=completed,
+        )
 
     def claim_pending(
         self,
@@ -153,10 +242,18 @@ class SettledOutboxRepository:
             )
             rows = connection.execute(
                 """
-                SELECT outbox_key
-                FROM agent_task_settled_outbox
-                WHERE status = 'pending'
-                ORDER BY created_at, outbox_key
+                SELECT outbox.outbox_key
+                FROM agent_task_settled_outbox AS outbox
+                WHERE outbox.status = 'pending'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM agent_tasks AS task
+                      WHERE task.task_id = outbox.task_id
+                        AND task.run_count = outbox.run_count
+                        AND (task.mailbox_suppressed = 1
+                             OR task.mailbox_delivered = 1)
+                  )
+                ORDER BY outbox.created_at, outbox.outbox_key
                 LIMIT ?
                 """,
                 (limit,),
@@ -228,6 +325,61 @@ class SettledOutboxRepository:
                 claimed_at = NULL, claim_expires_at = NULL, retracted_at = NULL
             WHERE task_id = ? AND run_count = ?
               AND status IN ('pending', 'claimed', 'delivered')
+            """,
+            (task_id, run_count),
+        )
+
+    @staticmethod
+    def retract_mailbox_for_task_run_locked(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        run_count: int,
+    ) -> bool:
+        """Retract current-run legacy mailbox rows when that table is present."""
+
+        mailbox_exists = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'agent_mailbox_messages'
+            """
+        ).fetchone()
+        if mailbox_exists is None:
+            return False
+        connection.execute(
+            """
+            UPDATE agent_mailbox_messages
+            SET status = 'retracted', claimed_at = NULL,
+                claim_expires_at = NULL, claimed_by = NULL, claim_token = NULL
+            WHERE child_task_id = ? AND child_run_count = ?
+              AND status IN ('pending', 'claimed')
+            """,
+            (task_id, run_count),
+        )
+        connection.execute(
+            """
+            UPDATE agent_task_settled_outbox
+            SET retracted_at = COALESCE(retracted_at, ?)
+            WHERE task_id = ? AND run_count = ? AND status = 'suppressed'
+            """,
+            (datetime.now(UTC).isoformat(), task_id, run_count),
+        )
+        return True
+
+    @staticmethod
+    def _confirm_delivered_for_task_run_locked(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        run_count: int,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE agent_task_settled_outbox
+            SET status = 'delivered', claimed_by = NULL, claim_token = NULL,
+                claimed_at = NULL, claim_expires_at = NULL
+            WHERE task_id = ? AND run_count = ?
+              AND status IN ('pending', 'claimed')
             """,
             (task_id, run_count),
         )

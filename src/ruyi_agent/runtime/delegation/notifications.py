@@ -36,6 +36,7 @@ class SettledRunNotifier:
         self._reconciliation_task: asyncio.Task[None] | None = None
         self._wake_tasks: set[asyncio.Task[None]] = set()
         self._last_error: BaseException | None = None
+        self._legacy_reconciliation_complete = False
 
     @property
     def last_error(self) -> BaseException | None:
@@ -129,7 +130,16 @@ class SettledRunNotifier:
                     context=f"observe delivery {intent.outbox_key}",
                 )
             if intent.recipient_task_id is not None:
-                wake_ids.append(intent.recipient_task_id)
+                try:
+                    needs_wake = mailbox.settled_outbox_needs_wake(intent)
+                except Exception as exc:
+                    self._record_error(
+                        exc,
+                        context=f"inspect wake requirement {intent.outbox_key}",
+                    )
+                else:
+                    if needs_wake:
+                        wake_ids.append(intent.recipient_task_id)
         return wake_ids
 
     def _release_failed_claim(
@@ -168,10 +178,14 @@ class SettledRunNotifier:
 
         if not self._control._task_manager.settled_outbox_enabled:
             return
-        try:
-            self._control._task_manager.reconcile_settled_outbox()
-        except Exception as exc:
-            self._record_error(exc, context="reconcile legacy settlements")
+        if not self._legacy_reconciliation_complete:
+            try:
+                migration = (
+                    self._control._task_manager.reconcile_settled_outbox_batch()
+                )
+                self._legacy_reconciliation_complete = migration.completed
+            except Exception as exc:
+                self._record_error(exc, context="reconcile legacy settlements")
         wake_ids = set(self._dispatch_available())
         mailbox = self._control._mailbox
         if mailbox is not None:
