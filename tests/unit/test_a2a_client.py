@@ -201,6 +201,82 @@ def test_a2a_client_preserves_error_mapping() -> None:
     assert errors[3].message == "Remote gateway for 'remote' returned invalid JSON"
 
 
+def test_a2a_client_marks_missing_credentials_before_transport_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx.Request] = []
+    remote_ref = _remote_ref(
+        auth={"type": "bearer", "token_env": "MISSING_REMOTE_TOKEN"}
+    )
+    monkeypatch.delenv("MISSING_REMOTE_TOKEN", raising=False)
+    client = A2AClient(
+        transports={
+            remote_ref.url: httpx.MockTransport(
+                lambda request: requests.append(request) or httpx.Response(200)
+            )
+        }
+    )
+
+    async def scenario() -> A2AClientError:
+        with pytest.raises(A2AClientError) as raised:
+            await client.get_task(remote_ref, task_id="task-1")
+        return raised.value
+
+    error = asyncio.run(scenario())
+    assert error.effect_boundary == "not_dispatched"
+    assert requests == []
+
+
+def test_a2a_client_marks_invalid_url_before_transport_dispatch() -> None:
+    remote_ref = RemoteRef(
+        name="invalid-remote",
+        description="invalid remote",
+        url="not-a-valid-http-url",
+        remote_agent_name="worker",
+    )
+    client = A2AClient()
+
+    async def scenario() -> A2AClientError:
+        with pytest.raises(A2AClientError) as raised:
+            await client.get_task(remote_ref, task_id="task-1")
+        return raised.value
+
+    error = asyncio.run(scenario())
+    assert error.effect_boundary == "not_dispatched"
+
+
+@pytest.mark.parametrize(
+    ("error_type", "expected_boundary"),
+    [
+        (httpx.ConnectError, "not_dispatched"),
+        (httpx.ConnectTimeout, "not_dispatched"),
+        (httpx.PoolTimeout, "not_dispatched"),
+        (httpx.ReadTimeout, "possibly_dispatched"),
+        (httpx.WriteTimeout, "possibly_dispatched"),
+    ],
+)
+def test_a2a_client_preserves_http_effect_boundary(
+    error_type: type[httpx.HTTPError],
+    expected_boundary: str,
+) -> None:
+    remote_ref = _remote_ref()
+
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise error_type("injected transport failure", request=request)
+
+    client = A2AClient(
+        transports={remote_ref.url: httpx.MockTransport(fail)}
+    )
+
+    async def scenario() -> A2AClientError:
+        with pytest.raises(A2AClientError) as raised:
+            await client.get_task(remote_ref, task_id="task-1")
+        return raised.value
+
+    error = asyncio.run(scenario())
+    assert error.effect_boundary == expected_boundary
+
+
 def test_a2a_client_closes_task_event_stream_when_consumer_is_cancelled() -> None:
     stream = HangingSuccessStream()
     remote_ref = _remote_ref()

@@ -5,10 +5,11 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 import ruyi_agent.runtime.delegation.async_runtime as runtime_module
-from ruyi_agent.integrations.a2a.client import A2AClientError
+from ruyi_agent.integrations.a2a.client import A2AClient, A2AClientError
 from ruyi_agent.runtime.delegation.task_manager import TaskManager
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.storage.mailbox_store import MailboxStore
@@ -113,6 +114,167 @@ def test_restart_turns_residual_remote_operation_into_durable_unknown(
         assert restarted_store.list_settled_outbox() == []
     finally:
         restarted_store.close()
+
+
+@pytest.mark.parametrize("operation", ["create", "send", "review", "cancel"])
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["credentials", "connect", "invalid-url"],
+)
+@async_test
+async def test_real_a2a_pre_dispatch_failure_restores_and_can_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation: str,
+    failure_mode: str,
+) -> None:
+    if failure_mode == "credentials":
+        monkeypatch.delenv("REMOTE_CODE_WIKI_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("REMOTE_CODE_WIKI_TOKEN", "configured-token")
+    requests: list[httpx.Request] = []
+    connect_attempts = 0
+
+    def dispatch(request: httpx.Request) -> httpx.Response:
+        nonlocal connect_attempts
+        connect_attempts += 1
+        if failure_mode == "connect" and connect_attempts == 1:
+            raise httpx.ConnectError(
+                "connection failed before request dispatch",
+                request=request,
+            )
+        requests.append(request)
+        if request.url.path.endswith("/input"):
+            payload = _payload(status="completed", run_count=2)
+        elif "/reviews/" in request.url.path:
+            payload = _payload(status="running", run_count=2)
+        elif request.url.path.endswith("/cancel"):
+            payload = _payload(status="cancelled", run_count=1)
+        else:
+            payload = _payload(
+                task_id="upstream-create",
+                status="running",
+                run_count=1,
+            )
+        return httpx.Response(200, json=payload)
+
+    db_path = str(
+        tmp_path / f"pre-dispatch-{failure_mode}-{operation}.sqlite"
+    )
+    task_store = TaskStore(db_path)
+    mailbox_store = MailboxStore(db_path)
+    remote_refs = build_test_remote_refs()
+    if failure_mode == "invalid-url":
+        remote_refs["remote_code_wiki"].url = "not-a-valid-http-url"
+    control = runtime_module.AgentControl(
+        {},
+        remote_refs,
+        checkpointer=object(),
+        backend=object(),
+        a2a_client=A2AClient(
+            transports={
+                "https://example.com/a2a": httpx.MockTransport(dispatch),
+            }
+        ),
+        task_store=task_store,
+        mailbox=AgentMailbox(mailbox_store),
+    )
+    task_id = f"pre-dispatch-{operation}"
+    try:
+        if operation == "create":
+            call = control.spawn_task(
+                "remote_code_wiki",
+                "dispatch",
+                task_id=task_id,
+                parent_thread_id="parent-thread",
+            )
+        else:
+            manager = control._task_manager
+            manager.create_task_record(
+                task_id,
+                "remote_code_wiki",
+                parent_task_id=None,
+                root_task_id=task_id,
+                depth=1,
+                route_kind="remote_ref",
+                upstream_task_id="upstream-task",
+                parent_thread_id="parent-thread",
+            )
+            if operation == "send":
+                manager.sync_remote_task(
+                    task_id,
+                    _payload(status="completed", run_count=1),
+                )
+                call = control.send_task_input(task_id, "continue")
+            elif operation == "review":
+                record = manager.sync_remote_task(
+                    task_id,
+                    _payload(
+                        status="waiting_for_human",
+                        run_count=1,
+                        review_id="review-1",
+                    ),
+                )
+                assert record.pending_review is not None
+                call = control.submit_review_decision(
+                    "review-1",
+                    [{"type": "approve"}],
+                )
+            else:
+                manager.sync_remote_task(
+                    task_id,
+                    _payload(status="running", run_count=1),
+                )
+                call = control.cancel_task(task_id)
+
+        with pytest.raises(A2AClientError) as raised:
+            await call
+        assert raised.value.effect_boundary == "not_dispatched"
+        assert requests == []
+        restored = control.get_task_record(task_id)
+        assert restored.external_operation is None
+        assert restored.external_operation_identity is None
+        assert restored.external_outcome_uncertain is False
+        assert restored.state == {
+            "create": "pending",
+            "send": "completed",
+            "review": "waiting_for_human",
+            "cancel": "running",
+        }[operation]
+        assert all(
+            row["settled_status"] != "interrupted"
+            for row in task_store.list_settled_outbox()
+        )
+
+        monkeypatch.setenv("REMOTE_CODE_WIKI_TOKEN", "fixed-token")
+        if failure_mode == "invalid-url":
+            remote_refs["remote_code_wiki"].url = "https://example.com/a2a"
+        if operation == "create":
+            retried = await control.spawn_task(
+                "remote_code_wiki",
+                "dispatch",
+                task_id=task_id,
+                parent_thread_id="parent-thread",
+            )
+            assert retried.upstream_task_id == "upstream-create"
+        elif operation == "send":
+            retried = await control.send_task_input(task_id, "continue")
+            assert retried.state == "completed" and retried.run_count == 2
+        elif operation == "review":
+            retried = await control.submit_review_decision(
+                "review-1",
+                [{"type": "approve"}],
+            )
+            assert retried.state == "running" and retried.run_count == 2
+        else:
+            retried = await control.cancel_task(task_id)
+            assert retried.state == "cancelled"
+        assert len(requests) == 1
+        assert requests[0].headers["authorization"] == "Bearer fixed-token"
+    finally:
+        await control.close()
+        mailbox_store.close()
+        task_store.close()
 
 
 @pytest.mark.parametrize("operation", ["send", "review", "cancel"])

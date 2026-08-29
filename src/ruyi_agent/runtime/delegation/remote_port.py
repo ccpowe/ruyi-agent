@@ -11,7 +11,7 @@ import asyncio
 import logging
 import uuid
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from ruyi_agent.integrations.a2a.client import A2AClientError
 from ruyi_agent.runtime.delegation.context import (
@@ -49,6 +49,24 @@ def _is_authoritative_rejection(exc: Exception) -> bool:
         and 400 <= exc.status_code < 500
         and exc.code in _AUTHORITATIVE_REJECTION_CODES
     )
+
+
+RemoteFailureDisposition = Literal[
+    "not_dispatched",
+    "remote_rejected",
+    "outcome_unknown",
+]
+
+
+def _remote_failure_disposition(exc: Exception) -> RemoteFailureDisposition:
+    if (
+        isinstance(exc, A2AClientError)
+        and exc.effect_boundary == "not_dispatched"
+    ):
+        return "not_dispatched"
+    if _is_authoritative_rejection(exc):
+        return "remote_rejected"
+    return "outcome_unknown"
 
 
 class RemoteTaskHost(Protocol):
@@ -133,12 +151,13 @@ class RemoteTaskPort:
             )
             raise
         except Exception as exc:
-            if self._handle_remote_operation_failure(
+            disposition = self._handle_remote_operation_failure(
                 record.task_id,
                 operation="create",
                 identity=idempotency_key,
                 exc=exc,
-            ):
+            )
+            if disposition == "remote_rejected":
                 self._control._task_manager.mark_failed(
                     record.task_id,
                     "Remote Gateway Task creation failed",
@@ -299,22 +318,23 @@ class RemoteTaskPort:
         operation: str,
         identity: str,
         exc: Exception,
-    ) -> bool:
-        """Return true only when the remote authoritatively rejected the effect."""
+    ) -> RemoteFailureDisposition:
+        """Persist the transport's explicit effect-boundary disposition."""
 
-        if _is_authoritative_rejection(exc):
+        disposition = _remote_failure_disposition(exc)
+        if disposition != "outcome_unknown":
             self._control._task_manager.reject_external_operation(
                 task_id,
                 operation=operation,
                 identity=identity,
             )
-            return True
+            return disposition
         self._mark_external_outcome_uncertain(
             task_id,
             operation=operation,
             identity=identity,
         )
-        return False
+        return disposition
 
     def _get_remote_entry_for_task(self, task_id: str) -> RemoteRefEntry:
         """

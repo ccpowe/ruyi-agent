@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal, TypeAlias
 
 import httpx
 
@@ -46,6 +46,9 @@ from ruyi_agent.runtime.task_events import (
 )
 
 
+A2AEffectBoundary: TypeAlias = Literal["not_dispatched", "possibly_dispatched"]
+
+
 class A2AClientError(Exception):
     """
     A2A 客户端统一异常类
@@ -61,6 +64,7 @@ class A2AClientError(Exception):
         code: 错误代码（如 "upstream_gateway_error"）
         message: 错误消息
         details: 额外的错误详情（可选）
+        effect_boundary: 请求确定未发送，或可能已发送而结果未知
     """
 
     def __init__(
@@ -70,12 +74,14 @@ class A2AClientError(Exception):
         code: str,
         message: str,
         details: dict[str, Any] | None = None,
+        effect_boundary: A2AEffectBoundary = "possibly_dispatched",
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
         self.details = details
+        self.effect_boundary = effect_boundary
 
 
 class A2AClient:
@@ -382,6 +388,7 @@ class A2AClient:
                 status_code=502,
                 code="upstream_gateway_error",
                 message=f"Remote gateway request failed for '{remote_ref.name}'",
+                effect_boundary=_http_error_effect_boundary(exc),
             ) from exc
         except GatewayTransportInvalidJSONError as exc:
             raise A2AClientError(
@@ -455,9 +462,28 @@ class A2AClient:
                     f"Remote ref '{remote_ref.name}' requires environment variable "
                     f"{token_env!r}"
                 ),
+                effect_boundary="not_dispatched",
             )
 
         return gateway_bearer_auth_headers(token)
+
+
+def _http_error_effect_boundary(
+    exc: httpx.HTTPError | httpx.InvalidURL,
+) -> A2AEffectBoundary:
+    if isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.PoolTimeout,
+            httpx.InvalidURL,
+            httpx.LocalProtocolError,
+            httpx.UnsupportedProtocol,
+        ),
+    ):
+        return "not_dispatched"
+    return "possibly_dispatched"
 
 
 def _remote_http_status_error(

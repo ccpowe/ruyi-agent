@@ -48,7 +48,6 @@ def begin_external_operation(
         # A durable in-flight request is unknown after process loss. Successful
         # effect evidence or an authoritative rejection is required to clear it.
         record.external_outcome_uncertain = True
-        record.updated_at = _now()
         manager._save_uncertain_external_operation(record)
 
 
