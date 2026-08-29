@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from ipaddress import IPv6Address
+from ipaddress import IPv4Address, IPv6Address
 from urllib.parse import SplitResult, urlsplit
+
+import httpx
 
 from ruyi_agent.config.errors import ConfigError
 
@@ -36,6 +38,7 @@ def validate_http_url(
         parsed.username is not None or parsed.password is not None
     ):
         raise ConfigError(f"{path} must not contain credentials.")
+    _validate_httpx_compatibility(value, path=path)
     return value
 
 
@@ -52,6 +55,16 @@ def _valid_hostname(hostname: str) -> bool:
     if ":" in hostname:
         try:
             IPv6Address(hostname.split("%", maxsplit=1)[0])
+        except ValueError:
+            return False
+        return True
+    dotted_quad = hostname.removesuffix(".")
+    ipv4_labels = dotted_quad.split(".")
+    if len(ipv4_labels) == 4 and all(
+        label.isascii() and label.isdigit() for label in ipv4_labels
+    ):
+        try:
+            IPv4Address(dotted_quad)
         except ValueError:
             return False
         return True
@@ -86,6 +99,13 @@ def _authority_has_whitespace(value: str, parsed: SplitResult) -> bool:
 def _has_empty_port(netloc: str) -> bool:
     authority = netloc.rsplit("@", maxsplit=1)[-1]
     return authority.endswith(":")
+
+
+def _validate_httpx_compatibility(value: str, *, path: str) -> None:
+    try:
+        httpx.URL(value)
+    except httpx.InvalidURL as exc:
+        raise _absolute_url_error(path) from exc
 
 
 def _absolute_url_error(path: str) -> ConfigError:

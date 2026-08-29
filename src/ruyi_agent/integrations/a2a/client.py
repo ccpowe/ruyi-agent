@@ -236,6 +236,8 @@ class A2AClient:
                     f"an invalid Task event {label}"
                 ),
             ) from exc
+        except httpx.InvalidURL as exc:
+            raise _remote_task_event_stream_error(remote_ref) from exc
         except (
             GatewayTransportInvalidJSONError,
             GatewayTransportInvalidPayloadError,
@@ -370,7 +372,7 @@ class A2AClient:
                 json=json,
                 idempotency_key=idempotency_key,
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise A2AClientError(
                 status_code=502,
                 code="upstream_gateway_error",

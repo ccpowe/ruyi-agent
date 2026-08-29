@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
+import httpx
 import pytest
 
 from ruyi_agent.config import ConfigError as PublicConfigError
 from ruyi_agent.config import loader as config_loader
 from ruyi_agent.config.errors import ConfigError
+from ruyi_agent.config.loader import RemoteRef
 from ruyi_agent.gateway.tasks import GatewayTaskModule
-from ruyi_agent.integrations.a2a.client import A2AClient
+from ruyi_agent.integrations.a2a.client import A2AClient, A2AClientError
 
 
 INVALID_HTTP_URLS = [
@@ -20,6 +23,17 @@ INVALID_HTTP_URLS = [
     "https://bad host.example/a2a",
     "https://bad_host.example/a2a",
     "https://[::1/a2a",
+    "https://999.999.999.999/a2a",
+    "https://a\u200db.example/a2a",
+    "https://☃.example/a2a",
+    "https://\u0378.example/a2a",
+]
+VALID_HTTP_URLS = [
+    "https://example.com/a2a",
+    "https://例え.テスト/a2a",
+    "http://127.0.0.1:8080/a2a",
+    "http://[::1]:8080/a2a",
+    "http://[fe80::1%25eth0]:8080/a2a",
 ]
 
 
@@ -94,6 +108,32 @@ def test_provider_base_url_rejects_malformed_authorities(
         config_loader.load_llm_provider_configs(config_path)
 
 
+@pytest.mark.parametrize("remote_url", VALID_HTTP_URLS)
+def test_remote_agent_url_keeps_httpx_compatible_hosts(
+    tmp_path: Path,
+    remote_url: str,
+) -> None:
+    config_path = tmp_path / "agents.toml"
+    _write_agents_config(config_path, remote_url=remote_url)
+
+    _main_agent_name, agents = config_loader.load_agent_configs(config_path)
+
+    assert agents["remote"].url == remote_url
+
+
+@pytest.mark.parametrize("base_url", VALID_HTTP_URLS)
+def test_provider_base_url_keeps_httpx_compatible_hosts(
+    tmp_path: Path,
+    base_url: str,
+) -> None:
+    config_path = tmp_path / "llm_providers.toml"
+    _write_provider_config(config_path, base_url=base_url)
+
+    providers = config_loader.load_llm_provider_configs(config_path)
+
+    assert providers["openrouter"].base_url == base_url
+
+
 @pytest.mark.parametrize(
     ("kind", "configured_url"),
     [
@@ -145,7 +185,7 @@ def test_bad_remote_url_stops_before_a2a_or_gateway_boundary(
     config_path = tmp_path / "agents.toml"
     _write_agents_config(
         config_path,
-        remote_url="https://gateway.example:70000/a2a",
+        remote_url="https://999.999.999.999/a2a",
     )
     reached_boundaries: list[str] = []
 
@@ -171,3 +211,18 @@ def test_bad_remote_url_stops_before_a2a_or_gateway_boundary(
     assert reached_boundaries == []
     assert config_loader.ConfigError is ConfigError
     assert PublicConfigError is ConfigError
+
+
+def test_a2a_defensively_wraps_programmatic_invalid_url() -> None:
+    remote_ref = RemoteRef(
+        name="remote",
+        description="remote",
+        url="https://999.999.999.999/a2a",
+        remote_agent_name="worker",
+        auth=None,
+    )
+
+    with pytest.raises(A2AClientError, match="Remote gateway request failed") as exc:
+        asyncio.run(A2AClient().get_task(remote_ref, task_id="task-1"))
+
+    assert isinstance(exc.value.__cause__, httpx.InvalidURL)
