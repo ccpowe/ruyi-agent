@@ -413,12 +413,18 @@ def _sanitize_remote_mailbox_messages(
         if message["status"] == "retracted":
             _isolate_legacy_remote_mailbox(connection, message=message)
             continue
-        binding, linked_outbox_keys = _resolve_legacy_remote_mailbox_binding(
+        (
+            binding,
+            linked_outbox_keys,
+            authoritative_local,
+        ) = _resolve_legacy_remote_mailbox_binding(
             connection,
             message=message,
             candidates=candidates,
             remote_errors=remote_errors,
         )
+        if authoritative_local:
+            continue
         if binding is None:
             _isolate_legacy_remote_mailbox(
                 connection,
@@ -527,7 +533,7 @@ def _resolve_legacy_remote_mailbox_binding(
     message: dict[str, object],
     candidates: list[dict[str, object]],
     remote_errors: dict[str, str],
-) -> tuple[dict[str, object] | None, tuple[str, ...]]:
+) -> tuple[dict[str, object] | None, tuple[str, ...], bool]:
     outbox_rows = connection.execute(
         """
         SELECT outbox.outbox_key, outbox.task_id, outbox.run_count,
@@ -548,7 +554,9 @@ def _resolve_legacy_remote_mailbox_binding(
     ).fetchall()
     linked_outbox_keys = tuple(str(row[0]) for row in outbox_rows)
     if len(outbox_rows) > 1:
-        return None, linked_outbox_keys
+        return None, linked_outbox_keys, False
+    if len(outbox_rows) == 1 and str(outbox_rows[0][9]) != "remote_ref":
+        return None, linked_outbox_keys, True
 
     matching = [
         candidate
@@ -565,7 +573,7 @@ def _resolve_legacy_remote_mailbox_binding(
             and _legacy_mailbox_matches_outbox(message=message, outbox=outbox)
         ]
     if len(matching) != 1:
-        return None, linked_outbox_keys
+        return None, linked_outbox_keys, False
 
     task = matching[0]
     task_id = str(task["task_id"])
@@ -598,6 +606,7 @@ def _resolve_legacy_remote_mailbox_binding(
             "linked_outbox_keys": linked_outbox_keys,
         },
         linked_outbox_keys,
+        False,
     )
 
 

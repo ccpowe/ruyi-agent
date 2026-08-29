@@ -373,6 +373,25 @@ def _insert_collision_task(
     )
 
 
+def _insert_local_collision_task(
+    connection: sqlite3.Connection,
+    *,
+    task_id: str,
+    agent_name: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO agent_tasks (
+            task_id, agent_name, state, thread_id, parent_task_id, root_task_id,
+            depth, created_at, updated_at, result, error, run_count, route_kind,
+            upstream_task_id, parent_thread_id
+        ) VALUES (?, ?, 'failed', ?, 'parent-task', 'parent-task', 2, ?, ?,
+                  NULL, 'local failure', 1, 'local', NULL, 'parent-thread')
+        """,
+        (task_id, agent_name, task_id, NOW, NOW),
+    )
+
+
 def _insert_collision_message(
     connection: sqlite3.Connection,
     *,
@@ -839,3 +858,73 @@ def test_public_id_upstream_collision_uses_agent_and_isolates_same_agent_pair(
     assert [message.message_id for message in claimed] == [
         "agent-resolved-message"
     ]
+
+
+def test_authoritative_local_outbox_wins_over_colliding_remote_upstream(
+    tmp_path,
+) -> None:
+    db_path = str(tmp_path / "local-authoritative-collision.sqlite")
+    _create_current_collision_database(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        _insert_local_collision_task(
+            connection,
+            task_id="local-collision",
+            agent_name="local_agent",
+        )
+        _insert_collision_task(
+            connection,
+            task_id="proxy-remote",
+            upstream_task_id="local-collision",
+            agent_name="remote_agent",
+        )
+        local_key = _insert_collision_outbox(
+            connection,
+            message_id="local-linked-message",
+            task_id="local-collision",
+            agent_name="local_agent",
+            run_count=1,
+        )
+        _insert_collision_message(
+            connection,
+            message_id="local-linked-message",
+            stored_task_id="local-collision",
+            agent_name="local_agent",
+            run_count=1,
+            idempotency_key=local_key,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    first = TaskStore(db_path)
+    first.close()
+    second = TaskStore(db_path)
+    mailbox_store = MailboxStore(db_path)
+    try:
+        message = _database_row(
+            db_path,
+            """
+            SELECT * FROM agent_mailbox_messages
+            WHERE message_id = 'local-linked-message'
+            """,
+        )
+        outbox = {
+            str(row["outbox_key"]): row
+            for row in second.list_settled_outbox()
+        }[local_key]
+    finally:
+        mailbox_store.close()
+        second.close()
+
+    assert message["status"] == "claimed"
+    assert message["idempotency_key"] == local_key
+    assert message["sender_task_id"] == "local-collision"
+    assert message["sender_agent_name"] == "local_agent"
+    assert message["child_task_id"] == "local-collision"
+    assert message["child_agent_name"] == "local_agent"
+    assert message["content"] == PRIVATE_ERROR
+    assert message["claim_token"] == "legacy-token-local-linked-message"
+    assert outbox["status"] == "claimed"
+    assert outbox["content"] == PRIVATE_ERROR
+    assert outbox["claim_token"] == "legacy-outbox-token"

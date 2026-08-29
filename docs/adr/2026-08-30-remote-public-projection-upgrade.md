@@ -59,6 +59,11 @@ cleared, its content becomes the static remote failure, and its state becomes
 are fenced. Isolation is per message and does not block runtime startup. A
 retracted row is never adopted later as a legacy outbox delivery.
 
+A single linked local outbox is authoritative local ownership, even when its
+public Task ID collides with a remote Task's upstream ID. The remote migration
+leaves that local outbox and mailbox row unchanged. Multiple contradictory
+outbox links remain ambiguous and are isolated.
+
 The repair deliberately runs on every open as well as recording a completed
 migration row. This makes a partially upgraded database and differing
 TaskStore/MailboxStore construction order converge to the same state.
