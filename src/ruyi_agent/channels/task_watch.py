@@ -8,9 +8,12 @@ from ruyi_agent.channels.gateway_client import (
     gateway_task_from_payload,
 )
 from ruyi_agent.channels.gateway_dto import GatewayTask
+from ruyi_agent.task_models import SETTLED_TASK_STATES
 
 
-TERMINAL_TASK_STATES = {"completed", "failed", "cancelled", "interrupted"}
+# Backward-compatible import name for Channel consumers. The runtime Task model
+# remains the single authority for settled states.
+TERMINAL_TASK_STATES = SETTLED_TASK_STATES
 
 TaskHook = Callable[[GatewayTask], Awaitable[None]]
 ErrorHook = Callable[[Exception], Awaitable[None]]

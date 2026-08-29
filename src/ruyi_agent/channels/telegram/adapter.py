@@ -4,23 +4,50 @@ import asyncio
 import base64
 import os
 import re
-import socket
-import sqlite3
-import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
-from uuid import uuid4
+from typing import Any
 
-import httpx
-
-from ruyi_agent.channels.gateway_client import (
-    GatewayHTTPClient,
-    GatewayTaskClient,
-    gateway_task_from_payload,
+from ruyi_agent.channels.gateway_client import GatewayTaskClient
+from ruyi_agent.channels.gateway_dto import GatewayTask
+from ruyi_agent.channels.presentation import ChannelDeliveryCoordinator
+from ruyi_agent.channels.task_watch import TERMINAL_TASK_STATES, TaskWatchManager
+from ruyi_agent.channels.telegram.client import (
+    IMAGE_ATTACHMENT_EXTENSIONS,
+    KrokiMermaidRenderer,
+    MermaidRenderError,
+    TelegramAttachment,
+    TelegramAttachmentDownloadWarning,
+    TelegramBotAPIClient,
+    TelegramClient,
+    TelegramInboundAttachment,
+    TelegramMessage,
+    _current_run_artifacts,
+    _gateway_attachment_kind,
 )
-from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTask
+from ruyi_agent.channels.telegram.formatting import (
+    _escape_mdv2,
+    _format_telegram_markdown_v2,
+    _split_telegram_message,
+    _strip_mdv2,
+)
+from ruyi_agent.channels.telegram.identity import (
+    build_telegram_identity_key,
+    build_telegram_session_key,
+)
+from ruyi_agent.channels.telegram.network import (
+    TelegramAPIError,
+    TelegramFallbackResolver,
+    TelegramFallbackTransport,
+    TelegramNetworkError,
+    UnsupportedTelegramChatTypeError,
+    _looks_like_network_error,
+)
+from ruyi_agent.channels.telegram.receipts import (
+    TelegramUpdateClaim,
+    TelegramUpdateStore as _TelegramUpdateStore,
+)
 from ruyi_agent.channels.turn import (
     AgentCommandTurn,
     ChannelTurnHandler,
@@ -29,273 +56,33 @@ from ruyi_agent.channels.turn import (
     ReviewTurn,
     parse_review_command,
 )
-from ruyi_agent.channels.task_watch import (
-    TERMINAL_TASK_STATES,
-    TaskWatchHooks,
-    TaskWatchManager,
-)
 from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 
 
-TELEGRAM_MAX_MESSAGE_LENGTH = 4096
-TELEGRAM_MDV2_SPECIAL_CHARS = r"_*[]()~`>#+-=|{}.!"
-FENCED_CODE_PATTERN = re.compile(r"```(?P<lang>[^\n`]*)\n?(?P<body>.*?)```", re.DOTALL)
-INLINE_CODE_PATTERN = re.compile(r"`([^`\n]+)`")
-LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-HEADER_PATTERN = re.compile(r"^(#{1,6})\s+(.*)$", re.MULTILINE)
-BOLD_PATTERN = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
-ITALIC_PATTERN = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", re.DOTALL)
-STRIKE_PATTERN = re.compile(r"~~(.+?)~~", re.DOTALL)
-SPOILER_PATTERN = re.compile(r"\|\|(.+?)\|\|", re.DOTALL)
-BLOCKQUOTE_PATTERN = re.compile(r"^(> ?.*)$", re.MULTILINE)
-TABLE_SEPARATOR_PATTERN = re.compile(r"^\s*\|?[\s:-]+(?:\|[\s:-]+)+\|?\s*$")
-TELEGRAM_API_HOST = "api.telegram.org"
-TELEGRAM_FALLBACK_SEED_IPS = ["149.154.167.220", "149.154.167.99", "149.154.167.50"]
-DEFAULT_GATEWAY_BEARER_TOKEN = "dev-token"
-DEFAULT_CHANNEL_SESSION_DB = "data/channel_sessions.sqlite3"
+__all__ = [
+    "TelegramAdapter",
+    "TelegramAttachmentDownloadWarning",
+    "TelegramBotAPIClient",
+    "TelegramFallbackResolver",
+    "TelegramFallbackTransport",
+    "TelegramInboundAttachment",
+    "TelegramMessage",
+    "TelegramUpdateClaim",
+    "TelegramUpdateStore",
+    "_format_telegram_markdown_v2",
+    "_looks_like_network_error",
+    "_split_telegram_message",
+    "build_telegram_identity_key",
+    "build_telegram_session_key",
+    "run_telegram_adapter",
+]
+
+
 TELEGRAM_CLAIM_RETRY_DELAY_SECONDS = 1.0
-IMAGE_ATTACHMENT_EXTENSIONS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".webp",
-}
-NETWORK_ERROR_PATTERNS = (
-    "temporary failure in name resolution",
-    "name or service not known",
-    "nodename nor servname provided",
-    "getaddrinfo failed",
-)
-
-
-@dataclass(slots=True)
-class TelegramAttachment:
-    kind: str
-    filename: str
-    content: bytes
-    caption: str | None = None
-    content_type: str | None = None
-
-
-@dataclass(slots=True)
-class TelegramInboundAttachment:
-    kind: str
-    filename: str
-    content_type: str | None
-    content: bytes
-
-
-@dataclass(slots=True)
-class TelegramAttachmentDownloadWarning:
-    kind: str
-    filename: str
-    error: str
-
-
-def _utf16_len(text: str) -> int:
-    return len(text.encode("utf-16-le")) // 2
-
-
-def _escape_mdv2(text: str) -> str:
-    escaped: list[str] = []
-    for char in text:
-        if char == "\\" or char in TELEGRAM_MDV2_SPECIAL_CHARS:
-            escaped.append(f"\\{char}")
-        else:
-            escaped.append(char)
-    return "".join(escaped)
-
-
-def _strip_mdv2(text: str) -> str:
-    text = re.sub(r"\\([\\_*[\]()~`>#+\-=|{}.!])", r"\1", text)
-    text = text.replace("*", "").replace("_", "").replace("~", "")
-    text = text.replace("||", "").replace("`", "")
-    return text
-
-
-def _protect_segments(
-    text: str,
-    pattern: re.Pattern[str],
-    renderer,
-    placeholders: list[str],
-) -> str:
-    def replace(match: re.Match[str]) -> str:
-        placeholder = f"\u0000TG{len(placeholders)}\u0000"
-        placeholders.append(renderer(match))
-        return placeholder
-
-    return pattern.sub(replace, text)
-
-
-def _restore_placeholders(text: str, placeholders: list[str]) -> str:
-    for index in range(len(placeholders) - 1, -1, -1):
-        text = text.replace(f"\u0000TG{index}\u0000", placeholders[index])
-    return text
-
-
-def _parse_pipe_row(line: str) -> list[str]:
-    stripped = line.strip()
-    if stripped.startswith("|"):
-        stripped = stripped[1:]
-    if stripped.endswith("|"):
-        stripped = stripped[:-1]
-    return [cell.strip() for cell in stripped.split("|")]
-
-
-def _wrap_markdown_tables(text: str) -> str:
-    lines = text.splitlines()
-    result: list[str] = []
-    index = 0
-    in_code_fence = False
-    while index < len(lines):
-        line = lines[index]
-        if line.strip().startswith("```"):
-            in_code_fence = not in_code_fence
-            result.append(line)
-            index += 1
-            continue
-        if (
-            not in_code_fence
-            and index + 1 < len(lines)
-            and "|" in line
-            and "|" in lines[index + 1]
-            and TABLE_SEPARATOR_PATTERN.match(lines[index + 1])
-        ):
-            headers = _parse_pipe_row(line)
-            index += 2
-            rows: list[list[str]] = []
-            while index < len(lines) and "|" in lines[index] and lines[index].strip():
-                rows.append(_parse_pipe_row(lines[index]))
-                index += 1
-            if headers and rows:
-                for row in rows:
-                    title = row[0] if row else "row"
-                    result.append(f"**{title}**")
-                    pairs = zip(headers[1:], row[1:], strict=False)
-                    for header, value in pairs:
-                        result.append(f"- {header}: {value}")
-                    result.append("")
-                if result and result[-1] == "":
-                    result.pop()
-                continue
-        result.append(line)
-        index += 1
-    return "\n".join(result)
-
-
-def _format_telegram_markdown_v2(text: str) -> str:
-    text = _wrap_markdown_tables(text)
-    placeholders: list[str] = []
-
-    def stash(rendered: str) -> str:
-        placeholder = f"\u0000TG{len(placeholders)}\u0000"
-        placeholders.append(rendered)
-        return placeholder
-
-    def render_fence(match: re.Match[str]) -> str:
-        lang = match.group("lang")
-        body = match.group("body").replace("\\", "\\\\").replace("`", "\\`")
-        return f"```{lang}\n{body}```"
-
-    text = _protect_segments(text, FENCED_CODE_PATTERN, render_fence, placeholders)
-    text = _protect_segments(
-        text,
-        INLINE_CODE_PATTERN,
-        lambda match: f"`{match.group(1).replace('\\', '\\\\')}`",
-        placeholders,
-    )
-    text = _protect_segments(
-        text,
-        LINK_PATTERN,
-        lambda match: (
-            f"[{_escape_mdv2(match.group(1))}]"
-            f"({match.group(2).replace('\\', '\\\\').replace(')', '\\)')})"
-        ),
-        placeholders,
-    )
-
-    text = HEADER_PATTERN.sub(
-        lambda match: stash(f"*{_escape_mdv2(match.group(2).strip('* '))}*"),
-        text,
-    )
-    text = BOLD_PATTERN.sub(
-        lambda match: stash(f"*{_escape_mdv2(match.group(1))}*"),
-        text,
-    )
-    text = STRIKE_PATTERN.sub(
-        lambda match: stash(f"~{_escape_mdv2(match.group(1))}~"),
-        text,
-    )
-    text = SPOILER_PATTERN.sub(
-        lambda match: stash(f"||{_escape_mdv2(match.group(1))}||"),
-        text,
-    )
-    text = ITALIC_PATTERN.sub(
-        lambda match: stash(f"_{_escape_mdv2(match.group(1))}_"),
-        text,
-    )
-    text = BLOCKQUOTE_PATTERN.sub(
-        lambda match: stash(f"> {_escape_mdv2(match.group(1)[1:].lstrip())}"),
-        text,
-    )
-
-    text = _escape_mdv2(text)
-    return _restore_placeholders(text, placeholders)
-
-
-def _split_telegram_message(
-    text: str, limit: int = TELEGRAM_MAX_MESSAGE_LENGTH
-) -> list[str]:
-    if _utf16_len(text) <= limit:
-        return [text]
-
-    chunks: list[str] = []
-    current = ""
-    for line in text.splitlines(keepends=True):
-        if _utf16_len(current + line) <= limit:
-            current += line
-            continue
-        if current:
-            chunks.append(current)
-            current = ""
-        if _utf16_len(line) <= limit:
-            current = line
-            continue
-        for char in line:
-            if _utf16_len(current + char) > limit and current:
-                chunks.append(current)
-                current = char
-            else:
-                current += char
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-class TelegramAPIError(Exception):
-    pass
-
-
-class TelegramNetworkError(TelegramAPIError):
-    pass
-
-
-class UnsupportedTelegramChatTypeError(ValueError):
-    pass
 
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
-
-
-def _utc_now_iso() -> str:
-    return _utc_now().isoformat()
-
-
-def _env_list(name: str) -> list[str]:
-    raw = os.getenv(name, "")
-    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 def _telegram_help_text() -> str:
@@ -318,864 +105,26 @@ def _telegram_help_text() -> str:
     )
 
 
-def _looks_like_network_error(exc: BaseException) -> bool:
-    if isinstance(
-        exc,
-        (
-            httpx.ConnectError,
-            httpx.ConnectTimeout,
-            httpx.ReadError,
-            httpx.ReadTimeout,
-            httpx.RemoteProtocolError,
-            httpx.PoolTimeout,
-        ),
-    ):
-        return True
-    text = str(exc).lower()
-    return any(pattern in text for pattern in NETWORK_ERROR_PATTERNS)
+class TelegramUpdateStore(_TelegramUpdateStore):
+    """Preserve the adapter clock seam while sharing lease persistence."""
 
-
-class TelegramFallbackResolver:
-    def __init__(
-        self,
-        *,
-        fallback_ips: list[str] | None = None,
-        timeout: float = 5.0,
-    ) -> None:
-        self._configured_ips = fallback_ips or []
-        self._timeout = timeout
-        self._discovered_ips: list[str] = []
-        self._sticky_ip: str | None = None
-        self._loaded = False
-
-    def mark_success(self, ip: str) -> None:
-        self._sticky_ip = ip
-
-    def mark_failure(self, ip: str) -> None:
-        if self._sticky_ip == ip:
-            self._sticky_ip = None
-
-    async def get_fallback_ips(self) -> list[str]:
-        if not self._loaded:
-            self._discovered_ips = await self._discover_fallback_ips()
-            self._loaded = True
-        ordered: list[str] = []
-        if self._sticky_ip:
-            ordered.append(self._sticky_ip)
-        for ip in [
-            *self._configured_ips,
-            *self._discovered_ips,
-            *TELEGRAM_FALLBACK_SEED_IPS,
-        ]:
-            if ip not in ordered:
-                ordered.append(ip)
-        return ordered
-
-    async def _discover_fallback_ips(self) -> list[str]:
-        discovered: list[str] = []
-        doh_urls = [
-            "https://cloudflare-dns.com/dns-query",
-            "https://dns.google/resolve",
-        ]
-        async with httpx.AsyncClient(
-            timeout=self._timeout,
-            headers={"Accept": "application/dns-json"},
-        ) as client:
-            for url in doh_urls:
-                try:
-                    response = await client.get(
-                        url,
-                        params={"name": TELEGRAM_API_HOST, "type": "A"},
-                    )
-                    response.raise_for_status()
-                    payload = response.json()
-                except Exception:
-                    continue
-                answers = payload.get("Answer")
-                if not isinstance(answers, list):
-                    continue
-                for answer in answers:
-                    if not isinstance(answer, dict):
-                        continue
-                    value = answer.get("data")
-                    if (
-                        isinstance(value, str)
-                        and _is_ipv4(value)
-                        and value not in discovered
-                    ):
-                        discovered.append(value)
-        return discovered
-
-
-def _is_ipv4(value: str) -> bool:
-    try:
-        socket.inet_aton(value)
-    except OSError:
-        return False
-    return value.count(".") == 3
-
-
-class _AsyncBytesStream(httpx.AsyncByteStream):
-    def __init__(self, content: bytes) -> None:
-        self._content = content
-
-    async def __aiter__(self):
-        yield self._content
-
-
-class TelegramFallbackTransport(httpx.AsyncBaseTransport):
-    def __init__(
-        self,
-        *,
-        resolver: TelegramFallbackResolver,
-        base_transport: httpx.AsyncBaseTransport | None = None,
-    ) -> None:
-        self._resolver = resolver
-        self._base_transport = base_transport or httpx.AsyncHTTPTransport(retries=1)
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        body = await request.aread()
-        primary_request = self._build_request(request, request.url, body)
-        try:
-            return await self._base_transport.handle_async_request(primary_request)
-        except Exception as exc:
-            if request.url.host != TELEGRAM_API_HOST or not _looks_like_network_error(
-                exc
-            ):
-                raise
-
-        fallback_ips = await self._resolver.get_fallback_ips()
-        last_exc: BaseException | None = None
-        for ip in fallback_ips:
-            fallback_request = self._build_fallback_request(request, ip, body)
-            try:
-                response = await self._base_transport.handle_async_request(
-                    fallback_request
-                )
-            except Exception as exc:
-                last_exc = exc
-                self._resolver.mark_failure(ip)
-                continue
-            self._resolver.mark_success(ip)
-            return response
-        if last_exc is not None:
-            raise last_exc
-        raise
-
-    def _build_request(
-        self,
-        request: httpx.Request,
-        url: httpx.URL,
-        body: bytes,
-    ) -> httpx.Request:
-        return httpx.Request(
-            request.method,
-            url,
-            headers=request.headers,
-            content=body,
-            extensions=dict(request.extensions),
-        )
-
-    def _build_fallback_request(
-        self,
-        request: httpx.Request,
-        ip: str,
-        body: bytes,
-    ) -> httpx.Request:
-        url = request.url.copy_with(host=ip)
-        fallback_request = self._build_request(request, url, body)
-        fallback_request.headers["Host"] = TELEGRAM_API_HOST
-        fallback_request.extensions["sni_hostname"] = TELEGRAM_API_HOST
-        return fallback_request
-
-    async def aclose(self) -> None:
-        await self._base_transport.aclose()
-
-
-@dataclass(frozen=True, slots=True)
-class TelegramUpdateClaim:
-    status: Literal["claimed", "processed", "busy"]
-    claimed_at: str | None = None
-    claim_token: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class TelegramPollResult:
-    next_offset: int | None
-    retry_after_delay: bool = False
-
-
-class TelegramUpdateStore:
     def __init__(
         self,
         db_path: str,
         *,
         claim_timeout_seconds: float = 300.0,
     ) -> None:
-        self._db_path = db_path
-        self._claim_timeout_seconds = max(0.0, claim_timeout_seconds)
-        self._ensure_parent_dir()
-        self._lock = threading.RLock()
-        self._conn = sqlite3.connect(
-            self._db_path,
-            check_same_thread=False,
-            timeout=30.0,
-        )
-        self._init_db()
-
-    def claim_update(self, update: "TelegramMessage") -> bool:
-        return self.claim_update_result(update).status == "claimed"
-
-    def claim_update_result(self, update: "TelegramMessage") -> TelegramUpdateClaim:
-        now_dt = _utc_now()
-        now = now_dt.isoformat()
-        new_claim_token = uuid4().hex
-        with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                row = self._conn.execute(
-                    """
-                    SELECT processed_at, claimed_at, claim_token
-                    FROM telegram_processed_updates
-                    WHERE update_id = ?
-                    """,
-                    (update.update_id,),
-                ).fetchone()
-                if row is None:
-                    self._conn.execute(
-                        """
-                        INSERT INTO telegram_processed_updates (
-                            update_id,
-                            chat_id,
-                            message_id,
-                            first_seen_at,
-                            claimed_at,
-                            claim_token,
-                            processed_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, NULL)
-                        """,
-                        (
-                            update.update_id,
-                            str(update.chat_id),
-                            str(update.message_id),
-                            now,
-                            now,
-                            new_claim_token,
-                        ),
-                    )
-                    self._conn.commit()
-                    return TelegramUpdateClaim(
-                        status="claimed",
-                        claimed_at=now,
-                        claim_token=new_claim_token,
-                    )
-
-                processed_at, claimed_at, claim_token = row
-                if processed_at:
-                    self._conn.commit()
-                    return TelegramUpdateClaim(status="processed")
-                if claim_token and not self._claim_expired(claimed_at, now_dt):
-                    self._conn.commit()
-                    return TelegramUpdateClaim(status="busy")
-
-                self._conn.execute(
-                    """
-                    UPDATE telegram_processed_updates
-                    SET chat_id = ?, message_id = ?, claimed_at = ?, claim_token = ?
-                    WHERE update_id = ? AND processed_at IS NULL
-                    """,
-                    (
-                        str(update.chat_id),
-                        str(update.message_id),
-                        now,
-                        new_claim_token,
-                        update.update_id,
-                    ),
-                )
-                self._conn.commit()
-                return TelegramUpdateClaim(
-                    status="claimed",
-                    claimed_at=now,
-                    claim_token=new_claim_token,
-                )
-            except BaseException:
-                self._conn.rollback()
-                raise
-
-    def mark_processed(
-        self,
-        update_id: int,
-        *,
-        claim_token: str,
-    ) -> bool:
-        now = _utc_now_iso()
-        with self._lock:
-            cursor = self._conn.execute(
-                """
-                UPDATE telegram_processed_updates
-                SET claimed_at = NULL, claim_token = NULL, processed_at = ?
-                WHERE update_id = ?
-                    AND claim_token = ?
-                    AND processed_at IS NULL
-                """,
-                (now, update_id, claim_token),
-            )
-            self._conn.commit()
-            return cursor.rowcount > 0
-
-    def release_claim(self, update_id: int, *, claim_token: str) -> bool:
-        with self._lock:
-            cursor = self._conn.execute(
-                """
-                UPDATE telegram_processed_updates
-                SET claimed_at = NULL, claim_token = NULL
-                WHERE update_id = ?
-                    AND claim_token = ?
-                    AND processed_at IS NULL
-                """,
-                (update_id, claim_token),
-            )
-            self._conn.commit()
-            return cursor.rowcount > 0
-
-    async def aclaim_update(self, update: "TelegramMessage") -> bool:
-        return await asyncio.to_thread(self.claim_update, update)
-
-    async def aclaim_update_result(
-        self,
-        update: "TelegramMessage",
-    ) -> TelegramUpdateClaim:
-        return await asyncio.to_thread(self.claim_update_result, update)
-
-    async def amark_processed(self, update_id: int, *, claim_token: str) -> bool:
-        return await asyncio.to_thread(
-            self.mark_processed,
-            update_id,
-            claim_token=claim_token,
+        super().__init__(
+            db_path,
+            claim_timeout_seconds=claim_timeout_seconds,
+            clock=lambda: _utc_now(),
         )
 
-    async def arelease_claim(self, update_id: int, *, claim_token: str) -> bool:
-        return await asyncio.to_thread(
-            self.release_claim,
-            update_id,
-            claim_token=claim_token,
-        )
 
-    def _ensure_parent_dir(self) -> None:
-        if self._db_path == ":memory:":
-            return
-        parent = Path(self._db_path).expanduser().resolve().parent
-        parent.mkdir(parents=True, exist_ok=True)
-
-    def _init_db(self) -> None:
-        with self._lock:
-            self._conn.execute("PRAGMA busy_timeout = 30000")
-            if self._db_path != ":memory:":
-                self._conn.execute("PRAGMA journal_mode = WAL")
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS telegram_processed_updates (
-                    update_id INTEGER PRIMARY KEY,
-                    chat_id TEXT NOT NULL,
-                    message_id TEXT NOT NULL,
-                    first_seen_at TEXT NOT NULL,
-                    claimed_at TEXT,
-                    claim_token TEXT,
-                    processed_at TEXT
-                )
-                """
-            )
-            columns = {
-                row[1]
-                for row in self._conn.execute(
-                    "PRAGMA table_info(telegram_processed_updates)"
-                ).fetchall()
-            }
-            if "claimed_at" not in columns:
-                self._conn.execute(
-                    "ALTER TABLE telegram_processed_updates ADD COLUMN claimed_at TEXT"
-                )
-            if "claim_token" not in columns:
-                self._conn.execute(
-                    "ALTER TABLE telegram_processed_updates ADD COLUMN claim_token TEXT"
-                )
-            self._conn.commit()
-
-    def _claim_expired(self, claimed_at: str | None, now: datetime) -> bool:
-        if not claimed_at:
-            return True
-        try:
-            claimed_at_dt = datetime.fromisoformat(claimed_at)
-        except ValueError:
-            return True
-        if claimed_at_dt.tzinfo is None:
-            claimed_at_dt = claimed_at_dt.replace(tzinfo=UTC)
-        return (now - claimed_at_dt).total_seconds() >= self._claim_timeout_seconds
-
-    def close(self) -> None:
-        with self._lock:
-            self._conn.close()
-
-
-@dataclass(slots=True)
-class TelegramMessage:
-    update_id: int
-    chat_id: int
-    user_id: int
-    text: str
-    message_id: int
-    chat_type: str = "private"
-    message_thread_id: int | None = None
-    reply_to_message_id: int | None = None
-    attachments: list[TelegramInboundAttachment] | None = None
-    attachment_warnings: list[TelegramAttachmentDownloadWarning] | None = None
-
-
-class TelegramClient(Protocol):
-    async def get_updates(
-        self,
-        *,
-        offset: int | None,
-        timeout: int,
-    ) -> list[TelegramMessage]: ...
-
-    async def send_message(
-        self,
-        *,
-        chat_id: int,
-        text: str,
-        reply_to_message_id: int | None = None,
-        parse_mode: str | None = None,
-    ) -> None: ...
-
-    async def send_photo(
-        self,
-        *,
-        chat_id: int,
-        filename: str,
-        content: bytes,
-        caption: str | None = None,
-        reply_to_message_id: int | None = None,
-        parse_mode: str | None = None,
-    ) -> None: ...
-
-    async def send_document(
-        self,
-        *,
-        chat_id: int,
-        filename: str,
-        content: bytes,
-        caption: str | None = None,
-        reply_to_message_id: int | None = None,
-        parse_mode: str | None = None,
-    ) -> None: ...
-
-
-def _string_or_none(value: Any) -> str | None:
-    return value if isinstance(value, str) and value else None
-
-
-def _gateway_attachment_kind(kind: str) -> str:
-    if kind in {"image", "document", "audio", "video", "file"}:
-        return kind
-    return "file"
-
-
-def _current_run_artifacts(
-    task: GatewayTask,
-    run_count: int,
-) -> list[GatewayPublishedArtifact]:
-    return [item for item in task.artifacts if item.run_count == run_count]
-
-
-class TelegramBotAPIClient:
-    def __init__(
-        self,
-        *,
-        bot_token: str,
-        timeout: float = 30.0,
-        default_parse_mode: str | None = None,
-        fallback_resolver: TelegramFallbackResolver | None = None,
-    ) -> None:
-        self._base_url = f"https://api.telegram.org/bot{bot_token}"
-        self._timeout = timeout
-        self._default_parse_mode = default_parse_mode
-        self._fallback_resolver = fallback_resolver or TelegramFallbackResolver(
-            fallback_ips=_env_list("TELEGRAM_FALLBACK_IPS"),
-        )
-
-    async def get_updates(
-        self,
-        *,
-        offset: int | None,
-        timeout: int,
-    ) -> list[TelegramMessage]:
-        payload = await self._request(
-            "getUpdates",
-            json={
-                "timeout": timeout,
-                "offset": offset,
-                "allowed_updates": ["message"],
-            },
-        )
-        updates = payload.get("result", [])
-        messages: list[TelegramMessage] = []
-        for update in updates:
-            if not isinstance(update, dict):
-                continue
-            message = update.get("message")
-            if not isinstance(message, dict):
-                continue
-            text = message.get("text")
-            caption = message.get("caption")
-            chat = message.get("chat")
-            from_user = message.get("from")
-            if not isinstance(chat, dict) or not isinstance(from_user, dict):
-                continue
-            if not isinstance(text, str):
-                text = caption if isinstance(caption, str) else ""
-            chat_id = chat.get("id")
-            chat_type = chat.get("type")
-            user_id = from_user.get("id")
-            message_id = message.get("message_id")
-            update_id = update.get("update_id")
-            message_thread_id = message.get("message_thread_id")
-            reply_to_message = message.get("reply_to_message")
-            reply_to_message_id = (
-                reply_to_message.get("message_id")
-                if isinstance(reply_to_message, dict)
-                else None
-            )
-            if not all(
-                isinstance(value, int)
-                for value in [chat_id, user_id, message_id, update_id]
-            ):
-                continue
-            attachments, attachment_warnings = await self._extract_inbound_attachments(
-                message
-            )
-            if not text and not attachments:
-                continue
-            messages.append(
-                TelegramMessage(
-                    update_id=update_id,
-                    chat_id=chat_id,
-                    user_id=user_id,
-                    text=text,
-                    message_id=message_id,
-                    chat_type=chat_type if isinstance(chat_type, str) else "private",
-                    message_thread_id=(
-                        message_thread_id
-                        if isinstance(message_thread_id, int)
-                        else None
-                    ),
-                    reply_to_message_id=(
-                        reply_to_message_id
-                        if isinstance(reply_to_message_id, int)
-                        else None
-                    ),
-                    attachments=attachments,
-                    attachment_warnings=attachment_warnings,
-                )
-            )
-        return messages
-
-    async def _extract_inbound_attachments(
-        self,
-        message: dict[str, Any],
-    ) -> tuple[
-        list[TelegramInboundAttachment], list[TelegramAttachmentDownloadWarning]
-    ]:
-        specs: list[tuple[str, dict[str, Any], str | None, str | None]] = []
-        document = message.get("document")
-        if isinstance(document, dict):
-            specs.append(
-                (
-                    "document",
-                    document,
-                    _string_or_none(document.get("file_name")),
-                    _string_or_none(document.get("mime_type")),
-                )
-            )
-        audio = message.get("audio")
-        if isinstance(audio, dict):
-            specs.append(
-                (
-                    "audio",
-                    audio,
-                    _string_or_none(audio.get("file_name")) or "audio",
-                    _string_or_none(audio.get("mime_type")),
-                )
-            )
-        video = message.get("video")
-        if isinstance(video, dict):
-            specs.append(
-                (
-                    "video",
-                    video,
-                    _string_or_none(video.get("file_name")) or "video.mp4",
-                    _string_or_none(video.get("mime_type")),
-                )
-            )
-        voice = message.get("voice")
-        if isinstance(voice, dict):
-            specs.append(
-                (
-                    "audio",
-                    voice,
-                    "voice.ogg",
-                    _string_or_none(voice.get("mime_type")) or "audio/ogg",
-                )
-            )
-        photos = message.get("photo")
-        if isinstance(photos, list) and photos:
-            photo = next(
-                (item for item in reversed(photos) if isinstance(item, dict)),
-                None,
-            )
-            if photo is not None:
-                specs.append(("image", photo, "photo.jpg", "image/jpeg"))
-
-        attachments: list[TelegramInboundAttachment] = []
-        warnings: list[TelegramAttachmentDownloadWarning] = []
-        for kind, item, filename, content_type in specs:
-            file_id = item.get("file_id")
-            if not isinstance(file_id, str):
-                continue
-            try:
-                content = await self._download_file(file_id)
-            except TelegramAPIError as exc:
-                warnings.append(
-                    TelegramAttachmentDownloadWarning(
-                        kind=kind,
-                        filename=filename or file_id,
-                        error=str(exc),
-                    )
-                )
-                continue
-            attachments.append(
-                TelegramInboundAttachment(
-                    kind=kind,
-                    filename=filename or file_id,
-                    content_type=content_type,
-                    content=content,
-                )
-            )
-        return attachments, warnings
-
-    async def _download_file(self, file_id: str) -> bytes:
-        payload = await self._request("getFile", json={"file_id": file_id})
-        result = payload.get("result")
-        if not isinstance(result, dict) or not isinstance(result.get("file_path"), str):
-            raise TelegramAPIError("Telegram getFile returned invalid payload")
-        file_path = result["file_path"]
-        url = f"{self._base_url.replace('/bot', '/file/bot')}/{file_path}"
-        async with httpx.AsyncClient(
-            timeout=self._timeout,
-            transport=TelegramFallbackTransport(resolver=self._fallback_resolver),
-        ) as client:
-            try:
-                response = await client.get(url)
-            except httpx.HTTPError as exc:
-                error_cls = (
-                    TelegramNetworkError
-                    if _looks_like_network_error(exc)
-                    else TelegramAPIError
-                )
-                raise error_cls(
-                    f"Telegram file download failed: file_id={file_id} error={exc}"
-                ) from exc
-        if not response.is_success:
-            raise TelegramAPIError(
-                f"Telegram file download failed: status={response.status_code}"
-            )
-        return response.content
-
-    async def send_message(
-        self,
-        *,
-        chat_id: int,
-        text: str,
-        reply_to_message_id: int | None = None,
-        parse_mode: str | None = None,
-    ) -> None:
-        payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
-        if reply_to_message_id is not None:
-            payload["reply_to_message_id"] = reply_to_message_id
-        effective_parse_mode = parse_mode
-        if effective_parse_mode is not None:
-            payload["parse_mode"] = effective_parse_mode
-            await self._request("sendMessage", json=payload)
-            return
-        await self._request("sendMessage", json=payload)
-
-    async def send_photo(
-        self,
-        *,
-        chat_id: int,
-        filename: str,
-        content: bytes,
-        caption: str | None = None,
-        reply_to_message_id: int | None = None,
-        parse_mode: str | None = None,
-    ) -> None:
-        await self._request_multipart(
-            "sendPhoto",
-            file_field="photo",
-            filename=filename,
-            content=content,
-            chat_id=chat_id,
-            caption=caption,
-            reply_to_message_id=reply_to_message_id,
-            parse_mode=parse_mode,
-        )
-
-    async def send_document(
-        self,
-        *,
-        chat_id: int,
-        filename: str,
-        content: bytes,
-        caption: str | None = None,
-        reply_to_message_id: int | None = None,
-        parse_mode: str | None = None,
-    ) -> None:
-        await self._request_multipart(
-            "sendDocument",
-            file_field="document",
-            filename=filename,
-            content=content,
-            chat_id=chat_id,
-            caption=caption,
-            reply_to_message_id=reply_to_message_id,
-            parse_mode=parse_mode,
-        )
-
-    async def _request(self, method: str, *, json: dict[str, Any]) -> dict[str, Any]:
-        async with httpx.AsyncClient(
-            base_url=self._base_url,
-            timeout=self._timeout,
-            transport=TelegramFallbackTransport(resolver=self._fallback_resolver),
-        ) as client:
-            try:
-                response = await client.post(f"/{method}", json=json)
-            except httpx.HTTPError as exc:
-                error_cls = (
-                    TelegramNetworkError
-                    if _looks_like_network_error(exc)
-                    else TelegramAPIError
-                )
-                raise error_cls(
-                    f"Telegram API request failed: method={method} error={exc}"
-                ) from exc
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise TelegramAPIError("Telegram API returned invalid JSON") from exc
-        if (
-            not response.is_success
-            or not isinstance(payload, dict)
-            or not payload.get("ok")
-        ):
-            description = (
-                payload.get("description")
-                if isinstance(payload, dict)
-                else response.text
-            )
-            raise TelegramAPIError(
-                f"Telegram API call failed: method={method} error={description}"
-            )
-        return payload
-
-    async def _request_multipart(
-        self,
-        method: str,
-        *,
-        file_field: str,
-        filename: str,
-        content: bytes,
-        chat_id: int,
-        caption: str | None = None,
-        reply_to_message_id: int | None = None,
-        parse_mode: str | None = None,
-    ) -> dict[str, Any]:
-        data: dict[str, Any] = {"chat_id": str(chat_id)}
-        if caption:
-            data["caption"] = caption
-        if reply_to_message_id is not None:
-            data["reply_to_message_id"] = str(reply_to_message_id)
-        effective_parse_mode = parse_mode
-        if effective_parse_mode is not None and caption:
-            data["parse_mode"] = effective_parse_mode
-        files = {
-            file_field: (filename, content),
-        }
-        async with httpx.AsyncClient(
-            base_url=self._base_url,
-            timeout=self._timeout,
-            transport=TelegramFallbackTransport(resolver=self._fallback_resolver),
-        ) as client:
-            try:
-                response = await client.post(f"/{method}", data=data, files=files)
-            except httpx.HTTPError as exc:
-                error_cls = (
-                    TelegramNetworkError
-                    if _looks_like_network_error(exc)
-                    else TelegramAPIError
-                )
-                raise error_cls(
-                    f"Telegram API request failed: method={method} error={exc}"
-                ) from exc
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise TelegramAPIError("Telegram API returned invalid JSON") from exc
-        if (
-            not response.is_success
-            or not isinstance(payload, dict)
-            or not payload.get("ok")
-        ):
-            description = (
-                payload.get("description")
-                if isinstance(payload, dict)
-                else response.text
-            )
-            raise TelegramAPIError(
-                f"Telegram API call failed: method={method} error={description}"
-            )
-        return payload
-
-
-class MermaidRenderError(Exception):
-    pass
-
-
-class KrokiMermaidRenderer:
-    def __init__(
-        self,
-        *,
-        base_url: str = "https://kroki.io",
-        timeout: float = 20.0,
-    ) -> None:
-        self._base_url = base_url.rstrip("/")
-        self._timeout = timeout
-
-    async def render_png(self, source: str) -> bytes:
-        payload = {
-            "diagram_source": source,
-            "diagram_type": "mermaid",
-            "output_format": "png",
-        }
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            try:
-                response = await client.post(f"{self._base_url}/", json=payload)
-            except httpx.HTTPError as exc:
-                raise MermaidRenderError(f"Kroki request failed: {exc}") from exc
-        if not response.is_success:
-            raise MermaidRenderError(
-                f"Kroki render failed: status={response.status_code}"
-            )
-        return response.content
+@dataclass(frozen=True, slots=True)
+class TelegramPollResult:
+    next_offset: int | None
+    retry_after_delay: bool = False
 
 
 class TelegramAdapter:
@@ -1209,12 +158,15 @@ class TelegramAdapter:
             poll_interval=task_poll_interval,
             terminal_review_grace_checks=terminal_review_grace_checks,
         )
+        self._delivery = ChannelDeliveryCoordinator(task_watch=self._task_watch)
         self._message_parse_mode = message_parse_mode
         self._mermaid_renderer = mermaid_renderer or KrokiMermaidRenderer(
             base_url=os.getenv("KROKI_BASE_URL", "https://kroki.io")
         )
         del media_root
-        self._delivered_terminal_runs: dict[str, int] = {}
+        self._delivered_terminal_runs = (
+            self._delivery.terminal_presenter.delivered_run_counts
+        )
 
     async def _send_message(
         self,
@@ -1672,7 +624,7 @@ class TelegramAdapter:
         )
 
     async def wait_for_watchers(self) -> None:
-        await self._task_watch.wait()
+        await self._delivery.wait()
 
     def _legacy_lookup_metadata(self, message: TelegramMessage) -> dict[str, str]:
         return {
@@ -1833,18 +785,16 @@ class TelegramAdapter:
         return metadata.get("message_thread_id") in {None, ""}
 
     def _ensure_watcher(self, *, task_id: str, chat_id: int, run_count: int) -> None:
-        self._task_watch.ensure(
+        self._delivery.ensure_watch(
             task_id=task_id,
             run_count=run_count,
-            hooks=TaskWatchHooks(
-                on_pending_review=lambda task: self._send_message(
-                    chat_id=chat_id,
-                    text=self._format_review_message(task),
-                ),
-                on_terminal=lambda task: self._send_terminal_if_needed(
-                    chat_id=chat_id,
-                    task=task,
-                ),
+            on_pending_review=lambda task: self._send_message(
+                chat_id=chat_id,
+                text=self._format_review_message(task),
+            ),
+            on_terminal=lambda task: self._send_terminal_if_needed(
+                chat_id=chat_id,
+                task=task,
             ),
         )
 
@@ -1897,34 +847,10 @@ class TelegramAdapter:
         )
 
     def _format_review_message(self, task: GatewayTask) -> str:
-        task_id = task.task_id
-        pending_review = task.pending_review
-        if pending_review is None:
-            return f"任务等待审批，但缺少审批详情。\n\ntask_id={task_id}"
-        review_id = pending_review.review_id
-        actions = pending_review.action_requests
-        configs = pending_review.review_configs
-        action_lines: list[str] = []
-        config_list = configs
-        for index, action in enumerate(actions, start=1):
-            config = config_list[index - 1] if index - 1 < len(config_list) else {}
-            tool_name = action.get("name") or config.get("action_name") or "tool"
-            args = action.get("args")
-            action_lines.append(f"{index}. {tool_name} args={args}")
-        actions_text = "\n".join(action_lines) if action_lines else "(no actions)"
-        return (
-            "任务等待人工审批。\n"
-            f"review_id={review_id}\n"
-            f"task_id={task_id}\n"
-            f"{actions_text}\n\n"
-            "快速批准：y\n"
-            "快速拒绝：n\n"
-            f"指定批准：/approve {review_id}\n"
-            f"指定拒绝：/reject {review_id} 原因"
-        )
+        return self._delivery.review_presenter.format(task)
 
     def _has_active_watcher(self, *, task_id: str, run_count: int) -> bool:
-        return self._task_watch.is_active(task_id=task_id, run_count=run_count)
+        return self._delivery.is_active(task_id=task_id, run_count=run_count)
 
     async def _send_terminal_if_needed(
         self,
@@ -1932,120 +858,23 @@ class TelegramAdapter:
         chat_id: int,
         task: GatewayTask | dict[str, Any],
     ) -> None:
-        task = gateway_task_from_payload(task)
-        task_id = task.task_id
-        run_count = task.run_count
-        delivered_run_count = self._delivered_terminal_runs.get(task_id, 0)
-        if run_count <= delivered_run_count:
-            return
-        await self._send_message(
-            chat_id=chat_id,
-            text=self._format_terminal_message(task),
-        )
-        await self._send_task_artifacts(chat_id=chat_id, task=task)
-        self._delivered_terminal_runs[task_id] = run_count
+        async def send_message(terminal_task: GatewayTask) -> None:
+            await self._send_message(
+                chat_id=chat_id,
+                text=self._delivery.terminal_presenter.format(terminal_task),
+            )
 
-    def _format_terminal_message(self, task: GatewayTask) -> str:
-        status = task.status
-        task_id = task.task_id
-        if status == "completed":
-            result = task.last_result or "(empty result)"
-            return f"{result}\n\ntask_id={task_id}"
-        if status == "failed":
-            error = task.error or "unknown error"
-            return f"任务失败：{error}\n\ntask_id={task_id}"
-        if status == "cancelled":
-            return f"任务已取消。\n\ntask_id={task_id}"
-        return f"任务结束，状态={status}\n\ntask_id={task_id}"
+        async def send_artifacts(terminal_task: GatewayTask) -> None:
+            await self._send_task_artifacts(chat_id=chat_id, task=terminal_task)
+
+        await self._delivery.terminal_presenter.present(
+            task,
+            send_message=send_message,
+            send_artifacts=send_artifacts,
+        )
 
 
 async def run_telegram_adapter() -> None:
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not bot_token:
-        raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
-    gateway_base_url = os.getenv("GATEWAY_BASE_URL", "http://127.0.0.1:8000")
-    gateway_bearer_token = (
-        os.getenv("GATEWAY_BEARER_TOKEN") or DEFAULT_GATEWAY_BEARER_TOKEN
-    )
-    default_agent_name = os.getenv("TELEGRAM_DEFAULT_AGENT", "main")
-    session_db_path = os.getenv(
-        "TELEGRAM_SESSION_DB",
-        os.getenv("CHANNEL_SESSION_DB", DEFAULT_CHANNEL_SESSION_DB),
-    )
-    update_db_path = os.getenv(
-        "TELEGRAM_UPDATE_DB",
-        str(Path(session_db_path).expanduser().with_name("telegram_updates.sqlite3")),
-    )
-    poll_timeout = int(os.getenv("TELEGRAM_POLL_TIMEOUT", "30"))
-    session_store = ChannelSessionStore(session_db_path)
-    update_store = TelegramUpdateStore(update_db_path)
-    try:
-        adapter = TelegramAdapter(
-            gateway_client=GatewayHTTPClient(
-                base_url=gateway_base_url,
-                bearer_token=gateway_bearer_token,
-            ),
-            telegram_client=TelegramBotAPIClient(
-                bot_token=bot_token,
-                timeout=float(
-                    os.getenv("TELEGRAM_API_TIMEOUT", str(poll_timeout + 10))
-                ),
-                default_parse_mode=os.getenv(
-                    "TELEGRAM_MESSAGE_PARSE_MODE",
-                    "MarkdownV2",
-                ),
-            ),
-            default_agent_name=default_agent_name,
-            session_store=session_store,
-            update_store=update_store,
-            poll_timeout=poll_timeout,
-            task_poll_interval=float(os.getenv("TELEGRAM_TASK_POLL_INTERVAL", "2")),
-            terminal_review_grace_checks=int(
-                os.getenv("TELEGRAM_TERMINAL_REVIEW_GRACE_CHECKS", "3")
-            ),
-            message_parse_mode=os.getenv("TELEGRAM_MESSAGE_PARSE_MODE", "MarkdownV2"),
-        )
-        await adapter.run_forever()
-    finally:
-        update_store.close()
-        session_store.close()
+    from ruyi_agent.channels.telegram.runner import run_telegram_adapter as run
 
-
-def build_telegram_session_key(
-    message: TelegramMessage,
-    *,
-    agent_name: str,
-) -> str:
-    if message.chat_type == "private":
-        return f"agent:{agent_name}:telegram:dm:{message.chat_id}"
-    if message.chat_type in {"group", "supergroup"}:
-        thread_part = (
-            f":thread:{message.message_thread_id}"
-            if message.message_thread_id is not None
-            else ""
-        )
-        return (
-            f"agent:{agent_name}:telegram:{message.chat_type}:"
-            f"{message.chat_id}{thread_part}:user:{message.user_id}"
-        )
-    raise UnsupportedTelegramChatTypeError(
-        f"Unsupported Telegram chat_type: {message.chat_type!r}"
-    )
-
-
-def build_telegram_identity_key(message: TelegramMessage) -> str:
-    if message.chat_type == "private":
-        return f"telegram:dm:{message.chat_id}"
-    if message.chat_type in {"group", "supergroup"}:
-        thread_part = (
-            f":thread:{message.message_thread_id}"
-            if message.message_thread_id is not None
-            else ""
-        )
-        return (
-            f"telegram:{message.chat_type}:"
-            f"{message.chat_id}{thread_part}:user:{message.user_id}"
-        )
-    raise UnsupportedTelegramChatTypeError(
-        f"Unsupported Telegram chat_type: {message.chat_type!r}"
-    )
+    await run()

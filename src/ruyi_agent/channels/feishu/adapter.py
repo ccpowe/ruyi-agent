@@ -1,27 +1,40 @@
 from __future__ import annotations
 
 import asyncio
-import io
-import json
-import os
 import re
-import sqlite3
-import threading
-from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
-from uuid import uuid4
+from typing import Any
 
-from ruyi_agent.channels.gateway_client import (
-    GatewayArtifact,
-    GatewayHTTPClient,
-    GatewayTaskClient,
-    gateway_task_from_payload,
+from ruyi_agent.channels.feishu.client import (
+    DEFAULT_FEISHU_MEDIA_MAX_BYTES,
+    FEISHU_ACK_MODES,
+    FeishuAPIError,
+    FeishuAttachment,
+    FeishuClient,
+    FeishuMention,
+    FeishuMessage,
+    FeishuReactionReceipt,
+    FeishuSDKClient,
+    UnsupportedFeishuChatTypeError,
+    _consume_cleanup_result,
+    _current_run_artifacts,
+    _feishu_help_text,
+    _looks_like_markdown,
+    _split_feishu_text,
+    parse_feishu_message_event,
 )
-from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTask
+from ruyi_agent.channels.feishu.identity import (
+    _is_feishu_group_chat,
+    _strip_mention_token,
+    build_feishu_identity_key,
+    build_feishu_session_key,
+)
+from ruyi_agent.channels.feishu.receipts import FeishuEventClaim, FeishuEventStore
+from ruyi_agent.channels.gateway_client import GatewayArtifact, GatewayTaskClient
+from ruyi_agent.channels.gateway_dto import GatewayTask
+from ruyi_agent.channels.presentation import ChannelDeliveryCoordinator
+from ruyi_agent.channels.task_watch import TERMINAL_TASK_STATES, TaskWatchManager
 from ruyi_agent.channels.turn import (
     AgentCommandTurn,
     ChannelTurnHandler,
@@ -30,887 +43,23 @@ from ruyi_agent.channels.turn import (
     ReviewTurn,
     parse_review_command,
 )
-from ruyi_agent.channels.task_watch import (
-    TERMINAL_TASK_STATES,
-    TaskWatchHooks,
-    TaskWatchManager,
-)
 from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 
 
-FEISHU_TEXT_CHUNK_LIMIT = 4000
-DEFAULT_FEISHU_MEDIA_MAX_BYTES = 30 * 1024 * 1024
-DEFAULT_GATEWAY_BEARER_TOKEN = "dev-token"
-DEFAULT_CHANNEL_SESSION_DB = "data/channel_sessions.sqlite3"
-FEISHU_ACK_MODES = {"reaction", "message", "off"}
-
-
-@dataclass(slots=True)
-class FeishuMention:
-    key: str
-    name: str | None = None
-    open_id: str | None = None
-    user_id: str | None = None
-    union_id: str | None = None
-
-
-@dataclass(slots=True)
-class FeishuMessage:
-    event_id: str
-    message_id: str
-    chat_id: str
-    chat_type: str
-    user_id: str
-    text: str
-    sender_open_id: str | None = None
-    sender_user_id: str | None = None
-    sender_union_id: str | None = None
-    thread_id: str | None = None
-    mentions: list[FeishuMention] | None = None
-
-
-@dataclass(slots=True)
-class FeishuAttachment:
-    filename: str
-    content: bytes
-
-
-@dataclass(slots=True)
-class FeishuReactionReceipt:
-    message_id: str
-    reaction_id: str | None
-    emoji_type: str
-
-
-class FeishuClient(Protocol):
-    async def run(
-        self,
-        handler: Callable[[FeishuMessage], Awaitable[None]],
-    ) -> None: ...
-
-    async def send_message(
-        self,
-        *,
-        chat_id: str,
-        text: str,
-        reply_to_message_id: str | None = None,
-    ) -> None: ...
-
-    async def send_markdown(
-        self,
-        *,
-        chat_id: str,
-        markdown: str,
-        reply_to_message_id: str | None = None,
-    ) -> None: ...
-
-    async def send_file(
-        self,
-        *,
-        chat_id: str,
-        filename: str,
-        content: bytes,
-        reply_to_message_id: str | None = None,
-    ) -> None: ...
-
-    async def add_reaction(
-        self,
-        *,
-        message_id: str,
-        emoji_type: str,
-    ) -> str | None: ...
-
-    async def delete_reaction(
-        self,
-        *,
-        message_id: str,
-        reaction_id: str,
-    ) -> None: ...
-
-
-class FeishuAPIError(Exception):
-    pass
-
-
-class UnsupportedFeishuChatTypeError(ValueError):
-    pass
-
-
-def _utc_now() -> datetime:
-    return datetime.now(UTC)
-
-
-def _utc_now_iso() -> str:
-    return _utc_now().isoformat()
-
-
-def _consume_cleanup_result(task: asyncio.Task[Any]) -> None:
-    with suppress(BaseException):
-        task.result()
-
-
-def _env_list(name: str) -> list[str]:
-    raw = os.getenv(name, "")
-    return [item.strip() for item in raw.split(",") if item.strip()]
-
-
-def _env_bool(name: str, *, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _feishu_help_text() -> str:
-    return "\n".join(
-        [
-            "可用命令：",
-            "`/help` - 查看命令说明",
-            "`/start` - 检查 Feishu adapter 是否已连接",
-            "`/new <message>` - 在当前 agent 下开启新会话",
-            "`/agent` - 查看可切换的 public agent",
-            "`/agent <agent_name>` - 切换直连 agent，并开启该 agent 的新会话",
-            "`/agent <agent_name> <message>` - 切换 agent 后直接创建新会话",
-            "`/resume` - 展示最近会话",
-            "`/resume <task_id>` - 恢复指定会话，已完成 task 也可续聊",
-            "`/approve <review_id>` - 批准指定审批项",
-            "`/reject <review_id> [reason]` - 拒绝指定审批项",
-            "`y` / `yes` / `/yes` - 批准当前待审批项",
-            "`n` / `no` / `/no` - 拒绝当前待审批项",
-        ]
-    )
-
-
-def _split_feishu_text(text: str, limit: int = FEISHU_TEXT_CHUNK_LIMIT) -> list[str]:
-    if len(text) <= limit:
-        return [text]
-    chunks: list[str] = []
-    current = ""
-    for line in text.splitlines(keepends=True):
-        if len(current) + len(line) <= limit:
-            current += line
-            continue
-        if current:
-            chunks.append(current)
-            current = ""
-        if len(line) <= limit:
-            current = line
-            continue
-        for char in line:
-            if len(current) + len(char) > limit and current:
-                chunks.append(current)
-                current = char
-            else:
-                current += char
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-def _looks_like_markdown(text: str) -> bool:
-    if re.search(r"(?m)^\s{0,3}#{1,6}\s+\S", text):
-        return True
-    if re.search(r"(?m)^\s*(?:[-*+]|\d+\.)\s+\S", text):
-        return True
-    if re.search(r"(?m)^\s*\|.+\|\s*$", text):
-        return True
-    return any(token in text for token in ("```", "**", "__", "`", "]("))
-
-
-def _build_feishu_markdown_card(markdown: str) -> dict[str, Any]:
-    return {
-        "config": {"wide_screen_mode": True},
-        "elements": [
-            {
-                "tag": "div",
-                "text": {
-                    "tag": "lark_md",
-                    "content": markdown,
-                },
-            }
-        ],
-    }
-
-
-def _current_run_artifacts(
-    task: GatewayTask,
-    run_count: int,
-) -> list[GatewayPublishedArtifact]:
-    return [item for item in task.artifacts if item.run_count == run_count]
-
-
-@dataclass(frozen=True, slots=True)
-class FeishuEventClaim:
-    status: Literal["claimed", "processed", "busy"]
-    event_key: str | None = None
-    claimed_at: str | None = None
-    claim_token: str | None = None
-
-
-def _feishu_event_key(message: FeishuMessage) -> str | None:
-    return message.event_id or message.message_id or None
-
-
-class FeishuEventStore:
-    def __init__(self, db_path: str, *, claim_timeout_seconds: float = 300.0) -> None:
-        self._db_path = db_path
-        self._claim_timeout_seconds = max(0.0, claim_timeout_seconds)
-        self._ensure_parent_dir()
-        self._lock = threading.RLock()
-        self._conn = sqlite3.connect(
-            self._db_path,
-            check_same_thread=False,
-            timeout=30.0,
-        )
-        self._init_db()
-
-    def claim_message(self, message: FeishuMessage) -> bool:
-        return self.claim_message_result(message).status == "claimed"
-
-    def claim_message_result(self, message: FeishuMessage) -> FeishuEventClaim:
-        event_key = _feishu_event_key(message)
-        if not event_key:
-            return FeishuEventClaim(status="claimed")
-        now_dt = _utc_now()
-        now = now_dt.isoformat()
-        new_claim_token = uuid4().hex
-        with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                row = self._conn.execute(
-                    """
-                    SELECT processed_at, claimed_at, claim_token
-                    FROM feishu_processed_events
-                    WHERE event_key = ?
-                    """,
-                    (event_key,),
-                ).fetchone()
-                if row is None:
-                    self._conn.execute(
-                        """
-                        INSERT INTO feishu_processed_events (
-                            event_key,
-                            chat_id,
-                            message_id,
-                            first_seen_at,
-                            claimed_at,
-                            claim_token,
-                            processed_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, NULL)
-                        """,
-                        (
-                            event_key,
-                            message.chat_id,
-                            message.message_id,
-                            now,
-                            now,
-                            new_claim_token,
-                        ),
-                    )
-                    self._conn.commit()
-                    return FeishuEventClaim(
-                        status="claimed",
-                        event_key=event_key,
-                        claimed_at=now,
-                        claim_token=new_claim_token,
-                    )
-
-                processed_at, claimed_at, claim_token = row
-                if processed_at:
-                    self._conn.commit()
-                    return FeishuEventClaim(
-                        status="processed",
-                        event_key=event_key,
-                    )
-                if claim_token and not self._claim_expired(claimed_at, now_dt):
-                    self._conn.commit()
-                    return FeishuEventClaim(status="busy", event_key=event_key)
-
-                self._conn.execute(
-                    """
-                    UPDATE feishu_processed_events
-                    SET chat_id = ?, message_id = ?, claimed_at = ?, claim_token = ?
-                    WHERE event_key = ? AND processed_at IS NULL
-                    """,
-                    (
-                        message.chat_id,
-                        message.message_id,
-                        now,
-                        new_claim_token,
-                        event_key,
-                    ),
-                )
-                self._conn.commit()
-                return FeishuEventClaim(
-                    status="claimed",
-                    event_key=event_key,
-                    claimed_at=now,
-                    claim_token=new_claim_token,
-                )
-            except BaseException:
-                self._conn.rollback()
-                raise
-
-    def mark_processed(self, event_key: str, *, claim_token: str) -> bool:
-        now = _utc_now_iso()
-        with self._lock:
-            cursor = self._conn.execute(
-                """
-                UPDATE feishu_processed_events
-                SET claimed_at = NULL, claim_token = NULL, processed_at = ?
-                WHERE event_key = ?
-                    AND claim_token = ?
-                    AND processed_at IS NULL
-                """,
-                (now, event_key, claim_token),
-            )
-            self._conn.commit()
-            return cursor.rowcount > 0
-
-    def release_claim(self, event_key: str, *, claim_token: str) -> bool:
-        with self._lock:
-            cursor = self._conn.execute(
-                """
-                UPDATE feishu_processed_events
-                SET claimed_at = NULL, claim_token = NULL
-                WHERE event_key = ?
-                    AND claim_token = ?
-                    AND processed_at IS NULL
-                """,
-                (event_key, claim_token),
-            )
-            self._conn.commit()
-            return cursor.rowcount > 0
-
-    async def aclaim_message(self, message: FeishuMessage) -> bool:
-        return await asyncio.to_thread(self.claim_message, message)
-
-    async def aclaim_message_result(
-        self,
-        message: FeishuMessage,
-    ) -> FeishuEventClaim:
-        return await asyncio.to_thread(self.claim_message_result, message)
-
-    async def amark_processed(self, event_key: str, *, claim_token: str) -> bool:
-        return await asyncio.to_thread(
-            self.mark_processed,
-            event_key,
-            claim_token=claim_token,
-        )
-
-    async def arelease_claim(self, event_key: str, *, claim_token: str) -> bool:
-        return await asyncio.to_thread(
-            self.release_claim,
-            event_key,
-            claim_token=claim_token,
-        )
-
-    def _ensure_parent_dir(self) -> None:
-        if self._db_path == ":memory:":
-            return
-        parent = Path(self._db_path).expanduser().resolve().parent
-        parent.mkdir(parents=True, exist_ok=True)
-
-    def _init_db(self) -> None:
-        with self._lock:
-            self._conn.execute("PRAGMA busy_timeout = 30000")
-            if self._db_path != ":memory:":
-                self._conn.execute("PRAGMA journal_mode = WAL")
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS feishu_processed_events (
-                    event_key TEXT PRIMARY KEY,
-                    chat_id TEXT NOT NULL,
-                    message_id TEXT NOT NULL,
-                    first_seen_at TEXT NOT NULL,
-                    claimed_at TEXT,
-                    claim_token TEXT,
-                    processed_at TEXT
-                )
-                """
-            )
-            columns = {
-                row[1]
-                for row in self._conn.execute(
-                    "PRAGMA table_info(feishu_processed_events)"
-                ).fetchall()
-            }
-            if "claimed_at" not in columns:
-                self._conn.execute(
-                    "ALTER TABLE feishu_processed_events ADD COLUMN claimed_at TEXT"
-                )
-            if "claim_token" not in columns:
-                self._conn.execute(
-                    "ALTER TABLE feishu_processed_events ADD COLUMN claim_token TEXT"
-                )
-            self._conn.commit()
-
-    def _claim_expired(self, claimed_at: str | None, now: datetime) -> bool:
-        if not claimed_at:
-            return True
-        try:
-            claimed_at_dt = datetime.fromisoformat(claimed_at)
-        except ValueError:
-            return True
-        if claimed_at_dt.tzinfo is None:
-            claimed_at_dt = claimed_at_dt.replace(tzinfo=UTC)
-        return (now - claimed_at_dt).total_seconds() >= self._claim_timeout_seconds
-
-    def close(self) -> None:
-        with self._lock:
-            self._conn.close()
-
-
-class FeishuSDKClient:
-    def __init__(
-        self,
-        *,
-        app_id: str,
-        app_secret: str,
-        domain: str = "feishu",
-        timeout: float = 10.0,
-    ) -> None:
-        self._app_id = app_id
-        self._app_secret = app_secret
-        self._domain = domain
-        self._timeout = timeout
-        self._client: Any | None = None
-
-    async def run(
-        self,
-        handler: Callable[[FeishuMessage], Awaitable[None]],
-    ) -> None:
-        loop = asyncio.get_running_loop()
-        await asyncio.to_thread(self._start_websocket, loop, handler)
-
-    async def send_message(
-        self,
-        *,
-        chat_id: str,
-        text: str,
-        reply_to_message_id: str | None = None,
-    ) -> None:
-        await self._send_message_content(
-            chat_id=chat_id,
-            msg_type="text",
-            content=json.dumps({"text": text}, ensure_ascii=False),
-            reply_to_message_id=reply_to_message_id,
-        )
-
-    async def send_markdown(
-        self,
-        *,
-        chat_id: str,
-        markdown: str,
-        reply_to_message_id: str | None = None,
-    ) -> None:
-        await self._send_message_content(
-            chat_id=chat_id,
-            msg_type="interactive",
-            content=json.dumps(
-                _build_feishu_markdown_card(markdown),
-                ensure_ascii=False,
-            ),
-            reply_to_message_id=reply_to_message_id,
-        )
-
-    async def send_file(
-        self,
-        *,
-        chat_id: str,
-        filename: str,
-        content: bytes,
-        reply_to_message_id: str | None = None,
-    ) -> None:
-        file_key = await self._upload_file(filename=filename, content=content)
-        await self._send_message_content(
-            chat_id=chat_id,
-            msg_type="file",
-            content=json.dumps({"file_key": file_key}, ensure_ascii=False),
-            reply_to_message_id=reply_to_message_id,
-        )
-
-    async def add_reaction(
-        self,
-        *,
-        message_id: str,
-        emoji_type: str,
-    ) -> str | None:
-        lark = _import_lark_oapi()
-        create_request_cls, create_body_cls, _, emoji_cls = (
-            _import_lark_reaction_types()
-        )
-        client = self._get_client(lark)
-        request = (
-            create_request_cls.builder()
-            .message_id(message_id)
-            .request_body(
-                create_body_cls.builder()
-                .reaction_type(emoji_cls.builder().emoji_type(emoji_type).build())
-                .build()
-            )
-            .build()
-        )
-        response = await client.im.v1.message_reaction.acreate(request)
-        self._ensure_success(response, action=f"add {emoji_type} reaction")
-        data = getattr(response, "data", None)
-        reaction_id = getattr(data, "reaction_id", None)
-        return reaction_id if isinstance(reaction_id, str) and reaction_id else None
-
-    async def delete_reaction(
-        self,
-        *,
-        message_id: str,
-        reaction_id: str,
-    ) -> None:
-        lark = _import_lark_oapi()
-        _, _, delete_request_cls, _ = _import_lark_reaction_types()
-        client = self._get_client(lark)
-        request = (
-            delete_request_cls.builder()
-            .message_id(message_id)
-            .reaction_id(reaction_id)
-            .build()
-        )
-        response = await client.im.v1.message_reaction.adelete(request)
-        self._ensure_success(response, action="delete reaction")
-
-    async def _send_message_content(
-        self,
-        *,
-        chat_id: str,
-        msg_type: str,
-        content: str,
-        reply_to_message_id: str | None = None,
-    ) -> None:
-        lark = _import_lark_oapi()
-        create_request_cls, create_body_cls, reply_request_cls, reply_body_cls = (
-            _import_lark_message_types()
-        )
-        client = self._get_client(lark)
-        if reply_to_message_id:
-            request = (
-                reply_request_cls.builder()
-                .message_id(reply_to_message_id)
-                .request_body(
-                    reply_body_cls.builder()
-                    .msg_type(msg_type)
-                    .content(content)
-                    .reply_in_thread(True)
-                    .build()
-                )
-                .build()
-            )
-            response = await client.im.v1.message.areply(request)
-        else:
-            request = (
-                create_request_cls.builder()
-                .receive_id_type("chat_id")
-                .request_body(
-                    create_body_cls.builder()
-                    .receive_id(chat_id)
-                    .msg_type(msg_type)
-                    .content(content)
-                    .build()
-                )
-                .build()
-            )
-            response = await client.im.v1.message.acreate(request)
-        self._ensure_success(response, action=f"send {msg_type} message")
-
-    async def _upload_file(self, *, filename: str, content: bytes) -> str:
-        lark = _import_lark_oapi()
-        create_file_request_cls, create_file_body_cls = _import_lark_file_types()
-        client = self._get_client(lark)
-        request = (
-            create_file_request_cls.builder()
-            .request_body(
-                create_file_body_cls.builder()
-                .file_type("stream")
-                .file_name(filename)
-                .file(io.BytesIO(content))
-                .build()
-            )
-            .build()
-        )
-        response = await client.im.v1.file.acreate(request)
-        self._ensure_success(response, action="upload file")
-        data = getattr(response, "data", None)
-        file_key = getattr(data, "file_key", None)
-        if not isinstance(file_key, str) or not file_key:
-            raise FeishuAPIError("Feishu upload file succeeded without file_key")
-        return file_key
-
-    def _ensure_success(self, response: Any, *, action: str) -> None:
-        success = response.success() if hasattr(response, "success") else False
-        if not success:
-            code = getattr(response, "code", "")
-            msg = getattr(response, "msg", "")
-            raise FeishuAPIError(f"Feishu {action} failed: code={code} msg={msg}")
-
-    def _start_websocket(
-        self,
-        loop: asyncio.AbstractEventLoop,
-        handler: Callable[[FeishuMessage], Awaitable[None]],
-    ) -> None:
-        lark = _import_lark_oapi()
-
-        def on_message(data: Any) -> None:
-            try:
-                payload = _sdk_object_to_dict(data)
-                message = parse_feishu_message_event(payload)
-            except Exception as exc:
-                print(f"[feishu warning] failed to parse event: {exc}", flush=True)
-                return
-            if message is None:
-                return
-            future = asyncio.run_coroutine_threadsafe(handler(message), loop)
-
-            def log_failure(done: asyncio.Future[Any]) -> None:
-                try:
-                    done.result()
-                except Exception as exc:
-                    print(f"[feishu warning] event handling failed: {exc}", flush=True)
-
-            future.add_done_callback(log_failure)
-
-        dispatcher = (
-            lark.EventDispatcherHandler.builder("", "")
-            .register_p2_im_message_receive_v1(on_message)
-            .build()
-        )
-        ws_client = lark.ws.Client(
-            self._app_id,
-            self._app_secret,
-            event_handler=dispatcher,
-            log_level=getattr(lark.LogLevel, "INFO", None),
-            domain=_resolve_lark_domain(lark, self._domain) or "https://open.feishu.cn",
-        )
-        ws_client.start()
-
-    def _get_client(self, lark: Any) -> Any:
-        if self._client is not None:
-            return self._client
-        builder = (
-            lark.Client.builder().app_id(self._app_id).app_secret(self._app_secret)
-        )
-        domain = _resolve_lark_domain(lark, self._domain)
-        if domain is not None and hasattr(builder, "domain"):
-            builder = builder.domain(domain)
-        if hasattr(builder, "timeout"):
-            builder = builder.timeout(self._timeout)
-        self._client = builder.build()
-        return self._client
-
-
-def _import_lark_oapi() -> Any:
-    try:
-        import lark_oapi as lark
-    except ImportError as exc:
-        raise FeishuAPIError(
-            "Missing lark-oapi dependency. Run `uv sync` after installing project deps."
-        ) from exc
-    return lark
-
-
-def _import_lark_message_types() -> tuple[Any, Any, Any, Any]:
-    try:
-        from lark_oapi.api.im.v1 import (
-            CreateMessageRequest,
-            CreateMessageRequestBody,
-            ReplyMessageRequest,
-            ReplyMessageRequestBody,
-        )
-    except ImportError as exc:
-        raise FeishuAPIError(
-            "Installed lark-oapi does not expose im.v1 message API"
-        ) from exc
-    return (
-        CreateMessageRequest,
-        CreateMessageRequestBody,
-        ReplyMessageRequest,
-        ReplyMessageRequestBody,
-    )
-
-
-def _import_lark_file_types() -> tuple[Any, Any]:
-    try:
-        from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
-    except ImportError as exc:
-        raise FeishuAPIError(
-            "Installed lark-oapi does not expose im.v1 file API"
-        ) from exc
-    return CreateFileRequest, CreateFileRequestBody
-
-
-def _import_lark_reaction_types() -> tuple[Any, Any, Any, Any]:
-    try:
-        from lark_oapi.api.im.v1 import (
-            CreateMessageReactionRequest,
-            CreateMessageReactionRequestBody,
-            DeleteMessageReactionRequest,
-            Emoji,
-        )
-    except ImportError as exc:
-        raise FeishuAPIError(
-            "Installed lark-oapi does not expose im.v1 reaction API"
-        ) from exc
-    return (
-        CreateMessageReactionRequest,
-        CreateMessageReactionRequestBody,
-        DeleteMessageReactionRequest,
-        Emoji,
-    )
-
-
-def _resolve_lark_domain(lark: Any, domain: str) -> Any | None:
-    domain_class = getattr(lark, "Domain", None)
-    if domain_class is None:
-        if domain.lower() == "lark":
-            return "https://open.larksuite.com"
-        return "https://open.feishu.cn"
-    if domain.lower() == "lark":
-        return getattr(domain_class, "Lark", None) or getattr(
-            domain_class, "LARK", None
-        )
-    return getattr(domain_class, "Feishu", None) or getattr(
-        domain_class, "FEISHU", None
-    )
-
-
-def _sdk_object_to_dict(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    try:
-        lark = _import_lark_oapi()
-        payload = json.loads(lark.JSON.marshal(value))
-        if isinstance(payload, dict):
-            return payload
-    except Exception:
-        pass
-    if hasattr(value, "model_dump"):
-        payload = value.model_dump()
-        if isinstance(payload, dict):
-            return payload
-    if hasattr(value, "to_dict"):
-        payload = value.to_dict()
-        if isinstance(payload, dict):
-            return payload
-    payload = getattr(value, "__dict__", {})
-    return payload if isinstance(payload, dict) else {}
-
-
-def parse_feishu_message_event(payload: dict[str, Any]) -> FeishuMessage | None:
-    event = payload.get("event")
-    if not isinstance(event, dict):
-        event = payload
-    message = event.get("message")
-    if not isinstance(message, dict):
-        return None
-    sender = event.get("sender")
-    sender_id = sender.get("sender_id") if isinstance(sender, dict) else {}
-    if not isinstance(sender_id, dict):
-        sender_id = {}
-
-    header = payload.get("header")
-    if not isinstance(header, dict):
-        header = {}
-
-    message_id = _string_value(message.get("message_id"))
-    chat_id = _string_value(message.get("chat_id"))
-    if not message_id or not chat_id:
-        return None
-
-    sender_open_id = _string_value(sender_id.get("open_id"))
-    sender_user_id = _string_value(sender_id.get("user_id"))
-    sender_union_id = _string_value(sender_id.get("union_id"))
-    user_id = sender_union_id or sender_user_id or sender_open_id
-    if not user_id:
-        return None
-
-    msg_type = _string_value(message.get("message_type"))
-    text = _extract_feishu_text(msg_type, message.get("content")).strip()
-    mentions = _parse_mentions(message.get("mentions"))
-    return FeishuMessage(
-        event_id=_string_value(header.get("event_id"))
-        or _string_value(payload.get("event_id")),
-        message_id=message_id,
-        chat_id=chat_id,
-        chat_type=_string_value(message.get("chat_type")) or "p2p",
-        user_id=user_id,
-        text=text,
-        sender_open_id=sender_open_id,
-        sender_user_id=sender_user_id,
-        sender_union_id=sender_union_id,
-        thread_id=_string_value(message.get("thread_id"))
-        or _string_value(message.get("root_id")),
-        mentions=mentions,
-    )
-
-
-def _string_value(value: Any) -> str:
-    return value if isinstance(value, str) else ""
-
-
-def _parse_mentions(value: Any) -> list[FeishuMention]:
-    if not isinstance(value, list):
-        return []
-    mentions: list[FeishuMention] = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        mention_id = item.get("id")
-        if not isinstance(mention_id, dict):
-            mention_id = {}
-        mentions.append(
-            FeishuMention(
-                key=_string_value(item.get("key")),
-                name=_string_value(item.get("name")) or None,
-                open_id=_string_value(mention_id.get("open_id")) or None,
-                user_id=_string_value(mention_id.get("user_id")) or None,
-                union_id=_string_value(mention_id.get("union_id")) or None,
-            )
-        )
-    return mentions
-
-
-def _extract_feishu_text(message_type: str, raw_content: Any) -> str:
-    content = raw_content
-    if isinstance(raw_content, str):
-        try:
-            content = json.loads(raw_content)
-        except json.JSONDecodeError:
-            return raw_content
-    if not isinstance(content, dict):
-        return ""
-    if message_type == "text":
-        text = content.get("text")
-        return text if isinstance(text, str) else ""
-    if message_type == "post":
-        fragments: list[str] = []
-        _collect_post_text(content.get("content"), fragments)
-        return "".join(fragments)
-    text = content.get("text")
-    return text if isinstance(text, str) else ""
-
-
-def _collect_post_text(value: Any, fragments: list[str]) -> None:
-    if isinstance(value, list):
-        for item in value:
-            _collect_post_text(item, fragments)
-        return
-    if not isinstance(value, dict):
-        return
-    tag = value.get("tag")
-    if tag in {"text", "a"} and isinstance(value.get("text"), str):
-        fragments.append(value["text"])
-    elif tag == "at":
-        name = value.get("user_name") or value.get("text")
-        if isinstance(name, str):
-            fragments.append(f"@{name}")
-    for child_key in ("content", "children"):
-        if child_key in value:
-            _collect_post_text(value[child_key], fragments)
+__all__ = [
+    "FeishuAdapter",
+    "FeishuAPIError",
+    "FeishuEventClaim",
+    "FeishuEventStore",
+    "FeishuMention",
+    "FeishuMessage",
+    "FeishuSDKClient",
+    "UnsupportedFeishuChatTypeError",
+    "build_feishu_identity_key",
+    "build_feishu_session_key",
+    "parse_feishu_message_event",
+    "run_feishu_adapter",
+]
 
 
 class FeishuAdapter:
@@ -962,6 +111,7 @@ class FeishuAdapter:
             poll_interval=task_poll_interval,
             terminal_review_grace_checks=terminal_review_grace_checks,
         )
+        self._delivery = ChannelDeliveryCoordinator(task_watch=self._task_watch)
         normalized_ack_mode = ack_mode.strip().lower()
         self._ack_mode = (
             normalized_ack_mode
@@ -973,7 +123,9 @@ class FeishuAdapter:
         self._approval_reaction = approval_reaction
         self._failure_reaction = failure_reaction
         del media_root, media_max_bytes
-        self._delivered_terminal_runs: dict[str, int] = {}
+        self._delivered_terminal_runs = (
+            self._delivery.terminal_presenter.delivered_run_counts
+        )
         self._task_reactions: dict[tuple[str, int], list[FeishuReactionReceipt]] = {}
 
     async def run_forever(self) -> None:
@@ -1472,7 +624,7 @@ class FeishuAdapter:
                 )
 
     async def wait_for_watchers(self) -> None:
-        await self._task_watch.wait()
+        await self._delivery.wait()
 
     def _legacy_lookup_metadata(self, message: FeishuMessage) -> dict[str, str]:
         return {
@@ -1629,18 +781,16 @@ class FeishuAdapter:
         async def on_error(_: Exception) -> None:
             await self._complete_task_reactions(key=key, status="failed")
 
-        self._task_watch.ensure(
+        self._delivery.ensure_watch(
             task_id=task_id,
             run_count=run_count,
-            hooks=TaskWatchHooks(
-                on_pending_review=on_pending_review,
-                on_terminal=lambda task: self._send_terminal_if_needed(
-                    chat_id=chat_id,
-                    task=task,
-                ),
-                on_superseded=on_superseded,
-                on_error=on_error,
+            on_pending_review=on_pending_review,
+            on_terminal=lambda task: self._send_terminal_if_needed(
+                chat_id=chat_id,
+                task=task,
             ),
+            on_superseded=on_superseded,
+            on_error=on_error,
         )
 
     def _parse_review_command(self, text: str) -> dict[str, Any] | None:
@@ -1699,34 +849,10 @@ class FeishuAdapter:
         )
 
     def _format_review_message(self, task: GatewayTask) -> str:
-        task_id = task.task_id
-        pending_review = task.pending_review
-        if pending_review is None:
-            return f"任务等待审批，但缺少审批详情。\n\ntask_id={task_id}"
-        review_id = pending_review.review_id
-        actions = pending_review.action_requests
-        configs = pending_review.review_configs
-        action_lines: list[str] = []
-        config_list = configs
-        for index, action in enumerate(actions, start=1):
-            config = config_list[index - 1] if index - 1 < len(config_list) else {}
-            tool_name = action.get("name") or config.get("action_name") or "tool"
-            args = action.get("args")
-            action_lines.append(f"{index}. {tool_name} args={args}")
-        actions_text = "\n".join(action_lines) if action_lines else "(no actions)"
-        return (
-            "任务等待人工审批。\n"
-            f"review_id={review_id}\n"
-            f"task_id={task_id}\n"
-            f"{actions_text}\n\n"
-            "快速批准：y\n"
-            "快速拒绝：n\n"
-            f"指定批准：/approve {review_id}\n"
-            f"指定拒绝：/reject {review_id} 原因"
-        )
+        return self._delivery.review_presenter.format(task)
 
     def _has_active_watcher(self, *, task_id: str, run_count: int) -> bool:
-        return self._task_watch.is_active(task_id=task_id, run_count=run_count)
+        return self._delivery.is_active(task_id=task_id, run_count=run_count)
 
     async def _send_terminal_if_needed(
         self,
@@ -1734,153 +860,36 @@ class FeishuAdapter:
         chat_id: str,
         task: GatewayTask | dict[str, Any],
     ) -> None:
-        task = gateway_task_from_payload(task)
-        task_id = task.task_id
-        run_count = task.run_count
-        delivered_run_count = self._delivered_terminal_runs.get(task_id, 0)
-        if run_count <= delivered_run_count:
-            await self._clear_task_reactions((task_id, run_count))
-            return
-        await self._send_message(
-            chat_id=chat_id,
-            text=self._format_terminal_message(task),
+        async def send_message(terminal_task: GatewayTask) -> None:
+            await self._send_message(
+                chat_id=chat_id,
+                text=self._delivery.terminal_presenter.format(terminal_task),
+            )
+
+        async def send_artifacts(terminal_task: GatewayTask) -> None:
+            await self._send_task_artifacts(chat_id=chat_id, task=terminal_task)
+
+        async def clear_duplicate(terminal_task: GatewayTask) -> None:
+            await self._clear_task_reactions(
+                (terminal_task.task_id, terminal_task.run_count)
+            )
+
+        async def complete_reactions(terminal_task: GatewayTask) -> None:
+            await self._complete_task_reactions(
+                key=(terminal_task.task_id, terminal_task.run_count),
+                status=terminal_task.status,
+            )
+
+        await self._delivery.terminal_presenter.present(
+            task,
+            send_message=send_message,
+            send_artifacts=send_artifacts,
+            on_duplicate=clear_duplicate,
+            on_delivered=complete_reactions,
         )
-        await self._send_task_artifacts(chat_id=chat_id, task=task)
-        self._delivered_terminal_runs[task_id] = run_count
-        await self._complete_task_reactions(
-            key=(task_id, run_count),
-            status=task.status,
-        )
-
-    def _format_terminal_message(self, task: GatewayTask) -> str:
-        status = task.status
-        task_id = task.task_id
-        if status == "completed":
-            result = task.last_result or "(empty result)"
-            return f"{result}\n\ntask_id={task_id}"
-        if status == "failed":
-            error = task.error or "unknown error"
-            return f"任务失败：{error}\n\ntask_id={task_id}"
-        if status == "cancelled":
-            return f"任务已取消。\n\ntask_id={task_id}"
-        return f"任务结束，状态={status}\n\ntask_id={task_id}"
-
-
-def _is_feishu_group_chat(chat_type: str) -> bool:
-    return chat_type not in {"p2p", "private", "dm"}
-
-
-def _strip_mention_token(text: str, token: str) -> str:
-    if not token:
-        return text
-    pattern = re.compile(rf"(?<!\S){re.escape(token)}(?=$|[\s,.:;!?，。：；！？])")
-    return pattern.sub("", text)
-
-
-def build_feishu_session_key(
-    message: FeishuMessage,
-    *,
-    agent_name: str,
-) -> str:
-    if not _is_feishu_group_chat(message.chat_type):
-        return f"agent:{agent_name}:feishu:dm:{message.chat_id}"
-    thread_part = (
-        f":thread:{message.thread_id}" if message.thread_id is not None else ""
-    )
-    return (
-        f"agent:{agent_name}:feishu:group:"
-        f"{message.chat_id}{thread_part}:user:{message.user_id}"
-    )
-
-
-def build_feishu_identity_key(message: FeishuMessage) -> str:
-    if not _is_feishu_group_chat(message.chat_type):
-        return f"feishu:dm:{message.chat_id}"
-    thread_part = (
-        f":thread:{message.thread_id}" if message.thread_id is not None else ""
-    )
-    return f"feishu:group:{message.chat_id}{thread_part}:user:{message.user_id}"
 
 
 async def run_feishu_adapter() -> None:
-    app_id = os.getenv("FEISHU_APP_ID")
-    app_secret = os.getenv("FEISHU_APP_SECRET")
-    if not app_id:
-        raise SystemExit("Missing FEISHU_APP_ID")
-    if not app_secret:
-        raise SystemExit("Missing FEISHU_APP_SECRET")
-    connection_mode = os.getenv("FEISHU_CONNECTION_MODE", "websocket").strip().lower()
-    if connection_mode != "websocket":
-        raise SystemExit("Only FEISHU_CONNECTION_MODE=websocket is supported for now")
-    gateway_base_url = os.getenv("GATEWAY_BASE_URL", "http://127.0.0.1:8000")
-    gateway_bearer_token = (
-        os.getenv("GATEWAY_BEARER_TOKEN") or DEFAULT_GATEWAY_BEARER_TOKEN
-    )
-    default_agent_name = os.getenv("FEISHU_DEFAULT_AGENT", "main")
-    session_db_path = os.getenv(
-        "FEISHU_SESSION_DB",
-        os.getenv("CHANNEL_SESSION_DB", DEFAULT_CHANNEL_SESSION_DB),
-    )
-    event_db_path = os.getenv(
-        "FEISHU_EVENT_DB",
-        str(Path(session_db_path).expanduser().with_name("feishu_events.sqlite3")),
-    )
-    require_mention = _env_bool("FEISHU_REQUIRE_MENTION", default=True)
-    group_policy = os.getenv("FEISHU_GROUP_POLICY", "disabled").strip().lower()
-    bot_open_id = os.getenv("FEISHU_BOT_OPEN_ID") or None
-    bot_user_id = os.getenv("FEISHU_BOT_USER_ID") or None
-    bot_union_id = os.getenv("FEISHU_BOT_UNION_ID") or None
-    bot_name = os.getenv("FEISHU_BOT_NAME") or None
-    if (
-        require_mention
-        and group_policy != "disabled"
-        and not any([bot_open_id, bot_user_id, bot_union_id, bot_name])
-    ):
-        raise SystemExit(
-            "Missing Feishu bot identity for group mention checks. Set one of "
-            "FEISHU_BOT_OPEN_ID, FEISHU_BOT_USER_ID, FEISHU_BOT_UNION_ID, "
-            "FEISHU_BOT_NAME, or set FEISHU_GROUP_POLICY=disabled for DM-only use."
-        )
-    session_store = ChannelSessionStore(session_db_path)
-    event_store = FeishuEventStore(event_db_path)
-    try:
-        adapter = FeishuAdapter(
-            gateway_client=GatewayHTTPClient(
-                base_url=gateway_base_url,
-                bearer_token=gateway_bearer_token,
-            ),
-            feishu_client=FeishuSDKClient(
-                app_id=app_id,
-                app_secret=app_secret,
-                domain=os.getenv("FEISHU_DOMAIN", "feishu"),
-                timeout=float(os.getenv("FEISHU_API_TIMEOUT", "10")),
-            ),
-            default_agent_name=default_agent_name,
-            session_store=session_store,
-            event_store=event_store,
-            require_mention=require_mention,
-            group_policy=group_policy,
-            allowed_users=set(_env_list("FEISHU_ALLOWED_USERS")),
-            allowed_groups=set(_env_list("FEISHU_ALLOWED_GROUPS")),
-            bot_open_id=bot_open_id,
-            bot_user_id=bot_user_id,
-            bot_union_id=bot_union_id,
-            bot_name=bot_name,
-            task_poll_interval=float(os.getenv("FEISHU_TASK_POLL_INTERVAL", "2")),
-            terminal_review_grace_checks=int(
-                os.getenv("FEISHU_TERMINAL_REVIEW_GRACE_CHECKS", "3")
-            ),
-            media_root=os.getenv("FEISHU_MEDIA_ROOT"),
-            media_max_bytes=int(
-                os.getenv("FEISHU_MEDIA_MAX_BYTES", str(DEFAULT_FEISHU_MEDIA_MAX_BYTES))
-            ),
-            ack_mode=os.getenv("FEISHU_ACK_MODE", "reaction"),
-            reactions_enabled=_env_bool("FEISHU_REACTIONS", default=True),
-            processing_reaction=os.getenv("FEISHU_PROCESSING_REACTION", "Typing"),
-            approval_reaction=os.getenv("FEISHU_APPROVAL_REACTION", "CheckMark"),
-            failure_reaction=os.getenv("FEISHU_FAILURE_REACTION", "CrossMark"),
-        )
-        await adapter.run_forever()
-    finally:
-        event_store.close()
-        session_store.close()
+    from ruyi_agent.channels.feishu.runner import run_feishu_adapter as run
+
+    await run()
