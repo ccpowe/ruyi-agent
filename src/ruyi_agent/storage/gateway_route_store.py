@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import threading
@@ -338,7 +339,39 @@ class GatewayRouteStore:
         self,
         task_id: str,
     ) -> TaskRouteRecord:
-        return await to_thread(self.restore_create_not_dispatched, task_id)
+        operation = asyncio.create_task(
+            to_thread(self.restore_create_not_dispatched, task_id)
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
+            except BaseException:
+                break
+        failure: BaseException | None = None
+        route: TaskRouteRecord | None = None
+        try:
+            route = await operation
+        except BaseException as exc:
+            failure = exc
+        current = asyncio.current_task()
+        if (
+            cancellation is None
+            and current is not None
+            and current.cancelling()
+        ):
+            cancellation = asyncio.CancelledError(
+                "cancelled during undispatched create reset"
+            )
+        if cancellation is not None:
+            raise cancellation from failure
+        if failure is not None:
+            raise failure
+        if route is None:  # pragma: no cover - operation contract
+            raise RuntimeError("Undispatched create reset returned no route")
+        return route
 
     def get_create_evidence(self, task_id: str) -> GatewayCreateEvidence | None:
         with self._lock:

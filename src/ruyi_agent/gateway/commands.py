@@ -14,7 +14,6 @@ from uuid import uuid4
 from ruyi_agent.gateway.application import GatewayApplicationContext
 from ruyi_agent.gateway.errors import GatewayEffectDisposition, GatewayTaskError
 from ruyi_agent.gateway.models import AttachmentInput, TaskResponse
-from ruyi_agent.gateway.route_reservations import shield_durable_cleanup
 from ruyi_agent.gateway.task_service import GatewayTaskService
 from ruyi_agent.storage.gateway_command_store import (
     GatewayCommandClaim,
@@ -292,30 +291,29 @@ class GatewayCommandService:
                 exc.effect_disposition
                 == GatewayEffectDisposition.NOT_DISPATCHED
             ):
-                with suppress(BaseException):
-                    await shield_durable_cleanup(
-                        self._context.command_store.arelease_not_dispatched(
-                            command_id=claim.command_id,
-                            claim_token=claim.claim_token,
-                        )
+                cancellation = await _finish_command_cleanup(
+                    self._context.command_store.arelease_not_dispatched(
+                        command_id=claim.command_id,
+                        claim_token=claim.claim_token,
                     )
+                )
             elif _is_terminal_command_error(exc):
-                with suppress(BaseException):
-                    await shield_durable_cleanup(
-                        self._context.command_store.afail(
-                            command_id=claim.command_id,
-                            claim_token=claim.claim_token,
-                            error_json=_dump_gateway_error(exc),
-                        )
+                cancellation = await _finish_command_cleanup(
+                    self._context.command_store.afail(
+                        command_id=claim.command_id,
+                        claim_token=claim.claim_token,
+                        error_json=_dump_gateway_error(exc),
                     )
+                )
             else:
-                with suppress(BaseException):
-                    await shield_durable_cleanup(
-                        self._context.command_store.arelease(
-                            command_id=claim.command_id,
-                            claim_token=claim.claim_token,
-                        )
+                cancellation = await _finish_command_cleanup(
+                    self._context.command_store.arelease(
+                        command_id=claim.command_id,
+                        claim_token=claim.claim_token,
                     )
+                )
+            if cancellation is not None:
+                raise cancellation
             raise
         except BaseException:
             unsafe_started = (
@@ -336,18 +334,18 @@ class GatewayCommandService:
                         "effect_outcome": "uncertain",
                     },
                 )
-                with suppress(BaseException):
-                    await shield_durable_cleanup(
-                        self._terminalize_unsafe_create(claim, uncertain)
-                    )
+                cancellation = await _finish_command_cleanup(
+                    self._settle_unsafe_create_interruption(claim, uncertain)
+                )
             else:
-                with suppress(BaseException):
-                    await shield_durable_cleanup(
-                        self._context.command_store.arelease(
-                            command_id=claim.command_id,
-                            claim_token=claim.claim_token,
-                        )
+                cancellation = await _finish_command_cleanup(
+                    self._context.command_store.arelease(
+                        command_id=claim.command_id,
+                        claim_token=claim.claim_token,
                     )
+                )
+            if cancellation is not None:
+                raise cancellation
             raise
         return GatewayCommandOutcome(task=task, replayed=False)
 
@@ -480,11 +478,22 @@ class GatewayCommandService:
             replayed=True,
         )
 
-    async def _terminalize_unsafe_create(
+    async def _settle_unsafe_create_interruption(
         self,
         claim: GatewayCommandClaim,
         error: GatewayTaskError,
     ) -> None:
+        if await self._tasks.create_not_dispatched_is_durable(
+            task_id=claim.task_id,
+            agent_name=claim.target,
+        ):
+            if claim.claim_token is None:
+                raise RuntimeError("Acquired Gateway command has no claim token")
+            await self._context.command_store.arelease_not_dispatched(
+                command_id=claim.command_id,
+                claim_token=claim.claim_token,
+            )
+            return
         try:
             route = await self._context.router.get_route(claim.task_id)
             await self._context.router.mark_create_outcome_uncertain(
@@ -500,6 +509,31 @@ class GatewayCommandService:
             claim_token=claim.claim_token,
             error_json=_dump_gateway_error(error),
         )
+
+
+async def _finish_command_cleanup(
+    cleanup: Awaitable[None],
+) -> asyncio.CancelledError | None:
+    """Complete a command transition and defer caller cancellation until durable."""
+
+    cleanup_task = asyncio.ensure_future(cleanup)
+    cancellation: asyncio.CancelledError | None = None
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+        except BaseException:
+            break
+    with suppress(BaseException):
+        await cleanup_task
+    current = asyncio.current_task()
+    if cancellation is None and current is not None and current.cancelling():
+        cancellation = asyncio.CancelledError(
+            "cancelled during Gateway command cleanup"
+        )
+    return cancellation
+
 
 def validate_idempotency_key(idempotency_key: str | None) -> None:
     if idempotency_key is None:
