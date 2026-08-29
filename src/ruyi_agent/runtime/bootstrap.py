@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
@@ -16,15 +16,12 @@ from ruyi_agent.runtime.delegation.async_runtime import AgentControl
 from ruyi_agent.integrations.backend.runtime import create_backend_runtime
 from ruyi_agent.config.loader import (
     LocalWorkerSpec,
-    RemoteRef,
     build_all_local_worker_specs,
     build_all_remote_refs,
     load_agent_configs,
     load_llm_provider_configs,
     load_mcp_server_configs,
     load_permission_config,
-    select_local_worker_specs_for_agent,
-    select_remote_refs_for_agent,
 )
 from ruyi_agent.runtime.delegation.context import validate_node_id
 from ruyi_agent.channels.http.routes import attach_gateway_routes
@@ -111,92 +108,6 @@ class AppRuntime:
     skill_syncer: SkillSyncer | None = None
 
 
-def _build_scoped_tool_factory(
-    control_ref: dict[str, AgentControl],
-    agent_name: str,
-):
-    """返回一个延迟工厂，用于在 worker_control 就绪后生成指定 agent 的委派工具列表。
-
-    worker_control 在 all_local_specs 构建完成之后才创建，存在初始化顺序依赖。
-    通过捕获可变字典 control_ref 而非直接捕获 worker_control，工厂函数在被调用时
-    才读取 control_ref["control"]，此时 worker_control 已填入，从而绕开循环依赖。
-    agent_name 固定在闭包中，确保每个 agent 只获得自己被授权的 scoped 工具集。
-    """
-
-    def build_tools() -> list[Any]:
-        return control_ref["control"].build_tools_for(agent_name)
-
-    return build_tools
-
-
-def _attach_delegation_scopes_to_local_specs(
-    *,
-    agent_configs: dict[str, dict[str, Any]],
-    all_local_specs: dict[str, LocalWorkerSpec],
-    all_remote_refs: dict[str, RemoteRef],
-    worker_control_ref: dict[str, AgentControl],
-) -> dict[str, LocalWorkerSpec]:
-    """为每个 local agent 注入其 delegation scope。
-
-    按 agents.toml 中每个 agent 的 workers 配置，筛选出它可委派的本地 spec 和
-    remote ref，并绑定一个延迟工厂 build_delegation_tools，让工具在 worker_control
-    就绪后才生成。最后做一次二次遍历，确保嵌套 spec 对象与完整图保持一致。
-    """
-    specs: dict[str, LocalWorkerSpec] = {}
-    for agent_name, base_spec in all_local_specs.items():
-        delegation_local_specs = select_local_worker_specs_for_agent(
-            agent_name,
-            agent_configs,
-            all_local_specs,
-        )
-        delegation_remote_refs = select_remote_refs_for_agent(
-            agent_name,
-            agent_configs,
-            all_remote_refs,
-        )
-        has_delegation_targets = bool(delegation_local_specs or delegation_remote_refs)
-        has_task_tools = (
-            has_delegation_targets
-            if base_spec.system_tools is None
-            else bool(
-                base_spec.system_tools
-                & {
-                    "spawn_agent",
-                    "wait_agent",
-                    "check_agent",
-                    "send_input",
-                    "cancel_agent",
-                    "list_agents",
-                }
-            )
-        )
-        specs[agent_name] = replace(
-            base_spec,
-            delegation_local_worker_specs=(
-                delegation_local_specs if has_delegation_targets else None
-            ),
-            delegation_remote_refs=(
-                delegation_remote_refs if has_delegation_targets else None
-            ),
-            build_delegation_tools=(
-                _build_scoped_tool_factory(worker_control_ref, agent_name)
-                if has_task_tools
-                else None
-            ),
-        )
-
-    # Keep nested spec objects consistent with the fully attached graph. Runtime
-    # execution resolves agents by name through AgentControl, but the prompt
-    # middleware also carries these specs and should not expose stale child specs.
-    for spec in specs.values():
-        if spec.delegation_local_worker_specs:
-            spec.delegation_local_worker_specs = {
-                child_name: specs[child_name]
-                for child_name in spec.delegation_local_worker_specs
-            }
-    return specs
-
-
 @asynccontextmanager
 async def bootstrap_application():
     """装配并持有当前进程内共享的应用运行时。
@@ -272,7 +183,7 @@ async def bootstrap_application():
             mailbox = AgentMailbox(mailbox_store)
             review_audit_store = ReviewAuditStore(review_audit_db)
             unavailable_agents: dict[str, str] = {}
-            base_local_specs = await build_all_local_worker_specs(
+            all_local_specs = await build_all_local_worker_specs(
                 agent_configs,
                 registry,
                 providers=llm_providers,
@@ -282,18 +193,12 @@ async def bootstrap_application():
                 unavailable_errors=unavailable_agents,
             )
             all_remote_refs = await build_all_remote_refs(agent_configs)
-            worker_control_ref: dict[str, AgentControl] = {}
-            all_local_specs = _attach_delegation_scopes_to_local_specs(
-                agent_configs=agent_configs,
-                all_local_specs=base_local_specs,
-                all_remote_refs=all_remote_refs,
-                worker_control_ref=worker_control_ref,
-            )
 
             # worker_control 是内部调度控制面。它登记所有 local agent 和 remote_ref，
-            # 但每个 agent 实际能调用哪些 target 由自己的 scoped delegation tools 决定。
+            # 每个 agent 的声明式 delegation_targets 在编译时通过 registry 解析，
+            # 并由 scoped delegation tools 强制执行访问范围。
             worker_control = AgentControl(
-                all_local_specs,  # 这些 local 的是已经注入国subagent的了。
+                all_local_specs,
                 all_remote_refs,
                 checkpointer=checkpointer,
                 backend=agent_backend,
@@ -311,8 +216,8 @@ async def bootstrap_application():
                 review_audit_store=review_audit_store,
                 skill_catalog=skill_catalog,
                 skill_syncer=skill_syncer,
+                unavailable_agents=unavailable_agents,
             )
-            worker_control_ref["control"] = worker_control
             await worker_control.wake_pending_mailbox_tasks()
             worker_control.start_mailbox_recovery()
             # Gateway Task Module 负责把任务路由到 public 本地 agent 或 remote_ref。

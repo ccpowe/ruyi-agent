@@ -1,122 +1,22 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from ruyi_agent.runtime.bootstrap import DEFAULT_AGENT_NODE_ID
-from ruyi_agent.runtime.bootstrap import _attach_delegation_scopes_to_local_specs
 from ruyi_agent.runtime.bootstrap import _is_loopback_gateway_host
 from ruyi_agent.runtime.bootstrap import _read_node_id_env
+from ruyi_agent.runtime.bootstrap import bootstrap_application
 from ruyi_agent.runtime.bootstrap import create_bootstrapped_gateway_app
 import ruyi_agent.runtime.bootstrap as bootstrap_module
-from ruyi_agent.config.loader import LocalWorkerSpec
-from ruyi_agent.config.loader import RemoteRef
 
 
-class FakeWorkerControl:
-    def __init__(self) -> None:
-        self.build_tools_calls = 0
+def test_bootstrap_has_no_mutable_control_reference_or_scope_rewrite() -> None:
+    source = inspect.getsource(bootstrap_application.__wrapped__)
 
-    def build_tools_for(self, agent_name: str) -> list[object]:
-        self.build_tools_calls += 1
-        return [f"worker-tool:{agent_name}"]
-
-
-def _local_spec(name: str) -> LocalWorkerSpec:
-    return LocalWorkerSpec(
-        name=name,
-        description=f"{name} desc",
-        system_prompt="prompt",
-        model=object(),
-        tools=[],
-        memory=[],
-        skills=[],
-    )
-
-
-def test_attach_delegation_scopes_uses_each_agent_workers() -> None:
-    agent_configs = {
-        "main": {
-            "kind": "local",
-            "workers": ["research", "remote_wiki"],
-        },
-        "research": {
-            "kind": "local",
-            "workers": ["checker"],
-        },
-        "checker": {
-            "kind": "local",
-            "workers": [],
-        },
-        "remote_wiki": {
-            "kind": "remote_ref",
-        },
-    }
-    local_specs = {
-        name: LocalWorkerSpec(
-            name=name,
-            description=f"{name} desc",
-            system_prompt="prompt",
-            model=object(),
-            tools=[],
-            memory=[],
-            skills=[],
-        )
-        for name in ["main", "research", "checker"]
-    }
-    remote_refs = {
-        "remote_wiki": RemoteRef(
-            name="remote_wiki",
-            description="remote wiki",
-            url="https://example.com/a2a",
-            remote_agent_name="wiki",
-        )
-    }
-    worker_control = FakeWorkerControl()
-    worker_control_ref = {"control": worker_control}
-
-    attached = _attach_delegation_scopes_to_local_specs(
-        agent_configs=agent_configs,
-        all_local_specs=local_specs,
-        all_remote_refs=remote_refs,
-        worker_control_ref=worker_control_ref,
-    )
-
-    assert sorted(attached["main"].delegation_local_worker_specs or {}) == ["research"]
-    assert sorted(attached["main"].delegation_remote_refs or {}) == ["remote_wiki"]
-    assert sorted(attached["research"].delegation_local_worker_specs or {}) == [
-        "checker"
-    ]
-    nested_research = (attached["main"].delegation_local_worker_specs or {})["research"]
-    assert nested_research is attached["research"]
-    assert sorted(nested_research.delegation_local_worker_specs or {}) == ["checker"]
-    assert attached["checker"].delegation_local_worker_specs is None
-    assert attached["checker"].build_delegation_tools is None
-    assert attached["main"].build_delegation_tools is not None
-    assert attached["main"].build_delegation_tools() == ["worker-tool:main"]
-    assert attached["research"].build_delegation_tools is not None
-    assert attached["research"].build_delegation_tools() == ["worker-tool:research"]
-
-
-def test_attach_delegation_scopes_installs_parent_tools_for_leaf_worker() -> None:
-    configs = {
-        "main": {"kind": "local", "workers": ["child"]},
-        "child": {"kind": "local", "workers": []},
-    }
-    main = _local_spec("main")
-    main.system_tools = frozenset({"spawn_agent", "send_input", "list_agents"})
-    child = _local_spec("child")
-    child.system_tools = frozenset({"send_input", "list_agents"})
-
-    attached = _attach_delegation_scopes_to_local_specs(
-        agent_configs=configs,
-        all_local_specs={"main": main, "child": child},
-        all_remote_refs={},
-        worker_control_ref={"control": FakeWorkerControl()},
-    )
-
-    assert attached["child"].delegation_local_worker_specs is None
-    assert attached["child"].build_delegation_tools is not None
-    assert attached["child"].build_delegation_tools() == ["worker-tool:child"]
+    assert "control_ref" not in source
+    assert "attach_delegation" not in source
 
 
 def test_read_node_id_env_uses_default_for_missing_value(

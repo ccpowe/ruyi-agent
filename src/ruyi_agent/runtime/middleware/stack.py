@@ -41,7 +41,7 @@ def build_runtime_middleware(
     memory: list[str] | None,
     local_worker_specs: dict[str, LocalWorkerSpec] | None,
     remote_refs: dict[str, RemoteRef] | None,
-    build_worker_tools: Callable[[], list[Any]] | None = None,
+    worker_tools: list[Any] | None = None,
     mailbox: AgentMailbox | None = None,
     load_tasks_for_thread: Callable[[str], None] | None = None,
     permission_policy: PermissionPolicy | None = None,
@@ -122,12 +122,12 @@ def build_runtime_middleware(
         ]
     )
 
-    if build_worker_tools is not None:
+    if worker_tools is not None:
         middleware.append(
             WorkerDelegationMiddleware(
                 specs=local_worker_specs or {},
                 remote_refs=remote_refs,
-                build_tools=build_worker_tools,
+                tools=worker_tools,
             )
         )
 

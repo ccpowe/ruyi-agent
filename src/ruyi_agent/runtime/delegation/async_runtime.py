@@ -51,6 +51,7 @@ from pydantic import BaseModel, Field
 from ruyi_agent.integrations.a2a.client import A2AClient, A2AClientError
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.config.loader import LocalWorkerSpec, RemoteRef
+from ruyi_agent.config.system_tools import DELEGATION_SYSTEM_TOOLS
 from ruyi_agent.runtime.delegation.context import (
     DelegationContext,
     MetadataScalar,
@@ -155,6 +156,12 @@ class ListAgentsSchema(BaseModel):
 
 class UnknownAgentTargetError(ValueError):
     """请求的 agent 目标未在当前 runtime 中注册"""
+
+    pass
+
+
+class UnavailableAgentTargetError(UnknownAgentTargetError):
+    """请求的本地 agent 已配置，但当前 runtime 无法构造其执行定义"""
 
     pass
 
@@ -542,6 +549,7 @@ class AgentRegistry:
         self,
         specs: dict[str, LocalWorkerSpec],
         remote_refs: dict[str, RemoteRef] | None = None,
+        unavailable_agents: dict[str, str] | None = None,
     ) -> None:
         """
         初始化 agent 注册表
@@ -549,6 +557,7 @@ class AgentRegistry:
         Args:
             specs: 本地 worker 配置表
             remote_refs: 远端 agent 引用配置表
+            unavailable_agents: 已配置但初始化失败的本地 agent 及原因
         """
         # 为什么有 registry：运行时需要同时知道有哪些本地 worker 可用，以及哪些 remote_ref 已登记。
         #  ["name_1":LocalWorkerEntry(),"name_2":RemoteRefEntry()...]
@@ -568,6 +577,7 @@ class AgentRegistry:
                 kind="remote_ref",
                 ref=remote_ref,
             )
+        self._unavailable_agents = dict(unavailable_agents or {})
 
     def has_agent(self, agent_name: str) -> bool:
         """
@@ -685,12 +695,15 @@ class AgentRegistry:
         Raises:
             UnknownAgentTargetError: agent_name 未注册
         """
-        try:
-            return self._entries[agent_name]
-        except KeyError as exc:
-            raise UnknownAgentTargetError(
-                f"Unknown agent target: {agent_name}"
-            ) from exc
+        entry = self._entries.get(agent_name)
+        if entry is not None:
+            return entry
+        unavailable_reason = self._unavailable_agents.get(agent_name)
+        if unavailable_reason is not None:
+            raise UnavailableAgentTargetError(
+                f"Agent target '{agent_name}' is unavailable: {unavailable_reason}"
+            )
+        raise UnknownAgentTargetError(f"Unknown agent target: {agent_name}")
 
     def get_spec(self, agent_name: str) -> LocalWorkerSpec:
         """
@@ -713,6 +726,28 @@ class AgentRegistry:
                 f"Agent target '{agent_name}' is a remote_ref and cannot be executed locally."
             )
         return entry.spec
+
+    def select_local_specs(
+        self,
+        target_names: set[str],
+    ) -> dict[str, LocalWorkerSpec]:
+        """Resolve the available local targets in one agent's declared scope."""
+        return {
+            name: entry.spec
+            for name, entry in self._entries.items()
+            if name in target_names and isinstance(entry, LocalWorkerEntry)
+        }
+
+    def select_remote_refs(
+        self,
+        target_names: set[str],
+    ) -> dict[str, RemoteRef]:
+        """Resolve the available remote targets in one agent's declared scope."""
+        return {
+            name: entry.ref
+            for name, entry in self._entries.items()
+            if name in target_names and isinstance(entry, RemoteRefEntry)
+        }
 
     def register_task(
         self,
@@ -1361,6 +1396,7 @@ class AgentControl:
         review_audit_store: ReviewAuditStore | None = None,
         skill_catalog: Mapping[str, SkillEntry] | None = None,
         skill_syncer: SkillSyncer | None = None,
+        unavailable_agents: dict[str, str] | None = None,
     ) -> None:
         """
         初始化委托控制器
@@ -1385,6 +1421,7 @@ class AgentControl:
             backend_kind: 当前 runtime 后端类型
             workspace_root: 当前 runtime 工作目录
             review_audit_store: 审批与权限审计日志
+            unavailable_agents: 已配置但初始化失败的本地 agent 及原因
 
         Raises:
             ValueError: 委托深度或任务预算配置不合法
@@ -1394,7 +1431,7 @@ class AgentControl:
             raise ValueError("max_delegation_depth must be at least 1")
         if max_tasks_per_root < 1:
             raise ValueError("max_tasks_per_root must be at least 1")
-        self._registry = AgentRegistry(specs, remote_refs)
+        self._registry = AgentRegistry(specs, remote_refs, unavailable_agents)
         self._task_manager = TaskManager(task_store)
         self._checkpointer = checkpointer
         self._message_state_reader = TaskMessageStateReader(checkpointer)
@@ -1496,15 +1533,24 @@ class AgentControl:
             return agent
 
         spec = self._registry.get_spec(agent_name)
+        allowed_targets = set(spec.delegation_targets)
+        has_delegation_tools = (
+            bool(allowed_targets)
+            if spec.system_tools is None
+            else bool(spec.system_tools & DELEGATION_SYSTEM_TOOLS)
+        )
+        worker_tools = (
+            self.build_tools_for(agent_name) if has_delegation_tools else None
+        )
         # worker 自己内部也走新的 runtime 包装器，
         # 这样整个系统里不会混入 deepagents 默认 task/general-purpose。
         agent = create_runtime_agent(
             model=spec.model,
             system_prompt=spec.system_prompt,
             tools=spec.tools,
-            local_worker_specs=spec.delegation_local_worker_specs,
-            remote_refs=spec.delegation_remote_refs,
-            build_worker_tools=spec.build_delegation_tools,
+            local_worker_specs=self._registry.select_local_specs(allowed_targets),
+            remote_refs=self._registry.select_remote_refs(allowed_targets),
+            worker_tools=worker_tools,
             memory=spec.memory,
             skills=spec.skills,
             backend=self._backend,
@@ -2347,13 +2393,7 @@ class AgentControl:
         Returns:
             该 worker 配置中允许继续委托的本地 worker 和 remote_ref 名称集合
         """
-        spec = self._registry.get_spec(agent_name)
-        allowed_targets: set[str] = set()
-        if spec.delegation_local_worker_specs:
-            allowed_targets.update(spec.delegation_local_worker_specs)
-        if spec.delegation_remote_refs:
-            allowed_targets.update(spec.delegation_remote_refs)
-        return allowed_targets
+        return set(self._registry.get_spec(agent_name).delegation_targets)
 
     def build_tools_for(self, agent_name: str) -> list[StructuredTool]:
         """
@@ -3286,10 +3326,10 @@ class AgentControl:
                 ),
                 parent_thread_id=parent_thread_id,
             )
-        except UnknownAgentTargetError:
+        except UnknownAgentTargetError as exc:
             available = ", ".join(self._registry.list_target_names())
             # 工具参数错误返回普通文本，而不是抛异常打断整轮 agent 执行。
-            return f"Unknown agent target: {agent_name}. Available: {available}"
+            return f"{exc}. Available: {available}"
         except MaxDelegationDepthError as exc:
             return self._format_depth_limit_error(exc)
         except MaxTasksPerRootError as exc:

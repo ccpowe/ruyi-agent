@@ -41,9 +41,7 @@ class LocalWorkerSpec:
     memory: list[str]
     skills: SkillSelection
     permission_profile: str | None = None
-    delegation_local_worker_specs: dict[str, LocalWorkerSpec] | None = None
-    delegation_remote_refs: dict[str, RemoteRef] | None = None
-    build_delegation_tools: Callable[[], list[Any]] | None = None
+    delegation_targets: tuple[str, ...] = ()
     tool_search: bool = False
     tool_search_registry: MCPRegistry | None = None
     tool_search_server_names: list[str] = field(default_factory=list)
@@ -870,6 +868,7 @@ async def build_local_worker_spec(
         memory=to_backend_paths(agent_config.get("memory", []), home_dir),
         skills=parse_skill_selection(agent_config.get("skills", "inherit")),
         permission_profile=agent_config.get("permission_profile"),
+        delegation_targets=tuple(agent_config.get("workers", [])),
         tool_search=tool_search,
         tool_search_registry=registry if tool_search else None,
         tool_search_server_names=server_names,
@@ -924,38 +923,6 @@ async def build_all_remote_refs(
             continue
         refs[agent_name] = build_remote_ref(agent_name, agent_configs)
     return refs
-
-
-def select_local_worker_specs_for_agent(
-    agent_name: str,
-    agent_configs: dict[str, dict[str, Any]],
-    all_local_specs: dict[str, LocalWorkerSpec],
-) -> dict[str, LocalWorkerSpec]:
-    """从全量 local spec 中筛选出指定 agent 的 workers 配置里的本地目标。"""
-    agent_config = agent_configs[agent_name]
-    if agent_config["kind"] != "local":
-        raise ValueError(f"Agent '{agent_name}' is not a local agent.")
-    return {
-        target_name: all_local_specs[target_name]
-        for target_name in agent_config.get("workers", [])
-        if target_name in all_local_specs
-    }
-
-
-def select_remote_refs_for_agent(
-    agent_name: str,
-    agent_configs: dict[str, dict[str, Any]],
-    all_remote_refs: dict[str, RemoteRef],
-) -> dict[str, RemoteRef]:
-    """从全量 remote ref 中筛选出指定 agent 的 workers 配置里的远端目标。"""
-    agent_config = agent_configs[agent_name]
-    if agent_config["kind"] != "local":
-        raise ValueError(f"Agent '{agent_name}' is not a local agent.")
-    return {
-        target_name: all_remote_refs[target_name]
-        for target_name in agent_config.get("workers", [])
-        if target_name in all_remote_refs
-    }
 
 
 def select_public_local_worker_specs(
