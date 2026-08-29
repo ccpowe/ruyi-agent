@@ -62,6 +62,25 @@ class _BlockingReleaseCommandStore(GatewayCommandStore):
         await super().arelease_not_dispatched(**kwargs)
 
 
+class _ConcurrentReopenCommandStore(GatewayCommandStore):
+    def __init__(self, db_path: str, *, participants: int) -> None:
+        super().__init__(db_path)
+        self._participants = participants
+        self._entered = 0
+        self._barrier = asyncio.Condition()
+
+    async def areopen_not_dispatched(self, **kwargs: str) -> bool:
+        async with self._barrier:
+            self._entered += 1
+            if self._entered == self._participants:
+                self._barrier.notify_all()
+            else:
+                await self._barrier.wait_for(
+                    lambda: self._entered >= self._participants
+                )
+        return await super().areopen_not_dispatched(**kwargs)
+
+
 def _leave_committed_reset_before_command_release(
     route_path: str,
     command_path: str,
@@ -474,6 +493,116 @@ def test_process_exit_after_route_reset_reopens_command_on_restart(
         task_id="process-reset-task",
         effect_requests=effects,
     )
+
+
+def test_concurrent_terminal_reopen_reclaims_before_using_stale_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    route_path = str(tmp_path / "concurrent-reopen-routes.sqlite")
+    command_path = str(tmp_path / "concurrent-reopen-commands.sqlite")
+    routes = GatewayRouteStore(route_path)
+    routes.reserve_route(
+        TaskRouteRecord(
+            task_id="concurrent-reopen-task",
+            agent_name="remote_code_wiki",
+            metadata={},
+            route_kind="remote_ref",
+            upstream_task_id=None,
+            route_state="pending",
+        ),
+        create_key_scope="external",
+        create_replay_policy="never",
+    )
+    routes.mark_create_effect_started("concurrent-reopen-task")
+    routes.restore_create_not_dispatched("concurrent-reopen-task")
+    commands = GatewayCommandStore(command_path)
+    claim = commands.claim(
+        principal_id="gateway-bearer",
+        idempotency_key=_HEADERS["Idempotency-Key"],
+        operation="create_task",
+        target="remote_code_wiki",
+        request_hash=command_request_hash(
+            operation="create_task",
+            target="remote_code_wiki",
+            body={
+                "input": {"content": "create exactly once", "attachments": []},
+                "metadata": {},
+                "webhook": None,
+            },
+        ),
+        proposed_task_id="concurrent-reopen-task",
+    )
+    assert claim.claim_token is not None
+    commands.mark_effect_started(
+        command_id=claim.command_id,
+        claim_token=claim.claim_token,
+        replay_safe=False,
+    )
+    routes.close()
+    commands.close()
+
+    monkeypatch.setenv("REMOTE_CODE_WIKI_TOKEN", "remote-secret")
+    recovered_routes = GatewayRouteStore(route_path)
+    recovered_commands = _ConcurrentReopenCommandStore(
+        command_path,
+        participants=4,
+    )
+    effects: list[httpx.Request] = []
+
+    def create_once(request: httpx.Request) -> httpx.Response:
+        effects.append(request)
+        return _success_response(request)
+
+    app, _ = build_app(
+        monkeypatch,
+        a2a_client=A2AClient(
+            transports={_REMOTE_URL: httpx.MockTransport(create_once)}
+        ),
+        route_store=recovered_routes,
+        command_store=recovered_commands,
+        remote_url=_REMOTE_URL,
+        remote_create_idempotency="none",
+    )
+
+    async def requests() -> tuple[list[httpx.Response], httpx.Response]:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://gateway.test",
+        ) as client:
+            same = await asyncio.gather(
+                *[
+                    client.post(
+                        "/agents/remote_code_wiki/tasks",
+                        headers=_HEADERS,
+                        json=_BODY,
+                    )
+                    for _ in range(4)
+                ]
+            )
+            conflict = await client.post(
+                "/agents/remote_code_wiki/tasks",
+                headers=_HEADERS,
+                json={"input": {"content": "different request"}, "metadata": {}},
+            )
+        return same, conflict
+
+    try:
+        same, conflict = asyncio.run(requests())
+        assert {response.status_code for response in same} == {201}
+        assert len({response.text for response in same}) == 1
+        assert sum(
+            response.headers.get("idempotency-replayed") == "true"
+            for response in same
+        ) == 3
+        assert len(effects) == 1
+        route = recovered_routes.get_route("concurrent-reopen-task")
+        assert route is not None and route.route_state == "active"
+        assert conflict.status_code == 409
+        assert conflict.json()["error"]["code"] == "idempotency_key_reused"
+    finally:
+        recovered_routes.close()
+        recovered_commands.close()
 
 
 @pytest.mark.parametrize("failure", ["missing_token", "invalid_url", "connect"])

@@ -89,10 +89,11 @@ class GatewayCommandService:
             request_hash=request_hash,
             proposed_task_id=str(uuid4()),
         )
-        if claim.status == "terminal" and await self._reopen_not_dispatched_create(
-            claim,
-            agent_name=agent_name,
-        ):
+        if claim.status == "terminal":
+            await self._reopen_not_dispatched_create(
+                claim,
+                agent_name=agent_name,
+            )
             claim = await self._claim(
                 principal_id=principal_id,
                 idempotency_key=idempotency_key,
@@ -354,7 +355,7 @@ class GatewayCommandService:
         claim: GatewayCommandClaim,
         *,
         agent_name: str,
-    ) -> bool:
+    ) -> None:
         """Recover the route-reset/command-release cross-database crash window."""
 
         if claim.error_json is None or not (
@@ -363,8 +364,8 @@ class GatewayCommandService:
                 agent_name=agent_name,
             )
         ):
-            return False
-        return await self._context.command_store.areopen_not_dispatched(
+            return
+        await self._context.command_store.areopen_not_dispatched(
             command_id=claim.command_id,
             expected_error_json=claim.error_json,
         )
