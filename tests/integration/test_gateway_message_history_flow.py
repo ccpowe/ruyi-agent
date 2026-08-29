@@ -155,13 +155,20 @@ def test_local_message_history_is_snapshot_consistent_and_survives_restart(
             )
             try:
                 pending_task_id = "pending-without-checkpoint"
-                control._task_manager.create_task_record(
+                pending_record = control._task_manager.create_task_record(
                     pending_task_id,
                     "main",
                     parent_task_id=None,
                     root_task_id=pending_task_id,
                     depth=1,
                 )
+                # Message history may legitimately be empty after a durable run
+                # starts but before its first checkpoint is written.  A bare
+                # pending record is not durable create evidence and must not be
+                # paired with an active route.
+                pending_record.state = "running"
+                pending_record.run_count = 1
+                task_store.update_task(pending_record)
                 await route_store.asave_route(
                     TaskRouteRecord(
                         task_id=pending_task_id,
