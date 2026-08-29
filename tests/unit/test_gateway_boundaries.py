@@ -14,7 +14,7 @@ import ruyi_agent.gateway.attachments as gateway_attachments
 import ruyi_agent.gateway.commands as gateway_commands
 import ruyi_agent.gateway.tasks as gateway_tasks
 from ruyi_agent.channels.http.routes import create_gateway_app
-from ruyi_agent.config.agent_models import LocalAgentConfig
+from ruyi_agent.config.agent_models import LocalAgentConfig, RemoteAgentConfig
 from ruyi_agent.gateway.application import GatewayAgentService
 from ruyi_agent.gateway.artifacts import GatewayArtifactService
 from ruyi_agent.gateway.commands import GatewayCommandOutcome, GatewayCommandService
@@ -98,6 +98,44 @@ def test_gateway_normalizes_legacy_configs_once_and_uses_typed_fields(
     monkeypatch.setattr(LocalAgentConfig, "__getitem__", fail_legacy_indexing)
     assert [item.name for item in service.list_agents()] == ["main"]
     assert service.get_agent("main").kind == "local"
+
+
+def test_gateway_keeps_catalog_only_legacy_constructor_input() -> None:
+    service = GatewayTaskModule(
+        main_agent_name="main",
+        agent_configs={
+            "main": {
+                "kind": "local",
+                "public": True,
+                "name": "main",
+                "description": "Main Agent",
+            }
+        },
+        control=cast(AgentControl, object()),
+    )
+
+    config = service._context.agent_configs["main"]  # noqa: SLF001
+    assert isinstance(config, LocalAgentConfig)
+    assert service.get_agent("main").description == "Main Agent"
+
+
+def test_gateway_keeps_remote_catalog_only_legacy_input() -> None:
+    service = GatewayTaskModule(
+        main_agent_name="remote",
+        agent_configs={
+            "remote": {
+                "kind": "remote_ref",
+                "public": True,
+                "name": "remote",
+                "description": "Remote Agent",
+            }
+        },
+        control=cast(AgentControl, object()),
+    )
+
+    config = service._context.agent_configs["remote"]  # noqa: SLF001
+    assert isinstance(config, RemoteAgentConfig)
+    assert service.get_agent("remote").description == "Remote Agent"
 
 
 def test_gateway_command_outcome_remains_reexported_from_facade_module() -> None:

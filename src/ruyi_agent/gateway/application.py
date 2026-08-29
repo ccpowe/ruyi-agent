@@ -25,6 +25,24 @@ from ruyi_agent.task_models import (
 )
 
 
+_LEGACY_GATEWAY_CATALOG_FIELDS = {
+    "kind",
+    "public",
+    "name",
+    "description",
+}
+_LEGACY_LOCAL_RUNTIME_DEFAULTS: dict[str, object] = {
+    "system_prompt": "",
+    "provider": "gateway-catalog",
+    "model": "gateway-catalog",
+    "memory": [],
+    "skills": [],
+    "server_names": [],
+    "tool_names": [],
+    "workers": [],
+}
+
+
 def parse_gateway_agent_configs(
     raw_agent_configs: Mapping[str, object],
 ) -> AgentConfigs:
@@ -34,7 +52,33 @@ def parse_gateway_agent_configs(
         # Listing-only embedders historically constructed an empty Gateway and
         # supplied their own remote listing router after initialization.
         return {}
-    return coerce_agent_configs(raw_agent_configs)
+    normalized = {
+        name: _normalize_legacy_gateway_config(config)
+        for name, config in raw_agent_configs.items()
+    }
+    return coerce_agent_configs(normalized)
+
+
+def _normalize_legacy_gateway_config(config: object) -> object:
+    if not isinstance(config, Mapping):
+        return config
+    if not set(config) <= _LEGACY_GATEWAY_CATALOG_FIELDS:
+        return config
+    if config.get("kind") == "local":
+        return {**config, **_LEGACY_LOCAL_RUNTIME_DEFAULTS}
+    if config.get("kind") == "remote_ref":
+        configured_name = config.get("name")
+        remote_agent_name = (
+            configured_name
+            if isinstance(configured_name, str) and configured_name
+            else "gateway-catalog"
+        )
+        return {
+            **config,
+            "url": "https://gateway-catalog.invalid",
+            "remote_agent_name": remote_agent_name,
+        }
+    return config
 
 
 @dataclass(slots=True)
