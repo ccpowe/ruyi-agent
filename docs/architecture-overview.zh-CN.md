@@ -107,10 +107,15 @@ Public 可见性属于 Gateway Task Module 的入口策略，不通过创建第�
 
 `src/ruyi_agent/channels/http/routes.py` 是 FastAPI Adapter，只负责：
 
+- 无认证、无缓存的 `/health` 存活探针和 `/ready` 生命周期就绪探针。
 - Bearer Token。
 - HTTP 请求模型和参数解析。
 - HTTP 状态码、Header 和 JSON 错误封装。
 - 调用 Gateway Task Interface。
+
+`/health` 不检查外部或持久化依赖，避免依赖抖动触发实例重启；`/ready` 由
+FastAPI lifespan gate 控制，在完整 runtime 安装后开放流量，并在资源关闭前先
+变为未就绪。模型、MCP、remote ref 和请求期 backend 状态不属于进程级探针。
 
 领域错误由 `gateway/errors.py` 定义，HTTP Adapter 再将错误代码或语义类型映射为状态码。
 

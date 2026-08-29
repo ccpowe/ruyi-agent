@@ -9,7 +9,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Any, Awaitable
+from typing import Any, Awaitable, Literal
 from urllib.parse import parse_qsl, quote
 
 from fastapi import Depends, FastAPI, Header, Request
@@ -54,6 +54,8 @@ from .team_console_auth import (
 
 
 TASK_EVENT_HEARTBEAT_SECONDS = 15.0
+
+_PROBE_HEADERS = {"Cache-Control": "no-store"}
 
 _INVALID_FORM_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
@@ -251,6 +253,18 @@ class TaskInput(BaseModel):
         raise ValueError("input.content or input.attachments is required")
 
 
+class HealthProbeResponse(BaseModel):
+    status: Literal["ok"]
+
+
+class ReadyProbeResponse(BaseModel):
+    status: Literal["ready"]
+
+
+class NotReadyProbeResponse(BaseModel):
+    status: Literal["not_ready"]
+
+
 class CreateTaskRequest(BaseModel):
     input: TaskInput
     metadata: dict[str, MetadataScalar] = Field(default_factory=dict)
@@ -310,8 +324,9 @@ def attach_gateway_routes(
     *,
     service_getter: Callable[[Request], GatewayTaskModule],
     bearer_token: str,
+    readiness_getter: Callable[[Request], bool] | None = None,
 ) -> None:
-    """Attach the authenticated Gateway HTTP Interface to a FastAPI app."""
+    """Attach the Gateway HTTP Interface and unauthenticated probes."""
 
     console_root = Path(__file__).resolve().parents[2] / "web" / "team_console"
     console_auth = TeamConsoleAuthenticator(bearer_token)
@@ -331,6 +346,51 @@ def attach_gateway_routes(
         return console_auth.console_transport_allowed(
             request.scope
         ) and console_auth.authenticate_console_session(request.scope)
+
+    @app.get(
+        "/health",
+        response_model=HealthProbeResponse,
+        tags=["Operations"],
+        summary="Check Gateway liveness",
+    )
+    async def health_probe() -> JSONResponse:
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ok"},
+            headers=dict(_PROBE_HEADERS),
+        )
+
+    @app.get(
+        "/ready",
+        response_model=ReadyProbeResponse,
+        responses={
+            503: {
+                "model": NotReadyProbeResponse,
+                "description": "Gateway runtime is not ready to accept traffic",
+            }
+        },
+        tags=["Operations"],
+        summary="Check Gateway readiness",
+    )
+    async def readiness_probe(request: Request) -> JSONResponse:
+        try:
+            ready = readiness_getter is None or readiness_getter(request)
+            if ready:
+                service_getter(request)
+        except Exception:
+            ready = False
+
+        if ready:
+            return JSONResponse(
+                status_code=200,
+                content={"status": "ready"},
+                headers=dict(_PROBE_HEADERS),
+            )
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready"},
+            headers={**_PROBE_HEADERS, "Retry-After": "1"},
+        )
 
     @app.get("/debug/team/login", response_class=HTMLResponse, include_in_schema=False)
     async def team_console_login(request: Request) -> Response:
@@ -600,9 +660,7 @@ def attach_gateway_routes(
         _: None = Depends(require_bearer),
     ) -> StreamingResponse:
         run_count = _parse_run_count(request.query_params.get("run_count"))
-        if last_event_id is not None and not is_valid_task_event_cursor(
-            last_event_id
-        ):
+        if last_event_id is not None and not is_valid_task_event_cursor(last_event_id):
             raise GatewayTaskError(
                 code="invalid_request",
                 message="Header 'Last-Event-ID' is invalid",

@@ -403,14 +403,21 @@ def create_bootstrapped_gateway_app() -> FastAPI:
                 "before exposing Gateway outside localhost."
             )
         async with bootstrap_application() as runtime:
-            app.state.app_runtime = runtime
-            app.state.gateway_service = runtime.gateway_service
-            yield
+            try:
+                app.state.app_runtime = runtime
+                app.state.gateway_service = runtime.gateway_service
+                app.state.gateway_ready = True
+                yield
+            finally:
+                # Stop accepting new traffic before runtime resources are closed.
+                app.state.gateway_ready = False
 
     app = FastAPI(title="ruyi-agent Gateway", lifespan=lifespan)
+    app.state.gateway_ready = False
     attach_gateway_routes(
         app,
         service_getter=lambda request: request.app.state.gateway_service,
         bearer_token=bearer_token,
+        readiness_getter=lambda request: bool(request.app.state.gateway_ready),
     )
     return app

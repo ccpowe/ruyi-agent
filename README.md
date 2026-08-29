@@ -183,10 +183,39 @@ ruyi --all
 
 ## Gateway API
 
-所有 Gateway API 都需要 Bearer Token：
+除公开的运行探针外，所有 Gateway 业务 API 都需要 Bearer Token：
 
 ```bash
 export GATEWAY_BEARER_TOKEN=dev-token
+```
+
+存活与就绪探针不需要认证，只返回最小状态且禁止缓存：
+
+```bash
+curl http://127.0.0.1:8000/health
+# {"status":"ok"}
+
+curl http://127.0.0.1:8000/ready
+# {"status":"ready"}
+```
+
+`GET /health` 是恒定、无依赖的进程存活信号；只要 ASGI 应用还能响应就返回
+`200`。`GET /ready` 只在 runtime 启动完成且 Gateway Task Module 已安装时返回
+`200`，启动前或关闭过程中返回 `503 {"status":"not_ready"}` 和
+`Retry-After: 1`。探针不会调用模型、MCP、remote agent，也不承诺检测运行期间的
+磁盘耗尽或 SQLite 损坏；具体业务依赖故障仍由对应 API 返回。
+
+Kubernetes 可分别配置：
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8000
 ```
 
 浏览器调试台位于：
