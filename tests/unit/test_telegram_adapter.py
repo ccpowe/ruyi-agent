@@ -190,8 +190,9 @@ def test_adapter_continues_existing_task_when_not_running() -> None:
         {"channel": "telegram", "chat_id": "100", "user_id": "200"}
     ]
     assert gateway.sent == [("task-9", "follow up", None)]
-    assert telegram.sent_messages[0]["text"].startswith("已收到，task\\_id\\=task\\-9")
-    assert "done: follow up" in telegram.sent_messages[1]["text"]
+    assert telegram.sent_messages[0]["text"].startswith("old")
+    assert telegram.sent_messages[1]["text"].startswith("已收到，task\\_id\\=task\\-9")
+    assert "done: follow up" in telegram.sent_messages[2]["text"]
 
 
 def test_adapter_legacy_fallback_uses_old_metadata_only() -> None:
@@ -348,7 +349,8 @@ def test_adapter_continues_session_store_task_without_listing() -> None:
 
     assert gateway.list_items == []
     assert gateway.sent == [("task-9", "follow up", None)]
-    assert "done: follow up" in telegram.sent_messages[1]["text"]
+    assert "old" in telegram.sent_messages[0]["text"]
+    assert "done: follow up" in telegram.sent_messages[2]["text"]
 
 
 def test_adapter_restores_watcher_when_existing_task_is_running() -> None:
@@ -375,7 +377,7 @@ def test_adapter_restores_watcher_when_existing_task_is_running() -> None:
 
     async def scenario() -> None:
         await adapter.handle_message(build_message("hello again"))
-        assert adapter._has_active_watcher(task_id="task-7", run_count=1)
+        assert adapter._delivery.is_active(task_id="task-7", run_count=1)
         gateway.tasks["task-7"] = {
             **running_task,
             "status": "completed",

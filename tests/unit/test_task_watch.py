@@ -83,11 +83,12 @@ async def test_watch_sends_terminal_once_during_grace_checks() -> None:
         hooks=TaskWatchHooks(
             on_pending_review=lambda _: append(events, "review"),
             on_terminal=lambda _: append(events, "terminal"),
+            on_terminal_grace_complete=lambda _: append(events, "grace-complete"),
         ),
     )
     await manager.wait()
 
-    assert events == ["terminal"]
+    assert events == ["terminal", "grace-complete"]
     assert gateway.calls == 3
 
 
@@ -134,6 +135,32 @@ async def test_watch_stops_when_newer_run_supersedes_it() -> None:
     await manager.wait()
 
     assert events == ["superseded"]
+
+
+@async_test
+async def test_watch_ignores_stale_lower_run_snapshot() -> None:
+    gateway = SequenceGateway(
+        [task("completed", run_count=1), task("completed", run_count=2)]
+    )
+    events: list[str] = []
+    manager = TaskWatchManager(
+        gateway_client=gateway,
+        poll_interval=0,
+        terminal_review_grace_checks=0,
+    )
+    manager.ensure(
+        task_id="task-1",
+        run_count=2,
+        hooks=TaskWatchHooks(
+            on_pending_review=lambda _: append(events, "review"),
+            on_terminal=lambda task: append(events, f"terminal:{task.run_count}"),
+        ),
+    )
+
+    await manager.wait()
+
+    assert events == ["terminal:2"]
+    assert gateway.calls == 2
 
 
 @async_test

@@ -16,6 +16,8 @@ RECOVERABLE_DELIVERY_STATES = {
     "retry_wait",
     "error",
     "delivering",
+    "review_waiting",
+    "terminal_grace",
 }
 
 
@@ -94,22 +96,7 @@ class ChannelDeliveryStore:
                 ) VALUES (?, ?, ?, ?, ?, ?, 'watch', 'watching', 0, 0, 0, ?, ?)
                 ON CONFLICT(intent_id) DO UPDATE SET
                     chat_id = excluded.chat_id,
-                    updated_at = excluded.updated_at,
-                    state = CASE
-                        WHEN channel_delivery_intents.state IN ('delivered', 'superseded')
-                            THEN channel_delivery_intents.state
-                        ELSE 'watching'
-                    END,
-                    next_attempt_at = CASE
-                        WHEN channel_delivery_intents.state IN ('delivered', 'superseded')
-                            THEN channel_delivery_intents.next_attempt_at
-                        ELSE NULL
-                    END,
-                    last_error = CASE
-                        WHEN channel_delivery_intents.state IN ('delivered', 'superseded')
-                            THEN channel_delivery_intents.last_error
-                        ELSE NULL
-                    END
+                    updated_at = excluded.updated_at
                 """,
                 (
                     intent_id,
@@ -226,9 +213,9 @@ class ChannelDeliveryStore:
                 """
                 UPDATE channel_delivery_intents
                 SET lease_until = ?, updated_at = ?
-                WHERE intent_id = ? AND lease_token = ?
+                WHERE intent_id = ? AND lease_token = ? AND lease_until > ?
                 """,
-                (now + lease_seconds, now, intent_id, token),
+                (now + lease_seconds, now, intent_id, token, now),
             )
             self._conn.commit()
         return cursor.rowcount == 1
@@ -254,16 +241,21 @@ class ChannelDeliveryStore:
         )
 
     def mark_watching(self, intent_id: str, *, token: str) -> bool:
+        now = self._clock()
         with self._lock:
             cursor = self._conn.execute(
                 """
                 UPDATE channel_delivery_intents
-                SET state = 'watching', attempt_count = 0,
+                SET state = CASE
+                        WHEN state IN ('review_waiting', 'terminal_grace') THEN state
+                        ELSE 'watching'
+                    END,
+                    attempt_count = 0,
                     next_attempt_at = NULL, last_error = NULL, updated_at = ?
-                WHERE intent_id = ? AND lease_token = ?
+                WHERE intent_id = ? AND lease_token = ? AND lease_until > ?
                     AND state NOT IN ('delivered', 'superseded')
                 """,
-                (self._clock(), intent_id, token),
+                (now, intent_id, token, now),
             )
             self._conn.commit()
         return cursor.rowcount == 1
@@ -297,6 +289,28 @@ class ChannelDeliveryStore:
                 "updated_at = ?"
             ),
             values=(error, self._clock()),
+        )
+
+    def mark_review_waiting(self, intent_id: str, *, token: str) -> bool:
+        return self._owned_update(
+            intent_id,
+            token=token,
+            assignments=(
+                "state = 'review_waiting', attempt_count = 0, "
+                "next_attempt_at = NULL, last_error = NULL, updated_at = ?"
+            ),
+            values=(self._clock(),),
+        )
+
+    def mark_terminal_steps_done(self, intent_id: str, *, token: str) -> bool:
+        return self._owned_update(
+            intent_id,
+            token=token,
+            assignments=(
+                "state = 'terminal_grace', attempt_count = 0, "
+                "next_attempt_at = NULL, last_error = NULL, updated_at = ?"
+            ),
+            values=(self._clock(),),
         )
 
     def mark_delivered(self, intent_id: str, *, token: str) -> bool:
@@ -346,9 +360,9 @@ class ChannelDeliveryStore:
                 owned = self._conn.execute(
                     """
                     SELECT 1 FROM channel_delivery_intents
-                    WHERE intent_id = ? AND lease_token = ?
+                    WHERE intent_id = ? AND lease_token = ? AND lease_until > ?
                     """,
-                    (intent_id, token),
+                    (intent_id, token, now),
                 ).fetchone()
                 if owned is None:
                     self._conn.rollback()
@@ -376,15 +390,18 @@ class ChannelDeliveryStore:
                 raise
 
     def release(self, intent_id: str, *, token: str) -> bool:
-        return self._owned_update(
-            intent_id,
-            token=token,
-            assignments=(
-                "lease_owner = NULL, lease_token = NULL, lease_until = NULL, "
-                "updated_at = ?"
-            ),
-            values=(self._clock(),),
-        )
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE channel_delivery_intents
+                SET lease_owner = NULL, lease_token = NULL, lease_until = NULL,
+                    updated_at = ?
+                WHERE intent_id = ? AND lease_token = ?
+                """,
+                (self._clock(), intent_id, token),
+            )
+            self._conn.commit()
+        return cursor.rowcount == 1
 
     def release_owner(self, owner: str) -> None:
         with self._lock:
@@ -407,13 +424,14 @@ class ChannelDeliveryStore:
         assignments: str,
         values: tuple[object, ...],
     ) -> bool:
+        now = self._clock()
         with self._lock:
             cursor = self._conn.execute(
                 f"""
                 UPDATE channel_delivery_intents SET {assignments}
-                WHERE intent_id = ? AND lease_token = ?
+                WHERE intent_id = ? AND lease_token = ? AND lease_until > ?
                 """,
-                (*values, intent_id, token),
+                (*values, intent_id, token, now),
             )
             self._conn.commit()
         return cursor.rowcount == 1

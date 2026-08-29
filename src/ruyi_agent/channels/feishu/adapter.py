@@ -17,7 +17,6 @@ from ruyi_agent.channels.feishu.client import (
     FeishuSDKClient,
     UnsupportedFeishuChatTypeError,
     _consume_cleanup_result,
-    _current_run_artifacts,
     _feishu_help_text,
     _looks_like_markdown,
     _split_feishu_text,
@@ -33,6 +32,7 @@ from ruyi_agent.channels.feishu.identity import (
 from ruyi_agent.channels.feishu.receipts import FeishuEventClaim, FeishuEventStore
 from ruyi_agent.channels.gateway_client import GatewayTaskClient
 from ruyi_agent.channels.gateway_dto import GatewayTask
+from ruyi_agent.channels.media import warn_deprecated_media_root
 from ruyi_agent.channels.presentation import (
     ChannelDeliveryCoordinator,
     ChannelDeliveryHooks,
@@ -99,7 +99,9 @@ class FeishuAdapter:
         processing_reaction: str = "Typing",
         approval_reaction: str = "CheckMark",
         failure_reaction: str = "CrossMark",
+        media_root: object | None = None,
     ) -> None:
+        warn_deprecated_media_root(media_root)
         self._gateway_client = gateway_client
         self._feishu_client = feishu_client
         self._default_agent_name = default_agent_name
@@ -165,8 +167,9 @@ class FeishuAdapter:
             raise RuntimeError("FeishuAdapter is closed")
         if self._started:
             return 0
+        recovered = await self._delivery.recover(self._recovery_hooks)
         self._started = True
-        return await self._delivery.recover(self._recovery_hooks)
+        return recovered
 
     async def close(self) -> None:
         if self._closed:
@@ -295,15 +298,17 @@ class FeishuAdapter:
         async def before_continue(task: GatewayTask) -> None:
             if task.status not in TERMINAL_TASK_STATES:
                 return
-            run_count = task.run_count
-            if self._has_active_watcher(
+            await self._delivery.ensure_terminal_delivery(
+                task=task,
+                session_key=session_key,
+                chat_id=message.chat_id,
                 task_id=task.task_id,
-                run_count=run_count,
-            ):
-                await self._send_terminal_if_needed(
+                run_count=task.run_count,
+                hooks=self._delivery_hooks(
                     chat_id=message.chat_id,
-                    task=task,
-                )
+                    key=(task.task_id, task.run_count),
+                ),
+            )
 
         outcome = await self._turn_handler.handle(
             InboundTurn(
@@ -896,51 +901,6 @@ class FeishuAdapter:
 
     def _format_review_message(self, task: GatewayTask) -> str:
         return self._delivery.review_presenter.format(task)
-
-    def _has_active_watcher(self, *, task_id: str, run_count: int) -> bool:
-        return self._delivery.is_active(task_id=task_id, run_count=run_count)
-
-    async def _send_terminal_if_needed(
-        self,
-        *,
-        chat_id: str,
-        task: GatewayTask | dict[str, Any],
-    ) -> None:
-        async def send_message(terminal_task: GatewayTask) -> None:
-            await self._send_message(
-                chat_id=chat_id,
-                text=self._delivery.terminal_presenter.format(terminal_task),
-            )
-
-        async def send_artifacts(terminal_task: GatewayTask) -> None:
-            for artifact in _current_run_artifacts(
-                terminal_task, terminal_task.run_count
-            ):
-                await self._artifact_delivery.send(
-                    terminal_task,
-                    artifact,
-                    chat_id=chat_id,
-                )
-
-        async def clear_duplicate(terminal_task: GatewayTask) -> None:
-            await self._clear_task_reactions(
-                (terminal_task.task_id, terminal_task.run_count)
-            )
-
-        async def complete_reactions(terminal_task: GatewayTask) -> None:
-            await self._complete_task_reactions(
-                key=(terminal_task.task_id, terminal_task.run_count),
-                status=terminal_task.status,
-            )
-
-        await self._delivery.terminal_presenter.present(
-            task,
-            send_message=send_message,
-            send_artifacts=send_artifacts,
-            on_duplicate=clear_duplicate,
-            on_delivered=complete_reactions,
-        )
-
 
 async def run_feishu_adapter() -> None:
     from ruyi_agent.channels.feishu.runner import run_feishu_adapter as run

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ruyi_agent.channels.gateway_dto import GatewayTask
+
 from _feishu_adapter_support import (
     FakeFeishuClient,
     FakeGatewayClient,
@@ -132,8 +134,24 @@ def test_adapter_sends_published_artifacts_on_terminal_task() -> None:
         default_agent_name="main",
         ack_mode="off",
     )
+    gateway.tasks["task-7"] = task
 
-    asyncio.run(adapter._send_terminal_if_needed(chat_id="chat-1", task=task))
+    async def scenario() -> None:
+        parsed = GatewayTask.model_validate(task)
+        await adapter._delivery.ensure_terminal_delivery(
+            task=parsed,
+            session_key="feishu:chat:chat-1",
+            chat_id="chat-1",
+            task_id=parsed.task_id,
+            run_count=parsed.run_count,
+            hooks=adapter._delivery_hooks(
+                chat_id="chat-1",
+                key=(parsed.task_id, parsed.run_count),
+            ),
+        )
+        await adapter.close()
+
+    asyncio.run(scenario())
 
     assert feishu.sent_messages[0]["text"] == "done\n\ntask_id=task-7"
     assert feishu.sent_files == [

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ruyi_agent.channels.gateway_dto import GatewayTask
+
 from _telegram_adapter_support import (
     FakeGatewayClient,
     FakeMermaidRenderer,
@@ -220,8 +222,21 @@ def test_adapter_sends_published_artifacts_on_terminal_task() -> None:
         telegram_client=telegram,
         default_agent_name="main",
     )
+    gateway.tasks["task-7"] = task
 
-    asyncio.run(adapter._send_terminal_if_needed(chat_id=100, task=task))
+    async def scenario() -> None:
+        parsed = GatewayTask.model_validate(task)
+        await adapter._delivery.ensure_terminal_delivery(
+            task=parsed,
+            session_key="telegram:chat:100",
+            chat_id="100",
+            task_id=parsed.task_id,
+            run_count=parsed.run_count,
+            hooks=adapter._delivery_hooks(100),
+        )
+        await adapter.close()
+
+    asyncio.run(scenario())
 
     assert telegram.sent_messages[0]["text"] == "done\n\ntask\\_id\\=task\\-7"
     assert telegram.sent_documents == [

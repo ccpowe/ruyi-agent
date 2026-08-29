@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import warnings
 from collections.abc import AsyncIterable, Mapping, Sequence
 
 
 class MediaLimitError(ValueError):
     """A remote media body violated the configured hard size contract."""
+
+
+def warn_deprecated_media_root(media_root: object | None) -> None:
+    if media_root is not None:
+        warnings.warn(
+            "media_root is deprecated and ignored; channel media is never "
+            "written to a caller-selected directory",
+            DeprecationWarning,
+            stacklevel=3,
+        )
 
 
 def validate_content_length(

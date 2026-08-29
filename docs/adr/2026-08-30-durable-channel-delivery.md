@@ -23,22 +23,35 @@ The state progression is:
 
 ```text
 watching -> retry_wait -> watching
-watching -> delivering(review|terminal) -> delivered
+watching -> delivering(review)   -> review_waiting -> watching
+watching -> delivering(terminal) -> terminal_grace -> delivered
 watching -> error                         (recoverable on restart)
 watching -> superseded                    (final)
 ```
 
+A review step is keyed by `review_id`; acknowledging one review leaves the
+intent recoverable so another mirrored descendant review for the same Task run
+can reopen observation. Terminal message/artifact steps move the intent only to
+`terminal_grace`. The watcher alone marks it final after the explicit grace
+window, so a restart skips acknowledged terminal steps but can still deliver a
+late review.
+
 Only one owner may claim a live intent. Every state and delivery-step write is
 conditioned on its lease token, so an expired owner cannot acknowledge work
-after a newer owner takes over. Shutdown stops new watches, cancels and gathers
-all owned watcher tasks, releases leases, and only then lets runners close the
-SQLite stores and platform clients.
+after a newer owner takes over. External platform sends and uploads run under a
+lease heartbeat; lease loss cancels the current effect and prevents subsequent
+steps. Shutdown stops new watches, cancels and gathers all owned watcher tasks,
+releases leases, and only then lets runners close the SQLite stores and
+platform clients. Startup recovery compensates a partially started batch by
+cancelling its new watches and releasing their leases before it may be retried.
 
 Gateway query failures are distinct from Gateway Task terminal failures.
 Network errors, timeouts, HTTP 408/429 and 5xx responses use bounded exponential
 backoff with jitter. A query failure never emits a terminal Task message or a
 failure reaction. Non-retryable errors and exhausted retries leave a durable
 recoverable `error` intent instead of an unobserved task exception.
+Snapshots whose `run_count` is lower than the watch are treated as stale and
+polled again; a higher run supersedes the watch.
 
 Review messages, terminal messages, and each terminal artifact have stable
 step keys. A retry skips every step already acknowledged in the ledger, so a
@@ -57,12 +70,16 @@ platform downloads and Gateway artifact downloads. Downloads validate the
 single `Content-Length` value when present and always enforce the limit while
 streaming, buffering at most `limit + 1` bytes. Missing or forged-short lengths
 therefore cannot bypass the hard cap. The unused `media_root` setting is
-removed.
+removed from configuration and runtime wiring. Adapter constructors continue
+to accept it as a deprecated, ignored keyword for source compatibility and
+emit a warning when it is supplied.
 
 ## Consequences
 
 - Adapter restart restores active Telegram and Feishu watches before receiving
   new events.
+- Continuing a settled session waits for the same durable terminal ledger used
+  by background watches; adapters do not race it with a direct presentation.
 - A temporary Gateway outage no longer converts a healthy Task into a failed
   Channel presentation.
 - Platform delivery is durable and step-idempotent within the documented API
@@ -75,7 +92,8 @@ removed.
 
 ## Verification
 
-Tests cover transient retry and exhaustion, restart recovery for both adapters,
-concurrent fenced claims, duplicate review/terminal observations, partial
-artifact failure, idempotent close, and missing, invalid, repeated,
+Tests cover transient retry and exhaustion, stale run projections, restart
+during terminal grace, sequential and concurrent review reopens, atomic startup
+recovery for both adapters, heartbeat/fence interleavings, settled-input races,
+partial artifact failure, idempotent close, and missing, invalid, repeated,
 forged-short, and oversized streamed media bodies.

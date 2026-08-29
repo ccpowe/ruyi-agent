@@ -50,6 +50,7 @@ class TaskWatchHooks:
     on_retry: RetryHook | None = None
     on_error: ErrorHook | None = None
     on_stopped: StoppedHook | None = None
+    on_terminal_grace_complete: TaskHook | None = None
 
 
 def is_retryable_gateway_error(exc: Exception) -> bool:
@@ -114,9 +115,20 @@ class TaskWatchManager:
         return watch is not None and not watch.done()
 
     async def wait(self) -> None:
-        active = [watch for watch in self._watches.values() if not watch.done()]
-        if active:
+        while active := [
+            watch for watch in self._watches.values() if not watch.done()
+        ]:
             await asyncio.gather(*active)
+
+    async def cancel(self, *, task_id: str, run_count: int) -> None:
+        """Cancel and consume one owned watcher, if it is still active."""
+
+        watch = self._watches.get((task_id, run_count))
+        if watch is None:
+            return
+        if not watch.done():
+            watch.cancel()
+        await asyncio.gather(watch, return_exceptions=True)
 
     async def close(self) -> None:
         if self._closed:
@@ -170,6 +182,12 @@ class TaskWatchManager:
                         if hooks.on_superseded is not None:
                             await hooks.on_superseded(task)
                         return
+                    if task.run_count < expected_run_count:
+                        # Gateway projections can briefly lag behind the run that
+                        # created this watch.  Never attribute that stale snapshot
+                        # to the newer run.
+                        await self._sleep(self._poll_interval)
+                        continue
                     if task.has_pending_review:
                         await hooks.on_pending_review(task)
                         return
@@ -179,6 +197,8 @@ class TaskWatchManager:
                             terminal_sent = True
                             delivery_attempt = 0
                         if grace_checks_remaining <= 0:
+                            if hooks.on_terminal_grace_complete is not None:
+                                await hooks.on_terminal_grace_complete(task)
                             return
                         grace_checks_remaining -= 1
                     else:
@@ -201,13 +221,13 @@ class TaskWatchManager:
         except Exception as exc:  # hooks must never leak an unobserved task failure
             await self._report_error(hooks, exc)
         finally:
+            if self._watches.get(key) is asyncio.current_task():
+                self._watches.pop(key, None)
             if hooks.on_stopped is not None:
                 try:
                     await hooks.on_stopped()
                 except BaseException:
                     pass
-            if self._watches.get(key) is asyncio.current_task():
-                self._watches.pop(key, None)
 
     @staticmethod
     async def _report_error(hooks: TaskWatchHooks, exc: Exception) -> None:

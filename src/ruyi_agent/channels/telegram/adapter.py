@@ -9,6 +9,7 @@ from typing import Any
 
 from ruyi_agent.channels.gateway_client import GatewayTaskClient
 from ruyi_agent.channels.gateway_dto import GatewayTask
+from ruyi_agent.channels.media import warn_deprecated_media_root
 from ruyi_agent.channels.presentation import (
     ChannelDeliveryCoordinator,
     ChannelDeliveryHooks,
@@ -25,7 +26,6 @@ from ruyi_agent.channels.telegram.client import (
     TelegramClient,
     TelegramInboundAttachment,
     TelegramMessage,
-    _current_run_artifacts,
     _gateway_attachment_kind,
 )
 from ruyi_agent.channels.telegram.delivery import TelegramArtifactDelivery
@@ -159,7 +159,9 @@ class TelegramAdapter:
         mermaid_renderer: KrokiMermaidRenderer | None = None,
         media_max_bytes: int = DEFAULT_TELEGRAM_MEDIA_MAX_BYTES,
         delivery_store: ChannelDeliveryStore | None = None,
+        media_root: object | None = None,
     ) -> None:
+        warn_deprecated_media_root(media_root)
         self._gateway_client = gateway_client
         self._telegram_client = telegram_client
         self._default_agent_name = default_agent_name
@@ -204,8 +206,9 @@ class TelegramAdapter:
             raise RuntimeError("TelegramAdapter is closed")
         if self._started:
             return 0
+        recovered = await self._delivery.recover(self._recovery_hooks)
         self._started = True
-        return await self._delivery.recover(self._recovery_hooks)
+        return recovered
 
     async def close(self) -> None:
         if self._closed:
@@ -530,15 +533,14 @@ class TelegramAdapter:
         async def before_continue(task: GatewayTask) -> None:
             if task.status not in TERMINAL_TASK_STATES:
                 return
-            run_count = task.run_count
-            if self._has_active_watcher(
+            await self._delivery.ensure_terminal_delivery(
+                task=task,
+                session_key=session_key,
+                chat_id=str(message.chat_id),
                 task_id=task.task_id,
-                run_count=run_count,
-            ):
-                await self._send_terminal_if_needed(
-                    chat_id=message.chat_id,
-                    task=task,
-                )
+                run_count=task.run_count,
+                hooks=self._delivery_hooks(message.chat_id),
+            )
 
         outcome = await self._turn_handler.handle(
             InboundTurn(
@@ -867,38 +869,6 @@ class TelegramAdapter:
 
     def _format_review_message(self, task: GatewayTask) -> str:
         return self._delivery.review_presenter.format(task)
-
-    def _has_active_watcher(self, *, task_id: str, run_count: int) -> bool:
-        return self._delivery.is_active(task_id=task_id, run_count=run_count)
-
-    async def _send_terminal_if_needed(
-        self,
-        *,
-        chat_id: int,
-        task: GatewayTask | dict[str, Any],
-    ) -> None:
-        async def send_message(terminal_task: GatewayTask) -> None:
-            await self._send_message(
-                chat_id=chat_id,
-                text=self._delivery.terminal_presenter.format(terminal_task),
-            )
-
-        async def send_artifacts(terminal_task: GatewayTask) -> None:
-            for artifact in _current_run_artifacts(
-                terminal_task, terminal_task.run_count
-            ):
-                await self._artifact_delivery.send(
-                    terminal_task,
-                    artifact,
-                    chat_id=chat_id,
-                )
-
-        await self._delivery.terminal_presenter.present(
-            task,
-            send_message=send_message,
-            send_artifacts=send_artifacts,
-        )
-
 
 async def run_telegram_adapter() -> None:
     from ruyi_agent.channels.telegram.runner import run_telegram_adapter as run
