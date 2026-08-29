@@ -25,7 +25,7 @@ from ruyi_agent.runtime.delegation.registry import (
     RegisteredAgent,
     RemoteRefEntry,
 )
-from ruyi_agent.runtime.delegation.run_supervisor import MutationPermit
+from ruyi_agent.runtime.delegation.run_supervisor import _MutationPermit
 from ruyi_agent.runtime.message_history import TaskMessageSnapshot
 from ruyi_agent.runtime.task_events import (
     TaskEventSubscription,
@@ -80,14 +80,14 @@ class TaskRuntimeHost(Protocol):
         task_id: str,
         decisions: list[dict[str, Any]],
         *,
-        permit: MutationPermit | None = None,
+        permit: _MutationPermit | None = None,
     ) -> asyncio.Task[None]: ...
     async def _start_run(
         self,
         task_id: str,
         user_input: str,
         *,
-        permit: MutationPermit | None = None,
+        permit: _MutationPermit | None = None,
     ) -> asyncio.Task[None]: ...
 
 
@@ -257,7 +257,7 @@ class TaskRuntime:
                         decisions=decisions,
                     )
                 finally:
-                    await self._control._run_supervisor.release_operation(operation)
+                    await self._control._run_supervisor.cleanup_operation(operation)
             if record.route_kind != "local":
                 raise ValueError(f"Unsupported review route={record.route_kind}")
             if record.state != "waiting_for_human":
@@ -273,12 +273,14 @@ class TaskRuntime:
                 permit=permit,
             )
         finally:
-            await self._control._run_supervisor.release_mutation(permit)
+            await self._control._run_supervisor.cleanup_mutation(permit)
         if wait and run_task is not None:
             try:
-                await run_task
+                await asyncio.shield(run_task)
             except asyncio.CancelledError:
-                pass
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
         return self._control._task_manager.get_task(task_id)
 
     def prepare_delegation_metadata(
@@ -371,7 +373,7 @@ class TaskRuntime:
                 permit=permit,
             )
         finally:
-            await self._control._run_supervisor.release_mutation(permit)
+            await self._control._run_supervisor.cleanup_mutation(permit)
 
     async def _spawn_task_admitted(
         self,
@@ -386,7 +388,7 @@ class TaskRuntime:
         attachments: list[dict[str, Any]] | None,
         webhook: dict[str, Any] | None,
         delegation_context: DelegationContext | None,
-        permit: MutationPermit,
+        permit: _MutationPermit,
     ) -> TaskRecord:
         """
         创建结构化委托任务
@@ -516,6 +518,27 @@ class TaskRuntime:
             else:
                 record = existing
             if isinstance(entry, RemoteRefEntry):
+                effective_idempotency_key = idempotency_key or task_id
+                if (
+                    record.external_outcome_uncertain
+                    and record.external_operation == "create"
+                    and record.upstream_task_id is None
+                ):
+                    stored_identity = record.external_operation_identity
+                    if not stored_identity:
+                        raise RuntimeError(
+                            f"Task '{task_id}' has no reconciliation identity"
+                        )
+                    if idempotency_key is not None and idempotency_key != stored_identity:
+                        raise ValueError(
+                            f"Task '{task_id}' must reuse its persisted idempotency key"
+                        )
+                    if entry.ref.create_idempotency != "ruyi_gateway_v1":
+                        raise RuntimeError(
+                            f"Remote create outcome for task '{task_id}' is uncertain; "
+                            "the route does not guarantee idempotent create reconciliation"
+                        )
+                    effective_idempotency_key = stored_identity
                 operation = await self._control._run_supervisor.promote_to_operation(
                     permit
                 )
@@ -527,15 +550,15 @@ class TaskRuntime:
                         delegation_context=task_context,
                         metadata=metadata,
                         attachments=attachments,
-                        idempotency_key=idempotency_key or task_id,
+                        idempotency_key=effective_idempotency_key,
                     )
                 finally:
-                    await self._control._run_supervisor.release_operation(operation)
+                    await self._control._run_supervisor.cleanup_operation(operation)
 
             await self._control._start_run(task_id, task, permit=permit)
             return self._control._task_manager.get_task(task_id)
         finally:
-            await self._control._run_supervisor.release_mutation(permit)
+            await self._control._run_supervisor.cleanup_mutation(permit)
             budget_lock.release()
 
     async def send_task_input(
@@ -586,7 +609,7 @@ class TaskRuntime:
                         idempotency_key=idempotency_key,
                     )
                 finally:
-                    await self._control._run_supervisor.release_operation(operation)
+                    await self._control._run_supervisor.cleanup_operation(operation)
             if record.state == "waiting_for_human":
                 raise TaskAlreadyRunningError(
                     f"Worker task is waiting for review: {task_id}"
@@ -619,7 +642,7 @@ class TaskRuntime:
             )
             wake_mailbox = True
         finally:
-            await self._control._run_supervisor.release_mutation(permit)
+            await self._control._run_supervisor.cleanup_mutation(permit)
         # Waking can take a scheduling lock, so it begins a fresh admission
         # after the durable publish critical section has been released.
         if wake_mailbox:
@@ -648,16 +671,16 @@ class TaskRuntime:
         operation = None
         try:
             record = self._control._task_manager.get_task(task_id)
+            if record.state not in ACTIVE_TASK_STATES:
+                return record
             if record.route_kind == "remote_ref":
-                if record.state not in ACTIVE_TASK_STATES:
-                    return record
                 operation = await self._control._run_supervisor.promote_to_operation(
                     permit
                 )
                 try:
                     return await self._control._cancel_remote_task(record)
                 finally:
-                    await self._control._run_supervisor.release_operation(operation)
+                    await self._control._run_supervisor.cleanup_operation(operation)
             run_task = self._control._run_supervisor.get_run(task_id)
             if run_task is None or run_task.done():
                 if record.state in ACTIVE_TASK_STATES:
@@ -667,14 +690,14 @@ class TaskRuntime:
             assert requested is run_task
             operation = await self._control._run_supervisor.promote_to_operation(permit)
         finally:
-            await self._control._run_supervisor.release_mutation(permit)
+            await self._control._run_supervisor.cleanup_mutation(permit)
         try:
-            await run_task
+            await asyncio.shield(run_task)
         except asyncio.CancelledError:
             current = asyncio.current_task()
             if current is not None and current.cancelling():
                 raise
         finally:
             assert operation is not None
-            await self._control._run_supervisor.release_operation(operation)
+            await self._control._run_supervisor.cleanup_operation(operation)
         return self._control._task_manager.get_task(task_id)

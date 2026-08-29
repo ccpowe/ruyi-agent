@@ -114,16 +114,20 @@ def test_remote_network_effects_do_not_leak_into_task_coordinator() -> None:
 def test_run_creation_and_mark_running_are_owned_by_supervisor() -> None:
     package = Path(async_runtime.__file__).parent
     supervisor = (package / "run_supervisor.py").read_text(encoding="utf-8")
+    notifier = (package / "notifications.py").read_text(encoding="utf-8")
     other_runtime_sources = "\n".join(
         path.read_text(encoding="utf-8")
         for path in package.glob("*.py")
-        if path.name not in {"run_supervisor.py", "task_manager.py"}
+        if path.name
+        not in {"run_supervisor.py", "task_manager.py", "notifications.py"}
     )
 
     assert "asyncio.create_task" in supervisor
     assert ".mark_running(" in supervisor
     assert "asyncio.create_task" not in other_runtime_sources
     assert ".mark_running(" not in other_runtime_sources
+    assert "_reconciliation_task = asyncio.create_task" in notifier
+    assert "_wake_tasks.add(task)" in notifier
 
 
 def test_runtime_boundary_modules_and_facade_stay_within_line_budgets() -> None:

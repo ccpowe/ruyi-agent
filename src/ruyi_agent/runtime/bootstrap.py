@@ -124,48 +124,50 @@ async def bootstrap_application():
     # backend 决定 skills、memory 和执行状态所在的位置，所以要先创建 backend，
     # 再把声明式配置翻译成真正可运行的 agent spec。
     backend_runtime = create_backend_runtime()
-    home_dir = backend_runtime.home_dir
-    skills_root = backend_runtime.skills_root
-    agent_backend = backend_runtime.backend
-    host_workspace_root = Path(os.getenv("LOCAL_BACKEND_ROOT", os.getcwd())).resolve()
-    skill_catalog = SkillCatalog(workspace_root=host_workspace_root).scan().skills
-    skill_syncer = SkillSyncer(backend=agent_backend, views_root=skills_root)
-    checkpoint_db = os.getenv("CHECKPOINT_DB", DEFAULT_CHECKPOINT_DB)
-    route_db = os.getenv("GATEWAY_ROUTE_DB", DEFAULT_GATEWAY_ROUTE_DB)
-    task_db = os.getenv("TASK_DB", DEFAULT_TASK_DB)
-    review_audit_db = os.getenv("REVIEW_AUDIT_DB", DEFAULT_REVIEW_AUDIT_DB)
-    max_delegation_depth = _read_positive_int_env(
-        "AGENT_MAX_DELEGATION_DEPTH",
-        DEFAULT_MAX_DELEGATION_DEPTH,
-    )
-    max_tasks_per_root = _read_positive_int_env(
-        "AGENT_MAX_TASKS_PER_ROOT",
-        DEFAULT_MAX_TASKS_PER_ROOT,
-    )
-    webhook_url = os.getenv("A2A_WEBHOOK_URL")
-    webhook_token = (
-        os.getenv("A2A_WEBHOOK_TOKEN")
-        or os.getenv("GATEWAY_BEARER_TOKEN")
-        or DEFAULT_GATEWAY_TOKEN
-    )
-    # agent 和 MCP 配置在这里从声明式配置变成带 model、tools、memory、skills 的
-    # runtime 对象。
-    main_agent_name, agent_configs = load_agent_configs()
-    llm_providers = load_llm_provider_configs()
-    permission_config = load_permission_config()
-    permission_policy = PermissionPolicy(permission_config)
-
-    # 这几个mcp 是获取全局的mcp配置 进行出初始化？
-    mcp_server_configs = load_mcp_server_configs()
-    registry = MCPRegistry(mcp_server_configs)
-    refresh_result = await registry.refresh()
-    for status in refresh_result.server_statuses:
-        if status.ok:
-            print(f"[mcp] {status.server_name}: ok, tools={status.tool_count}")
-        else:
-            print(f"[mcp] {status.server_name}: failed, error={status.error}")
-
     try:
+        home_dir = backend_runtime.home_dir
+        skills_root = backend_runtime.skills_root
+        agent_backend = backend_runtime.backend
+        host_workspace_root = Path(
+            os.getenv("LOCAL_BACKEND_ROOT", os.getcwd())
+        ).resolve()
+        skill_catalog = SkillCatalog(workspace_root=host_workspace_root).scan().skills
+        skill_syncer = SkillSyncer(backend=agent_backend, views_root=skills_root)
+        checkpoint_db = os.getenv("CHECKPOINT_DB", DEFAULT_CHECKPOINT_DB)
+        route_db = os.getenv("GATEWAY_ROUTE_DB", DEFAULT_GATEWAY_ROUTE_DB)
+        task_db = os.getenv("TASK_DB", DEFAULT_TASK_DB)
+        review_audit_db = os.getenv("REVIEW_AUDIT_DB", DEFAULT_REVIEW_AUDIT_DB)
+        max_delegation_depth = _read_positive_int_env(
+            "AGENT_MAX_DELEGATION_DEPTH",
+            DEFAULT_MAX_DELEGATION_DEPTH,
+        )
+        max_tasks_per_root = _read_positive_int_env(
+            "AGENT_MAX_TASKS_PER_ROOT",
+            DEFAULT_MAX_TASKS_PER_ROOT,
+        )
+        webhook_url = os.getenv("A2A_WEBHOOK_URL")
+        webhook_token = (
+            os.getenv("A2A_WEBHOOK_TOKEN")
+            or os.getenv("GATEWAY_BEARER_TOKEN")
+            or DEFAULT_GATEWAY_TOKEN
+        )
+        # agent 和 MCP 配置在这里从声明式配置变成带 model、tools、memory、skills 的
+        # runtime 对象。
+        main_agent_name, agent_configs = load_agent_configs()
+        llm_providers = load_llm_provider_configs()
+        permission_config = load_permission_config()
+        permission_policy = PermissionPolicy(permission_config)
+
+        # 这几个mcp 是获取全局的mcp配置 进行出初始化？
+        mcp_server_configs = load_mcp_server_configs()
+        registry = MCPRegistry(mcp_server_configs)
+        refresh_result = await registry.refresh()
+        for status in refresh_result.server_statuses:
+            if status.ok:
+                print(f"[mcp] {status.server_name}: ok, tools={status.tool_count}")
+            else:
+                print(f"[mcp] {status.server_name}: failed, error={status.error}")
+
         # checkpointer 和 route store 是进程级状态对象。两个 AgentControl 共享同一个
         # checkpointer，让 task 执行状态和主 agent 对话状态落在同一条持久化边界内。
         _ensure_sqlite_parent_dir(checkpoint_db)

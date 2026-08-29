@@ -99,6 +99,9 @@ class TaskRecord:
     skill_view_hash: str | None = None
     pending_review: dict[str, Any] | None = None
     artifacts: list[PublishedArtifact] = field(default_factory=list)
+    external_operation: str | None = None
+    external_operation_identity: str | None = None
+    external_outcome_uncertain: bool = False
 
 
 @dataclass(frozen=True, slots=True)

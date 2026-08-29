@@ -573,15 +573,18 @@ def test_remote_allocation_crash_window_recovers_from_persisted_placeholder(
     asyncio.run(leave_placeholder())
     placeholder = first_store.get_task("stable-remote")
     assert placeholder is not None
-    assert placeholder.state == "pending"
+    assert placeholder.state == "interrupted"
     assert placeholder.upstream_task_id is None
+    assert placeholder.external_operation == "create"
+    assert placeholder.external_operation_identity == "stable-remote"
+    assert placeholder.external_outcome_uncertain is True
     first_store.close()
 
     second_store = TaskStore(str(db_path))
     client = SuccessfulRemoteCreateA2AClient()
     second_control = async_subagent_runtime.AgentControl(
         build_specs(),
-        build_test_remote_refs(),
+        build_test_remote_refs(create_idempotency="ruyi_gateway_v1"),
         checkpointer=object(),
         backend=object(),
         task_store=second_store,
@@ -599,8 +602,60 @@ def test_remote_allocation_crash_window_recovers_from_persisted_placeholder(
             )
         )
         assert recovered.upstream_task_id == "remote-task-after-restart"
+        assert recovered.thread_id == "stable-remote"
         assert second_store.count_tasks_under_root("stable-remote") == 1
         assert client.idempotency_keys == ["stable-remote"]
+    finally:
+        second_store.close()
+
+
+def test_uncertain_remote_create_is_not_replayed_without_capability(tmp_path) -> None:
+    db_path = tmp_path / "tasks.sqlite"
+    first_store = TaskStore(str(db_path))
+    first_control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        build_test_remote_refs(),
+        checkpointer=object(),
+        backend=object(),
+        task_store=first_store,
+        a2a_client=CancelledRemoteCreateA2AClient(),
+        node_id="node-a",
+    )
+
+    async def leave_uncertain() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await first_control.spawn_task(
+                "remote_code_wiki",
+                "remote work",
+                task_id="unsafe-remote",
+            )
+
+    asyncio.run(leave_uncertain())
+    first_store.close()
+    second_store = TaskStore(str(db_path))
+    client = SuccessfulRemoteCreateA2AClient()
+    second_control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        build_test_remote_refs(),
+        checkpointer=object(),
+        backend=object(),
+        task_store=second_store,
+        a2a_client=client,
+        node_id="node-a",
+    )
+    try:
+        with pytest.raises(RuntimeError, match="does not guarantee"):
+            asyncio.run(
+                second_control.spawn_task(
+                    "remote_code_wiki",
+                    "remote work",
+                    task_id="unsafe-remote",
+                )
+            )
+        assert client.idempotency_keys == []
+        persisted = second_store.get_task("unsafe-remote")
+        assert persisted is not None
+        assert persisted.external_outcome_uncertain is True
     finally:
         second_store.close()
 
@@ -793,6 +848,38 @@ def test_passive_run_cancellation_marks_task_interrupted(
     assert record.state == "interrupted"
     assert record.error is not None
     assert record.error.startswith("Task interrupted:")
+
+
+def test_wait_agent_caller_cancellation_does_not_cancel_supervised_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = BlockingAgent()
+    monkeypatch.setattr(
+        async_subagent_runtime,
+        "create_runtime_agent",
+        lambda **kwargs: agent,
+    )
+    control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        checkpointer=object(),
+        backend=object(),
+    )
+
+    async def scenario() -> None:
+        record = await control.spawn_task("background_research", "block")
+        await agent.started.wait()
+        run = control.get_live_run(record.task_id)
+        assert run is not None
+        observer = asyncio.create_task(control.wait_agent(record.task_id))
+        await asyncio.sleep(0)
+        observer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await observer
+        assert run.cancelled() is False
+        assert run.done() is False
+        await control.cancel_task(record.task_id)
+
+    asyncio.run(scenario())
 
 
 def test_task_store_restores_local_running_task_as_interrupted(

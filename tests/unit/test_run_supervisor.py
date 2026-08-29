@@ -16,7 +16,11 @@ from ruyi_agent.runtime.delegation.contracts import (
     TaskAlreadyRunningError,
     UnknownWorkerTaskError,
 )
-from ruyi_agent.runtime.delegation.run_supervisor import RuntimeClosingError
+from ruyi_agent.runtime.delegation.run_supervisor import (
+    InvalidRuntimePermitError,
+    RuntimeClosingError,
+    _MutationPermit,
+)
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.storage.mailbox_store import MailboxStore
 from ruyi_agent.storage.task_store import TaskStore
@@ -107,6 +111,98 @@ class HangingRemoteA2AClient:
         self.started.set()
         await asyncio.Event().wait()
         raise AssertionError("shutdown must cancel remote allocation")
+
+
+class StateReadBlockingAgent:
+    def __init__(self) -> None:
+        self.state_read_started = asyncio.Event()
+
+    async def astream(self, *args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        if False:
+            yield None
+
+    async def aget_state(self, config: Any) -> Any:
+        del config
+        self.state_read_started.set()
+        await asyncio.Event().wait()
+
+
+class HangingRemoteOperationClient:
+    def __init__(self, operation: str) -> None:
+        self.operation = operation
+        self.started = asyncio.Event()
+        self.get_calls = 0
+
+    async def create_task(self, remote_ref: Any, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        status = "waiting_for_human" if self.operation == "review" else "completed"
+        if self.operation == "cancel":
+            status = "running"
+        payload: dict[str, Any] = {
+            "task_id": f"upstream-{self.operation}",
+            "agent_name": remote_ref.name,
+            "status": status,
+            "last_result": "ready" if status == "completed" else None,
+            "error": None,
+            "run_count": 1,
+            "created_at": "2026-08-30T00:00:00Z",
+            "updated_at": "2026-08-30T00:00:01Z",
+        }
+        if status == "waiting_for_human":
+            payload["pending_review"] = {
+                "review_id": "review-uncertain",
+                "action_requests": [],
+                "review_configs": [],
+            }
+        return payload
+
+    async def get_task(self, remote_ref: Any, *, task_id: str) -> dict[str, Any]:
+        self.get_calls += 1
+        return {
+            "task_id": task_id,
+            "agent_name": remote_ref.name,
+            "status": "completed",
+            "last_result": "reconciled",
+            "error": None,
+            "run_count": 2,
+            "created_at": "2026-08-30T00:00:00Z",
+            "updated_at": "2026-08-30T00:00:02Z",
+        }
+
+    async def send_input(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        assert self.operation == "send"
+        await self._hang()
+        raise AssertionError
+
+    async def submit_review_decision(
+        self, *args: Any, **kwargs: Any
+    ) -> dict[str, Any]:
+        del args, kwargs
+        assert self.operation == "review"
+        await self._hang()
+        raise AssertionError
+
+    async def cancel_task(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        assert self.operation == "cancel"
+        await self._hang()
+        raise AssertionError
+
+    async def _hang(self) -> None:
+        self.started.set()
+        await asyncio.Event().wait()
+
+
+class CancelledRemoteCreateClient:
+    def __init__(self) -> None:
+        self.create_calls = 0
+
+    async def create_task(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        self.create_calls += 1
+        raise asyncio.CancelledError
 
 
 def _durable_control(
@@ -534,7 +630,11 @@ async def test_close_cancels_tracked_hanging_remote_allocation() -> None:
     with pytest.raises(asyncio.CancelledError):
         await allocation
     assert control._run_supervisor._operations == set()
-    assert control.get_task_record("remote-hang").state == "pending"
+    interrupted = control.get_task_record("remote-hang")
+    assert interrupted.state == "interrupted"
+    assert interrupted.external_operation == "create"
+    assert interrupted.external_operation_identity == "remote-hang"
+    assert interrupted.external_outcome_uncertain is True
 
 
 @async_test
@@ -650,6 +750,10 @@ async def test_terminal_state_does_not_release_run_before_webhook_finishes(
     assert control.get_task_record(record.task_id).state == "completed"
     assert control.get_live_run(record.task_id) is run
 
+    cancelled = await control.cancel_task(record.task_id)
+    assert cancelled.state == "completed"
+    assert run.cancelled() is False
+
     with pytest.raises(TaskAlreadyRunningError, match="already running"):
         await control.send_task_input(record.task_id, "second")
     await asyncio.wait_for(control.close(), timeout=0.5)
@@ -760,11 +864,235 @@ async def test_close_waits_for_admitted_mutation_and_rejects_later_mutations() -
 
     with pytest.raises(RuntimeClosingError, match="closing"):
         await control._run_supervisor.acquire_mutation()
-    await control._run_supervisor.schedule("admitted", runner, permit=permit)
+    with pytest.raises(RuntimeClosingError, match="closing"):
+        await control._run_supervisor.schedule("admitted", runner, permit=permit)
     await control._run_supervisor.release_mutation(permit)
     await closing
 
-    assert control.get_task_record("admitted").state == "interrupted"
+    assert control.get_task_record("admitted").state == "pending"
+
+
+@async_test
+async def test_runtime_permits_reject_forgery_cross_task_and_reuse() -> None:
+    control = runtime_module.AgentControl({}, checkpointer=object(), backend=object())
+    supervisor = control._run_supervisor
+    forged = _MutationPermit()
+    with pytest.raises(InvalidRuntimePermitError, match="not issued"):
+        await supervisor.release_mutation(forged)
+    with pytest.raises(InvalidRuntimePermitError, match="not issued"):
+        await supervisor.promote_to_operation(forged)
+
+    permit = await supervisor.acquire_mutation()
+    copied = _MutationPermit()
+    for attribute in ("_supervisor", "_nonce", "_owner", "_issued", "_active"):
+        setattr(copied, attribute, getattr(permit, attribute))
+    with pytest.raises(InvalidRuntimePermitError, match="forged"):
+        await supervisor.release_mutation(copied)
+
+    async def steal() -> None:
+        with pytest.raises(InvalidRuntimePermitError, match="another asyncio Task"):
+            await supervisor.release_mutation(permit)
+
+    await asyncio.create_task(steal())
+    await supervisor.release_mutation(permit)
+    with pytest.raises(InvalidRuntimePermitError, match="already consumed"):
+        await supervisor.release_mutation(permit)
+    assert supervisor._active_mutations == 0
+    await control.close()
+
+
+@pytest.mark.parametrize("kind", ["mutation", "operation"])
+@async_test
+async def test_permit_cleanup_survives_double_cancel_while_condition_is_locked(
+    kind: str,
+) -> None:
+    control = runtime_module.AgentControl({}, checkpointer=object(), backend=object())
+    supervisor = control._run_supervisor
+    ready = asyncio.Event()
+    release = asyncio.Event()
+
+    async def owner() -> None:
+        mutation = await supervisor.acquire_mutation()
+        permit: Any = mutation
+        if kind == "operation":
+            permit = await supervisor.promote_to_operation(mutation)
+        ready.set()
+        await release.wait()
+        if kind == "operation":
+            await supervisor.cleanup_operation(permit)
+        else:
+            await supervisor.cleanup_mutation(permit)
+
+    task = asyncio.create_task(owner())
+    await ready.wait()
+    await supervisor._lifecycle_condition.acquire()
+    release.set()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    supervisor._lifecycle_condition.release()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert supervisor._active_mutations == 0
+    assert supervisor._operations == set()
+    assert supervisor._permits == {}
+    await control.close()
+
+
+@async_test
+async def test_review_wait_caller_cancel_does_not_cancel_supervised_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = ResumeBlockingInterruptingAgentFactory()
+    monkeypatch.setattr(runtime_module, "create_runtime_agent", factory)
+    control = runtime_module.AgentControl(
+        build_specs(),
+        checkpointer=object(),
+        backend=object(),
+        shutdown_grace_period=0,
+    )
+    record = await control.spawn_task("background_research", "review")
+    first_run = control.get_live_run(record.task_id)
+    assert first_run is not None
+    await first_run
+    review_id = control.get_task_record(record.task_id).pending_review["review_id"]
+    observer = asyncio.create_task(
+        control.submit_review_decision(
+            review_id,
+            [{"type": "approve"}],
+            wait=True,
+        )
+    )
+    await factory.created[0].resume_started.wait()
+    run = control.get_live_run(record.task_id)
+    assert run is not None
+    observer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await observer
+    assert run.cancelled() is False
+    assert run.done() is False
+    await control.close()
+    assert control.get_task_record(record.task_id).state == "interrupted"
+
+
+@pytest.mark.parametrize("explicit_cancel", [True, False])
+@async_test
+async def test_cancellation_during_agent_state_normalization_is_finalized(
+    monkeypatch: pytest.MonkeyPatch,
+    explicit_cancel: bool,
+) -> None:
+    agent = StateReadBlockingAgent()
+    monkeypatch.setattr(runtime_module, "create_runtime_agent", lambda **kwargs: agent)
+    control = runtime_module.AgentControl(
+        build_specs(),
+        checkpointer=object(),
+        backend=object(),
+        shutdown_grace_period=0,
+    )
+    record = await control.spawn_task("background_research", "normalize")
+    await agent.state_read_started.wait()
+    if explicit_cancel:
+        result = await control.cancel_task(record.task_id)
+        assert result.state == "cancelled"
+    else:
+        await control.close()
+        assert control.get_task_record(record.task_id).state == "interrupted"
+    await control.close()
+
+
+@pytest.mark.parametrize("operation", ["send", "review", "cancel"])
+@async_test
+async def test_cancelled_remote_mutation_is_durable_and_refresh_reconciles(
+    operation: str,
+) -> None:
+    client = HangingRemoteOperationClient(operation)
+    control = runtime_module.AgentControl(
+        {},
+        build_test_remote_refs(),
+        checkpointer=object(),
+        backend=object(),
+        a2a_client=client,
+    )
+    record = await control.spawn_task(
+        "remote_code_wiki",
+        operation,
+        task_id=f"remote-{operation}",
+    )
+    if operation == "send":
+        mutation = asyncio.create_task(
+            control.send_task_input(record.task_id, "continue")
+        )
+    elif operation == "review":
+        assert record.pending_review is not None
+        mutation = asyncio.create_task(
+            control.submit_review_decision(
+                record.pending_review["review_id"],
+                [{"type": "approve"}],
+            )
+        )
+    else:
+        mutation = asyncio.create_task(control.cancel_task(record.task_id))
+    await client.started.wait()
+    mutation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await mutation
+    uncertain = control.get_task_record(record.task_id)
+    assert uncertain.state == "interrupted"
+    assert uncertain.external_operation == operation
+    assert uncertain.external_operation_identity
+    assert uncertain.external_outcome_uncertain is True
+
+    reconciled = await control.refresh_task(record.task_id)
+    assert reconciled.state == "completed"
+    assert reconciled.external_operation is None
+    assert reconciled.external_operation_identity is None
+    assert reconciled.external_outcome_uncertain is False
+    assert client.get_calls == 1
+    await control.close()
+
+
+@async_test
+async def test_webhook_route_binds_uncertain_create_without_replaying() -> None:
+    client = CancelledRemoteCreateClient()
+    control = runtime_module.AgentControl(
+        {},
+        build_test_remote_refs(),
+        checkpointer=object(),
+        backend=object(),
+        a2a_client=client,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await control.spawn_task(
+            "remote_code_wiki",
+            "uncertain",
+            task_id="route-reconcile",
+        )
+    bound = control.ensure_remote_task_record(
+        agent_name="remote_code_wiki",
+        task_id="route-reconcile",
+        upstream_task_id="upstream-discovered",
+    )
+    assert bound.upstream_task_id == "upstream-discovered"
+    assert bound.thread_id == "route-reconcile"
+    handled = await control.handle_remote_task_event(
+        {
+            "task_id": "upstream-discovered",
+            "agent_name": "remote_code_wiki",
+            "status": "completed",
+            "last_result": "webhook reconciled",
+            "error": None,
+            "run_count": 1,
+            "created_at": "2026-08-30T00:00:00Z",
+            "updated_at": "2026-08-30T00:00:02Z",
+        }
+    )
+    assert handled is True
+    reconciled = control.get_task_record("route-reconcile")
+    assert reconciled.state == "completed"
+    assert reconciled.external_outcome_uncertain is False
+    assert client.create_calls == 1
+    await control.close()
 
 
 @async_test
@@ -780,6 +1108,14 @@ async def test_public_task_mutations_reject_after_close() -> None:
         await control.submit_review_decision("missing", [])
     with pytest.raises(RuntimeClosingError, match="closing"):
         await control.cancel_task("missing")
+    with pytest.raises(RuntimeClosingError, match="closing"):
+        control.ensure_remote_task_record(
+            agent_name="missing",
+            task_id="missing",
+            upstream_task_id="upstream",
+        )
+    with pytest.raises(RuntimeClosingError, match="closing"):
+        await control.handle_remote_task_event({"task_id": "upstream"})
 
 
 @async_test
@@ -1045,6 +1381,72 @@ async def test_bootstrap_closes_control_before_stores_checkpointer_and_backend(
     ]
     assert open_resources == set()
 
+
+@pytest.mark.parametrize("failure_stage", ["skills", "config", "mcp"])
+@async_test
+async def test_bootstrap_closes_backend_once_for_early_startup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_stage: str,
+) -> None:
+    closes = 0
+
+    class FakeBackendRuntime:
+        home_dir = str(tmp_path)
+        skills_root = "/skills"
+        backend = object()
+        kind = "fake"
+
+        def close(self) -> None:
+            nonlocal closes
+            closes += 1
+
+    class FakeSkillCatalog:
+        def __init__(self, workspace_root: Path) -> None:
+            del workspace_root
+
+        def scan(self) -> Any:
+            if failure_stage == "skills":
+                raise RuntimeError("skills failed")
+            return SimpleNamespace(skills={})
+
+    class FakeRegistry:
+        def __init__(self, configs: Any) -> None:
+            del configs
+
+        async def refresh(self) -> Any:
+            if failure_stage == "mcp":
+                raise RuntimeError("mcp failed")
+            return SimpleNamespace(server_statuses=[])
+
+    def load_configs() -> tuple[str, dict[str, Any]]:
+        if failure_stage == "config":
+            raise RuntimeError("config failed")
+        return "main", {}
+
+    monkeypatch.setattr(bootstrap_module, "configure_runtime_environment", lambda: None)
+    monkeypatch.setattr(
+        bootstrap_module,
+        "create_backend_runtime",
+        lambda: FakeBackendRuntime(),
+    )
+    monkeypatch.setattr(bootstrap_module, "SkillCatalog", FakeSkillCatalog)
+    monkeypatch.setattr(bootstrap_module, "SkillSyncer", lambda **kwargs: object())
+    monkeypatch.setattr(bootstrap_module, "load_agent_configs", load_configs)
+    monkeypatch.setattr(bootstrap_module, "load_llm_provider_configs", lambda: {})
+    monkeypatch.setattr(bootstrap_module, "load_permission_config", lambda: {})
+    monkeypatch.setattr(
+        bootstrap_module,
+        "PermissionPolicy",
+        lambda config: SimpleNamespace(default_profile="default"),
+    )
+    monkeypatch.setattr(bootstrap_module, "load_mcp_server_configs", lambda: {})
+    monkeypatch.setattr(bootstrap_module, "MCPRegistry", FakeRegistry)
+
+    with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
+        async with bootstrap_module.bootstrap_application():
+            raise AssertionError("failed startup must not yield")
+    assert closes == 1
 
 async def _async_value(value: Any) -> Any:
     return value

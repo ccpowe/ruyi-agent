@@ -41,6 +41,9 @@ TASK_WRITE_COLUMNS = (
     "skill_view_hash",
     "pending_review_json",
     "artifacts_json",
+    "external_operation",
+    "external_operation_identity",
+    "external_outcome_uncertain",
 )
 TASK_SELECT_COLUMNS = ", ".join(TASK_WRITE_COLUMNS)
 
@@ -128,6 +131,9 @@ def task_record_values(record: TaskRecord) -> tuple[Any, ...]:
             ensure_ascii=True,
             sort_keys=True,
         ),
+        record.external_operation,
+        record.external_operation_identity,
+        int(record.external_outcome_uncertain),
     )
 
 
@@ -171,6 +177,9 @@ def row_to_task_record(row: tuple[Any, ...]) -> TaskRecord:
         skill_view_hash=row[25],
         pending_review=json.loads(row[26]) if row[26] else None,
         artifacts=_parse_artifacts(row[27]),
+        external_operation=row[28],
+        external_operation_identity=row[29],
+        external_outcome_uncertain=bool(row[30]),
     )
 
 

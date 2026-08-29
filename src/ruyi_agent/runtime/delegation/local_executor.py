@@ -27,8 +27,8 @@ from ruyi_agent.runtime.delegation.contracts import (
 )
 from ruyi_agent.runtime.delegation.registry import LocalWorkerEntry, RegisteredAgent
 from ruyi_agent.runtime.delegation.run_supervisor import (
-    MutationPermit,
     RuntimeClosingError,
+    _MutationPermit,
 )
 from ruyi_agent.runtime.skills.resolver import resolve_skill_names
 from ruyi_agent.runtime.task_events import (
@@ -250,115 +250,147 @@ class LocalTaskExecutor:
             payload: 本轮传给 worker 的 graph 输入或 resume command
         """
         # 为什么把单轮执行封装出来：本地 async worker 的实际运行逻辑需要和调度控制解耦。
-        record = self._control._task_manager.get_task(task_id)
-        agent = self._control._get_or_create_agent(record.agent_name)
-        run_config = self._control._build_agent_run_config(record)
         try:
-            astream = getattr(agent, "astream", None)
-            if callable(astream):
-                latest: Any = _MISSING_STREAM_VALUE
-                interrupts: list[Any] = []
-                async for part in astream(
-                    payload,
-                    config=run_config,
-                    stream_mode=["messages", "values"],
-                    version="v2",
-                ):
-                    delta = assistant_delta_from_stream_part(part)
-                    if delta is not None:
-                        ledger = self._control._task_manager.event_ledger
-                        if ledger is not None:
-                            ledger.publish_assistant_delta(
-                                task_id=task_id,
-                                run_count=record.run_count,
-                                content=delta,
-                            )
-                    if isinstance(part, dict) and part.get("type") == "values":
-                        if "data" in part:
-                            latest = part["data"]
-                        raw_interrupts = part.get("interrupts")
-                        if isinstance(raw_interrupts, (tuple, list)):
-                            interrupts.extend(raw_interrupts)
-                if latest is _MISSING_STREAM_VALUE:
-                    aget_state = getattr(agent, "aget_state", None)
-                    if not callable(aget_state):
-                        raise RuntimeError(
-                            "Agent stream completed without values or readable state"
-                        )
-                    snapshot = await aget_state(run_config)
-                    latest = getattr(snapshot, "values", _MISSING_STREAM_VALUE)
-                    if latest is _MISSING_STREAM_VALUE:
-                        raise RuntimeError(
-                            "Agent stream completed without values or readable state"
-                        )
-                    raw_interrupts = getattr(snapshot, "interrupts", ())
-                    if isinstance(raw_interrupts, (tuple, list)):
-                        interrupts.extend(raw_interrupts)
-                result = GraphOutput(value=latest, interrupts=tuple(interrupts))
-            else:
-                result = await agent.ainvoke(
-                    payload,
-                    config=run_config,
-                    version="v2",
-                )
-            # Complete stream consumption (or the compatibility fallback) only
-            # returns after LangGraph has checkpointed the graph step.
+            record = self._control._task_manager.get_task(task_id)
+            agent = self._control._get_or_create_agent(record.agent_name)
+            run_config = self._control._build_agent_run_config(record)
+            result = await self._invoke_agent_payload(
+                agent,
+                payload,
+                run_config,
+                record,
+            )
             if self._control._mailbox is not None:
                 self._control._mailbox.acknowledge_task(task_id, record.thread_id)
-        except asyncio.CancelledError as exc:
-            if self._control._task_manager.was_cancel_requested(task_id):
-                self._control._task_manager.mark_cancelled(task_id)
-            else:
-                self._control._task_manager.mark_interrupted(
-                    task_id,
-                    _format_interrupted_error(exc),
-                )
-            self._control._maybe_publish_settled_message(task_id)
-            await self._control._send_settled_webhook(task_id)  # 如果配置了webhook 就会发送
-            raise
-        except Exception as exc:
-            self._control._task_manager.mark_failed(task_id, _format_exception_summary(exc))
-            self._control._maybe_publish_settled_message(task_id)
-            await self._control._send_settled_webhook(task_id)
-            return
 
-        outcome = await normalize_agent_turn(agent, run_config, result)
-        if outcome.review_payloads:
+            outcome = await normalize_agent_turn(agent, run_config, result)
+            if outcome.review_payloads and len(outcome.review_payloads) == 1:
+                self._control._task_manager.mark_waiting_for_human(
+                    task_id,
+                    outcome.review_payloads[0],
+                )
+                try:
+                    self._control._audit_task_review(
+                        "task_waiting_for_human",
+                        self._control._task_manager.get_task(task_id),
+                        payload=outcome.review_payloads[0],
+                    )
+                except Exception:
+                    logger.exception(
+                        "Non-authoritative review audit failed after review commit: %s",
+                        task_id,
+                    )
+                return
             if len(outcome.review_payloads) > 1:
                 self._control._task_manager.mark_failed(
                     task_id,
                     "Worker produced multiple simultaneous human review requests.",
                 )
-                self._control._maybe_publish_settled_message(task_id)
-                await self._control._send_settled_webhook(task_id)
-                return
-            self._control._task_manager.mark_waiting_for_human(
-                task_id,
-                outcome.review_payloads[0],
-            )
-            self._control._audit_task_review(
-                "task_waiting_for_human",
-                self._control._task_manager.get_task(task_id),
-                payload=outcome.review_payloads[0],
-            )
-            return
-
-        if outcome.has_unresolved_tool_calls:
-            self._control._task_manager.mark_failed(
-                task_id,
-                "Worker stopped before resolving pending tool calls.",
-            )
+            elif outcome.has_unresolved_tool_calls:
+                self._control._task_manager.mark_failed(
+                    task_id,
+                    "Worker stopped before resolving pending tool calls.",
+                )
+            else:
+                result_text = (
+                    outcome.content
+                    or "Task completed, but the final assistant reply was empty."
+                )
+                self._control._task_manager.mark_completed(task_id, result_text)
             self._control._maybe_publish_settled_message(task_id)
             await self._control._send_settled_webhook(task_id)
-            return
+        except asyncio.CancelledError as exc:
+            explicit_cancel = self._finalize_cancelled_run(task_id, exc)
+            if explicit_cancel:
+                await self._control._send_settled_webhook(task_id)
+            raise
+        except Exception as exc:
+            current = self._control._task_manager.get_task(task_id)
+            if current.state == "running":
+                self._control._task_manager.mark_failed(
+                    task_id,
+                    _format_exception_summary(exc),
+                )
+                self._control._maybe_publish_settled_message(task_id)
+                await self._control._send_settled_webhook(task_id)
+            else:
+                logger.exception(
+                    "Non-authoritative local run tail failed after task settlement: %s",
+                    task_id,
+                )
 
-        result_text = (
-            outcome.content
-            or "Task completed, but the final assistant reply was empty."
-        )
-        self._control._task_manager.mark_completed(task_id, result_text)
-        self._control._maybe_publish_settled_message(task_id)
-        await self._control._send_settled_webhook(task_id)
+    async def _invoke_agent_payload(
+        self,
+        agent: Any,
+        payload: Any,
+        run_config: dict[str, Any],
+        record: TaskRecord,
+    ) -> Any:
+        astream = getattr(agent, "astream", None)
+        if not callable(astream):
+            return await agent.ainvoke(payload, config=run_config, version="v2")
+        latest: Any = _MISSING_STREAM_VALUE
+        interrupts: list[Any] = []
+        async for part in astream(
+            payload,
+            config=run_config,
+            stream_mode=["messages", "values"],
+            version="v2",
+        ):
+            delta = assistant_delta_from_stream_part(part)
+            if delta is not None:
+                ledger = self._control._task_manager.event_ledger
+                if ledger is not None:
+                    ledger.publish_assistant_delta(
+                        task_id=record.task_id,
+                        run_count=record.run_count,
+                        content=delta,
+                    )
+            if isinstance(part, dict) and part.get("type") == "values":
+                if "data" in part:
+                    latest = part["data"]
+                raw_interrupts = part.get("interrupts")
+                if isinstance(raw_interrupts, (tuple, list)):
+                    interrupts.extend(raw_interrupts)
+        if latest is _MISSING_STREAM_VALUE:
+            aget_state = getattr(agent, "aget_state", None)
+            if not callable(aget_state):
+                raise RuntimeError(
+                    "Agent stream completed without values or readable state"
+                )
+            snapshot = await aget_state(run_config)
+            latest = getattr(snapshot, "values", _MISSING_STREAM_VALUE)
+            if latest is _MISSING_STREAM_VALUE:
+                raise RuntimeError(
+                    "Agent stream completed without values or readable state"
+                )
+            raw_interrupts = getattr(snapshot, "interrupts", ())
+            if isinstance(raw_interrupts, (tuple, list)):
+                interrupts.extend(raw_interrupts)
+        return GraphOutput(value=latest, interrupts=tuple(interrupts))
+
+    def _finalize_cancelled_run(
+        self,
+        task_id: str,
+        error: asyncio.CancelledError,
+    ) -> bool:
+        try:
+            record = self._control._task_manager.get_task(task_id)
+            if record.state != "running":
+                return False
+            explicit_cancel = self._control._task_manager.was_cancel_requested(task_id)
+            if explicit_cancel:
+                self._control._task_manager.mark_cancelled(task_id)
+            else:
+                self._control._task_manager.mark_interrupted(
+                    task_id,
+                    _format_interrupted_error(error),
+                )
+            self._control._maybe_publish_settled_message(task_id)
+            return explicit_cancel
+        except Exception:
+            logger.exception("Failed to finalize cancelled local run: %s", task_id)
+            return False
 
     async def _run_agent_turn(self, task_id: str, user_input: str) -> None:
         await self._control._run_agent_payload(
@@ -371,7 +403,7 @@ class LocalTaskExecutor:
         task_id: str,
         user_input: str,
         *,
-        permit: MutationPermit | None = None,
+        permit: _MutationPermit | None = None,
     ) -> asyncio.Task[None]:
         """
         启动本地任务的一轮异步执行
@@ -456,7 +488,7 @@ class LocalTaskExecutor:
         task_id: str,
         decisions: list[dict[str, Any]],
         *,
-        permit: MutationPermit | None = None,
+        permit: _MutationPermit | None = None,
     ) -> asyncio.Task[None]:
         record = self._control._task_manager.get_task(task_id)
         review_id = (record.pending_review or {}).get("review_id")

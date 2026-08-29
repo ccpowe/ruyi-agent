@@ -19,10 +19,9 @@ from ruyi_agent.runtime.delegation.context import DelegationContext
 from ruyi_agent.runtime.delegation.contracts import (
     UnknownWorkerTaskError,
     _now,
-    _parse_task_timestamp,
-    _validate_remote_task_state,
 )
 from ruyi_agent.runtime.delegation.live_runs import LiveRunRegistry
+from ruyi_agent.runtime.delegation import remote_reconciliation
 from ruyi_agent.runtime.task_events import (
     TaskEventLedger,
     TaskLifecycleEventType,
@@ -30,7 +29,6 @@ from ruyi_agent.runtime.task_events import (
     lifecycle_event_data,
     lifecycle_event_type,
     normalize_task_event_text,
-    public_task_event_fingerprint,
 )
 from ruyi_agent.storage.task_store import (
     TaskRootBudgetExceededError as MaxTasksPerRootError,
@@ -829,147 +827,79 @@ class TaskManager:
             record.updated_at = _now()
             self._clear_pending_review_and_save(record)
 
+    def begin_external_operation(
+        self,
+        task_id: str,
+        *,
+        operation: str,
+        identity: str,
+    ) -> None:
+        remote_reconciliation.begin_external_operation(
+            self,
+            task_id,
+            operation=operation,
+            identity=identity,
+        )
+
+    def clear_external_operation(self, task_id: str) -> None:
+        remote_reconciliation.clear_external_operation(self, task_id)
+
+    def mark_external_outcome_uncertain(
+        self,
+        task_id: str,
+        *,
+        operation: str,
+        identity: str,
+    ) -> None:
+        remote_reconciliation.mark_external_outcome_uncertain(
+            self,
+            task_id,
+            operation=operation,
+            identity=identity,
+        )
+
+    def bind_uncertain_remote_task(
+        self,
+        task_id: str,
+        upstream_task_id: str,
+    ) -> TaskRecord:
+        return remote_reconciliation.bind_uncertain_remote_task(
+            self,
+            task_id,
+            upstream_task_id,
+        )
+
+    def set_remote_webhook_if_missing(
+        self,
+        task_id: str,
+        webhook: dict[str, Any],
+    ) -> TaskRecord:
+        return remote_reconciliation.set_remote_webhook_if_missing(
+            self,
+            task_id,
+            webhook,
+        )
+
+    def bind_and_sync_remote_task(
+        self,
+        task_id: str,
+        upstream_task_id: str,
+        payload: dict[str, Any],
+    ) -> TaskRecord:
+        return remote_reconciliation.bind_and_sync_remote_task(
+            self,
+            task_id,
+            upstream_task_id,
+            payload,
+        )
+
     def sync_remote_task(self, task_id: str, payload: dict[str, Any]) -> TaskRecord:
         """Synchronize a remote Task with strong in-memory exception safety."""
 
         record = self.get_task(task_id)
         root = self._root_record(record)
         with self._review_memory_transaction(record, root):
-            return self._sync_remote_task(task_id, payload)
-
-    def _sync_remote_task(
-        self,
-        task_id: str,
-        payload: dict[str, Any],
-    ) -> TaskRecord:
-        """
-        将远端任务 payload 同步到本地任务记录
-
-        Args:
-            task_id: 当前 runtime 内部任务 ID
-            payload: 远端网关返回的任务状态 payload
-
-        Returns:
-            更新后的任务记录
-
-        Raises:
-            ValueError: 远端 payload 缺少必要字段或类型不合法
-        """
-        # 为什么集中同步远端状态：CLI 和 wait/check/send_input/cancel 都需要一致地映射远端任务视图。
-        record = self.get_task(task_id)
-        current_review = self._review_for_task(task_id)
-        previous_fingerprint = public_task_event_fingerprint(record)
-        previous_run_count = record.run_count
-        status, run_count = _validate_remote_task_state(task_id, payload)
-
-        last_result = payload.get("last_result")
-        error = payload.get("error")
-        pending_review = payload.get("pending_review")
-        public_pending_review = (
-            dict(pending_review) if isinstance(pending_review, dict) else None
-        )
-        if (
-            public_pending_review is not None
-            and "source_task_id" in public_pending_review
-        ):
-            public_pending_review["source_task_id"] = record.task_id
-        record.state = status
-        record.thread_id = record.task_id
-        record.result = (
-            normalize_task_event_text(last_result)
-            if isinstance(last_result, str)
-            else None
-        )
-        record.error = (
-            "Remote Gateway Task failed"
-            if status in {"failed", "interrupted"} and isinstance(error, str)
-            else None
-        )
-        record.pending_review = public_pending_review
-        record.run_count = run_count
-        if run_count != previous_run_count:
-            record.mailbox_suppressed = False
-            record.mailbox_delivered = False
-        record.created_at = _parse_task_timestamp(
-            payload.get("created_at"),
-            fallback=record.created_at,
-        )
-        record.updated_at = _parse_task_timestamp(
-            payload.get("updated_at"),
-            fallback=record.updated_at,
-        )
-        self._live_runs.discard(task_id)
-        record_changed = public_task_event_fingerprint(record) != previous_fingerprint
-        if record.state == "waiting_for_human" and record.pending_review is not None:
-            review_id = record.pending_review.get("review_id")
-            if not isinstance(review_id, str) or not review_id:
-                review_id = str(uuid.uuid4())
-            else:
-                review_id = normalize_task_event_text(review_id)
-            record.pending_review["review_id"] = review_id
-            matching_review = self.get_pending_review(review_id)
-            if (
-                matching_review is not None
-                and matching_review.task_id != record.task_id
-            ):
-                raise ValueError(f"Pending review already exists: {review_id}")
-            review = PendingReviewRecord(
-                review_id=review_id,
-                task_id=record.task_id,
-                root_task_id=record.root_task_id,
-                payload=dict(record.pending_review),
-                created_at=(
-                    current_review.created_at
-                    if current_review is not None
-                    and current_review.review_id == review_id
-                    else record.updated_at
-                ),
-                updated_at=record.updated_at,
-                ingest_sequence=self._review_ingest_sequence(
-                    current_review,
-                    review_id,
-                ),
-            )
-            reviews = [
-                item
-                for item in self.list_pending_reviews(root_task_id=record.root_task_id)
-                if item.task_id != record.task_id
-            ]
-            reviews.append(review)
-            root, root_changed = self._project_root_review(record, reviews)
-            self._persist_review_transition(
-                record,
-                pending_review=review,
-                root=root,
-                root_changed=root_changed,
-                record_changed=record_changed,
-            )
-            if current_review is not None:
-                self._pending_reviews.pop(current_review.review_id, None)
-            review = self._persisted_review(review)
-            self._pending_reviews[review.review_id] = review
-        elif current_review is not None:
-            remaining = [
-                review
-                for review in self.list_pending_reviews(
-                    root_task_id=record.root_task_id
-                )
-                if review.review_id != current_review.review_id
-            ]
-            root, root_changed = self._project_root_review(record, remaining)
-            self._persist_review_transition(
-                record,
-                pending_review=None,
-                root=root,
-                root_changed=root_changed,
-                record_changed=record_changed,
-            )
-            self._pending_reviews.pop(current_review.review_id, None)
-        elif record_changed:
-            self._save_lifecycle(record)
-        else:
-            self._save(record)
-        return record
+            return remote_reconciliation.sync_remote_task(self, task_id, payload)
 
     def find_by_upstream_task_id(self, upstream_task_id: str) -> TaskRecord | None:
         """

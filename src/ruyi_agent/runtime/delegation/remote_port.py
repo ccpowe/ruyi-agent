@@ -8,8 +8,9 @@ local run lifecycle.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Protocol
 
 from ruyi_agent.integrations.a2a.client import A2AClientError
@@ -25,6 +26,8 @@ from ruyi_agent.runtime.delegation.contracts import (
 from ruyi_agent.runtime.delegation.registry import RemoteRefEntry
 from ruyi_agent.task_models import TaskRecord
 
+logger = logging.getLogger(__name__)
+
 
 class RemoteTaskHost(Protocol):
     _a2a_client: Any
@@ -34,6 +37,7 @@ class RemoteTaskHost(Protocol):
     _node_id: str
     _permission_default_profile: str
     _registry: Any
+    _run_supervisor: Any
     _remote_poll_interval: float
     _remote_status_retry_attempts: int
     _task_manager: Any
@@ -83,6 +87,11 @@ class RemoteTaskPort:
         webhook = self._build_webhook_config()
         if webhook is not None:
             create_kwargs["webhook"] = webhook
+        self._control._task_manager.begin_external_operation(
+            record.task_id,
+            operation="create",
+            identity=idempotency_key,
+        )
         try:
             payload = await self._control._a2a_client.create_task(
                 entry.ref, **create_kwargs
@@ -93,16 +102,26 @@ class RemoteTaskPort:
                     f"Remote ref '{entry.name}' returned no task_id from remote gateway."
                 )
             _validate_remote_task_state(record.task_id, payload)
+        except asyncio.CancelledError:
+            self._mark_external_outcome_uncertain(
+                record.task_id,
+                operation="create",
+                identity=idempotency_key,
+            )
+            raise
         except Exception:
+            self._control._task_manager.clear_external_operation(record.task_id)
             self._control._task_manager.mark_failed(
                 record.task_id,
                 "Remote Gateway Task creation failed",
             )
             self._control._maybe_publish_settled_message(record.task_id)
             raise
-        record.upstream_task_id = upstream_task_id
-        record.thread_id = record.task_id
-        synced = self._control._task_manager.sync_remote_task(record.task_id, payload)
+        synced = self._control._task_manager.bind_and_sync_remote_task(
+            record.task_id,
+            upstream_task_id,
+            payload,
+        )
         if self._control._is_settled_record(synced):
             self._control._maybe_publish_settled_message(synced.task_id)
         return synced
@@ -116,12 +135,28 @@ class RemoteTaskPort:
     ) -> TaskRecord:
         """Forward a review decision and synchronize the local proxy record."""
         entry = self._get_remote_entry_for_task(record.task_id)
-        payload = await self._control._a2a_client.submit_review_decision(
-            entry.ref,
-            task_id=record.upstream_task_id or record.task_id,
-            review_id=review_id,
-            decisions=decisions,
+        self._control._task_manager.begin_external_operation(
+            record.task_id,
+            operation="review",
+            identity=review_id,
         )
+        try:
+            payload = await self._control._a2a_client.submit_review_decision(
+                entry.ref,
+                task_id=record.upstream_task_id or record.task_id,
+                review_id=review_id,
+                decisions=decisions,
+            )
+        except asyncio.CancelledError:
+            self._mark_external_outcome_uncertain(
+                record.task_id,
+                operation="review",
+                identity=review_id,
+            )
+            raise
+        except Exception:
+            self._control._task_manager.clear_external_operation(record.task_id)
+            raise
         return self._control._task_manager.sync_remote_task(record.task_id, payload)
 
     async def send_input(
@@ -134,6 +169,7 @@ class RemoteTaskPort:
     ) -> TaskRecord:
         """Forward input to one remote task and synchronize its proxy."""
         entry = self._get_remote_entry_for_task(record.task_id)
+        operation_identity = idempotency_key or f"{record.task_id}:send:{uuid.uuid4()}"
         send_kwargs: dict[str, Any] = {
             "task_id": record.upstream_task_id or record.task_id,
             "input_content": message,
@@ -141,19 +177,72 @@ class RemoteTaskPort:
         }
         if idempotency_key is not None:
             send_kwargs["idempotency_key"] = idempotency_key
-        payload = await self._control._a2a_client.send_input(
-            entry.ref, **send_kwargs
+        self._control._task_manager.begin_external_operation(
+            record.task_id,
+            operation="send",
+            identity=operation_identity,
         )
+        try:
+            payload = await self._control._a2a_client.send_input(
+                entry.ref, **send_kwargs
+            )
+        except asyncio.CancelledError:
+            self._mark_external_outcome_uncertain(
+                record.task_id,
+                operation="send",
+                identity=operation_identity,
+            )
+            raise
+        except Exception:
+            self._control._task_manager.clear_external_operation(record.task_id)
+            raise
         return self._control._task_manager.sync_remote_task(record.task_id, payload)
 
     async def cancel(self, record: TaskRecord) -> TaskRecord:
         """Cancel the active run represented by one remote proxy record."""
         entry = self._get_remote_entry_for_task(record.task_id)
-        payload = await self._control._a2a_client.cancel_task(
-            entry.ref,
-            task_id=record.upstream_task_id or record.task_id,
+        operation_identity = record.upstream_task_id or record.task_id
+        self._control._task_manager.begin_external_operation(
+            record.task_id,
+            operation="cancel",
+            identity=operation_identity,
         )
+        try:
+            payload = await self._control._a2a_client.cancel_task(
+                entry.ref,
+                task_id=operation_identity,
+            )
+        except asyncio.CancelledError:
+            self._mark_external_outcome_uncertain(
+                record.task_id,
+                operation="cancel",
+                identity=operation_identity,
+            )
+            raise
+        except Exception:
+            self._control._task_manager.clear_external_operation(record.task_id)
+            raise
         return self._control._task_manager.sync_remote_task(record.task_id, payload)
+
+    def _mark_external_outcome_uncertain(
+        self,
+        task_id: str,
+        *,
+        operation: str,
+        identity: str,
+    ) -> None:
+        try:
+            self._control._task_manager.mark_external_outcome_uncertain(
+                task_id,
+                operation=operation,
+                identity=identity,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to persist uncertain remote %s outcome for task %s",
+                operation,
+                task_id,
+            )
 
     def _get_remote_entry_for_task(self, task_id: str) -> RemoteRefEntry:
         """
@@ -207,18 +296,28 @@ class RemoteTaskPort:
         Raises:
             A2AClientError: 多次重试后仍无法获取远端状态
         """
-        last_exc: A2AClientError | None = None
-        for attempt in range(self._control._remote_status_retry_attempts):
-            try:
-                return await self._control._refresh_remote_task(task_id)
-            except A2AClientError as exc:
-                last_exc = exc
-                if attempt + 1 >= self._control._remote_status_retry_attempts:
-                    raise
-                await asyncio.sleep(self._control._remote_poll_interval)
-        if last_exc is not None:
-            raise last_exc
-        raise AssertionError("unreachable")
+        permit = await self._control._run_supervisor.acquire_mutation()
+        operation = None
+        try:
+            operation = await self._control._run_supervisor.promote_to_operation(
+                permit
+            )
+            last_exc: A2AClientError | None = None
+            for attempt in range(self._control._remote_status_retry_attempts):
+                try:
+                    return await self._control._refresh_remote_task(task_id)
+                except A2AClientError as exc:
+                    last_exc = exc
+                    if attempt + 1 >= self._control._remote_status_retry_attempts:
+                        raise
+                    await asyncio.sleep(self._control._remote_poll_interval)
+            if last_exc is not None:
+                raise last_exc
+            raise AssertionError("unreachable")
+        finally:
+            if operation is not None:
+                await self._control._run_supervisor.cleanup_operation(operation)
+            await self._control._run_supervisor.cleanup_mutation(permit)
 
     def _format_remote_status_unavailable(
         self,
@@ -302,17 +401,31 @@ class RemoteTaskPort:
         Returns:
             找到并同步到本地任务返回 True；无法识别事件返回 False
         """
-        upstream_task_id = payload.get("task_id")
-        if not isinstance(upstream_task_id, str) or not upstream_task_id:
-            return False
-        record = self._control._task_manager.find_by_upstream_task_id(upstream_task_id)
-        if record is None:
-            return False
-        synced = self._control._task_manager.sync_remote_task(record.task_id, payload)
-        if self._control._is_settled_record(synced):
-            self._control._maybe_publish_settled_message(synced.task_id)
-            await self._control._send_settled_webhook(synced.task_id)
-        return True
+        permit = await self._control._run_supervisor.acquire_mutation()
+        operation = None
+        try:
+            upstream_task_id = payload.get("task_id")
+            if not isinstance(upstream_task_id, str) or not upstream_task_id:
+                return False
+            record = self._control._task_manager.find_by_upstream_task_id(
+                upstream_task_id
+            )
+            if record is None:
+                return False
+            synced = self._control._task_manager.sync_remote_task(
+                record.task_id, payload
+            )
+            if self._control._is_settled_record(synced):
+                self._control._maybe_publish_settled_message(synced.task_id)
+                operation = await self._control._run_supervisor.promote_to_operation(
+                    permit
+                )
+                await self._control._send_settled_webhook(synced.task_id)
+            return True
+        finally:
+            if operation is not None:
+                await self._control._run_supervisor.cleanup_operation(operation)
+            await self._control._run_supervisor.cleanup_mutation(permit)
 
 
     async def list_remote_task_messages(
@@ -324,16 +437,26 @@ class RemoteTaskPort:
     ) -> dict[str, Any]:
         """Request one opaque message-history page for a remote-ref Task."""
 
-        record = self._control._task_manager.get_task(task_id)
-        if record.route_kind != "remote_ref":
-            raise ValueError(f"Task '{task_id}' is not a remote_ref task")
-        entry = self._control._get_remote_entry_for_task(task_id)
-        return await self._control._a2a_client.list_task_messages(
-            entry.ref,
-            task_id=record.upstream_task_id or task_id,
-            cursor=cursor,
-            limit=limit,
-        )
+        permit = await self._control._run_supervisor.acquire_mutation()
+        operation = None
+        try:
+            record = self._control._task_manager.get_task(task_id)
+            if record.route_kind != "remote_ref":
+                raise ValueError(f"Task '{task_id}' is not a remote_ref task")
+            entry = self._control._get_remote_entry_for_task(task_id)
+            operation = await self._control._run_supervisor.promote_to_operation(
+                permit
+            )
+            return await self._control._a2a_client.list_task_messages(
+                entry.ref,
+                task_id=record.upstream_task_id or task_id,
+                cursor=cursor,
+                limit=limit,
+            )
+        finally:
+            if operation is not None:
+                await self._control._run_supervisor.cleanup_operation(operation)
+            await self._control._run_supervisor.cleanup_mutation(permit)
 
     def open_remote_task_event_stream(
         self,
@@ -344,16 +467,31 @@ class RemoteTaskPort:
     ) -> AbstractAsyncContextManager[Any]:
         """Open the downstream SSE client boundary for a remote-ref Task."""
 
-        record = self._control._task_manager.get_task(task_id)
-        if record.route_kind != "remote_ref":
-            raise ValueError(f"Task '{task_id}' is not a remote_ref task")
-        entry = self._control._get_remote_entry_for_task(task_id)
-        return self._control._a2a_client.open_task_event_stream(
-            entry.ref,
-            task_id=record.upstream_task_id or task_id,
-            run_count=run_count,
-            last_event_id=last_event_id,
-        )
+        @asynccontextmanager
+        async def admitted_stream() -> Any:
+            permit = await self._control._run_supervisor.acquire_mutation()
+            operation = None
+            try:
+                record = self._control._task_manager.get_task(task_id)
+                if record.route_kind != "remote_ref":
+                    raise ValueError(f"Task '{task_id}' is not a remote_ref task")
+                entry = self._control._get_remote_entry_for_task(task_id)
+                operation = (
+                    await self._control._run_supervisor.promote_to_operation(permit)
+                )
+                async with self._control._a2a_client.open_task_event_stream(
+                    entry.ref,
+                    task_id=record.upstream_task_id or task_id,
+                    run_count=run_count,
+                    last_event_id=last_event_id,
+                ) as stream:
+                    yield stream
+            finally:
+                if operation is not None:
+                    await self._control._run_supervisor.cleanup_operation(operation)
+                await self._control._run_supervisor.cleanup_mutation(permit)
+
+        return admitted_stream()
 
 
     def ensure_remote_task_record(
@@ -382,6 +520,23 @@ class RemoteTaskPort:
         Raises:
             ValueError: agent 类型、任务路由或 upstream_task_id 不匹配
         """
+        return self._control._run_supervisor.mutate_now(
+            lambda: self._ensure_remote_task_record(
+                agent_name=agent_name,
+                task_id=task_id,
+                upstream_task_id=upstream_task_id,
+                webhook=webhook,
+            )
+        )
+
+    def _ensure_remote_task_record(
+        self,
+        *,
+        agent_name: str,
+        task_id: str,
+        upstream_task_id: str,
+        webhook: dict[str, Any] | None,
+    ) -> TaskRecord:
         try:
             record = self._control._task_manager.get_task(task_id)
         except UnknownWorkerTaskError:
@@ -413,13 +568,25 @@ class RemoteTaskPort:
             )
         if record.route_kind != "remote_ref":
             raise ValueError(f"Task '{task_id}' is not a remote_ref task")
+        if (
+            record.upstream_task_id is None
+            and record.external_outcome_uncertain
+            and record.external_operation == "create"
+        ):
+            return self._control._task_manager.bind_uncertain_remote_task(
+                task_id,
+                upstream_task_id,
+            )
         if record.upstream_task_id != upstream_task_id:
             raise ValueError(
                 f"Task '{task_id}' is linked to upstream task "
                 f"'{record.upstream_task_id}', not '{upstream_task_id}'"
             )
         if record.webhook is None and webhook is not None:
-            record.webhook = webhook
+            return self._control._task_manager.set_remote_webhook_if_missing(
+                task_id,
+                webhook,
+            )
         return record
 
     async def refresh_task(self, task_id: str) -> TaskRecord:

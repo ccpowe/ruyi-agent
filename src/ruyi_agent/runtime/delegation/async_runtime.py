@@ -56,9 +56,9 @@ from ruyi_agent.runtime.delegation.registry import (
 )
 from ruyi_agent.runtime.delegation.remote_port import RemoteTaskPort
 from ruyi_agent.runtime.delegation.run_supervisor import (
-    MutationPermit,
     RunSupervisor,
     RuntimeClosingError,
+    _MutationPermit,
 )
 from ruyi_agent.runtime.delegation.task_manager import TaskManager
 from ruyi_agent.runtime.delegation.task_runtime import TaskRuntime
@@ -230,7 +230,7 @@ class AgentControl:
         task_id: str,
         user_input: str,
         *,
-        permit: MutationPermit | None = None,
+        permit: _MutationPermit | None = None,
     ) -> asyncio.Task[None]:
         return await self._local_executor._start_run(
             task_id,
@@ -253,15 +253,27 @@ class AgentControl:
         self._local_executor.start_mailbox_recovery()
 
     async def close(self) -> None:
-        await self._local_executor.close()
-        await self._settled_notifier.close()
+        cancelled = False
+        try:
+            await self._local_executor.close()
+        except asyncio.CancelledError:
+            cancelled = True
+        try:
+            await self._run_supervisor._await_cleanup(
+                self._settled_notifier.close(),
+                name="settled-notifier",
+            )
+        except asyncio.CancelledError:
+            cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _resume_run(
         self,
         task_id: str,
         decisions: list[dict[str, Any]],
         *,
-        permit: MutationPermit | None = None,
+        permit: _MutationPermit | None = None,
     ) -> asyncio.Task[None]:
         return await self._local_executor._resume_run(
             task_id,

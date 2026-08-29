@@ -568,9 +568,11 @@ class DelegationTools:
             run_task = self._control._task_manager.get_live_run(task_id)
             if run_task is not None:
                 try:
-                    await run_task
+                    await asyncio.shield(run_task)
                 except asyncio.CancelledError:
-                    pass
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
             record = self._control._task_manager.get_task(task_id)
             if record.state in SETTLED_TASK_STATES:
                 return self._control._format_task_record(record)

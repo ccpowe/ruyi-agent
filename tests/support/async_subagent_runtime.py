@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
+
 from langchain_core.messages import AIMessage, AIMessageChunk
 
 from ruyi_agent.integrations.a2a.client import A2AClientError
@@ -391,7 +393,13 @@ class RemoteRefreshAfterRestartA2AClient:
         }
 
     async def send_input(
-        self, remote_ref, *, task_id: str, input_content: str, attachments=None
+        self,
+        remote_ref,
+        *,
+        task_id: str,
+        input_content: str,
+        attachments=None,
+        idempotency_key=None,
     ):
         self.sent_inputs.append(input_content)
         return {
@@ -453,7 +461,13 @@ class FlakyRemoteA2AClient:
         }
 
     async def send_input(
-        self, remote_ref, *, task_id: str, input_content: str, attachments=None
+        self,
+        remote_ref,
+        *,
+        task_id: str,
+        input_content: str,
+        attachments=None,
+        idempotency_key=None,
     ):
         raise AssertionError("send_input should not be called in this test")
 
@@ -490,7 +504,13 @@ class AlwaysFailingRemoteA2AClient:
         )
 
     async def send_input(
-        self, remote_ref, *, task_id: str, input_content: str, attachments=None
+        self,
+        remote_ref,
+        *,
+        task_id: str,
+        input_content: str,
+        attachments=None,
+        idempotency_key=None,
     ):
         raise AssertionError("send_input should not be called in this test")
 
@@ -514,7 +534,13 @@ class ShouldNotCallRemoteA2AClient:
         raise AssertionError("remote get_task should not be called")
 
     async def send_input(
-        self, remote_ref, *, task_id: str, input_content: str, attachments=None
+        self,
+        remote_ref,
+        *,
+        task_id: str,
+        input_content: str,
+        attachments=None,
+        idempotency_key=None,
     ):
         raise AssertionError("remote send_input should not be called")
 
@@ -553,7 +579,13 @@ class SlowRemoteA2AClient:
         raise AssertionError("remote get_task should not be called")
 
     async def send_input(
-        self, remote_ref, *, task_id: str, input_content: str, attachments=None
+        self,
+        remote_ref,
+        *,
+        task_id: str,
+        input_content: str,
+        attachments=None,
+        idempotency_key=None,
     ):
         raise AssertionError("remote send_input should not be called")
 
@@ -590,7 +622,13 @@ class RecordingRemoteA2AClient:
         raise AssertionError("remote get_task should not be called")
 
     async def send_input(
-        self, remote_ref, *, task_id: str, input_content: str, attachments=None
+        self,
+        remote_ref,
+        *,
+        task_id: str,
+        input_content: str,
+        attachments=None,
+        idempotency_key=None,
     ):
         raise AssertionError("remote send_input should not be called")
 
@@ -715,7 +753,13 @@ class ReviewRemoteA2AClient:
         raise AssertionError("remote get_task should not be called")
 
     async def send_input(
-        self, remote_ref, *, task_id: str, input_content: str, attachments=None
+        self,
+        remote_ref,
+        *,
+        task_id: str,
+        input_content: str,
+        attachments=None,
+        idempotency_key=None,
     ):
         raise AssertionError("remote send_input should not be called")
 
@@ -793,7 +837,10 @@ def write_test_skill(tmp_path, name: str) -> SkillEntry:
     )
 
 
-def build_test_remote_refs() -> dict[str, RemoteRef]:
+def build_test_remote_refs(
+    *,
+    create_idempotency: Literal["none", "ruyi_gateway_v1"] = "none",
+) -> dict[str, RemoteRef]:
     return {
         "remote_code_wiki": RemoteRef(
             name="remote_code_wiki",
@@ -801,5 +848,6 @@ def build_test_remote_refs() -> dict[str, RemoteRef]:
             url="https://example.com/a2a",
             remote_agent_name="code_wiki",
             auth={"type": "bearer", "token_env": "REMOTE_CODE_WIKI_TOKEN"},
+            create_idempotency=create_idempotency,
         )
     }

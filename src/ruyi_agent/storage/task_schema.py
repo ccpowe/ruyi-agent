@@ -65,7 +65,10 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             skill_view_path TEXT,
             skill_view_hash TEXT,
             pending_review_json TEXT,
-            artifacts_json TEXT NOT NULL DEFAULT '[]'
+            artifacts_json TEXT NOT NULL DEFAULT '[]',
+            external_operation TEXT,
+            external_operation_identity TEXT,
+            external_outcome_uncertain INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -195,6 +198,9 @@ def _ensure_legacy_columns(connection: sqlite3.Connection) -> None:
         ("skill_view_path", "TEXT"),
         ("skill_view_hash", "TEXT"),
         ("artifacts_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("external_operation", "TEXT"),
+        ("external_operation_identity", "TEXT"),
+        ("external_outcome_uncertain", "INTEGER NOT NULL DEFAULT 0"),
     ):
         _ensure_column(
             connection,
