@@ -28,6 +28,8 @@ class GatewayCommandClaim:
     command_id: str
     task_id: str
     mailbox_message_id: str | None
+    operation: str
+    target: str
     claim_token: str | None = None
     response_json: str | None = None
     error_json: str | None = None
@@ -113,6 +115,8 @@ class GatewayCommandStore:
                         command_id=command_id,
                         task_id=proposed_task_id,
                         mailbox_message_id=proposed_mailbox_message_id,
+                        operation=operation,
+                        target=target,
                         claim_token=claim_token,
                     )
 
@@ -141,6 +145,8 @@ class GatewayCommandStore:
                         command_id=command_id,
                         task_id=task_id,
                         mailbox_message_id=mailbox_message_id,
+                        operation=operation,
+                        target=target,
                         response_json=response_json,
                     )
                 if row["state"] == "failed":
@@ -155,6 +161,8 @@ class GatewayCommandStore:
                         command_id=command_id,
                         task_id=task_id,
                         mailbox_message_id=mailbox_message_id,
+                        operation=operation,
+                        target=target,
                         error_json=error_json,
                     )
                 if row["state"] == "processing":
@@ -164,6 +172,8 @@ class GatewayCommandStore:
                         command_id=command_id,
                         task_id=task_id,
                         mailbox_message_id=mailbox_message_id,
+                        operation=operation,
+                        target=target,
                     )
                 if row["state"] != "pending":
                     raise GatewayCommandStateError(
@@ -183,6 +193,8 @@ class GatewayCommandStore:
                     command_id=command_id,
                     task_id=task_id,
                     mailbox_message_id=mailbox_message_id,
+                    operation=operation,
+                    target=target,
                     claim_token=claim_token,
                 )
             except BaseException:

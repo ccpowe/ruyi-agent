@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from ruyi_agent.storage.gateway_command_store import GatewayCommandStore
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
+from ruyi_agent.task_models import TaskRouteRecord
 from tests.unit.gateway_http_support import (
     StaticRemoteA2AClient,
     auth_headers,
@@ -144,6 +145,97 @@ def test_legacy_succeeded_command_response_is_reprojected_to_public_route(
     assert replay.json()["task_id"] == public_id
     assert replay.json()["root_task_id"] == public_id
     assert replay.json()["parent_task_id"] is None
+    assert replay.json()["pending_review"]["source_task_id"] == public_id
+    assert replay.json()["artifacts"] == []
+    assert PRIVATE_ID not in replay.text
+    assert "remote.invalid" not in replay.text
+    assert remote.created_inputs == ["legacy projection"]
+
+
+@pytest.mark.parametrize("backup_kind", ["command_only", "pending_route"])
+def test_legacy_succeeded_command_without_active_route_is_static_and_public(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    backup_kind: str,
+) -> None:
+    original_route_path, command_path = _paths(
+        tmp_path,
+        f"legacy-{backup_kind}-source",
+    )
+    key = f"legacy-{backup_kind}-key"
+    original, remote = _create_keyed_remote_task(
+        monkeypatch,
+        route_path=original_route_path,
+        command_path=command_path,
+        key=key,
+    )
+    public_id = str(original["task_id"])
+    malicious = {
+        **original,
+        "task_id": PRIVATE_ID,
+        "agent_name": PRIVATE_ID,
+        "parent_task_id": PRIVATE_ID,
+        "root_task_id": PRIVATE_ID,
+        "last_result": f"private result {PRIVATE_ID} at {PRIVATE_URL}",
+        "error": f"failed {PRIVATE_ID} at {PRIVATE_URL}",
+        "metadata": {"private_task_url": PRIVATE_URL},
+        "pending_review": {
+            "review_id": "legacy-review",
+            "source_task_id": PRIVATE_ID,
+            "action_requests": [],
+            "review_configs": [],
+        },
+        "artifacts": [
+            {
+                "artifact_id": PRIVATE_ID,
+                "path": f"/tasks/{PRIVATE_ID}",
+                "name": PRIVATE_URL,
+                "content_type": "text/plain",
+                "size": 1,
+                "run_count": 1,
+            }
+        ],
+    }
+    with sqlite3.connect(command_path) as connection:
+        connection.execute(
+            "UPDATE gateway_commands SET response_json = ? WHERE idempotency_key = ?",
+            (json.dumps(malicious), key),
+        )
+
+    backup_route_path = str(tmp_path / f"{backup_kind}-routes.sqlite")
+    if backup_kind == "pending_route":
+        backup_routes = GatewayRouteStore(backup_route_path)
+        try:
+            backup_routes.save_route(
+                TaskRouteRecord(
+                    task_id=public_id,
+                    agent_name="remote_code_wiki",
+                    metadata={},
+                    route_kind="remote_ref",
+                    upstream_task_id=None,
+                    route_state="pending",
+                )
+            )
+        finally:
+            backup_routes.close()
+
+    replay, _ = _replay(
+        monkeypatch,
+        route_path=backup_route_path,
+        command_path=command_path,
+        key=key,
+        remote=remote,
+    )
+
+    assert replay.status_code == 201
+    assert replay.headers["idempotency-replayed"] == "true"
+    assert replay.json()["task_id"] == public_id
+    assert replay.json()["agent_name"] == "remote_code_wiki"
+    assert replay.json()["root_task_id"] == public_id
+    assert replay.json()["parent_task_id"] is None
+    assert replay.json()["last_result"] is None
+    assert replay.json()["error"] == "Remote Gateway Task failed"
+    assert replay.json()["metadata"] == {}
     assert replay.json()["pending_review"]["source_task_id"] == public_id
     assert replay.json()["artifacts"] == []
     assert PRIVATE_ID not in replay.text

@@ -373,20 +373,62 @@ class GatewayCommandService:
             record = self._context.router.ensure_record(route)
         except (GatewayTaskError, ValueError):
             route = None
-            record = None
+            try:
+                record = self._context.control.get_task_record(claim.task_id)
+            except ValueError:
+                record = None
+        trusted_local_record = bool(
+            route is None and record is not None and record.route_kind == "local"
+        )
+        identity_record = record if route is not None or trusted_local_record else None
         pending_review = _public_pending_review(
             stored.pending_review,
             task_id=claim.task_id,
         )
+        fallback_agent_name = (
+            claim.target if claim.operation == "create_task" else "unavailable"
+        )
         updates: dict[str, object] = {
             "task_id": claim.task_id,
-            "root_task_id": record.root_task_id if record is not None else claim.task_id,
-            "parent_task_id": record.parent_task_id if record is not None else None,
-            "agent_name": route.agent_name if route is not None else stored.agent_name,
-            "metadata": dict(route.metadata) if route is not None else {},
+            "root_task_id": (
+                identity_record.root_task_id
+                if identity_record is not None
+                else claim.task_id
+            ),
+            "parent_task_id": (
+                identity_record.parent_task_id
+                if identity_record is not None
+                else None
+            ),
+            "agent_name": (
+                route.agent_name
+                if route is not None
+                else (
+                    identity_record.agent_name
+                    if identity_record is not None
+                    else fallback_agent_name
+                )
+            ),
+            "metadata": (
+                dict(route.metadata)
+                if route is not None
+                else (dict(stored.metadata) if trusted_local_record else {})
+            ),
             "pending_review": pending_review,
         }
-        if route is not None and route.route_kind == "remote_ref":
+        if (route is None and not trusted_local_record) or (
+            route is not None and route.route_state != "active"
+        ):
+            updates.update(
+                {
+                    "artifacts": [],
+                    "last_result": None,
+                    "error": (
+                        "Remote Gateway Task failed" if stored.error else None
+                    ),
+                }
+            )
+        elif route is not None and route.route_kind == "remote_ref":
             updates["artifacts"] = []
             if stored.error:
                 updates["error"] = "Remote Gateway Task failed"
