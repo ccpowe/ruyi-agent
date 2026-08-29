@@ -262,7 +262,8 @@ class TaskRouter:
             ) from exc
         except BaseException:
             if route_kind == "remote_ref" and not (
-                self.remote_create_idempotency_guaranteed(agent_name)
+                idempotency_key is not None
+                and self.remote_create_idempotency_guaranteed(agent_name)
             ):
                 await shield_durable_cleanup(
                     self._mark_cancelled_remote_create_uncertain(reservation)

@@ -20,7 +20,7 @@ from ruyi_agent.storage.gateway_command_store import (
     GatewayCommandClaim,
     GatewayCommandConflictError,
 )
-from ruyi_agent.task_models import MetadataScalar
+from ruyi_agent.task_models import MetadataScalar, TaskRouteRecord
 
 DEFAULT_GATEWAY_PRINCIPAL = "gateway-bearer"
 COMMAND_WAIT_TIMEOUT_SECONDS = 30.0
@@ -91,7 +91,7 @@ class GatewayCommandService:
             proposed_task_id=str(uuid4()),
         )
         if claim.status == "replay":
-            return self._replayed_outcome(claim)
+            return await self._replayed_outcome(claim)
         if claim.status == "terminal":
             raise await self._terminal_error(claim, create_command=True)
 
@@ -171,7 +171,7 @@ class GatewayCommandService:
             proposed_mailbox_message_id=str(uuid4()),
         )
         if claim.status == "replay":
-            return self._replayed_outcome(claim)
+            return await self._replayed_outcome(claim)
         if claim.status == "terminal":
             raise await self._terminal_error(claim, create_command=False)
         return await self._execute(
@@ -334,36 +334,65 @@ class GatewayCommandService:
         *,
         create_command: bool,
     ) -> GatewayTaskError:
-        error = _load_gateway_error(claim.error_json)
+        stored_error = _load_gateway_error(claim.error_json)
         try:
             route = await self._context.router.get_route(claim.task_id)
         except GatewayTaskError:
-            return error
-        details = dict(error.details or {})
+            return _public_terminal_error(
+                stored_error,
+                create_command=create_command,
+                task_id=claim.task_id,
+                route=None,
+            )
+        error = _public_terminal_error(
+            stored_error,
+            create_command=create_command,
+            task_id=route.task_id,
+            route=route,
+        )
         if create_command and route.route_state == "pending":
             route = await self._context.router.mark_create_outcome_uncertain(
                 route,
                 error.message,
             )
-        details.update(
-            {
-                "task_id": route.task_id,
-                "task_url": f"/tasks/{route.task_id}",
-                "task_queryable": True,
-                "route_state": route.route_state,
-            }
+            error = _public_terminal_error(
+                stored_error,
+                create_command=True,
+                task_id=route.task_id,
+                route=route,
+            )
+        return error
+
+    async def _replayed_outcome(
+        self,
+        claim: GatewayCommandClaim,
+    ) -> GatewayCommandOutcome:
+        stored = TaskResponse.model_validate_json(claim.response_json)
+        try:
+            route = await self._context.router.get_route(claim.task_id)
+            record = self._context.router.ensure_record(route)
+        except (GatewayTaskError, ValueError):
+            route = None
+            record = None
+        pending_review = _public_pending_review(
+            stored.pending_review,
+            task_id=claim.task_id,
         )
-        if create_command:
-            details["create_retryable"] = False
-            if route.route_state == "active":
-                details["effect_outcome"] = "completed"
-            else:
-                details.setdefault("effect_outcome", "uncertain")
-        return GatewayTaskError(
-            kind=error.kind,
-            code=error.code,
-            message=error.message,
-            details=details,
+        updates: dict[str, object] = {
+            "task_id": claim.task_id,
+            "root_task_id": record.root_task_id if record is not None else claim.task_id,
+            "parent_task_id": record.parent_task_id if record is not None else None,
+            "agent_name": route.agent_name if route is not None else stored.agent_name,
+            "metadata": dict(route.metadata) if route is not None else {},
+            "pending_review": pending_review,
+        }
+        if route is not None and route.route_kind == "remote_ref":
+            updates["artifacts"] = []
+            if stored.error:
+                updates["error"] = "Remote Gateway Task failed"
+        return GatewayCommandOutcome(
+            task=stored.model_copy(update=updates),
+            replayed=True,
         )
 
     async def _terminalize_unsafe_create(
@@ -386,13 +415,6 @@ class GatewayCommandService:
             claim_token=claim.claim_token,
             error_json=_dump_gateway_error(error),
         )
-
-    def _replayed_outcome(self, claim: GatewayCommandClaim) -> GatewayCommandOutcome:
-        return GatewayCommandOutcome(
-            task=TaskResponse.model_validate_json(claim.response_json),
-            replayed=True,
-        )
-
 
 def validate_idempotency_key(idempotency_key: str | None) -> None:
     if idempotency_key is None:
@@ -452,3 +474,110 @@ def _load_gateway_error(payload: str | None) -> GatewayTaskError:
         message=str(parsed["message"]),
         details=parsed.get("details"),
     )
+
+
+_SAFE_TERMINAL_CODES = {
+    "agent_unavailable",
+    "attachment_too_large",
+    "delegation_budget_exhausted",
+    "delegation_depth_exceeded",
+    "idempotency_outcome_uncertain",
+    "invalid_attachment",
+    "invalid_delegation_context",
+    "remote_executor_not_implemented",
+    "route_persistence_failed",
+    "runtime_unavailable",
+    "task_creation_failed",
+    "task_effect_not_durable",
+    "task_route_unavailable",
+    "upstream_gateway_error",
+}
+
+
+def _public_terminal_error(
+    stored: GatewayTaskError,
+    *,
+    create_command: bool,
+    task_id: str,
+    route: TaskRouteRecord | None,
+) -> GatewayTaskError:
+    """Rebuild a legacy terminal command from public, authoritative fields."""
+
+    code = (
+        stored.code
+        if stored.code in _SAFE_TERMINAL_CODES
+        else "gateway_command_failed"
+    )
+    upstream = stored.kind == "upstream_failure" or code == "upstream_gateway_error"
+    if code == "idempotency_outcome_uncertain":
+        message = (
+            "The previous Gateway command may have reached a non-idempotent "
+            "downstream service"
+        )
+    elif upstream:
+        message = (
+            "Remote Gateway Task creation failed"
+            if create_command
+            else "Remote Gateway Task input failed"
+        )
+    elif code == "route_persistence_failed":
+        message = "Gateway could not durably transition the Task route"
+    elif code == "runtime_unavailable":
+        message = "Gateway runtime is unavailable"
+    elif code == "agent_unavailable":
+        message = "Gateway Agent is unavailable"
+    elif code.startswith("delegation_"):
+        message = "Gateway Task creation was rejected by delegation policy"
+    elif code == "task_effect_not_durable":
+        message = "Gateway Task effect has no durable run or remote binding"
+    else:
+        message = (
+            "Gateway Task creation failed"
+            if create_command
+            else "Gateway Task command failed"
+        )
+    details: dict[str, object] = {
+        "task_id": task_id,
+        "task_queryable": route is not None,
+    }
+    if route is not None:
+        details.update(
+            {
+                "task_url": f"/tasks/{task_id}",
+                "route_state": route.route_state,
+            }
+        )
+    if create_command:
+        details["create_retryable"] = False
+        details["effect_outcome"] = (
+            "completed"
+            if route is not None and route.route_state == "active"
+            else (
+                "not_started"
+                if route is not None and route.route_state == "failed"
+                else "uncertain"
+            )
+        )
+    return GatewayTaskError(
+        kind="upstream_failure" if upstream else None,
+        code=code,
+        message=message,
+        details=details,
+    )
+
+
+def _public_pending_review(
+    pending_review: dict[str, Any] | None,
+    *,
+    task_id: str,
+) -> dict[str, Any] | None:
+    if pending_review is None:
+        return None
+    projected = {
+        key: pending_review[key]
+        for key in ("review_id", "action_requests", "review_configs")
+        if key in pending_review
+    }
+    if "source_task_id" in pending_review:
+        projected["source_task_id"] = task_id
+    return projected

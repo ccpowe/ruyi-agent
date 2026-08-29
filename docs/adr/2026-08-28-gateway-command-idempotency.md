@@ -35,6 +35,11 @@ The key contract is:
 - Reusing a key for a different operation, target, or body returns
   `409 idempotency_key_reused`.
 - Omitting the header preserves the existing non-idempotent API behavior.
+  In particular, a cancelled or crashed no-key create is terminalized as an
+  uncertain public route and is never replayed by recovery, even when the
+  downstream supports `ruyi_gateway_v1`. A later no-key POST is a new operation
+  with a new public Task identity; without a caller key the Gateway cannot
+  correlate it with the earlier operation.
 - Idempotent local input requires a `MailboxStore`-backed Task Mailbox. A custom
   embedding without one returns `503 idempotency_unavailable` instead of
   claiming a guarantee it cannot recover across crashes. The standard runtime
@@ -60,8 +65,10 @@ official Ruyi Gateway replays the forwarded key. An unknown or explicitly
 non-capable remote create is never replayed after its effect boundary: request
 cancellation and process recovery durably terminalize the command as
 `idempotency_outcome_uncertain`, while retaining only the public Gateway Task
-identity and route state. A command release cannot turn such an effect-started
-claim back into executable `pending` state.
+identity and route state. The same terminalization applies when no external key
+was supplied: the internally generated downstream key protects only that one
+attempt and is not a public retry handle. A command release cannot turn such an
+effect-started claim back into executable `pending` state.
 
 The official Gateway HTTP client accepts idempotency keys. Telegram uses its
 `update_id`, and Feishu uses its `event_id` (falling back to `message_id`) as the
