@@ -8,11 +8,21 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from uuid import uuid4
 
+from ruyi_agent.gateway.create_errors import (
+    create_effect_error as _create_effect_error,
+    delegation_depth_error as _delegation_depth_error,
+)
 from ruyi_agent.gateway.errors import GatewayTaskError
 from ruyi_agent.gateway.message_cursors import (
     decode_task_message_cursor as _decode_task_message_cursor,
     encode_task_message_cursor as _encode_task_message_cursor,
     invalid_message_cursor as _invalid_message_cursor,
+)
+from ruyi_agent.gateway.public_errors import (
+    public_create_route_error,
+    public_remote_record,
+    public_upstream_error,
+    public_upstream_payload_error,
 )
 from ruyi_agent.gateway.route_reservations import (
     has_active_route_binding as _has_active_route_binding,
@@ -27,9 +37,6 @@ from ruyi_agent.integrations.a2a.client import A2AClientError
 from ruyi_agent.runtime.delegation.async_runtime import (
     AgentControl,
     DurableTaskMailboxRequiredError,
-    MaxDelegationDepthError,
-    MaxTasksPerRootError,
-    RemoteExecutorNotImplementedError,
     TaskAlreadyRunningError,
     UnknownAgentTargetError,
     UnknownWorkerTaskError,
@@ -254,15 +261,18 @@ class TaskRouter:
                 effect_outcome=effect_outcome,
             ) from exc
         except BaseException:
-            if route_kind == "remote_ref":
+            if route_kind == "remote_ref" and not (
+                self.remote_create_idempotency_guaranteed(agent_name)
+            ):
                 await shield_durable_cleanup(
                     self._mark_cancelled_remote_create_uncertain(reservation)
                 )
             raise
 
         if route_kind == "remote_ref" and not record.upstream_task_id:
-            error = _upstream_payload_error(
-                f"Remote ref '{agent_name}' returned no upstream task id"
+            error = public_upstream_payload_error(
+                operation="create",
+                task_id=gateway_task_id,
             )
             durable_route = await self._fail_reservation(
                 reservation,
@@ -329,7 +339,14 @@ class TaskRouter:
                 retryable=False,
                 effect_outcome="completed",
             ) from exc
-        return RoutedTask(record=record, route=route)
+        return RoutedTask(
+            record=(
+                public_remote_record(record)
+                if route_kind == "remote_ref"
+                else record
+            ),
+            route=route,
+        )
 
     async def _mark_cancelled_remote_create_uncertain(
         self,
@@ -353,7 +370,10 @@ class TaskRouter:
                 route.task_id,
                 route_state="uncertain" if uncertain else "failed",
                 upstream_task_id=route.upstream_task_id,
-                route_error=str(error),
+                route_error=public_create_route_error(
+                    error,
+                    route_kind=route.route_kind,
+                ),
             )
         except Exception:
             try:
@@ -429,11 +449,15 @@ class TaskRouter:
         if route.route_kind != "remote_ref":
             return self._get_local_record(route.task_id)
         try:
-            return self._control.ensure_remote_task_record(
-                agent_name=route.agent_name,
-                task_id=route.task_id,
-                upstream_task_id=route.upstream_task_id,
-                webhook=dict(route.webhook) if route.webhook is not None else None,
+            return public_remote_record(
+                self._control.ensure_remote_task_record(
+                    agent_name=route.agent_name,
+                    task_id=route.task_id,
+                    upstream_task_id=route.upstream_task_id,
+                    webhook=(
+                        dict(route.webhook) if route.webhook is not None else None
+                    ),
+                )
             )
         except UnknownAgentTargetError as exc:
             raise GatewayTaskError(
@@ -441,7 +465,10 @@ class TaskRouter:
                 message=f"Runtime is not configured for agent '{route.agent_name}'",
             ) from exc
         except ValueError as exc:
-            raise _upstream_payload_error(str(exc)) from exc
+            raise public_upstream_payload_error(
+                operation="get",
+                route=route,
+            ) from exc
 
     async def get_record(
         self,
@@ -455,13 +482,18 @@ class TaskRouter:
             return self.ensure_record(route)
         self.ensure_record(route)
         try:
-            return await self._control.refresh_task(route.task_id)
+            return public_remote_record(
+                await self._control.refresh_task(route.task_id)
+            )
         except UnknownWorkerTaskError as exc:
             raise _task_not_found(route.task_id) from exc
         except A2AClientError as exc:
-            raise _remote_gateway_error(exc) from exc
+            raise public_upstream_error(exc, operation="get", route=route) from exc
         except ValueError as exc:
-            raise _upstream_payload_error(str(exc)) from exc
+            raise public_upstream_payload_error(
+                operation="get",
+                route=route,
+            ) from exc
 
     async def list_task_messages(
         self,
@@ -481,16 +513,27 @@ class TaskRouter:
                     limit=limit,
                 )
             except A2AClientError as exc:
-                raise _remote_message_history_error(exc) from exc
+                raise public_upstream_error(
+                    exc,
+                    operation="messages",
+                    route=route,
+                ) from exc
             except ValueError as exc:
-                raise _upstream_payload_error(str(exc)) from exc
+                raise public_upstream_payload_error(
+                    operation="messages",
+                    route=route,
+                ) from exc
             try:
                 page = task_message_page_from_payload(payload)
             except ValueError as exc:
-                raise _upstream_payload_error(str(exc)) from exc
+                raise public_upstream_payload_error(
+                    operation="messages",
+                    route=route,
+                ) from exc
             if page.task_id != route.upstream_task_id:
-                raise _upstream_payload_error(
-                    "Remote Gateway returned a message page for the wrong task"
+                raise public_upstream_payload_error(
+                    operation="messages",
+                    route=route,
                 )
             return TaskMessagePage(
                 task_id=route.task_id,
@@ -647,7 +690,11 @@ class TaskRouter:
                     yield project_remote()
                 return
             except A2AClientError as exc:
-                raise _remote_task_events_error(exc) from exc
+                raise public_upstream_error(
+                    exc,
+                    operation="events",
+                    route=route,
+                ) from exc
 
         try:
             subscription = self._control.open_local_task_event_stream(
@@ -690,12 +737,19 @@ class TaskRouter:
     ) -> TaskRecord:
         await self.require_active_route(route)
         try:
-            return await self._control.send_task_input(
+            record = await self._control.send_task_input(
                 route.task_id,
                 input_content,
-                attachments=attachments if route.route_kind == "remote_ref" else None,
+                attachments=(
+                    attachments if route.route_kind == "remote_ref" else None
+                ),
                 idempotency_key=idempotency_key,
                 mailbox_message_id=mailbox_message_id,
+            )
+            return (
+                public_remote_record(record)
+                if route.route_kind == "remote_ref"
+                else record
             )
         except UnknownWorkerTaskError as exc:
             raise _task_not_found(route.task_id) from exc
@@ -712,20 +766,35 @@ class TaskRouter:
                 message=str(exc),
             ) from exc
         except A2AClientError as exc:
-            raise _remote_gateway_error(exc) from exc
+            raise public_upstream_error(exc, operation="send", route=route) from exc
         except ValueError as exc:
-            raise _upstream_payload_error(str(exc)) from exc
+            raise public_upstream_payload_error(
+                operation="send",
+                route=route,
+            ) from exc
 
     async def cancel(self, route: TaskRouteRecord) -> TaskRecord:
         await self.require_active_route(route)
         try:
-            return await self._control.cancel_task(route.task_id)
+            record = await self._control.cancel_task(route.task_id)
+            return (
+                public_remote_record(record)
+                if route.route_kind == "remote_ref"
+                else record
+            )
         except UnknownWorkerTaskError as exc:
             raise _task_not_found(route.task_id) from exc
         except A2AClientError as exc:
-            raise _remote_gateway_error(exc) from exc
+            raise public_upstream_error(
+                exc,
+                operation="cancel",
+                route=route,
+            ) from exc
         except ValueError as exc:
-            raise _upstream_payload_error(str(exc)) from exc
+            raise public_upstream_payload_error(
+                operation="cancel",
+                route=route,
+            ) from exc
 
     async def submit_review(
         self,
@@ -735,7 +804,12 @@ class TaskRouter:
         decisions: list[dict[str, Any]],
     ) -> TaskRecord:
         try:
-            return await self._control.submit_review_decision(review_id, decisions)
+            record = await self._control.submit_review_decision(review_id, decisions)
+            return (
+                public_remote_record(record)
+                if record.route_kind == "remote_ref"
+                else record
+            )
         except UnknownWorkerTaskError as exc:
             raise GatewayTaskError(
                 code="review_not_found",
@@ -747,9 +821,16 @@ class TaskRouter:
                 message=f"Task '{task_id}' has an active run, cannot resume review",
             ) from exc
         except A2AClientError as exc:
-            raise _remote_gateway_error(exc) from exc
+            raise public_upstream_error(
+                exc,
+                operation="review",
+                task_id=task_id,
+            ) from exc
         except ValueError as exc:
-            raise _upstream_payload_error(str(exc)) from exc
+            raise public_upstream_payload_error(
+                operation="review",
+                task_id=task_id,
+            ) from exc
 
     async def handle_remote_event(self, payload: dict[str, Any]) -> int:
         delivered = 0
@@ -873,126 +954,4 @@ def _task_not_found(task_id: str) -> GatewayTaskError:
     return GatewayTaskError(
         code="task_not_found",
         message=f"Task '{task_id}' does not exist",
-    )
-
-
-def _create_effect_error(
-    exc: Exception,
-    *,
-    agent_name: str,
-    route_kind: Literal["local", "remote_ref"],
-) -> tuple[GatewayTaskError, bool, str]:
-    """Translate create failures and identify result-uncertain effects."""
-
-    if isinstance(exc, UnknownAgentTargetError):
-        locality = "Local runtime" if route_kind == "local" else "Runtime"
-        return (
-            GatewayTaskError(
-                code="runtime_unavailable",
-                message=f"{locality} is not configured for agent '{agent_name}'",
-            ),
-            False,
-            "not_started",
-        )
-    if isinstance(exc, RemoteExecutorNotImplementedError):
-        return (
-            GatewayTaskError(
-                code="remote_executor_not_implemented",
-                message=str(exc),
-            ),
-            False,
-            "not_started",
-        )
-    if isinstance(exc, MaxDelegationDepthError):
-        return (
-            _delegation_depth_error(exc.current_depth, exc.max_depth),
-            False,
-            "not_started",
-        )
-    if isinstance(exc, MaxTasksPerRootError):
-        return _delegation_budget_error(exc), False, "not_started"
-    if isinstance(exc, A2AClientError):
-        uncertain = exc.status_code >= 500
-        return (
-            _remote_gateway_error(exc),
-            uncertain,
-            "uncertain" if uncertain else "not_started",
-        )
-    if isinstance(exc, ValueError):
-        uncertain = route_kind == "remote_ref"
-        return (
-            _upstream_payload_error(str(exc)),
-            uncertain,
-            "uncertain" if uncertain else "not_started",
-        )
-    return (
-        GatewayTaskError(
-            code="task_creation_failed",
-            message="Gateway Task creation failed",
-        ),
-        True,
-        "uncertain",
-    )
-
-
-def _remote_gateway_error(exc: A2AClientError) -> GatewayTaskError:
-    return GatewayTaskError(
-        kind="upstream_failure",
-        code=exc.code,
-        message=exc.message,
-        details=exc.details,
-    )
-
-
-def _remote_message_history_error(exc: A2AClientError) -> GatewayTaskError:
-    if exc.status_code == 400 and exc.code == "invalid_request":
-        return GatewayTaskError(
-            code="invalid_request",
-            message=exc.message,
-            details=exc.details,
-        )
-    return _remote_gateway_error(exc)
-
-
-def _remote_task_events_error(exc: A2AClientError) -> GatewayTaskError:
-    if (exc.status_code == 400 and exc.code == "invalid_request") or (
-        exc.status_code == 409 and exc.code == "task_run_mismatch"
-    ):
-        return GatewayTaskError(
-            code=exc.code,
-            message=exc.message,
-            details=exc.details,
-        )
-    return _remote_gateway_error(exc)
-
-
-def _delegation_depth_error(
-    current_depth: int,
-    max_depth: int,
-) -> GatewayTaskError:
-    return GatewayTaskError(
-        code="delegation_depth_exceeded",
-        message=(
-            "Delegation depth limit exceeded: "
-            f"current_depth={current_depth} max_depth={max_depth}"
-        ),
-    )
-
-
-def _delegation_budget_error(exc: MaxTasksPerRootError) -> GatewayTaskError:
-    return GatewayTaskError(
-        code="delegation_budget_exhausted",
-        message=(
-            "Task budget exhausted: "
-            f"root_task_id={exc.root_task_id} "
-            f"current_count={exc.current_count} "
-            f"max_tasks_per_root={exc.max_tasks_per_root}"
-        ),
-    )
-
-
-def _upstream_payload_error(message: str) -> GatewayTaskError:
-    return GatewayTaskError(
-        code="upstream_gateway_error",
-        message=message,
     )

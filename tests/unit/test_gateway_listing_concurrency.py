@@ -505,7 +505,7 @@ def test_review_cursor_retries_unscanned_owner_after_transient_failure() -> None
     assert recovered.next_cursor is None
 
 
-def test_review_cursor_resumes_exact_review_after_its_timestamp_changes() -> None:
+def test_review_snapshot_pages_are_exactly_once_after_owner_timestamp_changes() -> None:
     now = datetime(2026, 8, 29, tzinfo=UTC)
     pending_reviews = [
         PendingReviewRecord(
@@ -516,35 +516,55 @@ def test_review_cursor_resumes_exact_review_after_its_timestamp_changes() -> Non
             created_at=now + timedelta(seconds=index),
             updated_at=now + timedelta(seconds=index),
         )
-        for index in range(3)
+        for index in range(5)
     ]
-    routes = [route(index) for index in range(3)]
+    routes = [route(index) for index in range(6)]
     records = {
-        f"task-{index}": record(index, state="waiting_for_human") for index in range(3)
+        f"task-{index}": record(index, state="waiting_for_human") for index in range(6)
     }
     router = ListingRouter(
         routes,
         records,
         pending_reviews=pending_reviews,
-        failed_task_ids={"task-1"},
+        failed_task_ids={"task-3"},
     )
     service = service_with_router(router)
 
-    first = asyncio.run(service.list_reviews(cursor=None, limit=3))
-    assert [item.review_id for item in first.items] == ["review-2"]
+    first = asyncio.run(service.list_reviews(cursor=None, limit=2))
+    sequence = [item.review_id for item in first.items]
+    assert sequence == ["review-4"]
     assert first.next_cursor is not None
 
     router.failed_task_ids.clear()
     router.pending_reviews = [
         replace(item, updated_at=now + timedelta(minutes=5))
-        if item.review_id == "review-1"
+        if item.review_id in {"review-4", "review-3"}
         else item
         for item in pending_reviews
+    ] + [
+        PendingReviewRecord(
+            review_id="review-created-after-snapshot",
+            task_id="task-5",
+            root_task_id="task-5",
+            payload={"action_requests": [], "review_configs": []},
+            created_at=now + timedelta(minutes=10),
+            updated_at=now + timedelta(minutes=10),
+        )
     ]
-    recovered = asyncio.run(service.list_reviews(cursor=first.next_cursor, limit=3))
+    cursor = first.next_cursor
+    while cursor is not None:
+        page = asyncio.run(service.list_reviews(cursor=cursor, limit=2))
+        sequence.extend(item.review_id for item in page.items)
+        cursor = page.next_cursor
 
-    assert "review-1" in {item.review_id for item in recovered.items}
-    assert "review-0" in {item.review_id for item in recovered.items}
+    assert sequence == [
+        "review-4",
+        "review-3",
+        "review-2",
+        "review-1",
+        "review-0",
+    ]
+    assert len(sequence) == len(set(sequence))
 
 
 def test_review_cursor_uses_sort_key_fallback_only_if_resume_review_disappears() -> (

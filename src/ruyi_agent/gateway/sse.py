@@ -322,9 +322,11 @@ def task_stream_event_from_gateway(
         clean_data = {"reason": reason}
     else:
         _require_keys(event_data, {"code", "message"})
+        _short_required_text(event_data.get("code"), "code")
+        _bounded_required_text(event_data.get("message"), "message")
         clean_data = {
-            "code": _short_required_text(event_data.get("code"), "code"),
-            "message": _bounded_required_text(event_data.get("message"), "message"),
+            "code": "upstream_task_stream_error",
+            "message": "Remote Gateway Task stream failed",
         }
 
     stream_event = TaskStreamEvent(
@@ -429,10 +431,11 @@ def _validate_lifecycle_data(
     }
     _require_keys(raw, required, optional)
     status = _parse_remote_task_state(raw.get("status"))
+    remote_error = _bounded_optional_text(raw.get("error"), "error")
     clean: dict[str, Any] = {
         "status": status,
         "last_result": _bounded_optional_text(raw.get("last_result"), "last_result"),
-        "error": _bounded_optional_text(raw.get("error"), "error"),
+        "error": "Remote Gateway Task failed" if remote_error is not None else None,
         "updated_at": _isoformat(_parse_timestamp(raw.get("updated_at"), "updated_at")),
         "pending_review": _validate_pending_review(raw.get("pending_review")),
         "artifacts": _validate_artifacts(raw.get("artifacts")),

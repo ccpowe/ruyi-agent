@@ -556,6 +556,54 @@ def test_sse_codec_round_trip_and_remote_task_id_rewrite() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("event_type", ["task.failed", "stream.error"])
+def test_remote_sse_error_content_is_replaced_at_public_boundary(
+    event_type: str,
+) -> None:
+    common = {
+        "task_id": "private-upstream-task",
+        "run_count": 1,
+        "created_at": "2026-08-28T12:00:00+00:00",
+    }
+    data = (
+        {
+            **common,
+            "status": "failed",
+            "last_result": None,
+            "error": "private-upstream-task at /tasks/private-upstream-task",
+            "updated_at": "2026-08-28T12:00:00+00:00",
+            "pending_review": None,
+            "artifacts": [],
+        }
+        if event_type == "task.failed"
+        else {
+            **common,
+            "code": "private-upstream-task",
+            "message": "see /tasks/private-upstream-task",
+        }
+    )
+
+    projected = task_stream_event_from_gateway(
+        GatewayTaskEvent(
+            event_type=event_type,
+            event_id="cursor-1" if event_type == "task.failed" else None,
+            data=data,
+        ),
+        expected_task_id="private-upstream-task",
+        public_task_id="public-task",
+        run_count=1,
+    )
+
+    assert "private-upstream-task" not in json.dumps(projected.data)
+    if event_type == "task.failed":
+        assert projected.data["error"] == "Remote Gateway Task failed"
+    else:
+        assert projected.data == {
+            "code": "upstream_task_stream_error",
+            "message": "Remote Gateway Task stream failed",
+        }
+
+
 def test_sse_byte_decoder_handles_utf8_bom_and_split_crlf() -> None:
     async def chunks() -> AsyncIterator[bytes]:
         yield b"\xef"

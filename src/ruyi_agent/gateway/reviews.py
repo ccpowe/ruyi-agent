@@ -83,10 +83,12 @@ class GatewayReviewService:
             )
         pending_reviews = sorted(
             self._context.router.list_pending_reviews(),
-            key=lambda item: (item.updated_at, item.review_id),
+            key=_review_sort_key,
             reverse=True,
         )
-        scan_index = self._review_cursor_index(cursor, pending_reviews)
+        page = self._review_cursor_page(cursor, pending_reviews)
+        pending_reviews = page.records
+        scan_index = page.scan_index
         items = []
         blocked = False
         while len(items) < limit and scan_index < len(pending_reviews):
@@ -114,7 +116,10 @@ class GatewayReviewService:
             if blocked:
                 break
         next_cursor = (
-            self._encode_review_cursor(pending_reviews[scan_index])
+            self._encode_review_cursor(
+                pending_reviews[scan_index],
+                snapshot_frontier=page.snapshot_frontier,
+            )
             if scan_index < len(pending_reviews)
             else None
         )
@@ -215,26 +220,39 @@ class GatewayReviewService:
             await asyncio.gather(*(refresh(task_id) for task_id in owner_ids))
         return _OwnerRefreshResult(routes_by_id, unavailable_owner_ids)
 
-    def _review_cursor_index(
+    def _review_cursor_page(
         self,
         cursor: str | None,
         records: list[PendingReviewRecord],
-    ) -> int:
+    ) -> _ReviewCursorPage:
         if cursor is None:
-            return 0
+            return _ReviewCursorPage(
+                records=records,
+                scan_index=0,
+                snapshot_frontier=(
+                    _review_sort_key(records[0]) if records else None
+                ),
+            )
         try:
             payload = _decode_review_cursor_payload(cursor)
             if type(payload) is int:
                 if payload < 0 or payload > 2**63 - 1:
                     raise ValueError
-                return payload
+                return _ReviewCursorPage(
+                    records=records,
+                    scan_index=payload,
+                    snapshot_frontier=(
+                        _review_sort_key(records[0]) if records else None
+                    ),
+                )
             if not isinstance(payload, dict):
                 raise ValueError
+            snapshot_frontier: tuple[datetime, str] | None = None
             if set(payload) == {"review_id", "updated_at", "version"}:
                 if type(payload["version"]) is not int or payload["version"] != 1:
                     raise ValueError
                 review_id = payload["review_id"]
-                raw_updated_at = payload["updated_at"]
+                raw_fallback_at = payload["updated_at"]
             elif set(payload) == {
                 "fallback_updated_at",
                 "resume_review_id",
@@ -243,33 +261,67 @@ class GatewayReviewService:
                 if type(payload["version"]) is not int or payload["version"] != 2:
                     raise ValueError
                 review_id = payload["resume_review_id"]
-                raw_updated_at = payload["fallback_updated_at"]
+                raw_fallback_at = payload["fallback_updated_at"]
+            elif set(payload) == {
+                "fallback_created_at",
+                "resume_review_id",
+                "snapshot_created_at",
+                "snapshot_review_id",
+                "version",
+            }:
+                if type(payload["version"]) is not int or payload["version"] != 3:
+                    raise ValueError
+                review_id = payload["resume_review_id"]
+                raw_fallback_at = payload["fallback_created_at"]
+                snapshot_review_id = payload["snapshot_review_id"]
+                if (
+                    not isinstance(snapshot_review_id, str)
+                    or not 1 <= len(snapshot_review_id) <= 512
+                ):
+                    raise ValueError
+                snapshot_frontier = (
+                    _parse_cursor_timestamp(payload["snapshot_created_at"]),
+                    snapshot_review_id,
+                )
+                records = [
+                    record
+                    for record in records
+                    if _review_sort_key(record) <= snapshot_frontier
+                ]
             else:
                 raise ValueError
             if (
                 not isinstance(review_id, str)
                 or not 1 <= len(review_id) <= 512
-                or not isinstance(raw_updated_at, str)
-                or not 1 <= len(raw_updated_at) <= 128
             ):
                 raise ValueError
-            fallback_updated_at = datetime.fromisoformat(raw_updated_at)
-            if (
-                fallback_updated_at.tzinfo is None
-                or fallback_updated_at.utcoffset() is None
-            ):
-                raise ValueError
+            fallback_at = _parse_cursor_timestamp(raw_fallback_at)
             for index, record in enumerate(records):
                 if record.review_id == review_id:
-                    return index
-            fallback_key = (fallback_updated_at, review_id)
-            return next(
+                    return _ReviewCursorPage(
+                        records=records,
+                        scan_index=index,
+                        snapshot_frontier=(
+                            snapshot_frontier
+                            or (_review_sort_key(records[0]) if records else None)
+                        ),
+                    )
+            fallback_key = (fallback_at, review_id)
+            scan_index = next(
                 (
                     index
                     for index, record in enumerate(records)
-                    if (record.updated_at, record.review_id) < fallback_key
+                    if _review_sort_key(record) < fallback_key
                 ),
                 len(records),
+            )
+            return _ReviewCursorPage(
+                records=records,
+                scan_index=scan_index,
+                snapshot_frontier=(
+                    snapshot_frontier
+                    or (_review_sort_key(records[0]) if records else None)
+                ),
             )
         except Exception as exc:
             raise GatewayTaskError(
@@ -277,12 +329,21 @@ class GatewayReviewService:
                 message="Query parameter 'cursor' is invalid",
             ) from exc
 
-    def _encode_review_cursor(self, record: PendingReviewRecord) -> str:
+    def _encode_review_cursor(
+        self,
+        record: PendingReviewRecord,
+        *,
+        snapshot_frontier: tuple[datetime, str] | None,
+    ) -> str:
+        if snapshot_frontier is None:
+            raise ValueError("Review cursor snapshot frontier is missing")
         payload = json.dumps(
             {
-                "fallback_updated_at": record.updated_at.isoformat(),
+                "fallback_created_at": record.created_at.isoformat(),
                 "resume_review_id": record.review_id,
-                "version": 2,
+                "snapshot_created_at": snapshot_frontier[0].isoformat(),
+                "snapshot_review_id": snapshot_frontier[1],
+                "version": 3,
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -309,3 +370,23 @@ def _decode_review_cursor_payload(cursor: str) -> object:
 class _OwnerRefreshResult:
     routes_by_id: dict[str, TaskRouteRecord]
     unavailable_owner_ids: set[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _ReviewCursorPage:
+    records: list[PendingReviewRecord]
+    scan_index: int
+    snapshot_frontier: tuple[datetime, str] | None
+
+
+def _review_sort_key(record: PendingReviewRecord) -> tuple[datetime, str]:
+    return record.created_at, record.review_id
+
+
+def _parse_cursor_timestamp(raw: object) -> datetime:
+    if not isinstance(raw, str) or not 1 <= len(raw) <= 128:
+        raise ValueError
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError
+    return parsed

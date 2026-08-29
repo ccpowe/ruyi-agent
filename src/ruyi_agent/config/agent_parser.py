@@ -221,7 +221,7 @@ def _remote_create_idempotency(
     *,
     agent_name: str,
 ) -> RemoteCreateIdempotency:
-    if raw in {"none", "ruyi_gateway_v1"}:
+    if isinstance(raw, str) and raw in {"none", "ruyi_gateway_v1"}:
         return cast("RemoteCreateIdempotency", raw)
     raise ValueError(
         f"{_field(agent_name, 'create_idempotency')} must be "

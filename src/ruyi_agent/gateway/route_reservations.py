@@ -23,7 +23,10 @@ def reservation_record(route: TaskRouteRecord) -> TaskRecord:
         depth=1,
         created_at=route.created_at,
         updated_at=route.updated_at,
-        error=route.route_error or f"Gateway route reservation is {route.route_state}",
+        # Older databases may contain an untrusted downstream error string.
+        # A reservation has no routable downstream identity, so expose only
+        # its public state instead of replaying that persisted content.
+        error=f"Gateway Task route is {route.route_state}",
         route_kind=route.route_kind,
         upstream_task_id=None,
         webhook=dict(route.webhook) if route.webhook is not None else None,

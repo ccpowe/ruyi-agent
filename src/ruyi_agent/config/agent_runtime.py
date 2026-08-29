@@ -59,7 +59,9 @@ class RemoteRef:
             if auth_type != "bearer" or not isinstance(token_env, str) or not token_env:
                 raise ValueError("RemoteRef auth must define bearer type and token_env")
             self.auth = BearerAuthConfig(type="bearer", token_env=token_env)
-        if self.create_idempotency not in {"none", "ruyi_gateway_v1"}:
+        if not isinstance(self.create_idempotency, str) or (
+            self.create_idempotency not in {"none", "ruyi_gateway_v1"}
+        ):
             raise ValueError(
                 "RemoteRef create_idempotency must be 'none' or 'ruyi_gateway_v1'"
             )
