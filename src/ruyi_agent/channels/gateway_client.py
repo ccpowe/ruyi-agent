@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json as json_module
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -11,6 +12,11 @@ import httpx
 from pydantic import ValidationError
 
 from ruyi_agent.channels.gateway_dto import GatewayAgent, GatewayTask
+from ruyi_agent.channels.media import (
+    MediaLimitError,
+    read_bounded_media,
+    validate_content_length,
+)
 from ruyi_agent.gateway._http_transport import (
     GatewayHTTPTransport,
     GatewayTransportHTTPStatusError,
@@ -147,11 +153,15 @@ class GatewayHTTPClient:
         bearer_token: str,
         timeout: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        max_download_bytes: int | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._bearer_token = bearer_token
         self._timeout = timeout
         self._transport = transport
+        if max_download_bytes is not None and max_download_bytes <= 0:
+            raise ValueError("max_download_bytes must be positive")
+        self._max_download_bytes = max_download_bytes
         self._http = GatewayHTTPTransport(
             base_url=self._base_url,
             timeout=timeout,
@@ -230,20 +240,20 @@ class GatewayHTTPClient:
         )
 
     async def download_artifact(self, *, path: str) -> GatewayArtifact:
-        response = await self._request_raw(
+        headers, content = await self._download_raw(
             "POST",
             "/artifacts/download",
             json={"path": path},
         )
-        content_disposition = response.headers.get("content-disposition", "")
+        content_disposition = headers.get("content-disposition", "")
         filename = (
             _filename_from_content_disposition(content_disposition) or Path(path).name
         )
         return GatewayArtifact(
             kind="file",
             filename=filename or "artifact",
-            content_type=response.headers.get("content-type"),
-            content=response.content,
+            content_type=headers.get("content-type"),
+            content=content,
         )
 
     async def download_task_artifact(
@@ -252,19 +262,19 @@ class GatewayHTTPClient:
         task_id: str,
         artifact_id: str,
     ) -> GatewayArtifact:
-        response = await self._request_raw(
+        headers, content = await self._download_raw(
             "GET",
             f"/tasks/{task_id}/artifacts/{artifact_id}/download",
         )
-        content_disposition = response.headers.get("content-disposition", "")
+        content_disposition = headers.get("content-disposition", "")
         filename = (
             _filename_from_content_disposition(content_disposition) or artifact_id
         )
         return GatewayArtifact(
             kind="file",
             filename=filename or "artifact",
-            content_type=response.headers.get("content-type"),
-            content=response.content,
+            content_type=headers.get("content-type"),
+            content=content,
         )
 
     async def get_task(self, *, task_id: str) -> GatewayTask:
@@ -403,6 +413,58 @@ class GatewayHTTPClient:
                 code="gateway_error",
                 message="Gateway returned invalid payload",
             ) from exc
+
+    async def _download_raw(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+    ) -> tuple[httpx.Headers, bytes]:
+        if self._max_download_bytes is None:
+            response = await self._request_raw(method, path, json=json)
+            return response.headers, response.content
+        async with httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=self._timeout,
+            headers={
+                **gateway_bearer_auth_headers(self._bearer_token),
+                "Accept": "*/*",
+            },
+            transport=self._transport,
+        ) as client:
+            async with client.stream(method, path, json=json) as response:
+                if not response.is_success:
+                    try:
+                        error_body = await read_bounded_media(
+                            response.aiter_bytes(),
+                            max_bytes=min(self._max_download_bytes, 64 * 1024),
+                        )
+                        payload = json_module.loads(error_body)
+                    except MediaLimitError:
+                        raise
+                    except (UnicodeDecodeError, ValueError) as exc:
+                        raise GatewayClientError(
+                            status_code=502,
+                            code="gateway_error",
+                            message="Gateway returned invalid JSON",
+                        ) from exc
+                    raise _gateway_http_status_error(
+                        GatewayTransportHTTPStatusError(
+                            status_code=response.status_code,
+                            payload=payload,
+                        )
+                    )
+                validate_content_length(
+                    response.headers,
+                    max_bytes=self._max_download_bytes,
+                    values=response.headers.get_list("content-length"),
+                )
+                content = await read_bounded_media(
+                    response.aiter_bytes(),
+                    max_bytes=self._max_download_bytes,
+                )
+                return response.headers, content
 
 
 async def _map_task_event_errors(

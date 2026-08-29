@@ -77,7 +77,6 @@ def test_send_message_does_not_parse_media_reference(tmp_path: Path) -> None:
         gateway_client=gateway,
         feishu_client=feishu,
         default_agent_name="main",
-        media_root=tmp_path,
     )
 
     asyncio.run(

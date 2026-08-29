@@ -75,8 +75,9 @@ ChannelTurnResult:
 ```
 
 当前通过 `before_continue` hook 保留平台对上一轮 settled 结果的投递时机。
-Task Watch 的轮询策略由共享 Module 处理，文本、reaction 和 artifact delivery
-仍由 Channel Adapter 的 hook 处理。
+Task Watch 的轮询、重试、持久化 intent、启动恢复、lease/fencing 与逐步 delivery
+ledger 由共享 Module 处理；文本、reaction 和 artifact 的实际平台发送仍由
+Channel Adapter hook 处理。
 
 ## 关键决定
 
@@ -98,9 +99,14 @@ Task Watch 属于共享策略，而不是平台 adapter 的私有逻辑。
 - 检测 terminal 状态并且每次 watch 只触发一次 terminal hook。
 - 支持 terminal 后的短暂 grace checks，捕获延迟出现的 mirrored review。
 - 管理相同 task/run 的并发去重、活跃状态和等待生命周期。
+- 对瞬时 Gateway 查询错误执行有界指数退避，不把查询错误展示为 Task failed。
+- 持久化 watch/delivery intent，并在 adapter 启动时恢复。
+- 用 fenced lease 协调重复进程，用逐步 ledger 恢复 terminal/review/artifact 投递。
 
-平台 adapter 通过 hook 发送结果、artifacts 和可选 reaction，并继续维护跨 watch
-的 terminal delivery 去重。
+平台 adapter 通过 hook 发送结果、artifacts 和可选 reaction；跨 watch 的
+terminal/review delivery 去重由共享 durable coordinator 维护。平台 API 不接受
+幂等键时，send 成功而 ledger 提交前崩溃仍可能产生重复，具体边界见
+`docs/adr/2026-08-30-durable-channel-delivery.md`。
 
 ## 迁移顺序
 
@@ -113,7 +119,8 @@ Task Watch 属于共享策略，而不是平台 adapter 的私有逻辑。
 ## 测试策略
 
 - 共享 Channel Turn tests 覆盖 `/new`、`/agent`、`/resume`、review command、running task、terminal continue 和 pending review。
-- 共享 Task Watch tests 覆盖 run supersede、pending review、terminal、grace checks、并发去重和异常传播。
+- 共享 Task Watch tests 覆盖 run supersede、pending review、terminal、grace checks、
+  瞬时错误重试、并发 fenced claim、关闭等待和启动恢复。
 - Telegram tests 保留 MarkdownV2、附件下载、session key、topic、Bot API 发送行为。
 - Feishu tests 保留 mention、群聊策略、thread、card、reaction 和 SDK 发送行为。
 - `ChannelSessionStore` tests 只关注存储 CRUD，不再承载 channel turn policy。

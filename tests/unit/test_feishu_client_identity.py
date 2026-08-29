@@ -160,6 +160,7 @@ def test_feishu_runner_wires_real_sdk_client_factory(monkeypatch, tmp_path) -> N
     monkeypatch.setenv("FEISHU_DOMAIN", "lark")
     monkeypatch.setenv("FEISHU_API_TIMEOUT", "4.5")
     monkeypatch.setenv("FEISHU_GROUP_POLICY", "disabled")
+    monkeypatch.setenv("FEISHU_MEDIA_MAX_BYTES", "1234")
     monkeypatch.setenv("FEISHU_SESSION_DB", str(tmp_path / "sessions.sqlite3"))
     monkeypatch.setenv("FEISHU_EVENT_DB", str(tmp_path / "events.sqlite3"))
     monkeypatch.setattr(feishu_adapter_module, "FeishuAdapter", AdapterProbe)
@@ -174,4 +175,6 @@ def test_feishu_runner_wires_real_sdk_client_factory(monkeypatch, tmp_path) -> N
     assert sdk_client._timeout == 4.5
     assert sdk_client._client is None
     assert captured["default_agent_name"] == "main"
+    assert captured["media_max_bytes"] == 1234
+    assert captured["gateway_client"]._max_download_bytes == 1234
     assert captured["ran"] is True

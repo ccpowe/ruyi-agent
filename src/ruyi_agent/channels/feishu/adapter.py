@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import re
 from contextlib import suppress
-from pathlib import Path
 from typing import Any
 
 from ruyi_agent.channels.feishu.client import (
@@ -24,6 +23,7 @@ from ruyi_agent.channels.feishu.client import (
     _split_feishu_text,
     parse_feishu_message_event,
 )
+from ruyi_agent.channels.feishu.delivery import FeishuArtifactDelivery
 from ruyi_agent.channels.feishu.identity import (
     _is_feishu_group_chat,
     _strip_mention_token,
@@ -31,9 +31,13 @@ from ruyi_agent.channels.feishu.identity import (
     build_feishu_session_key,
 )
 from ruyi_agent.channels.feishu.receipts import FeishuEventClaim, FeishuEventStore
-from ruyi_agent.channels.gateway_client import GatewayArtifact, GatewayTaskClient
+from ruyi_agent.channels.gateway_client import GatewayTaskClient
 from ruyi_agent.channels.gateway_dto import GatewayTask
-from ruyi_agent.channels.presentation import ChannelDeliveryCoordinator
+from ruyi_agent.channels.presentation import (
+    ChannelDeliveryCoordinator,
+    ChannelDeliveryHooks,
+    delivery_session_key,
+)
 from ruyi_agent.channels.task_watch import TERMINAL_TASK_STATES, TaskWatchManager
 from ruyi_agent.channels.turn import (
     AgentCommandTurn,
@@ -42,6 +46,10 @@ from ruyi_agent.channels.turn import (
     ResumeCommandTurn,
     ReviewTurn,
     parse_review_command,
+)
+from ruyi_agent.storage.channel_delivery_store import (
+    ChannelDeliveryIntent,
+    ChannelDeliveryStore,
 )
 from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 
@@ -84,8 +92,8 @@ class FeishuAdapter:
         bot_name: str | None = None,
         task_poll_interval: float = 2.0,
         terminal_review_grace_checks: int = 3,
-        media_root: str | Path | None = None,
         media_max_bytes: int = DEFAULT_FEISHU_MEDIA_MAX_BYTES,
+        delivery_store: ChannelDeliveryStore | None = None,
         ack_mode: str = "reaction",
         reactions_enabled: bool = True,
         processing_reaction: str = "Typing",
@@ -114,7 +122,16 @@ class FeishuAdapter:
             poll_interval=task_poll_interval,
             terminal_review_grace_checks=terminal_review_grace_checks,
         )
-        self._delivery = ChannelDeliveryCoordinator(task_watch=self._task_watch)
+        self._delivery_store = delivery_store or ChannelDeliveryStore(
+            self._session_store.db_path
+        )
+        self._owns_delivery_store = delivery_store is None
+        self._delivery = ChannelDeliveryCoordinator(
+            task_watch=self._task_watch,
+            store=self._delivery_store,
+            platform="feishu",
+            lease_seconds=max(30.0, task_poll_interval * 3.0),
+        )
         normalized_ack_mode = ack_mode.strip().lower()
         self._ack_mode = (
             normalized_ack_mode
@@ -125,14 +142,39 @@ class FeishuAdapter:
         self._processing_reaction = processing_reaction
         self._approval_reaction = approval_reaction
         self._failure_reaction = failure_reaction
-        del media_root, media_max_bytes
-        self._delivered_terminal_runs = (
-            self._delivery.terminal_presenter.delivered_run_counts
+        if media_max_bytes <= 0:
+            raise ValueError("Feishu media_max_bytes must be positive")
+        self._artifact_delivery = FeishuArtifactDelivery(
+            gateway_client=self._gateway_client,
+            feishu_client=self._feishu_client,
+            max_bytes=media_max_bytes,
         )
+        self._started = False
+        self._closed = False
         self._task_reactions: dict[tuple[str, int], list[FeishuReactionReceipt]] = {}
 
     async def run_forever(self) -> None:
-        await self._feishu_client.run(self.handle_message)
+        await self.start()
+        try:
+            await self._feishu_client.run(self.handle_message)
+        finally:
+            await self.close()
+
+    async def start(self) -> int:
+        if self._closed:
+            raise RuntimeError("FeishuAdapter is closed")
+        if self._started:
+            return 0
+        self._started = True
+        return await self._delivery.recover(self._recovery_hooks)
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await self._delivery.close()
+        if self._owns_delivery_store:
+            self._delivery_store.close()
 
     async def handle_message(self, message: FeishuMessage) -> None:
         claim = await self._event_store.aclaim_message_result(message)
@@ -299,6 +341,11 @@ class FeishuAdapter:
                 task_id=task_id,
                 chat_id=message.chat_id,
                 run_count=run_count,
+                session_key=delivery_session_key(
+                    outcome.task,
+                    platform="feishu",
+                    chat_id=message.chat_id,
+                ),
             )
             return
         task = outcome.task
@@ -313,6 +360,11 @@ class FeishuAdapter:
             task_id=task_id,
             chat_id=message.chat_id,
             run_count=task.run_count,
+            session_key=delivery_session_key(
+                task,
+                platform="feishu",
+                chat_id=message.chat_id,
+            ),
         )
 
     def _is_allowed_message(self, message: FeishuMessage) -> bool:
@@ -581,51 +633,6 @@ class FeishuAdapter:
         stripped = re.sub(r"\n{3,}", "\n\n", text).strip()
         return stripped, []
 
-    def _attachment_from_gateway_artifact(
-        self, artifact: GatewayArtifact
-    ) -> FeishuAttachment:
-        return FeishuAttachment(
-            filename=artifact.filename or "artifact",
-            content=artifact.content,
-        )
-
-    async def _send_task_artifacts(
-        self,
-        *,
-        chat_id: str,
-        task: GatewayTask,
-    ) -> None:
-        task_id = task.task_id
-        run_count = task.run_count
-        for artifact in _current_run_artifacts(task, run_count):
-            artifact_id = artifact.artifact_id
-            filename = artifact.name or artifact_id
-            try:
-                downloaded = await self._gateway_client.download_task_artifact(
-                    task_id=task_id,
-                    artifact_id=artifact_id,
-                )
-            except Exception as exc:
-                await self._send_attachment_error(
-                    chat_id=chat_id,
-                    filename=filename,
-                    error=exc,
-                )
-                continue
-            attachment = self._attachment_from_gateway_artifact(downloaded)
-            try:
-                await self._feishu_client.send_file(
-                    chat_id=chat_id,
-                    filename=attachment.filename,
-                    content=attachment.content,
-                )
-            except Exception as exc:
-                await self._send_attachment_error(
-                    chat_id=chat_id,
-                    filename=attachment.filename,
-                    error=exc,
-                )
-
     async def wait_for_watchers(self) -> None:
         await self._delivery.wait()
 
@@ -694,6 +701,11 @@ class FeishuAdapter:
             task_id=task_id,
             chat_id=message.chat_id,
             run_count=task.run_count,
+            session_key=delivery_session_key(
+                task,
+                platform="feishu",
+                chat_id=message.chat_id,
+            ),
         )
 
     async def _handle_resume_command(
@@ -768,32 +780,58 @@ class FeishuAdapter:
             return str(metadata.get("message_thread_id")) == message.thread_id
         return metadata.get("message_thread_id") in {None, ""}
 
-    def _ensure_watcher(self, *, task_id: str, chat_id: str, run_count: int) -> None:
+    def _ensure_watcher(
+        self,
+        *,
+        task_id: str,
+        chat_id: str,
+        run_count: int,
+        session_key: str | None = None,
+    ) -> None:
         key = (task_id, run_count)
+        self._delivery.ensure_delivery(
+            session_key=session_key or f"feishu:chat:{chat_id}",
+            chat_id=chat_id,
+            task_id=task_id,
+            run_count=run_count,
+            hooks=self._delivery_hooks(chat_id=chat_id, key=key),
+        )
 
-        async def on_pending_review(task: GatewayTask) -> None:
-            await self._clear_task_reactions(key)
+    def _delivery_hooks(
+        self,
+        *,
+        chat_id: str,
+        key: tuple[str, int],
+    ) -> ChannelDeliveryHooks:
+        async def send_review(task: GatewayTask) -> None:
             await self._send_message(
                 chat_id=chat_id,
                 text=self._format_review_message(task),
             )
-
-        async def on_superseded(_: GatewayTask) -> None:
             await self._clear_task_reactions(key)
 
-        async def on_error(_: Exception) -> None:
-            await self._complete_task_reactions(key=key, status="failed")
-
-        self._delivery.ensure_watch(
-            task_id=task_id,
-            run_count=run_count,
-            on_pending_review=on_pending_review,
-            on_terminal=lambda task: self._send_terminal_if_needed(
+        return ChannelDeliveryHooks(
+            send_review=send_review,
+            send_terminal_message=lambda task: self._send_message(
                 chat_id=chat_id,
-                task=task,
+                text=self._delivery.terminal_presenter.format(task),
             ),
-            on_superseded=on_superseded,
-            on_error=on_error,
+            send_artifact=lambda task, artifact: self._artifact_delivery.send(
+                task,
+                artifact,
+                chat_id=chat_id,
+            ),
+            on_superseded=lambda _: self._clear_task_reactions(key),
+            on_terminal_delivered=lambda task: self._complete_task_reactions(
+                key=(task.task_id, task.run_count),
+                status=task.status,
+            ),
+        )
+
+    def _recovery_hooks(self, intent: ChannelDeliveryIntent) -> ChannelDeliveryHooks:
+        return self._delivery_hooks(
+            chat_id=intent.chat_id,
+            key=(intent.task_id, intent.run_count),
         )
 
     def _parse_review_command(self, text: str) -> dict[str, Any] | None:
@@ -849,6 +887,11 @@ class FeishuAdapter:
             task_id=task_id,
             chat_id=message.chat_id,
             run_count=task.run_count,
+            session_key=delivery_session_key(
+                task,
+                platform="feishu",
+                chat_id=message.chat_id,
+            ),
         )
 
     def _format_review_message(self, task: GatewayTask) -> str:
@@ -870,7 +913,14 @@ class FeishuAdapter:
             )
 
         async def send_artifacts(terminal_task: GatewayTask) -> None:
-            await self._send_task_artifacts(chat_id=chat_id, task=terminal_task)
+            for artifact in _current_run_artifacts(
+                terminal_task, terminal_task.run_count
+            ):
+                await self._artifact_delivery.send(
+                    terminal_task,
+                    artifact,
+                    chat_id=chat_id,
+                )
 
         async def clear_duplicate(terminal_task: GatewayTask) -> None:
             await self._clear_task_reactions(

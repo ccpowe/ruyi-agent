@@ -3,18 +3,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 from ruyi_agent.channels.gateway_client import GatewayTaskClient
 from ruyi_agent.channels.gateway_dto import GatewayTask
-from ruyi_agent.channels.presentation import ChannelDeliveryCoordinator
+from ruyi_agent.channels.presentation import (
+    ChannelDeliveryCoordinator,
+    ChannelDeliveryHooks,
+    delivery_session_key,
+)
 from ruyi_agent.channels.task_watch import TERMINAL_TASK_STATES, TaskWatchManager
 from ruyi_agent.channels.telegram.client import (
-    IMAGE_ATTACHMENT_EXTENSIONS,
+    DEFAULT_TELEGRAM_MEDIA_MAX_BYTES,
     KrokiMermaidRenderer,
     MermaidRenderError,
     TelegramAttachment,
@@ -26,6 +28,7 @@ from ruyi_agent.channels.telegram.client import (
     _current_run_artifacts,
     _gateway_attachment_kind,
 )
+from ruyi_agent.channels.telegram.delivery import TelegramArtifactDelivery
 from ruyi_agent.channels.telegram.formatting import (
     _escape_mdv2,
     _format_telegram_markdown_v2,
@@ -44,6 +47,7 @@ from ruyi_agent.channels.telegram.network import (
     UnsupportedTelegramChatTypeError,
     _looks_like_network_error,
 )
+from ruyi_agent.channels.telegram.presentation import extract_telegram_attachments
 from ruyi_agent.channels.telegram.receipts import (
     TelegramUpdateClaim,
     TelegramUpdateStore as _TelegramUpdateStore,
@@ -55,6 +59,10 @@ from ruyi_agent.channels.turn import (
     ResumeCommandTurn,
     ReviewTurn,
     parse_review_command,
+)
+from ruyi_agent.storage.channel_delivery_store import (
+    ChannelDeliveryIntent,
+    ChannelDeliveryStore,
 )
 from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 
@@ -149,7 +157,8 @@ class TelegramAdapter:
         terminal_review_grace_checks: int = 3,
         message_parse_mode: str | None = "MarkdownV2",
         mermaid_renderer: KrokiMermaidRenderer | None = None,
-        media_root: str | Path | None = None,
+        media_max_bytes: int = DEFAULT_TELEGRAM_MEDIA_MAX_BYTES,
+        delivery_store: ChannelDeliveryStore | None = None,
     ) -> None:
         self._gateway_client = gateway_client
         self._telegram_client = telegram_client
@@ -166,15 +175,45 @@ class TelegramAdapter:
             poll_interval=task_poll_interval,
             terminal_review_grace_checks=terminal_review_grace_checks,
         )
-        self._delivery = ChannelDeliveryCoordinator(task_watch=self._task_watch)
+        self._delivery_store = delivery_store or ChannelDeliveryStore(
+            self._session_store.db_path
+        )
+        self._owns_delivery_store = delivery_store is None
+        self._delivery = ChannelDeliveryCoordinator(
+            task_watch=self._task_watch,
+            store=self._delivery_store,
+            platform="telegram",
+            lease_seconds=max(30.0, task_poll_interval * 3.0),
+        )
         self._message_parse_mode = message_parse_mode
         self._mermaid_renderer = mermaid_renderer or KrokiMermaidRenderer(
             base_url=os.getenv("KROKI_BASE_URL", "https://kroki.io")
         )
-        del media_root
-        self._delivered_terminal_runs = (
-            self._delivery.terminal_presenter.delivered_run_counts
+        if media_max_bytes <= 0:
+            raise ValueError("Telegram media_max_bytes must be positive")
+        self._artifact_delivery = TelegramArtifactDelivery(
+            gateway_client=self._gateway_client,
+            telegram_client=self._telegram_client,
+            max_bytes=media_max_bytes,
         )
+        self._started = False
+        self._closed = False
+
+    async def start(self) -> int:
+        if self._closed:
+            raise RuntimeError("TelegramAdapter is closed")
+        if self._started:
+            return 0
+        self._started = True
+        return await self._delivery.recover(self._recovery_hooks)
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await self._delivery.close()
+        if self._owns_delivery_store:
+            self._delivery_store.close()
 
     async def _send_message(
         self,
@@ -272,90 +311,9 @@ class TelegramAdapter:
         self,
         text: str,
     ) -> tuple[str, list[TelegramAttachment]]:
-        attachments: list[TelegramAttachment] = []
-        stripped = text
-
-        mermaid_pattern = re.compile(
-            r"```mermaid\n(?P<body>.*?)```",
-            re.DOTALL | re.IGNORECASE,
-        )
-        mermaid_parts: list[str] = []
-        last_end = 0
-        mermaid_index = 0
-        for match in mermaid_pattern.finditer(stripped):
-            mermaid_parts.append(stripped[last_end : match.start()])
-            source = match.group("body").strip()
-            try:
-                image_bytes = await self._mermaid_renderer.render_png(source)
-            except MermaidRenderError:
-                mermaid_parts.append(match.group(0))
-                last_end = match.end()
-                continue
-            mermaid_index += 1
-            attachments.append(
-                TelegramAttachment(
-                    kind="photo",
-                    filename=f"mermaid_{mermaid_index}.png",
-                    content=image_bytes,
-                    caption=f"Mermaid diagram {mermaid_index}",
-                )
-            )
-            mermaid_parts.append(f"[Mermaid diagram {mermaid_index}]")
-            last_end = match.end()
-        mermaid_parts.append(stripped[last_end:])
-        stripped = "".join(mermaid_parts)
-
-        stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
-        return stripped, attachments
-
-    async def _send_task_artifacts(
-        self,
-        *,
-        chat_id: int,
-        task: GatewayTask,
-    ) -> None:
-        task_id = task.task_id
-        run_count = task.run_count
-        for artifact in _current_run_artifacts(task, run_count):
-            artifact_id = artifact.artifact_id
-            filename = artifact.name or artifact_id
-            try:
-                downloaded = await self._gateway_client.download_task_artifact(
-                    task_id=task_id,
-                    artifact_id=artifact_id,
-                )
-            except Exception as exc:
-                await self._send_attachment_error(
-                    chat_id=chat_id,
-                    filename=filename,
-                    error=exc,
-                )
-                continue
-            caption = artifact.caption
-            attachment = self._attachment_from_gateway_artifact(
-                downloaded,
-                caption=caption or filename,
-            )
-            await self._send_attachment(chat_id=chat_id, attachment=attachment)
-
-    def _attachment_from_gateway_artifact(
-        self,
-        artifact: Any,
-        *,
-        caption: str | None,
-    ) -> TelegramAttachment:
-        filename = getattr(artifact, "filename", None) or "artifact"
-        kind = (
-            "photo"
-            if Path(filename).suffix.lower() in IMAGE_ATTACHMENT_EXTENSIONS
-            else "document"
-        )
-        return TelegramAttachment(
-            kind=kind,
-            filename=filename,
-            content=getattr(artifact, "content"),
-            caption=caption,
-            content_type=getattr(artifact, "content_type", None),
+        return await extract_telegram_attachments(
+            text,
+            mermaid_renderer=self._mermaid_renderer,
         )
 
     async def _send_attachment(
@@ -396,26 +354,31 @@ class TelegramAdapter:
             )
 
     async def run_forever(self) -> None:
+        await self.start()
         offset: int | None = None
         network_failures = 0
-        while True:
-            try:
-                poll_result = await self._poll_once_result(offset=offset)
-                offset = poll_result.next_offset
-                network_failures = 0
-                if poll_result.retry_after_delay:
-                    await asyncio.sleep(TELEGRAM_CLAIM_RETRY_DELAY_SECONDS)
-            except TelegramNetworkError as exc:
-                network_failures += 1
-                delay = min(60, 5 * (2 ** (network_failures - 1)))
-                print(
-                    f"[telegram warning] network error: {exc}. retrying in {delay}s",
-                    flush=True,
-                )
-                await asyncio.sleep(delay)
-            except TelegramAPIError as exc:
-                print(f"[telegram warning] {exc}", flush=True)
-                await asyncio.sleep(1)
+        try:
+            while True:
+                try:
+                    poll_result = await self._poll_once_result(offset=offset)
+                    offset = poll_result.next_offset
+                    network_failures = 0
+                    if poll_result.retry_after_delay:
+                        await asyncio.sleep(TELEGRAM_CLAIM_RETRY_DELAY_SECONDS)
+                except TelegramNetworkError as exc:
+                    network_failures += 1
+                    delay = min(60, 5 * (2 ** (network_failures - 1)))
+                    print(
+                        f"[telegram warning] network error: {exc}. "
+                        f"retrying in {delay}s",
+                        flush=True,
+                    )
+                    await asyncio.sleep(delay)
+                except TelegramAPIError as exc:
+                    print(f"[telegram warning] {exc}", flush=True)
+                    await asyncio.sleep(1)
+        finally:
+            await self.close()
 
     async def poll_once(self, *, offset: int | None) -> int | None:
         result = await self._poll_once_result(offset=offset)
@@ -611,6 +574,11 @@ class TelegramAdapter:
                 task_id=task_id,
                 chat_id=message.chat_id,
                 run_count=outcome.task.run_count,
+                session_key=delivery_session_key(
+                    outcome.task,
+                    platform="telegram",
+                    chat_id=str(message.chat_id),
+                ),
             )
             await self._send_message(
                 chat_id=message.chat_id,
@@ -624,6 +592,11 @@ class TelegramAdapter:
             task_id=task_id,
             chat_id=message.chat_id,
             run_count=task.run_count,
+            session_key=delivery_session_key(
+                task,
+                platform="telegram",
+                chat_id=str(message.chat_id),
+            ),
         )
         await self._send_message(
             chat_id=message.chat_id,
@@ -683,6 +656,11 @@ class TelegramAdapter:
                 task_id=task_id,
                 chat_id=message.chat_id,
                 run_count=result.task.run_count,
+                session_key=delivery_session_key(
+                    result.task,
+                    platform="telegram",
+                    chat_id=str(message.chat_id),
+                ),
             )
         await self._send_message(
             chat_id=message.chat_id,
@@ -792,19 +770,47 @@ class TelegramAdapter:
             )
         return metadata.get("message_thread_id") in {None, ""}
 
-    def _ensure_watcher(self, *, task_id: str, chat_id: int, run_count: int) -> None:
-        self._delivery.ensure_watch(
+    def _ensure_watcher(
+        self,
+        *,
+        task_id: str,
+        chat_id: int,
+        run_count: int,
+        session_key: str | None = None,
+    ) -> None:
+        self._delivery.ensure_delivery(
+            session_key=session_key or f"telegram:chat:{chat_id}",
+            chat_id=str(chat_id),
             task_id=task_id,
             run_count=run_count,
-            on_pending_review=lambda task: self._send_message(
+            hooks=self._delivery_hooks(chat_id),
+        )
+
+    def _delivery_hooks(self, chat_id: int) -> ChannelDeliveryHooks:
+        async def send_review(task: GatewayTask) -> None:
+            await self._send_message(
                 chat_id=chat_id,
                 text=self._format_review_message(task),
-            ),
-            on_terminal=lambda task: self._send_terminal_if_needed(
+            )
+
+        async def send_terminal_message(task: GatewayTask) -> None:
+            await self._send_message(
                 chat_id=chat_id,
-                task=task,
+                text=self._delivery.terminal_presenter.format(task),
+            )
+
+        return ChannelDeliveryHooks(
+            send_review=send_review,
+            send_terminal_message=send_terminal_message,
+            send_artifact=lambda task, artifact: self._artifact_delivery.send(
+                task,
+                artifact,
+                chat_id=chat_id,
             ),
         )
+
+    def _recovery_hooks(self, intent: ChannelDeliveryIntent) -> ChannelDeliveryHooks:
+        return self._delivery_hooks(int(intent.chat_id))
 
     def _parse_review_command(self, text: str) -> dict[str, Any] | None:
         return parse_review_command(text)
@@ -847,6 +853,11 @@ class TelegramAdapter:
             task_id=task_id,
             chat_id=message.chat_id,
             run_count=task.run_count,
+            session_key=delivery_session_key(
+                task,
+                platform="telegram",
+                chat_id=str(message.chat_id),
+            ),
         )
         await self._send_message(
             chat_id=message.chat_id,
@@ -873,7 +884,14 @@ class TelegramAdapter:
             )
 
         async def send_artifacts(terminal_task: GatewayTask) -> None:
-            await self._send_task_artifacts(chat_id=chat_id, task=terminal_task)
+            for artifact in _current_run_artifacts(
+                terminal_task, terminal_task.run_count
+            ):
+                await self._artifact_delivery.send(
+                    terminal_task,
+                    artifact,
+                    chat_id=chat_id,
+                )
 
         await self._delivery.terminal_presenter.present(
             task,

@@ -7,6 +7,11 @@ from typing import Any, Protocol
 import httpx
 
 from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTask
+from ruyi_agent.channels.media import (
+    MediaLimitError,
+    read_bounded_media,
+    validate_content_length,
+)
 from ruyi_agent.channels.telegram.network import (
     TelegramAPIError,
     TelegramFallbackResolver,
@@ -23,6 +28,7 @@ IMAGE_ATTACHMENT_EXTENSIONS = {
     ".gif",
     ".webp",
 }
+DEFAULT_TELEGRAM_MEDIA_MAX_BYTES = 50 * 1024 * 1024
 
 
 def _env_list(name: str) -> list[str]:
@@ -52,6 +58,7 @@ class TelegramAttachmentDownloadWarning:
     kind: str
     filename: str
     error: str
+
 
 @dataclass(slots=True)
 class TelegramMessage:
@@ -132,6 +139,7 @@ class TelegramBotAPIClient:
         timeout: float = 30.0,
         default_parse_mode: str | None = None,
         fallback_resolver: TelegramFallbackResolver | None = None,
+        media_max_bytes: int = DEFAULT_TELEGRAM_MEDIA_MAX_BYTES,
     ) -> None:
         self._base_url = f"https://api.telegram.org/bot{bot_token}"
         self._timeout = timeout
@@ -139,6 +147,9 @@ class TelegramBotAPIClient:
         self._fallback_resolver = fallback_resolver or TelegramFallbackResolver(
             fallback_ips=_env_list("TELEGRAM_FALLBACK_IPS"),
         )
+        if media_max_bytes <= 0:
+            raise ValueError("Telegram media_max_bytes must be positive")
+        self._media_max_bytes = media_max_bytes
 
     async def get_updates(
         self,
@@ -311,7 +322,21 @@ class TelegramBotAPIClient:
             transport=TelegramFallbackTransport(resolver=self._fallback_resolver),
         ) as client:
             try:
-                response = await client.get(url)
+                async with client.stream("GET", url) as response:
+                    if not response.is_success:
+                        raise TelegramAPIError(
+                            "Telegram file download failed: "
+                            f"status={response.status_code}"
+                        )
+                    validate_content_length(
+                        response.headers,
+                        max_bytes=self._media_max_bytes,
+                        values=response.headers.get_list("content-length"),
+                    )
+                    return await read_bounded_media(
+                        response.aiter_bytes(),
+                        max_bytes=self._media_max_bytes,
+                    )
             except httpx.HTTPError as exc:
                 error_cls = (
                     TelegramNetworkError
@@ -321,11 +346,8 @@ class TelegramBotAPIClient:
                 raise error_cls(
                     f"Telegram file download failed: file_id={file_id} error={exc}"
                 ) from exc
-        if not response.is_success:
-            raise TelegramAPIError(
-                f"Telegram file download failed: status={response.status_code}"
-            )
-        return response.content
+            except MediaLimitError as exc:
+                raise TelegramAPIError(str(exc)) from exc
 
     async def send_message(
         self,

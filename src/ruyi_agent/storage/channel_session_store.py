@@ -51,6 +51,10 @@ class ChannelSessionStore:
         )
         self._init_db()
 
+    @property
+    def db_path(self) -> str:
+        return self._db_path
+
     def get_session(self, session_key: str) -> ChannelSessionRecord | None:
         with self._lock:
             row = self._conn.execute(

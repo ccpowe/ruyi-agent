@@ -79,7 +79,6 @@ bot_union_id = ""
 api_timeout = 10
 task_poll_interval = 2
 terminal_review_grace_checks = 3
-media_root = ""
 media_max_bytes = 31457280
 ack_mode = "reaction"
 reactions = true

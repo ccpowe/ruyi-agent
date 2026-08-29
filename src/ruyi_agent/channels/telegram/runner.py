@@ -4,7 +4,11 @@ import os
 from pathlib import Path
 
 from ruyi_agent.channels.gateway_client import GatewayHTTPClient
-from ruyi_agent.channels.telegram.client import TelegramBotAPIClient
+from ruyi_agent.channels.telegram.client import (
+    DEFAULT_TELEGRAM_MEDIA_MAX_BYTES,
+    TelegramBotAPIClient,
+)
+from ruyi_agent.storage.channel_delivery_store import ChannelDeliveryStore
 from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 
 
@@ -35,13 +39,19 @@ async def run_telegram_adapter() -> None:
         str(Path(session_db_path).expanduser().with_name("telegram_updates.sqlite3")),
     )
     poll_timeout = int(os.getenv("TELEGRAM_POLL_TIMEOUT", "30"))
+    media_max_bytes = int(
+        os.getenv("TELEGRAM_MEDIA_MAX_BYTES", str(DEFAULT_TELEGRAM_MEDIA_MAX_BYTES))
+    )
     session_store = ChannelSessionStore(session_db_path)
+    delivery_store = ChannelDeliveryStore(session_db_path)
     update_store = TelegramUpdateStore(update_db_path)
+    adapter: TelegramAdapter | None = None
     try:
         adapter = TelegramAdapter(
             gateway_client=GatewayHTTPClient(
                 base_url=gateway_base_url,
                 bearer_token=gateway_bearer_token,
+                max_download_bytes=media_max_bytes,
             ),
             telegram_client=TelegramBotAPIClient(
                 bot_token=bot_token,
@@ -52,6 +62,7 @@ async def run_telegram_adapter() -> None:
                     "TELEGRAM_MESSAGE_PARSE_MODE",
                     "MarkdownV2",
                 ),
+                media_max_bytes=media_max_bytes,
             ),
             default_agent_name=default_agent_name,
             session_store=session_store,
@@ -62,8 +73,13 @@ async def run_telegram_adapter() -> None:
                 os.getenv("TELEGRAM_TERMINAL_REVIEW_GRACE_CHECKS", "3")
             ),
             message_parse_mode=os.getenv("TELEGRAM_MESSAGE_PARSE_MODE", "MarkdownV2"),
+            media_max_bytes=media_max_bytes,
+            delivery_store=delivery_store,
         )
         await adapter.run_forever()
     finally:
+        if adapter is not None and hasattr(adapter, "close"):
+            await adapter.close()
         update_store.close()
+        delivery_store.close()
         session_store.close()

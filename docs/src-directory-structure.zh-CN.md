@@ -34,6 +34,8 @@ src/ruyi_agent/
 - `gateway_client.py`：Telegram、飞书和测试使用的 Gateway HTTP Client。
 - `turn.py`：共享 Channel Turn 策略。
 - `task_watch.py`：共享 Task Watch 策略。
+- `presentation.py`：durable Channel delivery coordinator 与共享 presenter。
+- `media.py`：跨平台 HTTP 媒体流式硬上限。
 - `telegram/adapter.py`：Telegram 平台 Adapter。
 - `feishu/adapter.py`：飞书平台 Adapter。
 
@@ -72,6 +74,7 @@ Channel Adapter 不直接管理 Task 状态，也不直接调用 `AgentControl`�
 - `task_store.py`：TaskRecord 生命周期与权威 Pending Review 资源。
 - `gateway_route_store.py`：Local/Remote Route。
 - `channel_session_store.py`：Channel identity、Active Agent 和当前 Task。
+- `channel_delivery_store.py`：可恢复 Task Watch、delivery step ledger 与 fenced lease。
 - `review_audit.py`：Review 决策审计。
 
 Telegram/飞书的事件去重 Store 当前定义在各自 Adapter 相关实现中。

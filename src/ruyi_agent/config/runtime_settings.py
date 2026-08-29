@@ -111,7 +111,6 @@ FEISHU_ENV = {
 FEISHU_PATH_ENV = {
     "session_db": "FEISHU_SESSION_DB",
     "event_db": "FEISHU_EVENT_DB",
-    "media_root": "FEISHU_MEDIA_ROOT",
 }
 
 LANGSMITH_ENV = {

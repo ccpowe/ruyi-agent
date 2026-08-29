@@ -9,6 +9,7 @@ from ruyi_agent.channels.feishu.client import (
 )
 from ruyi_agent.channels.feishu.receipts import FeishuEventStore
 from ruyi_agent.channels.gateway_client import GatewayHTTPClient
+from ruyi_agent.storage.channel_delivery_store import ChannelDeliveryStore
 from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 
 
@@ -59,6 +60,9 @@ async def run_feishu_adapter() -> None:
     bot_user_id = os.getenv("FEISHU_BOT_USER_ID") or None
     bot_union_id = os.getenv("FEISHU_BOT_UNION_ID") or None
     bot_name = os.getenv("FEISHU_BOT_NAME") or None
+    media_max_bytes = int(
+        os.getenv("FEISHU_MEDIA_MAX_BYTES", str(DEFAULT_FEISHU_MEDIA_MAX_BYTES))
+    )
     if (
         require_mention
         and group_policy != "disabled"
@@ -70,12 +74,15 @@ async def run_feishu_adapter() -> None:
             "FEISHU_BOT_NAME, or set FEISHU_GROUP_POLICY=disabled for DM-only use."
         )
     session_store = ChannelSessionStore(session_db_path)
+    delivery_store = ChannelDeliveryStore(session_db_path)
     event_store = FeishuEventStore(event_db_path)
+    adapter: FeishuAdapter | None = None
     try:
         adapter = FeishuAdapter(
             gateway_client=GatewayHTTPClient(
                 base_url=gateway_base_url,
                 bearer_token=gateway_bearer_token,
+                max_download_bytes=media_max_bytes,
             ),
             feishu_client=FeishuSDKClient(
                 app_id=app_id,
@@ -98,10 +105,8 @@ async def run_feishu_adapter() -> None:
             terminal_review_grace_checks=int(
                 os.getenv("FEISHU_TERMINAL_REVIEW_GRACE_CHECKS", "3")
             ),
-            media_root=os.getenv("FEISHU_MEDIA_ROOT"),
-            media_max_bytes=int(
-                os.getenv("FEISHU_MEDIA_MAX_BYTES", str(DEFAULT_FEISHU_MEDIA_MAX_BYTES))
-            ),
+            media_max_bytes=media_max_bytes,
+            delivery_store=delivery_store,
             ack_mode=os.getenv("FEISHU_ACK_MODE", "reaction"),
             reactions_enabled=_env_bool("FEISHU_REACTIONS", default=True),
             processing_reaction=os.getenv("FEISHU_PROCESSING_REACTION", "Typing"),
@@ -110,5 +115,8 @@ async def run_feishu_adapter() -> None:
         )
         await adapter.run_forever()
     finally:
+        if adapter is not None and hasattr(adapter, "close"):
+            await adapter.close()
         event_store.close()
+        delivery_store.close()
         session_store.close()

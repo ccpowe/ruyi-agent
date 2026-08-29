@@ -177,7 +177,6 @@ def test_adapter_does_not_parse_media_references(tmp_path: Path) -> None:
         gateway_client=FakeGatewayClient(),
         telegram_client=telegram,
         default_agent_name="main",
-        media_root=tmp_path,
     )
 
     asyncio.run(adapter._send_message(chat_id=100, text=f"MEDIA:{doc_path}"))

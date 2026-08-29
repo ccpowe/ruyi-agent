@@ -293,7 +293,7 @@ def test_empty_toml_values_do_not_override_existing_environment(
                 'openrouter_api_key = ""',
                 "",
                 "[channels.feishu]",
-                'media_root = ""',
+                'session_db = ""',
             ]
         ),
         encoding="utf-8",
@@ -304,4 +304,4 @@ def test_empty_toml_values_do_not_override_existing_environment(
     configure_runtime_environment(env=env)
 
     assert env["OPENROUTER_API_KEY"] == "external-key"
-    assert "FEISHU_MEDIA_ROOT" not in env
+    assert "FEISHU_SESSION_DB" not in env
