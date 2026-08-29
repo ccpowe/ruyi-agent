@@ -11,6 +11,7 @@ from ruyi_agent.gateway.application import (
 from ruyi_agent.gateway.errors import GatewayTaskError
 from ruyi_agent.gateway.listing import GatewayListingService
 from ruyi_agent.gateway.models import ReviewListResponse, ReviewResponse, TaskResponse
+from ruyi_agent.task_models import PendingReviewRecord, TaskRouteRecord
 
 
 class GatewayReviewService:
@@ -74,14 +75,18 @@ class GatewayReviewService:
                 message="Query parameter 'limit' must be between 1 and 100",
             )
         offset = self._listings.decode_cursor(cursor)
-        routes = await self._context.router.list_routes()
-        routes_by_id = {
-            route.task_id: route
-            for route, task in await self._listings.collect_tasks(routes)
-            if task is not None
-        }
+        pending_reviews = sorted(
+            self._context.router.list_pending_reviews(),
+            key=lambda item: (item.updated_at, item.review_id),
+            reverse=True,
+        )
+        page_records = pending_reviews[offset : offset + limit]
+        routes_by_id = await self._refresh_review_owner_routes(page_records)
         items = []
-        for pending in self._context.router.list_pending_reviews():
+        for original in page_records:
+            pending = self._context.router.get_pending_review(original.review_id)
+            if pending is None or pending.task_id != original.task_id:
+                continue
             route = routes_by_id.get(pending.task_id)
             if route is None:
                 continue
@@ -89,26 +94,30 @@ class GatewayReviewService:
             items.append(
                 self._projection.build_review(pending, record, route.metadata)
             )
-        items.sort(key=lambda item: (item.updated_at, item.review_id), reverse=True)
-        page = items[offset : offset + limit]
         next_cursor = (
             self._listings.encode_cursor(offset + limit)
-            if offset + limit < len(items)
+            if offset + limit < len(pending_reviews)
             else None
         )
-        return ReviewListResponse(items=page, next_cursor=next_cursor)
+        return ReviewListResponse(items=items, next_cursor=next_cursor)
 
     async def get_review(self, review_id: str) -> ReviewResponse:
-        routes = await self._context.router.list_routes()
-        routes_by_id = {
-            route.task_id: route
-            for route, task in await self._listings.collect_tasks(routes)
-            if task is not None
-        }
         pending = self._context.router.get_pending_review(review_id)
-        if pending is not None and (route := routes_by_id.get(pending.task_id)):
-            record = self._context.router.ensure_record(route)
-            return self._projection.build_review(pending, record, route.metadata)
+        if pending is not None:
+            routes_by_id = await self._refresh_review_owner_routes([pending])
+            refreshed = self._context.router.get_pending_review(review_id)
+            route = routes_by_id.get(pending.task_id)
+            if (
+                refreshed is not None
+                and refreshed.task_id == pending.task_id
+                and route is not None
+            ):
+                record = self._context.router.ensure_record(route)
+                return self._projection.build_review(
+                    refreshed,
+                    record,
+                    route.metadata,
+                )
         raise GatewayTaskError(
             code="review_not_found",
             message=f"Review '{review_id}' does not exist",
@@ -123,22 +132,21 @@ class GatewayReviewService:
                 message=f"Task '{task_id}' does not exist",
             )
         record = self._context.router.ensure_record(route)
-        routes = await self._context.router.list_routes()
-        routes_by_id = {
-            candidate.task_id: candidate
-            for candidate, item in await self._listings.collect_tasks(routes)
-            if item is not None
-        }
         pending_reviews = self._context.router.list_pending_reviews(
             root_task_id=task_id if record.root_task_id == task_id else None,
             task_id=None if record.root_task_id == task_id else task_id,
         )
         items = []
         for pending in pending_reviews:
-            owner_route = routes_by_id.get(pending.task_id)
-            if owner_route is None:
+            try:
+                owner_route = (
+                    route
+                    if pending.task_id == task_id
+                    else await self._context.router.get_route(pending.task_id)
+                )
+                owner = self._context.router.ensure_record(owner_route)
+            except GatewayTaskError:
                 continue
-            owner = self._context.router.ensure_record(owner_route)
             items.append(
                 self._projection.build_review(
                     pending,
@@ -147,3 +155,25 @@ class GatewayReviewService:
                 )
             )
         return ReviewListResponse(items=items, next_cursor=None)
+
+    async def _refresh_review_owner_routes(
+        self,
+        pending_reviews: list[PendingReviewRecord],
+    ) -> dict[str, TaskRouteRecord]:
+        """Refresh only deduplicated owner routes named by Pending Reviews."""
+
+        routes = []
+        seen_task_ids: set[str] = set()
+        for pending in pending_reviews:
+            if pending.task_id in seen_task_ids:
+                continue
+            seen_task_ids.add(pending.task_id)
+            try:
+                routes.append(await self._context.router.get_route(pending.task_id))
+            except GatewayTaskError:
+                continue
+        return {
+            route.task_id: route
+            for route, task in await self._listings.collect_tasks(routes)
+            if task is not None
+        }
