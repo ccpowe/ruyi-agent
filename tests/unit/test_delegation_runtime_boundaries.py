@@ -125,3 +125,23 @@ def test_runtime_boundary_modules_and_facade_stay_within_line_budgets() -> None:
     )
     assert control_node.end_lineno is not None
     assert control_node.end_lineno - control_node.lineno + 1 <= 700
+
+
+def test_delegation_runtime_regressions_stay_split_by_boundary() -> None:
+    unit_tests = Path(__file__).parent
+    legacy_monolith = unit_tests / "test_async_subagent_runtime.py"
+    boundary_tests = sorted(unit_tests.glob("test_async_subagent_*.py"))
+
+    assert not legacy_monolith.exists()
+    assert {path.name for path in boundary_tests} == {
+        "test_async_subagent_local_executor.py",
+        "test_async_subagent_remote_port.py",
+        "test_async_subagent_task_manager_reviews.py",
+        "test_async_subagent_task_runtime.py",
+        "test_async_subagent_tools_and_delivery.py",
+    }
+    assert {
+        path.name: len(path.read_text(encoding="utf-8").splitlines())
+        for path in boundary_tests
+        if len(path.read_text(encoding="utf-8").splitlines()) >= 1500
+    } == {}
