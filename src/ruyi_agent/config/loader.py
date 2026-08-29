@@ -28,6 +28,7 @@ from ruyi_agent.config.agent_parser import (
     parse_agent_configs,
     parse_skill_selection,
 )
+from ruyi_agent.config.errors import ConfigError
 from ruyi_agent.config.paths import resolve_ruyi_paths
 from ruyi_agent.config.permission_parser import parse_permission_config
 from ruyi_agent.config.provider_models import (
@@ -153,6 +154,7 @@ __all__ = [
     "AgentConfigs",
     "BearerAuthConfig",
     "CONFIG_DIR",
+    "ConfigError",
     "LLMProviderSpec",
     "LLM_PROVIDERS_CONFIG_PATH",
     "LOCAL_AGENT_ALLOWED_FIELDS",

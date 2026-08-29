@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from urllib.parse import urlsplit
 
 from ruyi_agent.config.provider_models import (
     LLMProviderSpec,
     SUPPORTED_MODEL_PROVIDERS,
     validate_provider_init_kwargs,
 )
+from ruyi_agent.config.url_validation import validate_http_url
 
 
 def parse_llm_provider_configs(raw_providers: object) -> dict[str, LLMProviderSpec]:
@@ -38,9 +38,7 @@ def _parse_provider(provider_name: str, raw_provider: object) -> LLMProviderSpec
         raise ValueError(f"{path}.kind must be one of: {allowed}")
     base_url = _optional_string(raw_provider.get("base_url"), path=f"{path}.base_url")
     if base_url is not None:
-        parsed_url = urlsplit(base_url)
-        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-            raise ValueError(f"{path}.base_url must be an absolute HTTP(S) URL")
+        base_url = validate_http_url(base_url, path=f"{path}.base_url")
     api_key_env = _optional_string(
         raw_provider.get("api_key_env"), path=f"{path}.api_key_env"
     )

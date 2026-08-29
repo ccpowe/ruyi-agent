@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, cast
-from urllib.parse import urlsplit
 
 from ruyi_agent.config.agent_models import (
     AgentConfig,
@@ -15,6 +14,7 @@ from ruyi_agent.config.agent_models import (
     SkillSelection,
 )
 from ruyi_agent.config.system_tools import validate_system_tool_names
+from ruyi_agent.config.url_validation import validate_http_url
 
 
 LOCAL_AGENT_REQUIRED_FIELDS = {
@@ -340,12 +340,7 @@ def _string_tuple(value: object, *, path: str) -> tuple[str, ...]:
 def _remote_url(value: object, *, agent_name: str) -> str:
     path = _field(agent_name, "url")
     url = _non_empty_string(value, path=path)
-    parsed = urlsplit(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError(f"{path} must be an absolute HTTP(S) URL.")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError(f"{path} must not contain credentials.")
-    return url
+    return validate_http_url(url, path=path)
 
 
 def _raise_name_mismatch(agent_name: str, configured_name: str) -> None:
