@@ -192,7 +192,20 @@ def test_public_remote_ref_maps_unhashable_status_to_upstream_error(
         )
 
     assert response.status_code == 502
-    assert response.json()["error"]["code"] == "upstream_gateway_error"
+    error = response.json()["error"]
+    assert error["code"] == "upstream_gateway_error"
+    task_id = error["details"]["task_id"]
+    assert error["details"] == {
+        "task_id": task_id,
+        "task_url": f"/tasks/{task_id}",
+        "route_state": "uncertain",
+        "create_retryable": False,
+    }
+    with TestClient(app) as client:
+        query = client.get(f"/tasks/{task_id}", headers=auth_headers())
+    assert query.status_code == 200
+    assert query.json()["task_id"] == task_id
+    assert query.json()["status"] == "failed"
     assert factory.control is not None
     records = factory.control.list_task_records()
     assert len(records) == 1

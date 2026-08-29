@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal, TypeAlias, cast
 
 
@@ -17,6 +17,10 @@ TaskState: TypeAlias = Literal[
     "interrupted",
 ]
 TaskRouteKind: TypeAlias = Literal["local", "remote_ref"]
+TaskRouteState: TypeAlias = Literal["pending", "active", "failed", "uncertain"]
+TASK_ROUTE_STATES: frozenset[TaskRouteState] = frozenset(
+    {"pending", "active", "failed", "uncertain"}
+)
 MetadataScalar: TypeAlias = str | int | float | bool | None
 
 ACTIVE_TASK_STATES: frozenset[TaskState] = frozenset(
@@ -117,5 +121,9 @@ class TaskRouteRecord:
     agent_name: str
     metadata: dict[str, MetadataScalar]
     route_kind: TaskRouteKind
-    upstream_task_id: str
+    upstream_task_id: str | None
     webhook: dict[str, MetadataScalar] | None = None
+    route_state: TaskRouteState = "active"
+    route_error: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))

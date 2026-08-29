@@ -4,8 +4,13 @@ import json
 import sqlite3
 import threading
 from asyncio import to_thread
+from datetime import UTC, datetime
 from pathlib import Path
-from ruyi_agent.task_models import TaskRouteRecord
+from ruyi_agent.task_models import (
+    TASK_ROUTE_STATES,
+    TaskRouteRecord,
+    TaskRouteState,
+)
 
 
 class GatewayRouteStore:
@@ -21,12 +26,15 @@ class GatewayRouteStore:
         self._init_db()
 
     def save_route(self, route: TaskRouteRecord) -> None:
+        self._validate_route_state(route.route_state)
+        route.updated_at = datetime.now(UTC)
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 existing = self._conn.execute(
                     """
-                    SELECT agent_name, route_kind, upstream_task_id
+                    SELECT agent_name, route_kind, upstream_task_id, route_state,
+                        created_at
                     FROM gateway_task_routes
                     WHERE task_id = ?
                     """,
@@ -47,8 +55,9 @@ class GatewayRouteStore:
                         """
                         INSERT INTO gateway_task_routes (
                             task_id, agent_name, metadata_json, route_kind,
-                            upstream_task_id, webhook_json
-                        ) VALUES (?, ?, ?, ?, ?, ?)
+                            upstream_task_id, webhook_json, route_state, route_error,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             route.task_id,
@@ -57,30 +66,63 @@ class GatewayRouteStore:
                             route.route_kind,
                             route.upstream_task_id,
                             webhook_json,
+                            route.route_state,
+                            route.route_error,
+                            route.created_at.isoformat(),
+                            route.updated_at.isoformat(),
                         ),
                     )
                 else:
+                    route.created_at = datetime.fromisoformat(str(existing[4]))
                     stable_binding = (
                         str(existing[0]),
                         str(existing[1]),
-                        str(existing[2]),
                     )
                     requested_binding = (
                         route.agent_name,
                         route.route_kind,
-                        route.upstream_task_id,
                     )
                     if stable_binding != requested_binding:
+                        raise ValueError(
+                            f"Gateway route binding conflict for task '{route.task_id}'"
+                        )
+                    if str(existing[3]) == "active" and route.route_state != "active":
+                        raise ValueError(
+                            f"Active Gateway route '{route.task_id}' cannot be downgraded"
+                        )
+                    existing_upstream = (
+                        str(existing[2]) if existing[2] is not None else None
+                    )
+                    if (
+                        existing_upstream is not None
+                        and route.upstream_task_id is not None
+                        and existing_upstream != route.upstream_task_id
+                        and not (
+                            str(existing[3]) != "active"
+                            and route.route_kind == "remote_ref"
+                            and existing_upstream == route.task_id
+                        )
+                    ):
                         raise ValueError(
                             f"Gateway route binding conflict for task '{route.task_id}'"
                         )
                     self._conn.execute(
                         """
                         UPDATE gateway_task_routes
-                        SET metadata_json = ?, webhook_json = ?
+                        SET metadata_json = ?, webhook_json = ?,
+                            upstream_task_id = COALESCE(?, upstream_task_id),
+                            route_state = ?, route_error = ?, updated_at = ?
                         WHERE task_id = ?
                         """,
-                        (metadata_json, webhook_json, route.task_id),
+                        (
+                            metadata_json,
+                            webhook_json,
+                            route.upstream_task_id,
+                            route.route_state,
+                            route.route_error,
+                            route.updated_at.isoformat(),
+                            route.task_id,
+                        ),
                     )
                 self._conn.commit()
             except BaseException:
@@ -90,12 +132,92 @@ class GatewayRouteStore:
     async def asave_route(self, route: TaskRouteRecord) -> None:
         await to_thread(self.save_route, route)
 
+    def reserve_route(self, route: TaskRouteRecord) -> TaskRouteRecord:
+        """Persist a stable Gateway identity before starting its effect."""
+
+        reservation = TaskRouteRecord(
+            task_id=route.task_id,
+            agent_name=route.agent_name,
+            metadata=dict(route.metadata),
+            route_kind=route.route_kind,
+            upstream_task_id=route.task_id,
+            webhook=dict(route.webhook) if route.webhook is not None else None,
+            route_state="pending",
+        )
+        with self._lock:
+            existing = self.get_route(route.task_id)
+            if existing is not None:
+                if (
+                    existing.agent_name != reservation.agent_name
+                    or existing.route_kind != reservation.route_kind
+                ):
+                    raise ValueError(
+                        f"Gateway route binding conflict for task '{route.task_id}'"
+                    )
+                return existing
+            self.save_route(reservation)
+        return reservation
+
+    async def areserve_route(self, route: TaskRouteRecord) -> TaskRouteRecord:
+        return await to_thread(self.reserve_route, route)
+
+    def transition_route(
+        self,
+        task_id: str,
+        *,
+        route_state: TaskRouteState,
+        upstream_task_id: str | None = None,
+        route_error: str | None = None,
+    ) -> TaskRouteRecord:
+        """Transition a reservation without allowing identity rebinding."""
+
+        self._validate_route_state(route_state)
+        with self._lock:
+            route = self.get_route(task_id)
+            if route is None:
+                raise KeyError(task_id)
+            if (
+                route.upstream_task_id is not None
+                and upstream_task_id is not None
+                and route.upstream_task_id != upstream_task_id
+                and not (
+                    route.route_kind == "remote_ref"
+                    and route.route_state != "active"
+                    and route.upstream_task_id == route.task_id
+                )
+            ):
+                raise ValueError(
+                    f"Gateway route binding conflict for task '{task_id}'"
+                )
+            route.upstream_task_id = upstream_task_id or route.upstream_task_id
+            route.route_state = route_state
+            route.route_error = route_error
+            self.save_route(route)
+            return route
+
+    async def atransition_route(
+        self,
+        task_id: str,
+        *,
+        route_state: TaskRouteState,
+        upstream_task_id: str | None = None,
+        route_error: str | None = None,
+    ) -> TaskRouteRecord:
+        return await to_thread(
+            self.transition_route,
+            task_id,
+            route_state=route_state,
+            upstream_task_id=upstream_task_id,
+            route_error=route_error,
+        )
+
     def get_route(self, task_id: str) -> TaskRouteRecord | None:
         with self._lock:
             row = self._conn.execute(
                 """
                 SELECT task_id, agent_name, metadata_json, route_kind,
-                    upstream_task_id, webhook_json
+                    upstream_task_id, webhook_json, route_state, route_error,
+                    created_at, updated_at
                 FROM gateway_task_routes
                 WHERE task_id = ?
                 """,
@@ -113,7 +235,8 @@ class GatewayRouteStore:
             rows = self._conn.execute(
                 """
                 SELECT task_id, agent_name, metadata_json, route_kind,
-                    upstream_task_id, webhook_json
+                    upstream_task_id, webhook_json, route_state, route_error,
+                    created_at, updated_at
                 FROM gateway_task_routes
                 """
             ).fetchall()
@@ -130,9 +253,10 @@ class GatewayRouteStore:
             row = self._conn.execute(
                 """
                 SELECT task_id, agent_name, metadata_json, route_kind,
-                    upstream_task_id, webhook_json
+                    upstream_task_id, webhook_json, route_state, route_error,
+                    created_at, updated_at
                 FROM gateway_task_routes
-                WHERE upstream_task_id = ?
+                WHERE upstream_task_id = ? AND route_state = 'active'
                 """,
                 (upstream_task_id,),
             ).fetchone()
@@ -163,7 +287,12 @@ class GatewayRouteStore:
                     metadata_json TEXT NOT NULL,
                     route_kind TEXT NOT NULL,
                     upstream_task_id TEXT NOT NULL,
-                    webhook_json TEXT
+                    webhook_json TEXT,
+                    route_state TEXT NOT NULL DEFAULT 'active'
+                        CHECK (route_state IN ('pending', 'active', 'failed', 'uncertain')),
+                    route_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
                 """
             )
@@ -177,11 +306,48 @@ class GatewayRouteStore:
                 self._conn.execute(
                     "ALTER TABLE gateway_task_routes ADD COLUMN webhook_json TEXT"
                 )
+            if "route_state" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE gateway_task_routes "
+                    "ADD COLUMN route_state TEXT NOT NULL DEFAULT 'active'"
+                )
+            if "route_error" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE gateway_task_routes ADD COLUMN route_error TEXT"
+                )
+            now = datetime.now(UTC).isoformat()
+            if "created_at" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE gateway_task_routes ADD COLUMN created_at TEXT"
+                )
+                self._conn.execute(
+                    "UPDATE gateway_task_routes SET created_at = ?",
+                    (now,),
+                )
+            if "updated_at" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE gateway_task_routes ADD COLUMN updated_at TEXT"
+                )
+                self._conn.execute(
+                    "UPDATE gateway_task_routes SET updated_at = ?",
+                    (now,),
+                )
             self._conn.commit()
 
     def _row_to_route(
         self,
-        row: tuple[str, str, str, str, str, str | None],
+        row: tuple[
+            str,
+            str,
+            str,
+            str,
+            str | None,
+            str | None,
+            str,
+            str | None,
+            str,
+            str,
+        ],
     ) -> TaskRouteRecord:
         metadata_json = row[2]
         metadata = json.loads(metadata_json)
@@ -189,6 +355,8 @@ class GatewayRouteStore:
         webhook = json.loads(webhook_json) if webhook_json else None
         if not isinstance(webhook, dict):
             webhook = None
+        route_state = str(row[6])
+        self._validate_route_state(route_state)
         return TaskRouteRecord(
             task_id=row[0],
             agent_name=row[1],
@@ -196,7 +364,15 @@ class GatewayRouteStore:
             route_kind=row[3],
             upstream_task_id=row[4],
             webhook=webhook,
+            route_state=route_state,
+            route_error=row[7],
+            created_at=datetime.fromisoformat(row[8]),
+            updated_at=datetime.fromisoformat(row[9]),
         )
+
+    def _validate_route_state(self, route_state: object) -> None:
+        if route_state not in TASK_ROUTE_STATES:
+            raise ValueError(f"Invalid Gateway route state: {route_state!r}")
 
     def close(self) -> None:
         with self._lock:
