@@ -8,7 +8,7 @@ src/ruyi_agent/
 ├── gateway/             Gateway Task Module
 ├── channels/            HTTP 与平台 Adapter、共享 Channel 策略
 ├── runtime/             Agent 构建、执行、Subagent、Middleware、Skills
-├── control_plane/       Permission 与 Review 契约
+├── control_plane/       Permission 策略
 ├── integrations/        A2A、Backend、MCP、OpenAI Codex 集成
 ├── storage/             SQLite 持久化 Adapter
 ├── config/              配置加载与运行环境
@@ -44,6 +44,7 @@ Channel Adapter 不直接管理 Task 状态，也不直接调用 `AgentControl`�
 - `bootstrap.py`：进程级对象装配和资源生命周期。
 - `agent_factory.py`：把 Agent Spec 构造成可执行 Agent。
 - `agent_turn.py`：Agent 单轮执行辅助逻辑。
+- `task_events.py`：Gateway Task 生命周期事件的持久化与公共投影。
 - `delegation/async_runtime.py`：`AgentControl`、TaskRecord、Task 状态机和 Subagent 工具。
 - `delegation/context.py`：跨 Gateway Delegation Context。
 - `mailbox/`：用户/Agent 输入与父子 Task settled 结果的持久投递和安全注入。
@@ -53,10 +54,11 @@ Channel Adapter 不直接管理 Task 状态，也不直接调用 `AgentControl`�
 ## `control_plane`
 
 - `permissions.py`：Permission profile 与工具决策。
-- `reviews.py`：Review 控制和审计协作。
-- `contracts.py`：Review Decision、Action 和 Snapshot 模型。
 
-这里不再包含 `ProtocolController` 或 Gateway command/event/snapshot 原型。
+当前 Review 不在 `control_plane` 中维护独立契约或控制器：公共投影位于
+`gateway/models.py`，Task Review 状态与决策由 `AgentControl` 和 Gateway Task Module
+处理，审计由 `storage/review_audit.py` 持久化。这里不再包含旧 Review
+控制面、`ProtocolController` 或 Gateway command/event/snapshot 原型。
 
 ## `integrations`
 
