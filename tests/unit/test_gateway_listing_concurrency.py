@@ -707,6 +707,152 @@ def test_v2_review_cursor_missing_resume_upgrades_without_duplicates_or_gaps() -
     assert len(sequence) == len(set(sequence))
 
 
+@pytest.mark.parametrize("resume_present", [True, False])
+def test_v2_review_cursor_keeps_immutable_legacy_membership_until_exhausted(
+    resume_present: bool,
+) -> None:
+    now = datetime(2026, 8, 29, tzinfo=UTC)
+    pending_reviews = [
+        PendingReviewRecord(
+            review_id=f"review-{index}",
+            task_id=f"task-{index}",
+            root_task_id=f"task-{index}",
+            payload={"action_requests": [], "review_configs": []},
+            created_at=now + timedelta(seconds=index),
+            updated_at=now + timedelta(seconds=6 - index),
+            ingest_sequence=index + 1,
+            cursor_order_updated_at=now + timedelta(seconds=6 - index),
+        )
+        for index in range(6)
+        if resume_present or index != 2
+    ]
+    router = ListingRouter(
+        [route(index) for index in range(7)],
+        {
+            f"task-{index}": record(index, state="waiting_for_human")
+            for index in range(7)
+        },
+        pending_reviews=pending_reviews,
+    )
+    service = service_with_router(router)
+    cursor = base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "fallback_updated_at": (now + timedelta(seconds=4)).isoformat(),
+                "resume_review_id": "review-2",
+                "version": 2,
+            },
+            separators=(",", ":"),
+        ).encode()
+    ).decode()
+
+    sequence: list[str] = []
+    first = asyncio.run(service.list_reviews(cursor=cursor, limit=1))
+    sequence.extend(item.review_id for item in first.items)
+    cursor = first.next_cursor
+    assert cursor is not None
+    first_compatibility_cursor = json.loads(base64.urlsafe_b64decode(cursor))
+    assert first_compatibility_cursor["version"] == 5
+    assert first_compatibility_cursor["legacy_resume_included"] is resume_present
+    assert first_compatibility_cursor["snapshot_ingest_sequence"] == 6
+
+    router.pending_reviews = [
+        replace(
+            item,
+            updated_at=(
+                now + timedelta(days=1)
+                if item.ingest_sequence % 2
+                else now - timedelta(days=1)
+            ),
+        )
+        for item in pending_reviews
+    ] + [
+        PendingReviewRecord(
+            review_id="review-created-after-upgrade",
+            task_id="task-6",
+            root_task_id="task-6",
+            payload={"action_requests": [], "review_configs": []},
+            created_at=now - timedelta(days=2),
+            updated_at=now - timedelta(days=2),
+            ingest_sequence=7,
+            cursor_order_updated_at=now - timedelta(days=2),
+        )
+    ]
+
+    while cursor is not None:
+        page = asyncio.run(service.list_reviews(cursor=cursor, limit=1))
+        sequence.extend(item.review_id for item in page.items)
+        cursor = page.next_cursor
+        if cursor is not None:
+            compatibility_cursor = json.loads(base64.urlsafe_b64decode(cursor))
+            assert compatibility_cursor["version"] == 5
+            assert compatibility_cursor["legacy_resume_included"] is resume_present
+
+    expected = ["review-3", "review-4", "review-5"]
+    if resume_present:
+        expected.insert(0, "review-2")
+    assert sequence == expected
+    assert len(sequence) == len(set(sequence))
+    assert "review-created-after-upgrade" not in sequence
+
+
+def test_v5_review_cursor_falls_back_in_legacy_order_when_resume_disappears() -> None:
+    now = datetime(2026, 8, 29, tzinfo=UTC)
+    pending_reviews = [
+        PendingReviewRecord(
+            review_id=f"review-{index}",
+            task_id=f"task-{index}",
+            root_task_id=f"task-{index}",
+            payload={"action_requests": [], "review_configs": []},
+            created_at=now,
+            updated_at=now + timedelta(seconds=4 - index),
+            ingest_sequence=index + 1,
+            cursor_order_updated_at=now + timedelta(seconds=4 - index),
+        )
+        for index in range(4)
+    ]
+    router = ListingRouter(
+        [route(index) for index in range(4)],
+        {
+            f"task-{index}": record(index, state="waiting_for_human")
+            for index in range(4)
+        },
+        pending_reviews=pending_reviews,
+    )
+    service = service_with_router(router)
+    cursor = base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "fallback_updated_at": (now + timedelta(seconds=4)).isoformat(),
+                "resume_review_id": "review-0",
+                "version": 2,
+            },
+            separators=(",", ":"),
+        ).encode()
+    ).decode()
+
+    first = asyncio.run(service.list_reviews(cursor=cursor, limit=1))
+    assert [item.review_id for item in first.items] == ["review-0"]
+    assert first.next_cursor is not None
+    router.pending_reviews = [
+        replace(item, updated_at=now + timedelta(days=1))
+        for item in pending_reviews
+        if item.review_id != "review-1"
+    ]
+
+    sequence = ["review-0"]
+    cursor = first.next_cursor
+    while cursor is not None:
+        decoded_cursor = json.loads(base64.urlsafe_b64decode(cursor))
+        assert decoded_cursor["version"] == 5
+        page = asyncio.run(service.list_reviews(cursor=cursor, limit=1))
+        sequence.extend(item.review_id for item in page.items)
+        cursor = page.next_cursor
+
+    assert sequence == ["review-0", "review-2", "review-3"]
+    assert len(sequence) == len(set(sequence))
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -743,6 +889,15 @@ def test_v2_review_cursor_missing_resume_upgrades_without_duplicates_or_gaps() -
             "resume_review_id": "review-1",
             "fallback_ingest_sequence": 1,
             "snapshot_ingest_sequence": 0,
+        },
+        {
+            "version": 5,
+            "resume_review_id": "review-1",
+            "fallback_cursor_order_updated_at": "2026-08-29T00:00:00+00:00",
+            "snapshot_ingest_sequence": 1,
+            "legacy_resume_review_id": "review-1",
+            "legacy_resume_included": 1,
+            "legacy_fallback_updated_at": "2026-08-29T00:00:00+00:00",
         },
         2**63,
     ],

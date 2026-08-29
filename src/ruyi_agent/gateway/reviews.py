@@ -119,6 +119,7 @@ class GatewayReviewService:
             self._encode_review_cursor(
                 pending_reviews[scan_index],
                 snapshot_frontier=page.snapshot_frontier,
+                legacy_v2_boundary=page.legacy_v2_boundary,
             )
             if scan_index < len(pending_reviews)
             else None
@@ -269,6 +270,52 @@ class GatewayReviewService:
                     fallback_sequence=fallback_sequence,
                     snapshot_frontier=snapshot_frontier,
                 )
+            if set(payload) == {
+                "fallback_cursor_order_updated_at",
+                "legacy_fallback_updated_at",
+                "legacy_resume_included",
+                "legacy_resume_review_id",
+                "resume_review_id",
+                "snapshot_ingest_sequence",
+                "version",
+            }:
+                if type(payload["version"]) is not int or payload["version"] != 5:
+                    raise ValueError
+                if type(payload["legacy_resume_included"]) is not bool:
+                    raise ValueError
+                boundary = _LegacyV2Boundary(
+                    fallback_updated_at=_parse_cursor_timestamp(
+                        payload["legacy_fallback_updated_at"]
+                    ),
+                    resume_review_id=_parse_cursor_review_id(
+                        payload["legacy_resume_review_id"]
+                    ),
+                    include_resume=payload["legacy_resume_included"],
+                )
+                review_id = _parse_cursor_review_id(payload["resume_review_id"])
+                fallback_cursor_order_updated_at = _parse_cursor_timestamp(
+                    payload["fallback_cursor_order_updated_at"]
+                )
+                snapshot_frontier = _parse_cursor_sequence(
+                    payload["snapshot_ingest_sequence"]
+                )
+                records = _legacy_v2_snapshot_records(
+                    records,
+                    boundary=boundary,
+                    snapshot_frontier=snapshot_frontier,
+                )
+                page = _resume_legacy_v2_page(
+                    records,
+                    review_id=review_id,
+                    fallback_cursor_order_updated_at=fallback_cursor_order_updated_at,
+                    snapshot_frontier=snapshot_frontier,
+                )
+                return _ReviewCursorPage(
+                    records=page.records,
+                    scan_index=page.scan_index,
+                    snapshot_frontier=page.snapshot_frontier,
+                    legacy_v2_boundary=boundary,
+                )
             if set(payload) == {"review_id", "updated_at", "version"}:
                 if type(payload["version"]) is not int or payload["version"] != 1:
                     raise ValueError
@@ -284,7 +331,28 @@ class GatewayReviewService:
                     raise ValueError
                 review_id = _parse_cursor_review_id(payload["resume_review_id"])
                 raw_fallback_at = payload["fallback_updated_at"]
-                legacy_timestamp_field = "updated_at"
+                fallback_at = _parse_cursor_timestamp(raw_fallback_at)
+                snapshot_frontier = _review_snapshot_frontier(records)
+                boundary = _LegacyV2Boundary(
+                    fallback_updated_at=fallback_at,
+                    resume_review_id=review_id,
+                    include_resume=any(
+                        record.review_id == review_id for record in records
+                    ),
+                )
+                if snapshot_frontier is None:
+                    return _ReviewCursorPage(records=[], scan_index=0)
+                records = _legacy_v2_snapshot_records(
+                    records,
+                    boundary=boundary,
+                    snapshot_frontier=snapshot_frontier,
+                )
+                return _ReviewCursorPage(
+                    records=records,
+                    scan_index=0,
+                    snapshot_frontier=snapshot_frontier,
+                    legacy_v2_boundary=boundary,
+                )
             elif set(payload) == {
                 "fallback_created_at",
                 "resume_review_id",
@@ -345,18 +413,34 @@ class GatewayReviewService:
         record: PendingReviewRecord,
         *,
         snapshot_frontier: int | None,
+        legacy_v2_boundary: _LegacyV2Boundary | None = None,
     ) -> str:
         if snapshot_frontier is None:
             raise ValueError("Review cursor snapshot frontier is missing")
         _parse_cursor_sequence(record.ingest_sequence)
         _parse_cursor_sequence(snapshot_frontier)
-        payload = json.dumps(
-            {
-                "fallback_ingest_sequence": record.ingest_sequence,
+        cursor_payload: dict[str, object] = {
+            "fallback_ingest_sequence": record.ingest_sequence,
+            "resume_review_id": record.review_id,
+            "snapshot_ingest_sequence": snapshot_frontier,
+            "version": 4,
+        }
+        if legacy_v2_boundary is not None:
+            cursor_payload = {
+                "fallback_cursor_order_updated_at": (
+                    _legacy_cursor_order_updated_at(record).isoformat()
+                ),
+                "legacy_fallback_updated_at": (
+                    legacy_v2_boundary.fallback_updated_at.isoformat()
+                ),
+                "legacy_resume_included": legacy_v2_boundary.include_resume,
+                "legacy_resume_review_id": legacy_v2_boundary.resume_review_id,
                 "resume_review_id": record.review_id,
                 "snapshot_ingest_sequence": snapshot_frontier,
-                "version": 4,
-            },
+                "version": 5,
+            }
+        payload = json.dumps(
+            cursor_payload,
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
@@ -388,7 +472,15 @@ class _OwnerRefreshResult:
 class _ReviewCursorPage:
     records: list[PendingReviewRecord]
     scan_index: int
-    snapshot_frontier: int | None
+    snapshot_frontier: int | None = None
+    legacy_v2_boundary: _LegacyV2Boundary | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyV2Boundary:
+    fallback_updated_at: datetime
+    resume_review_id: str
+    include_resume: bool
 
 
 def _review_sort_key(record: PendingReviewRecord) -> tuple[int, str]:
@@ -397,6 +489,63 @@ def _review_sort_key(record: PendingReviewRecord) -> tuple[int, str]:
 
 def _review_snapshot_frontier(records: list[PendingReviewRecord]) -> int | None:
     return records[0].ingest_sequence if records else None
+
+
+def _legacy_v2_snapshot_records(
+    records: list[PendingReviewRecord],
+    *,
+    boundary: _LegacyV2Boundary,
+    snapshot_frontier: int,
+) -> list[PendingReviewRecord]:
+    fallback_key = (boundary.fallback_updated_at, boundary.resume_review_id)
+    return sorted(
+        (
+            record
+            for record in records
+            if record.ingest_sequence <= snapshot_frontier
+            and (
+                (
+                    boundary.include_resume
+                    and record.review_id == boundary.resume_review_id
+                )
+                or (_legacy_cursor_order_updated_at(record), record.review_id)
+                < fallback_key
+            )
+        ),
+        key=_legacy_v2_sort_key,
+        reverse=True,
+    )
+
+
+def _legacy_cursor_order_updated_at(record: PendingReviewRecord) -> datetime:
+    immutable_order = getattr(record, "cursor_order_updated_at", None)
+    return immutable_order if immutable_order is not None else record.updated_at
+
+
+def _legacy_v2_sort_key(record: PendingReviewRecord) -> tuple[datetime, str]:
+    return _legacy_cursor_order_updated_at(record), record.review_id
+
+
+def _resume_legacy_v2_page(
+    records: list[PendingReviewRecord],
+    *,
+    review_id: str,
+    fallback_cursor_order_updated_at: datetime,
+    snapshot_frontier: int,
+) -> _ReviewCursorPage:
+    for index, record in enumerate(records):
+        if record.review_id == review_id:
+            return _ReviewCursorPage(records, index, snapshot_frontier)
+    fallback_key = (fallback_cursor_order_updated_at, review_id)
+    scan_index = next(
+        (
+            index
+            for index, record in enumerate(records)
+            if _legacy_v2_sort_key(record) < fallback_key
+        ),
+        len(records),
+    )
+    return _ReviewCursorPage(records, scan_index, snapshot_frontier)
 
 
 def _resume_sequence_page(

@@ -88,10 +88,18 @@ idempotently before installing the unique sequence index.
 
 New review-list cursors use the local ingest high-water as an immutable snapshot
 frontier and the first unscanned review's identity/sequence as the resume point.
-They therefore do not depend on mutable remote timestamps. Legacy cursor
-versions remain readable; after locating their exact resume item (or applying
-their strict timestamp fallback when it disappeared), continuation switches to
-the ingest-sequence snapshot format.
+They therefore do not depend on mutable remote timestamps. A Pending Review
+also freezes `cursor_order_updated_at` when it first receives an ingest sequence;
+refreshing the same review never changes that legacy ordering value.
+
+Legacy v2 cursors remain readable against that immutable upgrade snapshot. Their
+compatibility continuation cursor retains the original timestamp/review boundary,
+whether the original resume review still existed, the ingest high-water, and the
+first unscanned immutable legacy order/identity. The service scans that bounded
+membership in frozen `(cursor_order_updated_at, review_id)` order until it is
+exhausted; it does not switch to a broader current cursor halfway through the old
+snapshot. Fresh list requests and their continuations use the version 4
+ingest-sequence format.
 
 Local and `remote_ref` Tasks use the same resource model. Remote refresh and
 Review Command responses reconcile the local proxy Task and its Pending Review
