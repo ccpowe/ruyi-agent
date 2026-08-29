@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
+from uuid import uuid4
 
 import httpx
 
@@ -50,6 +51,7 @@ TELEGRAM_API_HOST = "api.telegram.org"
 TELEGRAM_FALLBACK_SEED_IPS = ["149.154.167.220", "149.154.167.99", "149.154.167.50"]
 DEFAULT_GATEWAY_BEARER_TOKEN = "dev-token"
 DEFAULT_CHANNEL_SESSION_DB = "data/channel_sessions.sqlite3"
+TELEGRAM_CLAIM_RETRY_DELAY_SECONDS = 1.0
 IMAGE_ATTACHMENT_EXTENSIONS = {
     ".png",
     ".jpg",
@@ -279,8 +281,12 @@ class UnsupportedTelegramChatTypeError(ValueError):
     pass
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 def _utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+    return _utc_now().isoformat()
 
 
 def _env_list(name: str) -> list[str]:
@@ -474,6 +480,13 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
 class TelegramUpdateClaim:
     status: Literal["claimed", "processed", "busy"]
     claimed_at: str | None = None
+    claim_token: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramPollResult:
+    next_offset: int | None
+    retry_after_delay: bool = False
 
 
 class TelegramUpdateStore:
@@ -498,14 +511,15 @@ class TelegramUpdateStore:
         return self.claim_update_result(update).status == "claimed"
 
     def claim_update_result(self, update: "TelegramMessage") -> TelegramUpdateClaim:
-        now_dt = datetime.now(UTC)
+        now_dt = _utc_now()
         now = now_dt.isoformat()
+        new_claim_token = uuid4().hex
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 row = self._conn.execute(
                     """
-                    SELECT processed_at, claimed_at
+                    SELECT processed_at, claimed_at, claim_token
                     FROM telegram_processed_updates
                     WHERE update_id = ?
                     """,
@@ -520,8 +534,9 @@ class TelegramUpdateStore:
                             message_id,
                             first_seen_at,
                             claimed_at,
+                            claim_token,
                             processed_at
-                        ) VALUES (?, ?, ?, ?, ?, NULL)
+                        ) VALUES (?, ?, ?, ?, ?, ?, NULL)
                         """,
                         (
                             update.update_id,
@@ -529,34 +544,44 @@ class TelegramUpdateStore:
                             str(update.message_id),
                             now,
                             now,
+                            new_claim_token,
                         ),
                     )
                     self._conn.commit()
-                    return TelegramUpdateClaim(status="claimed", claimed_at=now)
+                    return TelegramUpdateClaim(
+                        status="claimed",
+                        claimed_at=now,
+                        claim_token=new_claim_token,
+                    )
 
-                processed_at, claimed_at = row
+                processed_at, claimed_at, claim_token = row
                 if processed_at:
                     self._conn.commit()
                     return TelegramUpdateClaim(status="processed")
-                if not self._claim_expired(claimed_at, now_dt):
+                if claim_token and not self._claim_expired(claimed_at, now_dt):
                     self._conn.commit()
                     return TelegramUpdateClaim(status="busy")
 
                 self._conn.execute(
                     """
                     UPDATE telegram_processed_updates
-                    SET chat_id = ?, message_id = ?, claimed_at = ?
+                    SET chat_id = ?, message_id = ?, claimed_at = ?, claim_token = ?
                     WHERE update_id = ? AND processed_at IS NULL
                     """,
                     (
                         str(update.chat_id),
                         str(update.message_id),
                         now,
+                        new_claim_token,
                         update.update_id,
                     ),
                 )
                 self._conn.commit()
-                return TelegramUpdateClaim(status="claimed", claimed_at=now)
+                return TelegramUpdateClaim(
+                    status="claimed",
+                    claimed_at=now,
+                    claim_token=new_claim_token,
+                )
             except BaseException:
                 self._conn.rollback()
                 raise
@@ -565,42 +590,34 @@ class TelegramUpdateStore:
         self,
         update_id: int,
         *,
-        claimed_at: str | None = None,
+        claim_token: str,
     ) -> bool:
         now = _utc_now_iso()
-        with self._lock:
-            if claimed_at is None:
-                cursor = self._conn.execute(
-                    """
-                    UPDATE telegram_processed_updates
-                    SET claimed_at = NULL, processed_at = ?
-                    WHERE update_id = ? AND processed_at IS NULL
-                    """,
-                    (now, update_id),
-                )
-            else:
-                cursor = self._conn.execute(
-                    """
-                    UPDATE telegram_processed_updates
-                    SET claimed_at = NULL, processed_at = ?
-                    WHERE update_id = ?
-                        AND claimed_at = ?
-                        AND processed_at IS NULL
-                    """,
-                    (now, update_id, claimed_at),
-                )
-            self._conn.commit()
-            return cursor.rowcount > 0
-
-    def release_claim(self, update_id: int, *, claimed_at: str) -> bool:
         with self._lock:
             cursor = self._conn.execute(
                 """
                 UPDATE telegram_processed_updates
-                SET claimed_at = NULL
-                WHERE update_id = ? AND claimed_at = ? AND processed_at IS NULL
+                SET claimed_at = NULL, claim_token = NULL, processed_at = ?
+                WHERE update_id = ?
+                    AND claim_token = ?
+                    AND processed_at IS NULL
                 """,
-                (update_id, claimed_at),
+                (now, update_id, claim_token),
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    def release_claim(self, update_id: int, *, claim_token: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE telegram_processed_updates
+                SET claimed_at = NULL, claim_token = NULL
+                WHERE update_id = ?
+                    AND claim_token = ?
+                    AND processed_at IS NULL
+                """,
+                (update_id, claim_token),
             )
             self._conn.commit()
             return cursor.rowcount > 0
@@ -614,18 +631,18 @@ class TelegramUpdateStore:
     ) -> TelegramUpdateClaim:
         return await asyncio.to_thread(self.claim_update_result, update)
 
-    async def amark_processed(self, update_id: int, *, claimed_at: str) -> bool:
+    async def amark_processed(self, update_id: int, *, claim_token: str) -> bool:
         return await asyncio.to_thread(
             self.mark_processed,
             update_id,
-            claimed_at=claimed_at,
+            claim_token=claim_token,
         )
 
-    async def arelease_claim(self, update_id: int, *, claimed_at: str) -> bool:
+    async def arelease_claim(self, update_id: int, *, claim_token: str) -> bool:
         return await asyncio.to_thread(
             self.release_claim,
             update_id,
-            claimed_at=claimed_at,
+            claim_token=claim_token,
         )
 
     def _ensure_parent_dir(self) -> None:
@@ -647,6 +664,7 @@ class TelegramUpdateStore:
                     message_id TEXT NOT NULL,
                     first_seen_at TEXT NOT NULL,
                     claimed_at TEXT,
+                    claim_token TEXT,
                     processed_at TEXT
                 )
                 """
@@ -660,6 +678,10 @@ class TelegramUpdateStore:
             if "claimed_at" not in columns:
                 self._conn.execute(
                     "ALTER TABLE telegram_processed_updates ADD COLUMN claimed_at TEXT"
+                )
+            if "claim_token" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE telegram_processed_updates ADD COLUMN claim_token TEXT"
                 )
             self._conn.commit()
 
@@ -1374,8 +1396,11 @@ class TelegramAdapter:
         network_failures = 0
         while True:
             try:
-                offset = await self.poll_once(offset=offset)
+                poll_result = await self._poll_once_result(offset=offset)
+                offset = poll_result.next_offset
                 network_failures = 0
+                if poll_result.retry_after_delay:
+                    await asyncio.sleep(TELEGRAM_CLAIM_RETRY_DELAY_SECONDS)
             except TelegramNetworkError as exc:
                 network_failures += 1
                 delay = min(60, 5 * (2 ** (network_failures - 1)))
@@ -1389,6 +1414,10 @@ class TelegramAdapter:
                 await asyncio.sleep(1)
 
     async def poll_once(self, *, offset: int | None) -> int | None:
+        result = await self._poll_once_result(offset=offset)
+        return result.next_offset
+
+    async def _poll_once_result(self, *, offset: int | None) -> TelegramPollResult:
         updates = await self._telegram_client.get_updates(
             offset=offset,
             timeout=self._poll_timeout,
@@ -1403,9 +1432,12 @@ class TelegramAdapter:
                 )
                 continue
             if claim.status == "busy":
-                break
-            if claim.claimed_at is None:
-                raise RuntimeError("Claimed Telegram update is missing its lease token")
+                return TelegramPollResult(
+                    next_offset=next_offset,
+                    retry_after_delay=True,
+                )
+            if claim.claim_token is None:
+                raise RuntimeError("Claimed Telegram update is missing its owner token")
             try:
                 await self.handle_message(update)
             except Exception as exc:
@@ -1416,20 +1448,26 @@ class TelegramAdapter:
                 )
                 await self._update_store.arelease_claim(
                     update.update_id,
-                    claimed_at=claim.claimed_at,
+                    claim_token=claim.claim_token,
                 )
-                break
+                return TelegramPollResult(
+                    next_offset=next_offset,
+                    retry_after_delay=True,
+                )
             marked = await self._update_store.amark_processed(
                 update.update_id,
-                claimed_at=claim.claimed_at,
+                claim_token=claim.claim_token,
             )
             if not marked:
-                break
+                return TelegramPollResult(
+                    next_offset=next_offset,
+                    retry_after_delay=True,
+                )
             candidate = update.update_id + 1
             next_offset = (
                 candidate if next_offset is None else max(next_offset, candidate)
             )
-        return next_offset
+        return TelegramPollResult(next_offset=next_offset)
 
     async def handle_message(self, message: TelegramMessage) -> None:
         text = message.text.strip()

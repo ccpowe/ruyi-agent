@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+import ruyi_agent.channels.telegram.adapter as telegram_adapter_module
 from ruyi_agent.channels.gateway_client import GatewayClientError
 from ruyi_agent.channels.telegram.adapter import (
     TelegramAdapter,
@@ -189,6 +191,7 @@ class FakeTelegramClient:
         self.fail_all_messages = False
         self.fail_documents = False
         self.updates: list[TelegramMessage] = []
+        self.get_updates_calls: list[int | None] = []
 
     async def get_updates(
         self,
@@ -196,6 +199,7 @@ class FakeTelegramClient:
         offset: int | None,
         timeout: int,
     ) -> list[TelegramMessage]:
+        self.get_updates_calls.append(offset)
         return [
             update
             for update in self.updates
@@ -627,16 +631,18 @@ def test_update_store_migrates_old_schema_and_reclaims_expired_lease(
                     "PRAGMA table_info(telegram_processed_updates)"
                 ).fetchall()
             }
-        assert "claimed_at" in columns
+        assert {"claimed_at", "claim_token"}.issubset(columns)
 
         first_claim = store.claim_update_result(update)
         assert first_claim.status == "claimed"
         assert first_claim.claimed_at is not None
+        assert first_claim.claim_token is not None
 
         reclaimed = store.claim_update_result(update)
         assert reclaimed.status == "claimed"
         assert reclaimed.claimed_at is not None
-        assert store.mark_processed(10, claimed_at=reclaimed.claimed_at)
+        assert reclaimed.claim_token is not None
+        assert store.mark_processed(10, claim_token=reclaimed.claim_token)
         assert store.claim_update_result(update).status == "processed"
         assert not store.claim_update(update)
     finally:
@@ -649,12 +655,32 @@ def test_update_store_release_makes_unprocessed_update_claimable() -> None:
     try:
         claim = store.claim_update_result(update)
         assert claim.status == "claimed"
-        assert claim.claimed_at is not None
+        assert claim.claim_token is not None
         assert store.claim_update_result(update).status == "busy"
 
-        assert store.release_claim(10, claimed_at=claim.claimed_at)
+        assert store.release_claim(10, claim_token=claim.claim_token)
         reclaimed = store.claim_update_result(update)
         assert reclaimed.status == "claimed"
+    finally:
+        store.close()
+
+
+def test_update_store_stale_owner_cannot_finish_reclaimed_lease(monkeypatch) -> None:
+    fixed_now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(telegram_adapter_module, "_utc_now", lambda: fixed_now)
+    update = build_message("hello", update_id=10)
+    store = TelegramUpdateStore(":memory:", claim_timeout_seconds=0)
+    try:
+        stale_claim = store.claim_update_result(update)
+        current_claim = store.claim_update_result(update)
+
+        assert stale_claim.claimed_at == current_claim.claimed_at
+        assert stale_claim.claim_token is not None
+        assert current_claim.claim_token is not None
+        assert stale_claim.claim_token != current_claim.claim_token
+        assert not store.mark_processed(10, claim_token=stale_claim.claim_token)
+        assert not store.release_claim(10, claim_token=stale_claim.claim_token)
+        assert store.mark_processed(10, claim_token=current_claim.claim_token)
     finally:
         store.close()
 
@@ -793,6 +819,48 @@ def test_poll_once_does_not_advance_past_update_with_live_claim() -> None:
         assert gateway.create_attempts == 0
     finally:
         update_store.close()
+
+
+def test_run_forever_backs_off_when_update_has_live_claim(monkeypatch) -> None:
+    class StopPolling(Exception):
+        pass
+
+    gateway = FakeGatewayClient()
+    telegram = FakeTelegramClient()
+    update = build_message("hello", update_id=10)
+    telegram.updates = [update]
+    update_store = TelegramUpdateStore(":memory:")
+    assert update_store.claim_update(update)
+    adapter = TelegramAdapter(
+        gateway_client=gateway,
+        telegram_client=telegram,
+        default_agent_name="main",
+        update_store=update_store,
+    )
+    sleep_delays: list[float] = []
+
+    async def stop_after_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+        raise StopPolling
+
+    monkeypatch.setattr(telegram_adapter_module.asyncio, "sleep", stop_after_sleep)
+
+    async def scenario() -> None:
+        try:
+            await adapter.run_forever()
+        except StopPolling:
+            return
+        raise AssertionError("run_forever did not back off after a live claim")
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        update_store.close()
+
+    assert telegram.get_updates_calls == [None]
+    assert sleep_delays == [
+        telegram_adapter_module.TELEGRAM_CLAIM_RETRY_DELAY_SECONDS
+    ]
 
 
 def test_format_telegram_markdown_v2_converts_common_markdown() -> None:
