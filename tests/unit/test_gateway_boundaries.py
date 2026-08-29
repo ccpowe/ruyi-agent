@@ -7,6 +7,13 @@ from typing import Any, cast
 
 from fastapi.routing import APIRoute
 
+import ruyi_agent.channels.http.error_handlers as http_error_handlers
+import ruyi_agent.channels.http.event_routes as http_event_routes
+import ruyi_agent.channels.http.routes as http_routes
+import ruyi_agent.channels.http.schemas as http_schemas
+import ruyi_agent.gateway.attachments as gateway_attachments
+import ruyi_agent.gateway.commands as gateway_commands
+import ruyi_agent.gateway.tasks as gateway_tasks
 from ruyi_agent.channels.http.routes import create_gateway_app
 from ruyi_agent.gateway.application import GatewayAgentService
 from ruyi_agent.gateway.artifacts import GatewayArtifactService
@@ -66,6 +73,65 @@ def test_gateway_command_outcome_remains_reexported_from_facade_module() -> None
     from ruyi_agent.gateway.tasks import GatewayCommandOutcome as FacadeOutcome
 
     assert FacadeOutcome is GatewayCommandOutcome
+
+
+def test_http_routes_facade_preserves_baseline_import_snapshot() -> None:
+    expected_exports = {
+        "TASK_EVENT_HEARTBEAT_SECONDS",
+        "TaskInput",
+        "HealthProbeResponse",
+        "ReadyProbeResponse",
+        "NotReadyProbeResponse",
+        "CreateTaskRequest",
+        "SendInputRequest",
+        "ReviewDecisionInput",
+        "ArtifactDownloadRequest",
+        "HTTP_STATUS_BY_ERROR",
+        "HTTP_STATUS_BY_ERROR_KIND",
+    }
+
+    assert expected_exports <= vars(http_routes).keys()
+    assert (
+        http_routes.TASK_EVENT_HEARTBEAT_SECONDS
+        is http_event_routes.TASK_EVENT_HEARTBEAT_SECONDS
+    )
+    assert http_routes.TaskInput is http_schemas.TaskInput
+    assert http_routes.HealthProbeResponse is http_schemas.HealthProbeResponse
+    assert http_routes.ReadyProbeResponse is http_schemas.ReadyProbeResponse
+    assert http_routes.NotReadyProbeResponse is http_schemas.NotReadyProbeResponse
+    assert http_routes.CreateTaskRequest is http_schemas.CreateTaskRequest
+    assert http_routes.SendInputRequest is http_schemas.SendInputRequest
+    assert http_routes.ReviewDecisionInput is http_schemas.ReviewDecisionInput
+    assert http_routes.ArtifactDownloadRequest is http_schemas.ArtifactDownloadRequest
+    assert http_routes.HTTP_STATUS_BY_ERROR is http_error_handlers.HTTP_STATUS_BY_ERROR
+    assert (
+        http_routes.HTTP_STATUS_BY_ERROR_KIND
+        is http_error_handlers.HTTP_STATUS_BY_ERROR_KIND
+    )
+
+
+def test_gateway_tasks_facade_preserves_baseline_import_snapshot() -> None:
+    expected_exports = {
+        "ATTACHMENT_METADATA_KEY",
+        "ATTACHMENT_INBOX_SUBDIR",
+        "SAFE_ATTACHMENT_CHARS",
+        "COMMAND_WAIT_TIMEOUT_SECONDS",
+    }
+
+    assert expected_exports <= vars(gateway_tasks).keys()
+    assert (
+        gateway_tasks.ATTACHMENT_METADATA_KEY
+        is gateway_attachments.ATTACHMENT_METADATA_KEY
+    )
+    assert (
+        gateway_tasks.ATTACHMENT_INBOX_SUBDIR
+        is gateway_attachments.ATTACHMENT_INBOX_SUBDIR
+    )
+    assert gateway_tasks.SAFE_ATTACHMENT_CHARS is gateway_attachments.SAFE_ATTACHMENT_CHARS
+    assert (
+        gateway_tasks.COMMAND_WAIT_TIMEOUT_SECONDS
+        is gateway_commands.COMMAND_WAIT_TIMEOUT_SECONDS
+    )
 
 
 def test_gateway_http_composition_preserves_public_route_contract() -> None:

@@ -12,8 +12,14 @@ from ruyi_agent.gateway.application import (
     GatewayProjection,
 )
 from ruyi_agent.gateway.artifacts import GatewayArtifactService
-from ruyi_agent.gateway.attachments import GatewayAttachmentService
+from ruyi_agent.gateway.attachments import (
+    ATTACHMENT_INBOX_SUBDIR as ATTACHMENT_INBOX_SUBDIR,
+    ATTACHMENT_METADATA_KEY as ATTACHMENT_METADATA_KEY,
+    SAFE_ATTACHMENT_CHARS as SAFE_ATTACHMENT_CHARS,
+    GatewayAttachmentService,
+)
 from ruyi_agent.gateway.commands import (
+    COMMAND_WAIT_TIMEOUT_SECONDS as COMMAND_WAIT_TIMEOUT_SECONDS,
     DEFAULT_GATEWAY_PRINCIPAL,
     GatewayCommandOutcome,
     GatewayCommandService,

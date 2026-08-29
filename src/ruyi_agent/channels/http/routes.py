@@ -11,10 +11,27 @@ from ruyi_agent.gateway.tasks import GatewayTaskModule
 from .artifact_routes import attach_artifact_routes
 from .console_routes import attach_console_routes
 from .context import GatewayHttpContext
-from .error_handlers import attach_error_handlers
-from .event_routes import attach_event_routes
+from .error_handlers import (
+    HTTP_STATUS_BY_ERROR as HTTP_STATUS_BY_ERROR,
+    HTTP_STATUS_BY_ERROR_KIND as HTTP_STATUS_BY_ERROR_KIND,
+    attach_error_handlers,
+)
+from .event_routes import (
+    TASK_EVENT_HEARTBEAT_SECONDS as TASK_EVENT_HEARTBEAT_SECONDS,
+    attach_event_routes,
+)
 from .probe_routes import attach_probe_routes
 from .review_routes import attach_review_routes
+from .schemas import (
+    ArtifactDownloadRequest as ArtifactDownloadRequest,
+    CreateTaskRequest as CreateTaskRequest,
+    HealthProbeResponse as HealthProbeResponse,
+    NotReadyProbeResponse as NotReadyProbeResponse,
+    ReadyProbeResponse as ReadyProbeResponse,
+    ReviewDecisionInput as ReviewDecisionInput,
+    SendInputRequest as SendInputRequest,
+    TaskInput as TaskInput,
+)
 from .task_routes import attach_task_routes
 from .team_console_auth import TeamConsoleNoStoreMiddleware
 
