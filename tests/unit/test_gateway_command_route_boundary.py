@@ -29,7 +29,7 @@ def _row(db_path: str, query: str) -> sqlite3.Row:
         connection.close()
 
 
-def test_command_marker_before_route_boundary_replays_authoritative_not_started(
+def test_reserved_route_reopens_terminal_command_without_duplicate_dispatch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -89,8 +89,8 @@ def test_command_marker_before_route_boundary_replays_authoritative_not_started(
     routes.close()
     commands.close()
 
-    # Startup recovery sees both durable facts.  The command ledger remains
-    # conservatively terminal, while the route boundary proves no effect began.
+    # The two ledgers open independently. The command is initially conservative,
+    # then the matching reserved route authoritatively reopens it on the retry.
     recovered_routes = GatewayRouteStore(route_path)
     recovered_commands = GatewayCommandStore(command_path)
     recovered_route = recovered_routes.get_route(task_id)
@@ -98,7 +98,7 @@ def test_command_marker_before_route_boundary_replays_authoritative_not_started(
         command_path,
         "SELECT state, error_json FROM gateway_commands",
     )
-    assert recovered_route is not None and recovered_route.route_state == "failed"
+    assert recovered_route is not None and recovered_route.route_state == "pending"
     assert recovered_routes.get_create_evidence(task_id) == evidence_before
     assert recovered_command["state"] == "failed"
     assert (
@@ -122,26 +122,16 @@ def test_command_marker_before_route_boundary_replays_authoritative_not_started(
             )
             queried = client.get(f"/tasks/{task_id}", headers=auth_headers())
 
-        assert replay.status_code == 409
-        assert replay.json() == {
-            "error": {
-                "code": "task_creation_not_retryable",
-                "message": "Gateway Task creation did not start",
-                "details": {
-                    "task_id": task_id,
-                    "task_queryable": True,
-                    "task_url": f"/tasks/{task_id}",
-                    "route_state": "failed",
-                    "create_retryable": False,
-                    "effect_outcome": "not_started",
-                },
-            }
-        }
-        assert "uncertain" not in replay.text
-        assert "may have reached" not in replay.text
+        assert replay.status_code == 201
+        assert replay.json()["task_id"] == task_id
         assert queried.status_code == 200
-        assert queried.json()["status"] == "failed"
-        assert remote.created_inputs == []
+        assert queried.json()["status"] == "completed"
+        assert remote.created_inputs == [input_content]
+        recovered_command = _row(
+            command_path,
+            "SELECT state, effect_started, replay_safe FROM gateway_commands",
+        )
+        assert tuple(recovered_command) == ("succeeded", 1, 0)
     finally:
         recovered_routes.close()
         recovered_commands.close()

@@ -304,6 +304,42 @@ class GatewayRouteStore:
     ) -> GatewayCreateEvidence:
         return await to_thread(self.mark_create_effect_started, task_id)
 
+    def restore_create_not_dispatched(self, task_id: str) -> TaskRouteRecord:
+        """Restore the replay boundary after transport proves no request was sent."""
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE gateway_task_routes
+                    SET create_effect_boundary = 'reserved', route_error = NULL,
+                        updated_at = ?
+                    WHERE task_id = ? AND route_state = 'pending'
+                        AND create_effect_boundary = 'started'
+                    """,
+                    (datetime.now(UTC).isoformat(), task_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError(
+                        f"Gateway route '{task_id}' cannot restore an undispatched "
+                        "create effect"
+                    )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        route = self.get_route(task_id)
+        if route is None:  # pragma: no cover - protected by the transaction
+            raise KeyError(task_id)
+        return route
+
+    async def arestore_create_not_dispatched(
+        self,
+        task_id: str,
+    ) -> TaskRouteRecord:
+        return await to_thread(self.restore_create_not_dispatched, task_id)
+
     def get_create_evidence(self, task_id: str) -> GatewayCreateEvidence | None:
         with self._lock:
             row = self._conn.execute(
@@ -334,6 +370,36 @@ class GatewayRouteStore:
         task_id: str,
     ) -> GatewayCreateEvidence | None:
         return await to_thread(self.get_create_evidence, task_id)
+
+    def create_not_dispatched_is_durable(
+        self,
+        *,
+        task_id: str,
+        agent_name: str,
+    ) -> bool:
+        """Check raw route evidence without reconciling its pending state."""
+
+        route = self.get_route(task_id)
+        evidence = self.get_create_evidence(task_id)
+        return bool(
+            route is not None
+            and route.agent_name == agent_name
+            and route.route_state == "pending"
+            and evidence is not None
+            and evidence.effect_boundary == "reserved"
+        )
+
+    async def acreate_not_dispatched_is_durable(
+        self,
+        *,
+        task_id: str,
+        agent_name: str,
+    ) -> bool:
+        return await to_thread(
+            self.create_not_dispatched_is_durable,
+            task_id=task_id,
+            agent_name=agent_name,
+        )
 
     def transition_route(
         self,
@@ -546,19 +612,11 @@ class GatewayRouteStore:
                 self._conn.execute(
                     """
                     UPDATE gateway_task_routes
-                    SET route_state = 'failed',
-                        route_error = 'Gateway Task creation did not start'
-                    WHERE route_state = 'pending'
-                        AND create_effect_boundary = 'reserved'
-                    """
-                )
-                self._conn.execute(
-                    """
-                    UPDATE gateway_task_routes
                     SET route_state = 'uncertain',
                         route_error = 'Remote Task creation was interrupted'
                     WHERE route_kind = 'remote_ref'
                         AND route_state = 'pending'
+                        AND create_effect_boundary != 'reserved'
                         AND NOT (
                             create_key_scope = 'external'
                             AND create_replay_policy = 'ruyi_gateway_v1'

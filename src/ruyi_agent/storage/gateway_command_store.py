@@ -326,6 +326,56 @@ class GatewayCommandStore:
     async def arelease(self, **kwargs: str) -> None:
         await to_thread(self.release, **kwargs)
 
+    def release_not_dispatched(self, *, command_id: str, claim_token: str) -> None:
+        """Release an unsafe claim after route evidence proves zero dispatch."""
+
+        now = datetime.now(UTC).isoformat()
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE gateway_commands
+                SET state = 'pending', claim_token = NULL, effect_started = 0,
+                    replay_safe = 0, error_json = NULL, updated_at = ?
+                WHERE command_id = ? AND operation = 'create_task'
+                    AND state = 'processing' AND claim_token = ?
+                """,
+                (now, command_id, claim_token),
+            )
+            self._conn.commit()
+            if cursor.rowcount != 1:
+                raise GatewayCommandStateError(
+                    f"Gateway command '{command_id}' is no longer owned by this claim"
+                )
+
+    async def arelease_not_dispatched(self, **kwargs: str) -> None:
+        await to_thread(self.release_not_dispatched, **kwargs)
+
+    def reopen_not_dispatched(
+        self,
+        *,
+        command_id: str,
+        expected_error_json: str,
+    ) -> bool:
+        """Reopen a terminal create when separate route evidence proves no send."""
+
+        now = datetime.now(UTC).isoformat()
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE gateway_commands
+                SET state = 'pending', claim_token = NULL, effect_started = 0,
+                    replay_safe = 0, error_json = NULL, updated_at = ?
+                WHERE command_id = ? AND operation = 'create_task'
+                    AND state = 'failed' AND error_json = ?
+                """,
+                (now, command_id, expected_error_json),
+            )
+            self._conn.commit()
+        return cursor.rowcount == 1
+
+    async def areopen_not_dispatched(self, **kwargs: str) -> bool:
+        return await to_thread(self.reopen_not_dispatched, **kwargs)
+
     def count_commands(self) -> int:
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) FROM gateway_commands").fetchone()

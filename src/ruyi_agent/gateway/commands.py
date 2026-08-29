@@ -12,7 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from ruyi_agent.gateway.application import GatewayApplicationContext
-from ruyi_agent.gateway.errors import GatewayTaskError
+from ruyi_agent.gateway.errors import GatewayEffectDisposition, GatewayTaskError
 from ruyi_agent.gateway.models import AttachmentInput, TaskResponse
 from ruyi_agent.gateway.route_reservations import shield_durable_cleanup
 from ruyi_agent.gateway.task_service import GatewayTaskService
@@ -90,6 +90,18 @@ class GatewayCommandService:
             request_hash=request_hash,
             proposed_task_id=str(uuid4()),
         )
+        if claim.status == "terminal" and await self._reopen_not_dispatched_create(
+            claim,
+            agent_name=agent_name,
+        ):
+            claim = await self._claim(
+                principal_id=principal_id,
+                idempotency_key=idempotency_key,
+                operation="create_task",
+                target=agent_name,
+                request_hash=request_hash,
+                proposed_task_id=claim.task_id,
+            )
         if claim.status == "replay":
             return await self._replayed_outcome(claim)
         if claim.status == "terminal":
@@ -276,7 +288,18 @@ class GatewayCommandService:
                 response_json=task.model_dump_json(),
             )
         except GatewayTaskError as exc:
-            if _is_terminal_command_error(exc):
+            if (
+                exc.effect_disposition
+                == GatewayEffectDisposition.NOT_DISPATCHED
+            ):
+                with suppress(BaseException):
+                    await shield_durable_cleanup(
+                        self._context.command_store.arelease_not_dispatched(
+                            command_id=claim.command_id,
+                            claim_token=claim.claim_token,
+                        )
+                    )
+            elif _is_terminal_command_error(exc):
                 with suppress(BaseException):
                     await shield_durable_cleanup(
                         self._context.command_store.afail(
@@ -327,6 +350,26 @@ class GatewayCommandService:
                     )
             raise
         return GatewayCommandOutcome(task=task, replayed=False)
+
+    async def _reopen_not_dispatched_create(
+        self,
+        claim: GatewayCommandClaim,
+        *,
+        agent_name: str,
+    ) -> bool:
+        """Recover the route-reset/command-release cross-database crash window."""
+
+        if claim.error_json is None or not (
+            await self._tasks.create_not_dispatched_is_durable(
+                task_id=claim.task_id,
+                agent_name=agent_name,
+            )
+        ):
+            return False
+        return await self._context.command_store.areopen_not_dispatched(
+            command_id=claim.command_id,
+            expected_error_json=claim.error_json,
+        )
 
     async def _terminal_error(
         self,

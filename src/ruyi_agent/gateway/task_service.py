@@ -54,6 +54,19 @@ class GatewayTaskService:
             self._context.router.remote_create_idempotency_guaranteed(agent_name)
         )
 
+    async def create_not_dispatched_is_durable(
+        self,
+        *,
+        task_id: str,
+        agent_name: str,
+    ) -> bool:
+        """Return whether route evidence authoritatively proves zero dispatch."""
+
+        return await self._context.router.create_not_dispatched_is_durable(
+            task_id=task_id,
+            agent_name=agent_name,
+        )
+
     async def create_effect(
         self,
         *,

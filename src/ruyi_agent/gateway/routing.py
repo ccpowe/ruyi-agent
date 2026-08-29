@@ -9,8 +9,8 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from ruyi_agent.gateway.create_errors import (
-    create_effect_error as _create_effect_error,
     delegation_depth_error as _delegation_depth_error,
+    recover_create_effect_error as _recover_create_effect_error,
 )
 from ruyi_agent.gateway.errors import GatewayTaskError
 from ruyi_agent.gateway.message_cursors import (
@@ -277,31 +277,18 @@ class TaskRouter:
                 **kwargs,
             )
         except Exception as exc:
-            error, uncertain, effect_outcome = _create_effect_error(
+            raise await _recover_create_effect_error(
                 exc,
                 agent_name=agent_name,
                 route_kind=route_kind,
-            )
-            retryable = bool(
-                uncertain
-                and idempotency_key
-                and route_kind == "remote_ref"
-                and self.remote_create_idempotency_guaranteed(agent_name)
-            )
-            durable_route = reservation
-            if not retryable:
-                durable_route = await self._fail_reservation(
-                    reservation,
-                    error,
-                    uncertain=uncertain,
-                )
-            raise with_route_identity(
-                error,
-                durable_route,
                 task_id=gateway_task_id,
-                retryable=retryable,
-                route_state=reservation.route_state,
-                effect_outcome=effect_outcome,
+                idempotency_key_present=idempotency_key is not None,
+                remote_replay_safe=remote_replay_safe,
+                reservation=reservation,
+                route_store=self._route_store,
+                fail_reservation=lambda route, error, uncertain: (
+                    self._fail_reservation(route, error, uncertain=uncertain)
+                ),
             ) from exc
         except BaseException:
             await shield_durable_cleanup(
@@ -455,6 +442,19 @@ class TaskRouter:
 
     async def save_route(self, route: TaskRouteRecord) -> None:
         await self._route_store.asave_route(route)
+
+    async def create_not_dispatched_is_durable(
+        self,
+        *,
+        task_id: str,
+        agent_name: str,
+    ) -> bool:
+        """Read raw cross-store evidence without reconciling the pending route."""
+
+        return await self._route_store.acreate_not_dispatched_is_durable(
+            task_id=task_id,
+            agent_name=agent_name,
+        )
 
     async def mark_create_outcome_uncertain(
         self,

@@ -83,6 +83,7 @@ def with_route_identity(
         message=error.message,
         details=details,
         kind=error.kind,
+        effect_disposition=error.effect_disposition,
     )
 
 
@@ -150,14 +151,16 @@ async def reconcile_pending_create(
         return route
     evidence = await route_store.aget_create_evidence(route.task_id)
     if route.route_kind == "remote_ref":
-        if evidence is not None and evidence.permits_remote_replay:
+        if evidence is not None and (
+            evidence.effect_boundary == "reserved"
+            or evidence.permits_remote_replay
+        ):
             return route
-        no_effect = evidence is not None and evidence.effect_boundary == "reserved"
         return await _settle_interrupted_route(
             route,
             route_store=route_store,
             effect_exists=False,
-            no_effect=no_effect,
+            no_effect=False,
         )
 
     record: TaskRecord | None
