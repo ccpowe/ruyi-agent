@@ -550,12 +550,28 @@ def _public_terminal_error(
         if stored.code in _SAFE_TERMINAL_CODES
         else "gateway_command_failed"
     )
-    upstream = stored.kind == "upstream_failure" or code == "upstream_gateway_error"
+    route_proves_not_started = bool(
+        create_command
+        and route is not None
+        and route.route_state == "failed"
+        and code == "idempotency_outcome_uncertain"
+    )
+    if route_proves_not_started:
+        # The command marker is persisted before the route effect boundary.  A
+        # crash in between leaves a conservative command-ledger error, but the
+        # route database can later prove that no create effect started.  Public
+        # replay must follow that newer authoritative classification.
+        code = "task_creation_not_retryable"
+    upstream = not route_proves_not_started and (
+        stored.kind == "upstream_failure" or code == "upstream_gateway_error"
+    )
     if code == "idempotency_outcome_uncertain":
         message = (
             "The previous Gateway command may have reached a non-idempotent "
             "downstream service"
         )
+    elif code == "task_creation_not_retryable":
+        message = "Gateway Task creation did not start"
     elif upstream:
         message = (
             "Remote Gateway Task creation failed"
