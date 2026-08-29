@@ -39,13 +39,16 @@ does not use HTML form rules: a literal `+` stays distinct from `%20`.
 
 SQLite applies ordinary last-value selection to repeated `cache` and `vfs`
 control parameters. `mode` has an additional connection-open validation step:
-the sequence may only move toward equal or more restrictive access. For
-example, `rwc` followed by `rw`, and `rw` followed by `ro`, open successfully
-and expose the final value; the reverse sequences fail with `access mode not
-allowed`. Both stores call `sqlite3.connect` before requesting the startup lock,
-so an invalid `mode` sequence never participates in the identity critical
-section. A successful sequence is folded to its final effective value like the
-other parameters.
+when repeated values are all disk access modes (`ro`, `rw`, or `rwc`), the
+sequence may only move toward equal or more restrictive access. For example,
+`rwc` followed by `rw`, and `rw` followed by `ro`, open successfully and expose
+the final value; the reverse sequences fail with `access mode not allowed`.
+This restriction does not extend to `memory`: `ro` followed by `memory`, and
+`memory` followed by any disk access mode, are valid, with the final value
+selecting the named-memory or filesystem target. Both stores call
+`sqlite3.connect` before requesting the startup lock, so an invalid disk-mode
+sequence never participates in the identity critical section. Every successful
+sequence is folded to its final effective value like the other parameters.
 
 Named `mode=memory` databases retain their decoded URI path instead of being
 resolved as filesystem paths. A non-empty named memory URI with
@@ -98,3 +101,9 @@ Small real-SQLite control tests demonstrate shared/private `cache` behavior,
 successful/failing `vfs` order, successful restrictive `mode` transitions, and
 rejected access escalation. Full Task and Gateway Command constructors assert
 that rejected `mode` aliases make zero initialization-lock calls.
+
+Additional connections demonstrate that `ro` followed by `memory` shares the
+writable final named-memory target, while `memory` followed by `ro`, `rw`, or
+`rwc` selects the final filesystem database. The tests verify read-only access,
+opening an existing writable file, and creating and writing a new file,
+respectively, against equivalent final-only aliases.

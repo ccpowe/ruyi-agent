@@ -451,7 +451,107 @@ def test_sqlite_cache_and_vfs_control_parameters_use_final_decoded_value(
         sqlite3.connect(f"{uri}vfs=unix&vfs=no_such_round10", uri=True)
 
 
-def test_sqlite_mode_validates_escalation_before_initialization_lock(
+def test_sqlite_ro_to_memory_uses_writable_shared_final_target(tmp_path: Path) -> None:
+    memory_name = quote(f"mode-memory-{tmp_path.name}", safe="")
+    override_uri = f"file:{memory_name}?mode=ro&mode=memory&cache=shared&label=current"
+    final_uri = f"file:{memory_name}?label=current&cache=shared&mode=memory"
+    assert task_database_module._database_identity(
+        override_uri
+    ) == task_database_module._database_identity(final_uri)
+
+    anchor = sqlite3.connect(final_uri, uri=True)
+    override = sqlite3.connect(override_uri, uri=True)
+    second_final = sqlite3.connect(final_uri, uri=True)
+    try:
+        override.execute("CREATE TABLE memory_mode_evidence (value INTEGER)")
+        override.execute("INSERT INTO memory_mode_evidence VALUES (1)")
+        override.commit()
+        assert anchor.execute("SELECT value FROM memory_mode_evidence").fetchall() == [
+            (1,)
+        ]
+        second_final.execute("INSERT INTO memory_mode_evidence VALUES (2)")
+        second_final.commit()
+        assert anchor.execute(
+            "SELECT value FROM memory_mode_evidence ORDER BY value"
+        ).fetchall() == [(1,), (2,)]
+    finally:
+        anchor.close()
+        override.close()
+        second_final.close()
+
+
+def test_sqlite_memory_to_disk_modes_use_final_filesystem_target(
+    tmp_path: Path,
+) -> None:
+    for mode in ("ro", "rw"):
+        db_path = tmp_path / f"memory-to-{mode}.sqlite"
+        setup = sqlite3.connect(db_path)
+        setup.execute("CREATE TABLE disk_mode_evidence (value INTEGER)")
+        setup.execute("INSERT INTO disk_mode_evidence VALUES (1)")
+        setup.commit()
+        setup.close()
+        uri = f"file:{quote(str(db_path), safe='/')}?"
+        override_uri = f"{uri}mode=memory&mode={mode}"
+        final_uri = f"{uri}mode={mode}"
+        assert task_database_module._database_identity(
+            override_uri
+        ) == task_database_module._database_identity(final_uri)
+
+        override = sqlite3.connect(override_uri, uri=True)
+        final = sqlite3.connect(final_uri, uri=True)
+        try:
+            assert override.execute(
+                "SELECT value FROM disk_mode_evidence"
+            ).fetchall() == [(1,)]
+            assert final.execute("SELECT value FROM disk_mode_evidence").fetchall() == [
+                (1,)
+            ]
+            if mode == "ro":
+                with pytest.raises(
+                    sqlite3.OperationalError,
+                    match="attempt to write a readonly database",
+                ):
+                    override.execute("INSERT INTO disk_mode_evidence VALUES (2)")
+                override.rollback()
+            else:
+                override.execute("INSERT INTO disk_mode_evidence VALUES (2)")
+                override.commit()
+                assert final.execute(
+                    "SELECT value FROM disk_mode_evidence ORDER BY value"
+                ).fetchall() == [(1,), (2,)]
+        finally:
+            override.close()
+            final.close()
+
+    rwc_path = tmp_path / "memory-to-rwc.sqlite"
+    uri = f"file:{quote(str(rwc_path), safe='/')}?"
+    override_uri = f"{uri}mode=memory&mode=rwc"
+    final_uri = f"{uri}mode=rwc"
+    assert not rwc_path.exists()
+    assert task_database_module._database_identity(
+        override_uri
+    ) == task_database_module._database_identity(final_uri)
+    override = sqlite3.connect(override_uri, uri=True)
+    final = sqlite3.connect(final_uri, uri=True)
+    try:
+        override.execute("CREATE TABLE disk_mode_evidence (value INTEGER)")
+        override.execute("INSERT INTO disk_mode_evidence VALUES (1)")
+        override.commit()
+        assert rwc_path.is_file()
+        assert final.execute("SELECT value FROM disk_mode_evidence").fetchall() == [
+            (1,)
+        ]
+        final.execute("INSERT INTO disk_mode_evidence VALUES (2)")
+        final.commit()
+        assert override.execute(
+            "SELECT value FROM disk_mode_evidence ORDER BY value"
+        ).fetchall() == [(1,), (2,)]
+    finally:
+        override.close()
+        final.close()
+
+
+def test_sqlite_disk_mode_escalation_fails_before_initialization_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
