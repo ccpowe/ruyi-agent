@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import multiprocessing
 import time
 from pathlib import Path
@@ -407,7 +408,7 @@ def test_public_remote_ref_maps_unhashable_status_to_upstream_error(
     assert len(records) == 1
     assert records[0].state == "failed"
     assert records[0].upstream_task_id is None
-    assert "before upstream binding" in (records[0].error or "")
+    assert records[0].error == "Remote Gateway Task creation failed"
 
 
 def test_remote_response_lost_is_terminal_across_restart_and_queryable(
@@ -822,12 +823,27 @@ def test_remote_ref_review_is_exposed_and_forwarded(
         proxy_task_id = create_payload["task_id"]
         assert create_payload["status"] == "waiting_for_human"
         assert create_payload["pending_review"]["review_id"] == "remote-review-1"
+        assert create_payload["pending_review"]["source_task_id"] == proxy_task_id
+
+        task_response = client.get(f"/tasks/{proxy_task_id}", headers=auth_headers())
+        assert task_response.status_code == 200, task_response.json()
+        assert task_response.json()["pending_review"]["source_task_id"] == proxy_task_id
+
+        task_list_response = client.get("/tasks", headers=auth_headers())
+        assert task_list_response.status_code == 200, task_list_response.json()
+        listed_task = next(
+            item
+            for item in task_list_response.json()["items"]
+            if item["task_id"] == proxy_task_id
+        )
+        assert listed_task["pending_review"]["source_task_id"] == proxy_task_id
 
         reviews_response = client.get("/reviews", headers=auth_headers())
         assert reviews_response.status_code == 200, reviews_response.json()
         reviews_payload = reviews_response.json()
         assert reviews_payload["items"][0]["review_id"] == "remote-review-1"
         assert reviews_payload["items"][0]["task_id"] == proxy_task_id
+        assert reviews_payload["items"][0]["thread_id"] == proxy_task_id
         assert reviews_payload["items"][0]["route_kind"] == "remote_ref"
 
         review_response = client.get(
@@ -836,6 +852,7 @@ def test_remote_ref_review_is_exposed_and_forwarded(
         )
         assert review_response.status_code == 200, review_response.json()
         assert review_response.json()["task_id"] == proxy_task_id
+        assert review_response.json()["thread_id"] == proxy_task_id
 
         task_reviews_response = client.get(
             f"/tasks/{proxy_task_id}/reviews",
@@ -844,6 +861,17 @@ def test_remote_ref_review_is_exposed_and_forwarded(
         assert task_reviews_response.status_code == 200
         assert (
             task_reviews_response.json()["items"][0]["review_id"] == "remote-review-1"
+        )
+        assert task_reviews_response.json()["items"][0]["thread_id"] == proxy_task_id
+        assert "upstream-review-task" not in json.dumps(
+            {
+                "created": create_payload,
+                "task": task_response.json(),
+                "tasks": task_list_response.json(),
+                "reviews": reviews_payload,
+                "review": review_response.json(),
+                "task_reviews": task_reviews_response.json(),
+            }
         )
 
         assert factory.control is not None

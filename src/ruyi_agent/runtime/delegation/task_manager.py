@@ -457,7 +457,12 @@ class TaskManager:
             task_id=task_id,
             agent_name=agent_name,
             state="pending",
-            thread_id=upstream_task_id or task_id,
+            # A remote Gateway's Task id is a private transport binding.  The
+            # durable/public thread identity of this proxy remains its local
+            # Task id across refresh, restart, review, and webhook paths.
+            thread_id=(
+                task_id if route_kind == "remote_ref" else upstream_task_id or task_id
+            ),
             parent_task_id=parent_task_id,
             root_task_id=root_task_id,
             depth=depth,
@@ -818,20 +823,27 @@ class TaskManager:
         last_result = payload.get("last_result")
         error = payload.get("error")
         pending_review = payload.get("pending_review")
+        public_pending_review = (
+            dict(pending_review) if isinstance(pending_review, dict) else None
+        )
+        if (
+            public_pending_review is not None
+            and "source_task_id" in public_pending_review
+        ):
+            public_pending_review["source_task_id"] = record.task_id
         record.state = status
+        record.thread_id = record.task_id
         record.result = (
             normalize_task_event_text(last_result)
             if isinstance(last_result, str)
             else None
         )
         record.error = (
-            normalize_task_event_text(error)
+            "Remote Gateway Task failed"
             if status in {"failed", "interrupted"} and isinstance(error, str)
             else None
         )
-        record.pending_review = (
-            dict(pending_review) if isinstance(pending_review, dict) else None
-        )
+        record.pending_review = public_pending_review
         record.run_count = run_count
         if run_count != previous_run_count:
             record.mailbox_suppressed = False

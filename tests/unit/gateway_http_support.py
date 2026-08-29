@@ -355,6 +355,7 @@ class ReviewRemoteA2AClient(StaticRemoteA2AClient):
             "updated_at": "2026-04-23T00:00:01Z",
             "pending_review": {
                 "review_id": "remote-review-1",
+                "source_task_id": "upstream-review-task",
                 "action_requests": [
                     {
                         "name": "execute",
@@ -394,6 +395,7 @@ class ReviewRemoteA2AClient(StaticRemoteA2AClient):
             "updated_at": "2026-04-23T00:00:01Z",
             "pending_review": {
                 "review_id": "remote-review-1",
+                "source_task_id": "upstream-review-task",
                 "action_requests": [
                     {
                         "name": "execute",

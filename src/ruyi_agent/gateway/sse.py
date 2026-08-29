@@ -304,6 +304,7 @@ def task_stream_event_from_gateway(
         clean_data = _validate_lifecycle_data(
             event_data,
             event_type=event.event_type,
+            public_task_id=public_task_id,
         )
     elif event.event_type == "task.artifact_published":
         clean_data = _validate_artifact_event_data(event_data)
@@ -412,6 +413,7 @@ def _validate_lifecycle_data(
     raw: dict[str, Any],
     *,
     event_type: str,
+    public_task_id: str,
 ) -> dict[str, Any]:
     required = {
         "status",
@@ -437,7 +439,10 @@ def _validate_lifecycle_data(
         "last_result": _bounded_optional_text(raw.get("last_result"), "last_result"),
         "error": "Remote Gateway Task failed" if remote_error is not None else None,
         "updated_at": _isoformat(_parse_timestamp(raw.get("updated_at"), "updated_at")),
-        "pending_review": _validate_pending_review(raw.get("pending_review")),
+        "pending_review": _validate_pending_review(
+            raw.get("pending_review"),
+            public_task_id=public_task_id,
+        ),
         "artifacts": _validate_artifacts(raw.get("artifacts")),
     }
     for key in (
@@ -498,7 +503,11 @@ def _parse_remote_task_state(value: object) -> TaskState:
         raise SSEProtocolError("Remote Task event status is invalid") from exc
 
 
-def _validate_pending_review(value: Any) -> dict[str, Any] | None:
+def _validate_pending_review(
+    value: Any,
+    *,
+    public_task_id: str,
+) -> dict[str, Any] | None:
     if value is None:
         return None
     if not isinstance(value, dict):
@@ -507,9 +516,11 @@ def _validate_pending_review(value: Any) -> dict[str, Any] | None:
     if not set(value) <= allowed:
         raise SSEProtocolError("Remote pending_review contains unsupported fields")
     clean: dict[str, Any] = {}
-    for key in ("review_id", "source_task_id"):
-        if key in value:
-            clean[key] = _short_required_text(value[key], key)
+    if "review_id" in value:
+        clean["review_id"] = _short_required_text(value["review_id"], "review_id")
+    if "source_task_id" in value:
+        _short_required_text(value["source_task_id"], "source_task_id")
+        clean["source_task_id"] = public_task_id
     if "action_requests" in value:
         items = value["action_requests"]
         if not isinstance(items, list) or len(items) > MAX_REVIEW_ITEMS:

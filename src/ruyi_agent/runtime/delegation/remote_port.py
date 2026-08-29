@@ -93,15 +93,15 @@ class RemoteTaskPort:
                     f"Remote ref '{entry.name}' returned no task_id from remote gateway."
                 )
             _validate_remote_task_state(record.task_id, payload)
-        except Exception as exc:
+        except Exception:
             self._control._task_manager.mark_failed(
                 record.task_id,
-                f"Remote task allocation failed before upstream binding: {exc}",
+                "Remote Gateway Task creation failed",
             )
             self._control._maybe_publish_settled_message(record.task_id)
             raise
         record.upstream_task_id = upstream_task_id
-        record.thread_id = upstream_task_id
+        record.thread_id = record.task_id
         synced = self._control._task_manager.sync_remote_task(record.task_id, payload)
         if self._control._is_settled_record(synced):
             self._control._maybe_publish_settled_message(synced.task_id)

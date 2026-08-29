@@ -117,11 +117,19 @@ def public_route_details(
 
 
 def public_remote_record(record: TaskRecord) -> TaskRecord:
-    """Hide an untrusted remote error string in a public Task projection."""
+    """Defensively project a remote record using only local public identity."""
 
-    if record.error is None:
-        return record
-    return replace(record, error="Remote Gateway Task failed")
+    pending_review = (
+        dict(record.pending_review) if record.pending_review is not None else None
+    )
+    if pending_review is not None and "source_task_id" in pending_review:
+        pending_review["source_task_id"] = record.task_id
+    return replace(
+        record,
+        thread_id=record.task_id,
+        error=("Remote Gateway Task failed" if record.error is not None else None),
+        pending_review=pending_review,
+    )
 
 
 def public_create_route_error(
