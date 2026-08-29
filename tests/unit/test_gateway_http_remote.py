@@ -36,6 +36,7 @@ from tests.unit.gateway_http_support import (
     auth_headers,
     build_agent_configs,
     build_app,
+    build_local_agent_config,
     build_specs,
 )
 
@@ -66,12 +67,10 @@ def test_remote_ref_forwards_via_a2a(
     remote_service = GatewayTaskModule(
         main_agent_name="code_wiki",
         agent_configs={
-            "code_wiki": {
-                "kind": "local",
-                "public": True,
-                "name": "code_wiki",
-                "description": "remote code wiki",
-            }
+            "code_wiki": build_local_agent_config(
+                "code_wiki",
+                "remote code wiki",
+            )
         },
         control=remote_control,
     )
@@ -559,12 +558,7 @@ def test_remote_a_to_b_to_a_loop_is_rejected_by_visited_nodes(
     a_service = GatewayTaskModule(
         main_agent_name="main",
         agent_configs={
-            "main": {
-                "kind": "local",
-                "public": True,
-                "name": "main",
-                "description": "node a main",
-            },
+            "main": build_local_agent_config("main", "node a main"),
             "remote_code_wiki": {
                 "kind": "remote_ref",
                 "public": True,
@@ -601,12 +595,10 @@ def test_remote_a_to_b_to_a_loop_is_rejected_by_visited_nodes(
     b_service = GatewayTaskModule(
         main_agent_name="code_wiki",
         agent_configs={
-            "code_wiki": {
-                "kind": "local",
-                "public": True,
-                "name": "code_wiki",
-                "description": "node b code wiki",
-            }
+            "code_wiki": build_local_agent_config(
+                "code_wiki",
+                "node b code wiki",
+            )
         },
         control=b_control,
     )
@@ -694,12 +686,10 @@ def test_remote_route_persists_across_service_restart(
     remote_service = GatewayTaskModule(
         main_agent_name="code_wiki",
         agent_configs={
-            "code_wiki": {
-                "kind": "local",
-                "public": True,
-                "name": "code_wiki",
-                "description": "remote code wiki",
-            }
+            "code_wiki": build_local_agent_config(
+                "code_wiki",
+                "remote code wiki",
+            )
         },
         control=remote_control,
     )

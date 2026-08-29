@@ -19,6 +19,7 @@ from tests.support.async_subagent_runtime import (
     build_specs,
     build_test_remote_refs,
 )
+from tests.unit.gateway_http_support import build_local_agent_config
 
 
 def test_format_exception_summary_expands_exception_group() -> None:
@@ -102,12 +103,10 @@ def test_spawn_remote_ref_runs_via_a2a_gateway(
     remote_service = GatewayTaskModule(
         main_agent_name="code_wiki",
         agent_configs={
-            "code_wiki": {
-                "kind": "local",
-                "public": True,
-                "name": "code_wiki",
-                "description": "remote code wiki",
-            }
+            "code_wiki": build_local_agent_config(
+                "code_wiki",
+                "remote code wiki",
+            )
         },
         control=remote_control,
     )

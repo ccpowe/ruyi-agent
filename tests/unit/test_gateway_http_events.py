@@ -26,6 +26,7 @@ from tests.unit.gateway_http_support import (
     auth_headers,
     build_agent_configs,
     build_app,
+    build_local_agent_config,
     build_specs,
     build_test_remote_refs,
     parse_sse_records,
@@ -268,12 +269,10 @@ def test_remote_task_event_stream_rewrites_task_id_and_replays_cursor(
     remote_service = GatewayTaskModule(
         main_agent_name="code_wiki",
         agent_configs={
-            "code_wiki": {
-                "kind": "local",
-                "public": True,
-                "name": "code_wiki",
-                "description": "remote code wiki",
-            }
+            "code_wiki": build_local_agent_config(
+                "code_wiki",
+                "remote code wiki",
+            )
         },
         control=remote_control,
     )

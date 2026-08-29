@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -10,6 +10,7 @@ from ruyi_agent.gateway.application import (
     GatewayAgentService,
     GatewayApplicationContext,
     GatewayProjection,
+    parse_gateway_agent_configs,
 )
 from ruyi_agent.gateway.artifacts import GatewayArtifactService
 from ruyi_agent.gateway.attachments import (
@@ -57,7 +58,7 @@ class GatewayTaskModule:
         self,
         *,
         main_agent_name: str,
-        agent_configs: dict[str, Any],
+        agent_configs: Mapping[str, object],
         control: AgentControl,
         route_store: GatewayRouteStore | None = None,
         command_store: GatewayCommandStore | None = None,
@@ -69,6 +70,7 @@ class GatewayTaskModule:
     ) -> None:
         if remote_listing_concurrency <= 0:
             raise ValueError("remote_listing_concurrency must be positive")
+        parsed_agent_configs = parse_gateway_agent_configs(agent_configs)
         router = TaskRouter(
             control=control,
             route_store=route_store or GatewayRouteStore(":memory:"),
@@ -76,7 +78,7 @@ class GatewayTaskModule:
         )
         context = GatewayApplicationContext(
             main_agent_name=main_agent_name,
-            agent_configs=agent_configs,
+            agent_configs=parsed_agent_configs,
             control=control,
             router=router,
             command_store=command_store or GatewayCommandStore(":memory:"),
@@ -101,7 +103,7 @@ class GatewayTaskModule:
         # Preserve historical embedder/test aliases while production services
         # obtain their dependencies from the shared context.
         self._main_agent_name = main_agent_name
-        self._agent_configs = agent_configs
+        self._agent_configs = parsed_agent_configs
         self._control = control
         self._command_store = context.command_store
         self._unavailable_agents = context.unavailable_agents

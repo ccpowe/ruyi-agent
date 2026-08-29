@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
 
+from ruyi_agent.config.agent_models import AgentConfig, AgentConfigs
+from ruyi_agent.config.agent_parser import coerce_agent_configs
 from ruyi_agent.gateway.errors import GatewayTaskError
 from ruyi_agent.gateway.models import (
     AgentRefResponse,
@@ -23,12 +25,16 @@ from ruyi_agent.task_models import (
 )
 
 
-def agent_config_value(config: Any, field: str) -> Any:
-    """Read one field from either legacy mappings or typed Agent configs."""
+def parse_gateway_agent_configs(
+    raw_agent_configs: Mapping[str, object],
+) -> AgentConfigs:
+    """Validate the legacy constructor input once at the Gateway boundary."""
 
-    if isinstance(config, dict):
-        return config[field]
-    return getattr(config, field)
+    if not raw_agent_configs:
+        # Listing-only embedders historically constructed an empty Gateway and
+        # supplied their own remote listing router after initialization.
+        return {}
+    return coerce_agent_configs(raw_agent_configs)
 
 
 @dataclass(slots=True)
@@ -41,7 +47,7 @@ class GatewayApplicationContext:
     """
 
     main_agent_name: str
-    agent_configs: dict[str, Any]
+    agent_configs: AgentConfigs
     control: AgentControl
     router: TaskRouter
     command_store: GatewayCommandStore
@@ -58,15 +64,15 @@ class GatewayProjection:
         self,
         *,
         agent_name: str,
-        config: Any,
+        config: AgentConfig,
         main_agent_name: str,
         unavailable_agents: dict[str, str],
     ) -> AgentRefResponse:
         return AgentRefResponse(
-            name=agent_config_value(config, "name"),
-            kind=agent_config_value(config, "kind"),
-            public=agent_config_value(config, "public"),
-            description=agent_config_value(config, "description"),
+            name=config.name,
+            kind=config.kind,
+            public=config.public,
+            description=config.description,
             is_default=agent_name == main_agent_name,
             available=agent_name not in unavailable_agents,
             unavailable_reason=unavailable_agents.get(agent_name),
@@ -148,7 +154,7 @@ class GatewayAgentService:
                 unavailable_agents=self._context.unavailable_agents,
             )
             for name, config in sorted(self._context.agent_configs.items())
-            if agent_config_value(config, "public")
+            if config.public
         ]
 
     def get_agent(self, agent_name: str) -> AgentRefResponse:
@@ -161,7 +167,7 @@ class GatewayAgentService:
             unavailable_agents=self._context.unavailable_agents,
         )
 
-    def get_config(self, agent_name: str) -> Any:
+    def get_config(self, agent_name: str) -> AgentConfig:
         try:
             return self._context.agent_configs[agent_name]
         except KeyError as exc:
@@ -170,8 +176,8 @@ class GatewayAgentService:
                 message=f"Agent '{agent_name}' does not exist",
             ) from exc
 
-    def ensure_public(self, agent_name: str, config: Any) -> None:
-        if agent_config_value(config, "public"):
+    def ensure_public(self, agent_name: str, config: AgentConfig) -> None:
+        if config.public:
             return
         raise GatewayTaskError(
             code="agent_not_public",

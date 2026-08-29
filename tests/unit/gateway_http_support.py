@@ -471,20 +471,41 @@ def build_test_remote_refs() -> dict[str, RemoteRef]:
     }
 
 
+def build_local_agent_config(
+    name: str,
+    description: str,
+    *,
+    public: bool = True,
+    workers: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "kind": "local",
+        "public": public,
+        "name": name,
+        "description": description,
+        "system_prompt": "prompt",
+        "provider": "test-provider",
+        "model": "test-model",
+        "memory": [],
+        "skills": [],
+        "server_names": [],
+        "tool_names": [],
+        "workers": list(workers or []),
+    }
+
+
 def build_agent_configs() -> dict[str, dict[str, object]]:
     return {
-        "main": {
-            "kind": "local",
-            "public": True,
-            "name": "main",
-            "description": "main entry agent",
-        },
-        "background_research": {
-            "kind": "local",
-            "public": False,
-            "name": "background_research",
-            "description": "background helper",
-        },
+        "main": build_local_agent_config(
+            "main",
+            "main entry agent",
+            workers=["background_research", "remote_code_wiki"],
+        ),
+        "background_research": build_local_agent_config(
+            "background_research",
+            "background helper",
+            public=False,
+        ),
         "remote_code_wiki": {
             "kind": "remote_ref",
             "public": True,

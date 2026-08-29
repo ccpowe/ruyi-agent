@@ -10,7 +10,6 @@ from ruyi_agent.gateway.application import (
     GatewayAgentService,
     GatewayApplicationContext,
     GatewayProjection,
-    agent_config_value,
 )
 from ruyi_agent.gateway.attachments import GatewayAttachmentService
 from ruyi_agent.gateway.errors import GatewayTaskError
@@ -62,7 +61,7 @@ class GatewayTaskService:
         return await self._create_routed_task(
             task_id=task_id,
             agent_name=agent_name,
-            route_kind=agent_config_value(config, "kind"),
+            route_kind=config.kind,
             input_content=input_content,
             attachments=attachments,
             metadata=clean_metadata,

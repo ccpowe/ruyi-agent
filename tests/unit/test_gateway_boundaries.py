@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, cast
 
 from fastapi.routing import APIRoute
@@ -15,6 +14,7 @@ import ruyi_agent.gateway.attachments as gateway_attachments
 import ruyi_agent.gateway.commands as gateway_commands
 import ruyi_agent.gateway.tasks as gateway_tasks
 from ruyi_agent.channels.http.routes import create_gateway_app
+from ruyi_agent.config.agent_models import LocalAgentConfig
 from ruyi_agent.gateway.application import GatewayAgentService
 from ruyi_agent.gateway.artifacts import GatewayArtifactService
 from ruyi_agent.gateway.commands import GatewayCommandOutcome, GatewayCommandService
@@ -25,27 +25,39 @@ from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.runtime.delegation.async_runtime import AgentControl
 
 
-@dataclass(frozen=True)
-class TypedLikeAgentConfig:
-    name: str
-    kind: str
-    public: bool
-    description: str
+def legacy_local_config(
+    name: str,
+    *,
+    public: bool,
+    description: str,
+) -> dict[str, object]:
+    return {
+        "kind": "local",
+        "public": public,
+        "name": name,
+        "description": description,
+        "system_prompt": "",
+        "provider": "test-provider",
+        "model": "test-model",
+        "memory": [],
+        "skills": [],
+        "server_names": [],
+        "tool_names": [],
+        "workers": [],
+    }
 
 
 def build_boundary_service() -> GatewayTaskModule:
     return GatewayTaskModule(
         main_agent_name="main",
         agent_configs={
-            "main": TypedLikeAgentConfig(
-                name="main",
-                kind="local",
+            "main": legacy_local_config(
+                "main",
                 public=True,
                 description="Main Agent",
             ),
-            "private": TypedLikeAgentConfig(
-                name="private",
-                kind="local",
+            "private": legacy_local_config(
+                "private",
                 public=False,
                 description="Private Agent",
             ),
@@ -67,6 +79,25 @@ def test_gateway_facade_composes_focused_application_services() -> None:
     agents = service.list_agents()
     assert [item.name for item in agents] == ["main"]
     assert service.get_agent("main").description == "Main Agent"
+
+
+def test_gateway_normalizes_legacy_configs_once_and_uses_typed_fields(
+    monkeypatch,
+) -> None:
+    service = build_boundary_service()
+
+    assert all(
+        isinstance(config, LocalAgentConfig)
+        for config in service._context.agent_configs.values()  # noqa: SLF001
+    )
+    assert service._agent_configs is service._context.agent_configs  # noqa: SLF001
+
+    def fail_legacy_indexing(self: LocalAgentConfig, key: str) -> object:
+        raise AssertionError(f"Gateway indexed typed config field {key!r}")
+
+    monkeypatch.setattr(LocalAgentConfig, "__getitem__", fail_legacy_indexing)
+    assert [item.name for item in service.list_agents()] == ["main"]
+    assert service.get_agent("main").kind == "local"
 
 
 def test_gateway_command_outcome_remains_reexported_from_facade_module() -> None:
