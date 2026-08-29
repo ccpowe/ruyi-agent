@@ -33,6 +33,18 @@ class HangingErrorStream(httpx.AsyncByteStream):
         self.closed = True
 
 
+class CloseTrackingStream(httpx.AsyncByteStream):
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.closed = False
+
+    async def __aiter__(self):
+        yield self.body
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 class ErrorStreamTransport(httpx.AsyncBaseTransport):
     def __init__(self, stream: httpx.AsyncByteStream) -> None:
         self.stream = stream
@@ -64,8 +76,14 @@ class FakeGatewayHTTPClient(GatewayHTTPClient):
 
 
 def test_filename_from_content_disposition_parses_quoted_and_bare_values() -> None:
-    assert _filename_from_content_disposition('attachment; filename="report.pdf"') == "report.pdf"
-    assert _filename_from_content_disposition("attachment; filename=report.pdf") == "report.pdf"
+    assert (
+        _filename_from_content_disposition('attachment; filename="report.pdf"')
+        == "report.pdf"
+    )
+    assert (
+        _filename_from_content_disposition("attachment; filename=report.pdf")
+        == "report.pdf"
+    )
     assert _filename_from_content_disposition("attachment") is None
 
 
@@ -166,6 +184,97 @@ def test_gateway_http_client_sends_idempotency_header_for_mutations() -> None:
     ]
 
 
+def test_gateway_http_client_preserves_task_http_contract() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"task_id": "task-1"})
+
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test/",
+        bearer_token="token",
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def scenario() -> None:
+        await client.create_task(
+            agent_name="main",
+            content="hello",
+            metadata={"channel": "telegram"},
+            attachments=[{"path": "report.txt"}],
+            idempotency_key="create-1",
+        )
+        await client.send_input(
+            task_id="task-1",
+            content="continue",
+            attachments=[{"path": "more.txt"}],
+            idempotency_key="input-1",
+        )
+        await client.get_task(task_id="task-1")
+        await client.list_task_messages(
+            task_id="task-1",
+            cursor="opaque-cursor",
+            limit=7,
+        )
+        await client.submit_review_decision(
+            task_id="task-1",
+            review_id="review-1",
+            decisions=[{"type": "approve"}],
+        )
+
+    asyncio.run(scenario())
+
+    assert [request.method for request in requests] == [
+        "POST",
+        "POST",
+        "GET",
+        "GET",
+        "POST",
+    ]
+    assert [request.url.path for request in requests] == [
+        "/agents/main/tasks",
+        "/tasks/task-1/input",
+        "/tasks/task-1",
+        "/tasks/task-1/messages",
+        "/tasks/task-1/reviews/review-1/decision",
+    ]
+    assert requests[0].headers["authorization"] == "Bearer token"
+    assert requests[0].headers["accept"] == "application/json"
+    assert requests[0].headers["idempotency-key"] == "create-1"
+    assert requests[1].headers["idempotency-key"] == "input-1"
+    assert "idempotency-key" not in requests[2].headers
+    assert requests[0].read() == (
+        b'{"input":{"content":"hello","attachments":[{"path":"report.txt"}]},'
+        b'"metadata":{"channel":"telegram"}}'
+    )
+    assert requests[1].read() == (
+        b'{"input":{"content":"continue","attachments":[{"path":"more.txt"}]}}'
+    )
+    assert dict(requests[3].url.params) == {
+        "cursor": "opaque-cursor",
+        "limit": "7",
+    }
+    assert requests[4].read() == b'{"decisions":[{"type":"approve"}]}'
+
+
+def test_gateway_http_client_maps_non_json_error_to_gateway_error() -> None:
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(503, content=b"temporarily unavailable")
+        ),
+    )
+
+    with pytest.raises(GatewayClientError) as exc_info:
+        asyncio.run(client.get_task(task_id="task-1"))
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.code == "gateway_error"
+    assert exc_info.value.message == "Gateway returned invalid JSON"
+
+
 def test_gateway_http_client_returns_complete_message_page() -> None:
     requests: list[httpx.Request] = []
 
@@ -214,14 +323,14 @@ def test_gateway_http_client_returns_complete_message_page() -> None:
 def test_gateway_http_client_streams_task_events_and_forwards_cursor() -> None:
     requests: list[httpx.Request] = []
     body = (
-        'id: opaque-cursor\n'
-        'event: task.completed\n'
+        "id: opaque-cursor\n"
+        "event: task.completed\n"
         'data: {"task_id":"task-1","run_count":2,'
         '"created_at":"2026-08-28T12:00:00+00:00",'
         '"status":"completed","last_result":"done","error":null,'
         '"updated_at":"2026-08-28T12:00:00+00:00",'
         '"pending_review":null,"artifacts":[]}\n\n'
-        'event: stream.end\n'
+        "event: stream.end\n"
         'data: {"task_id":"task-1","run_count":2,'
         '"created_at":"2026-08-28T12:00:01+00:00",'
         '"reason":"completed"}\n\n'
@@ -261,6 +370,28 @@ def test_gateway_http_client_streams_task_events_and_forwards_cursor() -> None:
     assert requests[0].headers["accept"] == "text/event-stream"
     assert requests[0].headers["accept-encoding"] == "identity"
     assert dict(requests[0].url.params) == {"run_count": "2"}
+
+
+def test_gateway_http_client_closes_unconsumed_task_event_stream() -> None:
+    stream = CloseTrackingStream(b'event: stream.end\ndata: {"reason":"completed"}\n\n')
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=stream,
+            )
+        ),
+    )
+
+    async def scenario() -> None:
+        async with client.stream_task_events(task_id="task-1", run_count=1):
+            assert stream.closed is False
+
+    asyncio.run(scenario())
+    assert stream.closed is True
 
 
 def test_gateway_http_client_rejects_non_sse_success_response() -> None:
@@ -364,10 +495,7 @@ def test_gateway_http_client_rejects_oversized_error_body() -> None:
 
 
 def test_gateway_http_client_sanitizes_error_text() -> None:
-    body = (
-        b'{"error":{"code":"invalid\\ud800request",'
-        b'"message":"bad\\ud800message"}}'
-    )
+    body = b'{"error":{"code":"invalid\\ud800request","message":"bad\\ud800message"}}'
     client = GatewayHTTPClient(
         base_url="http://gateway.test",
         bearer_token="token",
@@ -387,13 +515,7 @@ def test_gateway_http_client_sanitizes_error_text() -> None:
 
 
 def test_gateway_http_client_maps_deep_error_json_to_client_error() -> None:
-    body = (
-        b'{"error":'
-        + (b"[" * 10_000)
-        + b"0"
-        + (b"]" * 10_000)
-        + b"}"
-    )
+    body = b'{"error":' + (b"[" * 10_000) + b"0" + (b"]" * 10_000) + b"}"
     client = GatewayHTTPClient(
         base_url="http://gateway.test",
         bearer_token="token",
