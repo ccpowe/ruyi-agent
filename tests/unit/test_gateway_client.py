@@ -11,6 +11,7 @@ from ruyi_agent.channels.gateway_client import (
     GatewayHTTPClient,
     _filename_from_content_disposition,
 )
+from ruyi_agent.channels.gateway_dto import GatewayTask
 from ruyi_agent.gateway.sse import MAX_SSE_ERROR_BODY_BYTES
 
 
@@ -155,7 +156,10 @@ def test_gateway_http_client_sends_idempotency_header_for_mutations() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, json={"task_id": "task-1"})
+        return httpx.Response(
+            200,
+            json={"task_id": "task-1", "status": "running", "run_count": 1},
+        )
 
     client = GatewayHTTPClient(
         base_url="http://gateway.test",
@@ -189,7 +193,10 @@ def test_gateway_http_client_preserves_task_http_contract() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, json={"task_id": "task-1"})
+        return httpx.Response(
+            200,
+            json={"task_id": "task-1", "status": "running", "run_count": 1},
+        )
 
     client = GatewayHTTPClient(
         base_url="http://gateway.test/",
@@ -256,6 +263,102 @@ def test_gateway_http_client_preserves_task_http_contract() -> None:
         "limit": "7",
     }
     assert requests[4].read() == b'{"decisions":[{"type":"approve"}]}'
+
+
+def test_gateway_http_client_returns_validated_task_dto() -> None:
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={"task_id": "task-1", "status": "running", "run_count": 2},
+            )
+        ),
+    )
+
+    task = asyncio.run(client.get_task(task_id="task-1"))
+
+    assert isinstance(task, GatewayTask)
+    assert task.task_id == "task-1"
+    assert task.run_count == 2
+
+
+@pytest.mark.parametrize(
+    "path,payload",
+    [
+        (
+            "/tasks",
+            {"items": [{"task_id": "task-1", "status": "running", "run_count": "1"}]},
+        ),
+        (
+            "/tasks",
+            {
+                "items": [
+                    {
+                        "task_id": "task-1",
+                        "status": "running",
+                        "run_count": 1,
+                        "pending_review": {},
+                    }
+                ]
+            },
+        ),
+        ("/agents", {"items": [{"name": "main"}]}),
+    ],
+)
+def test_gateway_http_client_rejects_malformed_list_elements(
+    path: str,
+    payload: dict[str, Any],
+) -> None:
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json=payload)
+        ),
+    )
+
+    with pytest.raises(GatewayClientError) as exc_info:
+        if path == "/tasks":
+            asyncio.run(client.list_tasks(metadata={}))
+        else:
+            asyncio.run(client.list_agents())
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.code == "gateway_error"
+
+
+def test_gateway_http_client_rejects_malformed_published_artifact() -> None:
+    client = GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "task_id": "task-1",
+                    "status": "completed",
+                    "run_count": 1,
+                    "artifacts": [
+                        {
+                            "artifact_id": "artifact-1",
+                            "path": "/workspace/report.txt",
+                            "name": "report.txt",
+                            "content_type": "text/plain",
+                            "run_count": 1,
+                        }
+                    ],
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(GatewayClientError) as exc_info:
+        asyncio.run(client.get_task(task_id="task-1"))
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.code == "gateway_error"
 
 
 def test_gateway_http_client_maps_non_json_error_to_gateway_error() -> None:
