@@ -18,6 +18,7 @@ def initialize_task_database(database: TaskDatabase) -> None:
         connection.execute("PRAGMA foreign_keys = ON")
         if database.db_path != ":memory:":
             connection.execute("PRAGMA journal_mode = WAL")
+    with database.transaction(immediate=True) as connection:
         _create_tables(connection)
         _ensure_legacy_columns(connection)
         sanitize_legacy_remote_public_projections(connection)
@@ -25,7 +26,6 @@ def initialize_task_database(database: TaskDatabase) -> None:
         _backfill_pending_review_cursor_order(connection)
         _backfill_pending_review_ingest_sequences(connection)
         _create_indexes(connection)
-        connection.commit()
 
 
 def _create_tables(connection: sqlite3.Connection) -> None:
@@ -393,51 +393,274 @@ def _sanitize_remote_mailbox_messages(
 ) -> None:
     rows = connection.execute(
         """
-        SELECT message.message_id, message.child_task_id,
-               message.child_run_count, message.content, message.status,
-               message.settled_status, task.task_id, task.state, task.run_count
-        FROM agent_mailbox_messages AS message
-        JOIN agent_tasks AS task
-          ON message.child_task_id IN (task.task_id, task.upstream_task_id)
-        WHERE task.route_kind = 'remote_ref'
-          AND message.status IN ('pending', 'claimed', 'retracted')
+        SELECT message_id, idempotency_key, recipient_task_id,
+               recipient_thread_id, sender_task_id, sender_agent_name,
+               child_task_id, child_agent_name, child_run_count,
+               settled_status, content, status
+        FROM agent_mailbox_messages
+        WHERE status IN ('pending', 'claimed', 'retracted')
+          AND child_task_id IS NOT NULL AND child_run_count IS NOT NULL
+          AND settled_status IN ('completed', 'failed', 'cancelled', 'interrupted')
         """
     ).fetchall()
-    for (
-        message_id,
-        _stored_child_task_id,
-        child_run_count,
-        content,
-        status,
-        settled_status,
-        task_id_value,
-        task_state,
-        task_run_count,
-    ) in rows:
-        task_id = str(task_id_value)
-        public_content = _public_remote_settlement_content(
-            content=str(content),
-            old_error=remote_errors.get(task_id),
-            settled_status=(
-                str(settled_status) if settled_status is not None else None
-            ),
-            task_state=str(task_state),
-            is_current_run=(
-                child_run_count is not None
-                and int(child_run_count) == int(task_run_count)
-            ),
+    resolved: list[dict[str, object]] = []
+    for row in rows:
+        message = _legacy_mailbox_message(row)
+        candidates = _legacy_remote_task_candidates(connection, message=message)
+        if not candidates:
+            continue
+        if message["status"] == "retracted":
+            _isolate_legacy_remote_mailbox(connection, message=message)
+            continue
+        binding, linked_outbox_keys = _resolve_legacy_remote_mailbox_binding(
+            connection,
+            message=message,
+            candidates=candidates,
+            remote_errors=remote_errors,
         )
+        if binding is None:
+            _isolate_legacy_remote_mailbox(
+                connection,
+                message=message,
+                linked_outbox_keys=linked_outbox_keys,
+            )
+            continue
+        resolved.append(binding)
+
+    expected_key_counts: dict[str, int] = {}
+    for binding in resolved:
+        key = str(binding["outbox_key"])
+        expected_key_counts[key] = expected_key_counts.get(key, 0) + 1
+    for binding in resolved:
+        message_id = str(binding["message_id"])
+        outbox_key = str(binding["outbox_key"])
+        key_owners = connection.execute(
+            """
+            SELECT message_id
+            FROM agent_mailbox_messages
+            WHERE idempotency_key = ? AND message_id != ?
+            """,
+            (outbox_key, message_id),
+        ).fetchall()
+        if expected_key_counts[outbox_key] != 1 or key_owners:
+            _isolate_legacy_remote_mailbox(
+                connection,
+                message=binding,
+                linked_outbox_keys=tuple(binding["linked_outbox_keys"]),
+            )
+            continue
         connection.execute(
             """
             UPDATE agent_mailbox_messages
-            SET sender_task_id = ?, child_task_id = ?, content = ?,
+            SET idempotency_key = ?, sender_task_id = ?, sender_agent_name = ?,
+                child_task_id = ?, child_agent_name = ?, content = ?,
                 status = CASE WHEN status = 'claimed' THEN 'pending' ELSE status END,
                 claimed_at = NULL, claim_expires_at = NULL,
                 claimed_by = NULL, claim_token = NULL
-            WHERE message_id = ? AND status = ?
+            WHERE message_id = ? AND status IN ('pending', 'claimed')
             """,
-            (task_id, task_id, public_content, message_id, status),
+            (
+                outbox_key,
+                binding["task_id"],
+                binding["agent_name"],
+                binding["task_id"],
+                binding["agent_name"],
+                binding["content"],
+                message_id,
+            ),
         )
+
+
+def _legacy_mailbox_message(row: tuple[object, ...]) -> dict[str, object]:
+    return {
+        "message_id": str(row[0]),
+        "idempotency_key": str(row[1]) if row[1] is not None else None,
+        "recipient_task_id": str(row[2]) if row[2] is not None else None,
+        "recipient_thread_id": str(row[3]),
+        "sender_task_id": str(row[4]) if row[4] is not None else None,
+        "sender_agent_name": str(row[5]) if row[5] is not None else None,
+        "child_task_id": str(row[6]),
+        "child_agent_name": str(row[7]) if row[7] is not None else None,
+        "child_run_count": int(row[8]),
+        "settled_status": str(row[9]),
+        "content": str(row[10]),
+        "status": str(row[11]),
+    }
+
+
+def _legacy_remote_task_candidates(
+    connection: sqlite3.Connection,
+    *,
+    message: dict[str, object],
+) -> list[dict[str, object]]:
+    rows = connection.execute(
+        """
+        SELECT task_id, upstream_task_id, agent_name, state, run_count,
+               parent_task_id, parent_thread_id, mailbox_suppressed
+        FROM agent_tasks
+        WHERE route_kind = 'remote_ref'
+          AND (? IN (task_id, upstream_task_id)
+               OR ? IN (task_id, upstream_task_id))
+        ORDER BY task_id
+        """,
+        (message["child_task_id"], message["sender_task_id"]),
+    ).fetchall()
+    return [
+        {
+            "task_id": str(row[0]),
+            "upstream_task_id": str(row[1]) if row[1] is not None else None,
+            "agent_name": str(row[2]),
+            "state": str(row[3]),
+            "run_count": int(row[4]),
+            "parent_task_id": str(row[5]) if row[5] is not None else None,
+            "parent_thread_id": str(row[6]) if row[6] is not None else None,
+            "mailbox_suppressed": bool(row[7]),
+        }
+        for row in rows
+    ]
+
+
+def _resolve_legacy_remote_mailbox_binding(
+    connection: sqlite3.Connection,
+    *,
+    message: dict[str, object],
+    candidates: list[dict[str, object]],
+    remote_errors: dict[str, str],
+) -> tuple[dict[str, object] | None, tuple[str, ...]]:
+    outbox_rows = connection.execute(
+        """
+        SELECT outbox.outbox_key, outbox.task_id, outbox.run_count,
+               outbox.recipient_task_id, outbox.recipient_thread_id,
+               outbox.child_agent_name, outbox.settled_status, outbox.content,
+               outbox.status
+        FROM agent_task_settled_outbox AS outbox
+        JOIN agent_tasks AS task ON task.task_id = outbox.task_id
+        WHERE task.route_kind = 'remote_ref'
+          AND (outbox.message_id = ?
+               OR (? IS NOT NULL AND outbox.outbox_key = ?))
+        ORDER BY outbox.outbox_key
+        """,
+        (
+            message["message_id"],
+            message["idempotency_key"],
+            message["idempotency_key"],
+        ),
+    ).fetchall()
+    linked_outbox_keys = tuple(str(row[0]) for row in outbox_rows)
+    if len(outbox_rows) > 1:
+        return None, linked_outbox_keys
+
+    matching = [
+        candidate
+        for candidate in candidates
+        if _legacy_mailbox_matches_task(message=message, task=candidate)
+    ]
+    outbox = outbox_rows[0] if outbox_rows else None
+    if outbox is not None:
+        matching = [
+            candidate
+            for candidate in matching
+            if candidate["task_id"] == str(outbox[1])
+            and _legacy_mailbox_matches_outbox(message=message, outbox=outbox)
+        ]
+    if len(matching) != 1:
+        return None, linked_outbox_keys
+
+    task = matching[0]
+    task_id = str(task["task_id"])
+    run_count = int(message["child_run_count"])
+    outbox_key = (
+        str(outbox[0])
+        if outbox is not None
+        else (
+            f"settled:{message['recipient_thread_id']}:{task_id}:{run_count}"
+        )
+    )
+    content = (
+        str(outbox[7])
+        if outbox is not None
+        else _public_remote_settlement_content(
+            content=str(message["content"]),
+            old_error=remote_errors.get(task_id),
+            settled_status=str(message["settled_status"]),
+            task_state=str(task["state"]),
+            is_current_run=run_count == int(task["run_count"]),
+        )
+    )
+    return (
+        {
+            **message,
+            "task_id": task_id,
+            "agent_name": task["agent_name"],
+            "outbox_key": outbox_key,
+            "content": content,
+            "linked_outbox_keys": linked_outbox_keys,
+        },
+        linked_outbox_keys,
+    )
+
+
+def _legacy_mailbox_matches_task(
+    *,
+    message: dict[str, object],
+    task: dict[str, object],
+) -> bool:
+    identities = {task["task_id"], task["upstream_task_id"]} - {None}
+    return (
+        message["child_task_id"] in identities
+        and message["sender_task_id"] in identities
+        and message["child_agent_name"] == task["agent_name"]
+        and message["sender_agent_name"] == task["agent_name"]
+        and message["recipient_task_id"] == task["parent_task_id"]
+        and message["recipient_thread_id"] == task["parent_thread_id"]
+    )
+
+
+def _legacy_mailbox_matches_outbox(
+    *,
+    message: dict[str, object],
+    outbox: tuple[object, ...],
+) -> bool:
+    return (
+        int(outbox[2]) == message["child_run_count"]
+        and (str(outbox[3]) if outbox[3] is not None else None)
+        == message["recipient_task_id"]
+        and str(outbox[4]) == message["recipient_thread_id"]
+        and str(outbox[5]) == message["child_agent_name"]
+        and str(outbox[5]) == message["sender_agent_name"]
+        and str(outbox[6]) == message["settled_status"]
+    )
+
+
+def _isolate_legacy_remote_mailbox(
+    connection: sqlite3.Connection,
+    *,
+    message: dict[str, object],
+    linked_outbox_keys: tuple[str, ...] = (),
+) -> None:
+    connection.execute(
+        """
+        UPDATE agent_mailbox_messages
+        SET idempotency_key = NULL, content = ?, status = 'retracted',
+            claimed_at = NULL, claim_expires_at = NULL,
+            claimed_by = NULL, claim_token = NULL
+        WHERE message_id = ? AND status != 'delivered'
+        """,
+        (REMOTE_TASK_PUBLIC_ERROR, message["message_id"]),
+    )
+    if not linked_outbox_keys:
+        return
+    placeholders = ",".join("?" for _ in linked_outbox_keys)
+    connection.execute(
+        f"""
+        UPDATE agent_task_settled_outbox
+        SET status = 'suppressed', claimed_at = NULL, claim_expires_at = NULL,
+            claimed_by = NULL, claim_token = NULL, last_error = NULL,
+            retracted_at = COALESCE(retracted_at, ?)
+        WHERE outbox_key IN ({placeholders}) AND status != 'delivered'
+        """,
+        (datetime.now(UTC).isoformat(), *linked_outbox_keys),
+    )
 
 
 def _public_remote_settlement_content(

@@ -343,48 +343,54 @@ class GatewayCommandStore:
     def _recover_interrupted_claims(self) -> None:
         now = datetime.now(UTC).isoformat()
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT command_id, task_id
-                FROM gateway_commands
-                WHERE state = 'processing' AND effect_started = 1 AND replay_safe = 0
-                """
-            ).fetchall()
-            for row in rows:
-                error_json = json.dumps(
-                    {
-                        "code": "idempotency_outcome_uncertain",
-                        "message": (
-                            "The previous Gateway command may have reached a "
-                            "non-idempotent downstream service"
-                        ),
-                        "details": {
-                            "task_id": str(row["task_id"]),
-                            "create_retryable": False,
-                            "effect_outcome": "uncertain",
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._conn.execute(
+                    """
+                    SELECT command_id, task_id
+                    FROM gateway_commands
+                    WHERE state = 'processing' AND effect_started = 1
+                        AND replay_safe = 0
+                    """
+                ).fetchall()
+                for row in rows:
+                    error_json = json.dumps(
+                        {
+                            "code": "idempotency_outcome_uncertain",
+                            "message": (
+                                "The previous Gateway command may have reached a "
+                                "non-idempotent downstream service"
+                            ),
+                            "details": {
+                                "task_id": str(row["task_id"]),
+                                "create_retryable": False,
+                                "effect_outcome": "uncertain",
+                            },
                         },
-                    },
-                    sort_keys=True,
-                )
+                        sort_keys=True,
+                    )
+                    self._conn.execute(
+                        """
+                        UPDATE gateway_commands
+                        SET state = 'failed', claim_token = NULL, error_json = ?,
+                            updated_at = ?
+                        WHERE command_id = ? AND state = 'processing'
+                        """,
+                        (error_json, now, str(row["command_id"])),
+                    )
                 self._conn.execute(
                     """
                     UPDATE gateway_commands
-                    SET state = 'failed', claim_token = NULL, error_json = ?,
+                    SET state = 'pending', claim_token = NULL, effect_started = 0,
                         updated_at = ?
-                    WHERE command_id = ? AND state = 'processing'
+                    WHERE state = 'processing'
                     """,
-                    (error_json, now, str(row["command_id"])),
+                    (now,),
                 )
-            self._conn.execute(
-                """
-                UPDATE gateway_commands
-                SET state = 'pending', claim_token = NULL, effect_started = 0,
-                    updated_at = ?
-                WHERE state = 'processing'
-                """,
-                (now,),
-            )
-            self._conn.commit()
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     def _ensure_parent_dir(self) -> None:
         if self._db_path == ":memory:" or self._db_path.startswith("file:"):
@@ -399,44 +405,50 @@ class GatewayCommandStore:
             self._conn.execute("PRAGMA busy_timeout = 30000")
             if self._db_path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode = WAL")
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS gateway_commands (
-                    command_id TEXT PRIMARY KEY,
-                    principal_id TEXT NOT NULL,
-                    idempotency_key TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    target TEXT NOT NULL,
-                    request_hash TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    mailbox_message_id TEXT,
-                    claim_token TEXT,
-                    response_json TEXT,
-                    error_json TEXT,
-                    effect_started INTEGER NOT NULL DEFAULT 0,
-                    replay_safe INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(principal_id, idempotency_key)
-                )
-                """
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                _initialize_gateway_command_schema(self._conn)
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+
+
+def _initialize_gateway_command_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gateway_commands (
+            command_id TEXT PRIMARY KEY,
+            principal_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            target TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            state TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            mailbox_message_id TEXT,
+            claim_token TEXT,
+            response_json TEXT,
+            error_json TEXT,
+            effect_started INTEGER NOT NULL DEFAULT 0,
+            replay_safe INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(principal_id, idempotency_key)
+        )
+        """
+    )
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(gateway_commands)").fetchall()
+    }
+    additions = {
+        "error_json": "TEXT",
+        "effect_started": "INTEGER NOT NULL DEFAULT 0",
+        "replay_safe": "INTEGER NOT NULL DEFAULT 1",
+    }
+    for column, declaration in additions.items():
+        if column not in columns:
+            connection.execute(
+                f"ALTER TABLE gateway_commands ADD COLUMN {column} {declaration}"
             )
-            columns = {
-                str(row[1])
-                for row in self._conn.execute(
-                    "PRAGMA table_info(gateway_commands)"
-                ).fetchall()
-            }
-            additions = {
-                "error_json": "TEXT",
-                "effect_started": "INTEGER NOT NULL DEFAULT 0",
-                "replay_safe": "INTEGER NOT NULL DEFAULT 1",
-            }
-            for column, declaration in additions.items():
-                if column not in columns:
-                    self._conn.execute(
-                        f"ALTER TABLE gateway_commands "
-                        f"ADD COLUMN {column} {declaration}"
-                    )
-            self._conn.commit()
