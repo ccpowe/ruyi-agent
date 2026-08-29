@@ -122,7 +122,7 @@ def test_refresh_populates_statuses_and_inventory(monkeypatch: pytest.MonkeyPatc
     result = asyncio.run(registry.refresh())
     client = created["client"]
 
-    assert client.calls == ["exa", "deepwiki"]
+    assert sorted(client.calls) == ["deepwiki", "exa"]
     assert result.total_servers == 2
     assert result.success_servers == 1
     assert result.failed_servers == 1
@@ -150,6 +150,157 @@ def test_refresh_populates_statuses_and_inventory(monkeypatch: pytest.MonkeyPatc
         "properties": {"query": {"type": "string"}},
     }
     assert tools[1].args_schema == {"type": "object", "title": "FetchArgs"}
+
+
+def test_refresh_starts_server_loads_concurrently_and_limits_parallelism(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise_refresh() -> None:
+        release_loads = asyncio.Event()
+        first_wave_started = asyncio.Event()
+
+        class BlockingMCPClient:
+            def __init__(self) -> None:
+                self.started: list[str] = []
+                self.active_loads = 0
+                self.max_active_loads = 0
+
+            async def get_tools(self, server_name: str | None = None):
+                assert server_name is not None
+                self.started.append(server_name)
+                self.active_loads += 1
+                self.max_active_loads = max(
+                    self.max_active_loads,
+                    self.active_loads,
+                )
+                if self.active_loads == 2:
+                    first_wave_started.set()
+                try:
+                    await release_loads.wait()
+                    return [FakeTool(name=f"{server_name}_tool")]
+                finally:
+                    self.active_loads -= 1
+
+        created: dict[str, BlockingMCPClient] = {}
+
+        def factory(
+            server_configs: dict[str, dict[str, object]],
+        ) -> BlockingMCPClient:
+            assert list(server_configs) == ["one", "two", "three", "four"]
+            client = BlockingMCPClient()
+            created["client"] = client
+            return client
+
+        monkeypatch.setattr(mcp_registry, "MultiServerMCPClient", factory)
+        registry = mcp_registry.MCPRegistry(
+            {
+                "one": {"transport": "http"},
+                "two": {"transport": "http"},
+                "three": {"transport": "http"},
+                "four": {"transport": "http"},
+            },
+            max_refresh_concurrency=2,
+        )
+
+        refresh_task = asyncio.create_task(registry.refresh())
+        await asyncio.wait_for(first_wave_started.wait(), timeout=1)
+
+        client = created["client"]
+        assert client.active_loads == 2
+        assert len(client.started) == 2
+        assert len(set(client.started)) == 2
+
+        release_loads.set()
+        result = await asyncio.wait_for(refresh_task, timeout=1)
+
+        assert client.max_active_loads == 2
+        assert sorted(client.started) == ["four", "one", "three", "two"]
+        assert result.success_servers == 4
+
+    asyncio.run(exercise_refresh())
+
+
+def test_refresh_uses_configuration_order_after_out_of_order_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise_refresh() -> None:
+        second_finished = asyncio.Event()
+        completion_order: list[str] = []
+
+        class OutOfOrderMCPClient:
+            async def get_tools(self, server_name: str | None = None):
+                assert server_name is not None
+                if server_name == "configured-first":
+                    await second_finished.wait()
+                completion_order.append(server_name)
+                if server_name == "configured-second":
+                    second_finished.set()
+                return [FakeTool(name=f"{server_name}_tool")]
+
+        monkeypatch.setattr(
+            mcp_registry,
+            "MultiServerMCPClient",
+            lambda server_configs: OutOfOrderMCPClient(),
+        )
+        registry = mcp_registry.MCPRegistry(
+            {
+                "configured-first": {"transport": "http"},
+                "configured-second": {"transport": "http"},
+            }
+        )
+
+        result = await asyncio.wait_for(registry.refresh(), timeout=1)
+        tools = await registry.list_tools()
+        resolved_tools = await registry.pick_tools(
+            ["configured-first_tool", "configured-second_tool"]
+        )
+
+        assert completion_order == ["configured-second", "configured-first"]
+        assert [status.server_name for status in result.server_statuses] == [
+            "configured-first",
+            "configured-second",
+        ]
+        assert [tool.server_name for tool in tools] == [
+            "configured-first",
+            "configured-second",
+        ]
+        assert [tool.name for tool in resolved_tools] == [
+            "configured-first_tool",
+            "configured-second_tool",
+        ]
+
+    asyncio.run(exercise_refresh())
+
+
+def test_refresh_with_no_servers_preserves_empty_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_configs: list[dict[str, dict[str, object]]] = []
+
+    def factory(
+        server_configs: dict[str, dict[str, object]],
+    ) -> FakeMCPClient:
+        created_configs.append(server_configs)
+        return FakeMCPClient(server_configs, responses={})
+
+    monkeypatch.setattr(mcp_registry, "MultiServerMCPClient", factory)
+    registry = mcp_registry.MCPRegistry({})
+
+    result = asyncio.run(registry.refresh())
+
+    assert created_configs == [{}]
+    assert result.total_servers == 0
+    assert result.success_servers == 0
+    assert result.failed_servers == 0
+    assert result.total_tools == 0
+    assert result.server_statuses == []
+    assert registry.get_server_statuses() == []
+    assert asyncio.run(registry.list_tools()) == []
+
+
+def test_refresh_concurrency_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="max_refresh_concurrency must be at least 1"):
+        mcp_registry.MCPRegistry({}, max_refresh_concurrency=0)
 
 
 def test_tool_name_resolution_supports_raw_and_qualified_names(

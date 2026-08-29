@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -11,6 +12,7 @@ from jsonschema.validators import validator_for
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 MCP_SERVER_METADATA_KEYS = {"description"}
+DEFAULT_MCP_REFRESH_CONCURRENCY = 4
 
 
 @dataclass(slots=True)
@@ -49,9 +51,17 @@ class RefreshResult:
 
 
 class MCPRegistry:
-    def __init__(self, server_configs: dict[str, dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        server_configs: dict[str, dict[str, Any]],
+        *,
+        max_refresh_concurrency: int = DEFAULT_MCP_REFRESH_CONCURRENCY,
+    ) -> None:
         # 为什么有这个初始化：把 MCP 配置和运行期缓存集中收口，避免上层直接依赖底层 client。
+        if max_refresh_concurrency < 1:
+            raise ValueError("max_refresh_concurrency must be at least 1")
         self._server_configs = server_configs
+        self._max_refresh_concurrency = max_refresh_concurrency
         self._client: MultiServerMCPClient | None = None
         self._tool_inventory_by_server: dict[str, list[ToolInfo]] = {}
         self._tool_info_by_qualified_name: dict[str, ToolInfo] = {}
@@ -84,9 +94,29 @@ class MCPRegistry:
         raw_name_to_qualified_names: dict[str, list[str]] = {}
         server_statuses: dict[str, ServerLoadStatus] = {}
 
-        for server_name in self.list_servers():
+        server_names = self.list_servers()
+        semaphore = asyncio.Semaphore(self._max_refresh_concurrency)
+
+        async def load_server_tools(
+            server_name: str,
+        ) -> tuple[list[Any] | None, Exception | None]:
+            # 为什么只并发远端拉取：各 server 使用独立 session，而缓存构建仍按配置顺序完成。
+            async with semaphore:
+                try:
+                    return await client.get_tools(server_name=server_name), None
+                except Exception as exc:
+                    return None, exc
+
+        load_results = await asyncio.gather(
+            *(load_server_tools(server_name) for server_name in server_names)
+        )
+
+        for server_name, (tools, load_error) in zip(server_names, load_results):
             try:
-                tools = await client.get_tools(server_name=server_name)
+                if load_error is not None:
+                    raise load_error
+                if tools is None:
+                    raise RuntimeError(f"MCP server {server_name} returned no tool list")
                 tool_infos: list[ToolInfo] = []
 
                 for tool in tools:
@@ -140,7 +170,7 @@ class MCPRegistry:
             ),
             refreshed_at=refreshed_at,
             server_statuses=[
-                server_statuses[server_name] for server_name in self.list_servers()
+                server_statuses[server_name] for server_name in server_names
             ],
         )
 
