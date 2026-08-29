@@ -4,6 +4,8 @@ import asyncio
 from dataclasses import fields
 from pathlib import Path
 
+import pytest
+
 from ruyi_agent.runtime.delegation.async_runtime import (
     PublishedArtifact as RuntimePublishedArtifact,
 )
@@ -47,6 +49,99 @@ def test_live_run_registry_releases_completed_handle() -> None:
         await asyncio.sleep(0)
 
         assert registry.get_task("task-1") is None
+
+    asyncio.run(scenario())
+
+
+def test_live_run_registry_rejects_replacing_active_run() -> None:
+    async def scenario() -> None:
+        registry = LiveRunRegistry()
+        first = asyncio.create_task(asyncio.Event().wait())
+        replacement = asyncio.create_task(asyncio.Event().wait())
+        try:
+            registry.register("task-1", first)
+
+            with pytest.raises(RuntimeError, match="already active"):
+                registry.register("task-1", replacement)
+
+            assert registry.get_task("task-1") is first
+        finally:
+            first.cancel()
+            replacement.cancel()
+            await asyncio.gather(first, replacement, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_old_done_callback_cannot_discard_replacement_run() -> None:
+    async def scenario() -> None:
+        registry = LiveRunRegistry()
+        replacement_release = asyncio.Event()
+        replacement = asyncio.create_task(replacement_release.wait())
+        old = asyncio.create_task(asyncio.sleep(0))
+
+        # asyncio runs done callbacks in registration order. Install the
+        # replacement immediately after old settles, before the registry's old
+        # cleanup callback gets its turn.
+        old.add_done_callback(lambda _: registry.register("task-1", replacement))
+        registry.register("task-1", old)
+
+        await old
+        await asyncio.sleep(0)
+
+        assert registry.get_task("task-1") is replacement
+        assert registry.is_active("task-1") is True
+
+        replacement_release.set()
+        await replacement
+        await asyncio.sleep(0)
+        assert registry.get_task("task-1") is None
+
+    asyncio.run(scenario())
+
+
+def test_cancel_requested_does_not_leak_into_replacement_run() -> None:
+    async def scenario() -> None:
+        registry = LiveRunRegistry()
+        first = asyncio.create_task(asyncio.Event().wait())
+        replacement = asyncio.create_task(asyncio.Event().wait())
+        registry.register("task-1", first)
+
+        assert registry.request_cancel("task-1") is first
+        assert registry.was_cancel_requested("task-1") is True
+
+        registry.discard("task-1")
+        registry.register("task-1", replacement)
+        assert registry.was_cancel_requested("task-1") is False
+
+        await asyncio.gather(first, return_exceptions=True)
+        assert registry.get_task("task-1") is replacement
+
+        replacement.cancel()
+        await asyncio.gather(replacement, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_request_cancel_targets_only_requested_run() -> None:
+    async def scenario() -> None:
+        registry = LiveRunRegistry()
+        first = asyncio.create_task(asyncio.Event().wait())
+        second = asyncio.create_task(asyncio.Event().wait())
+        registry.register("task-1", first)
+        registry.register("task-2", second)
+
+        cancelled = registry.request_cancel("task-1")
+
+        assert cancelled is first
+        assert first.cancelling() == 1
+        assert second.cancelling() == 0
+        assert registry.was_cancel_requested("task-1") is True
+        assert registry.was_cancel_requested("task-2") is False
+
+        await asyncio.gather(first, return_exceptions=True)
+        second.cancel()
+        await asyncio.gather(second, return_exceptions=True)
 
     asyncio.run(scenario())
 
