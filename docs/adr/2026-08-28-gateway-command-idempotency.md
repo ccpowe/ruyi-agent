@@ -129,6 +129,13 @@ a crash with missing or pre-evidence facts is conservatively `uncertain`.
 Pre-evidence route databases are migrated with `legacy_unknown` facts so their
 absence can never be mistaken for permission to replay.
 
+The command-ledger effect marker is committed before the route effect boundary.
+If a crash lands between those commits, the command row remains conservatively
+terminal, but replay projects its public outcome from the newer authoritative
+route classification. In particular, a durable `reserved` boundary recovered
+as `failed/not_started` must never be described as an uncertain command that may
+have reached a downstream service.
+
 Successful command records are retained with the task database and have no
 automatic expiration in this version. Clients must treat keys as non-reusable.
 
