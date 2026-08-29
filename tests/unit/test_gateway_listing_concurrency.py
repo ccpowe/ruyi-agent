@@ -123,6 +123,7 @@ def route(
     agent_name: str = "remote",
     route_kind: str = "remote_ref",
     metadata: dict[str, str] | None = None,
+    route_state: str = "active",
 ) -> TaskRouteRecord:
     return TaskRouteRecord(
         task_id=f"task-{index}",
@@ -130,6 +131,7 @@ def route(
         metadata=dict(metadata or {}),
         route_kind=route_kind,  # type: ignore[arg-type]
         upstream_task_id=f"upstream-{index}",
+        route_state=route_state,  # type: ignore[arg-type]
     )
 
 
@@ -409,7 +411,7 @@ def test_list_task_reviews_refreshes_only_requested_task() -> None:
     response = asyncio.run(service.list_task_reviews("task-0"))
 
     assert {item.task_id for item in response.items} == {"task-7", "task-88"}
-    assert router.called == ["task-0"]
+    assert set(router.called) == {"task-0", "task-7", "task-88"}
     assert set(router.get_route_calls) == {"task-0", "task-7", "task-88"}
     assert router.list_routes_calls == 0
 
@@ -443,3 +445,131 @@ def test_unavailable_review_owner_has_stable_not_found_semantics(failure: str) -
     listed = asyncio.run(service.list_reviews(cursor=None, limit=10))
     assert listed.items == []
     assert router.list_routes_calls == 0
+
+
+def test_review_page_scans_past_invisible_owners_until_limit_is_full() -> None:
+    routes = [route(index) for index in range(5)]
+    records = {
+        item.task_id: record(
+            index,
+            state="waiting_for_human",
+            pending_review={
+                "review_id": f"review-{index}",
+                "action_requests": [],
+                "review_configs": [],
+            },
+        )
+        for index, item in enumerate(routes)
+    }
+    router = ListingRouter(
+        routes,
+        records,
+        missing_task_ids={"task-4", "task-3"},
+    )
+    service = service_with_router(router)
+
+    response = asyncio.run(service.list_reviews(cursor=None, limit=2))
+
+    assert [item.review_id for item in response.items] == ["review-2", "review-1"]
+    assert set(router.get_route_calls) == {"task-4", "task-3", "task-2", "task-1"}
+    assert response.next_cursor is not None
+
+
+def test_review_cursor_retries_unscanned_owner_after_transient_failure() -> None:
+    routes = [route(index) for index in range(3)]
+    records = {
+        item.task_id: record(
+            index,
+            state="waiting_for_human",
+            pending_review={
+                "review_id": f"review-{index}",
+                "action_requests": [],
+                "review_configs": [],
+            },
+        )
+        for index, item in enumerate(routes)
+    }
+    router = ListingRouter(routes, records, failed_task_ids={"task-1"})
+    service = service_with_router(router)
+
+    first = asyncio.run(service.list_reviews(cursor=None, limit=3))
+    assert [item.review_id for item in first.items] == ["review-2"]
+    assert first.next_cursor is not None
+
+    router.failed_task_ids.clear()
+    recovered = asyncio.run(
+        service.list_reviews(cursor=first.next_cursor, limit=3)
+    )
+    assert [item.review_id for item in recovered.items] == ["review-1", "review-0"]
+    assert recovered.next_cursor is None
+
+
+def test_review_page_refills_when_refresh_resolves_a_phantom_review() -> None:
+    routes = [route(index) for index in range(4)]
+    records = {
+        item.task_id: record(
+            index,
+            state="waiting_for_human",
+            pending_review={
+                "review_id": f"review-{index}",
+                "action_requests": [],
+                "review_configs": [],
+            },
+        )
+        for index, item in enumerate(routes)
+    }
+    router = ListingRouter(routes, records)
+    original_get_record = router.get_record
+
+    async def resolving_get_record(owner_route: TaskRouteRecord) -> TaskRecord:
+        refreshed = await original_get_record(owner_route)
+        if owner_route.task_id == "task-3":
+            refreshed.pending_review = None
+        return refreshed
+
+    router.get_record = resolving_get_record  # type: ignore[method-assign]
+    service = service_with_router(router)
+
+    response = asyncio.run(service.list_reviews(cursor=None, limit=2))
+
+    assert [item.review_id for item in response.items] == ["review-2", "review-1"]
+    assert router.called == ["task-3", "task-2", "task-1"]
+
+
+def test_list_task_reviews_refreshes_child_owners_and_omits_stale_ones() -> None:
+    routes = [route(index) for index in range(5)]
+    records = {item.task_id: record(index) for index, item in enumerate(routes)}
+    records["task-0"] = record(0, root_task_id="task-0")
+    for index in range(1, 5):
+        records[f"task-{index}"] = record(
+            index,
+            state="waiting_for_human",
+            root_task_id="task-0",
+            pending_review={
+                "review_id": f"review-{index}",
+                "action_requests": [],
+                "review_configs": [],
+            },
+        )
+    router = ListingRouter(
+        routes,
+        records,
+        missing_task_ids={"task-3"},
+        failed_task_ids={"task-4"},
+    )
+    original_get_record = router.get_record
+
+    async def resolving_get_record(owner_route: TaskRouteRecord) -> TaskRecord:
+        refreshed = await original_get_record(owner_route)
+        if owner_route.task_id == "task-2":
+            refreshed.pending_review = None
+        return refreshed
+
+    router.get_record = resolving_get_record  # type: ignore[method-assign]
+    service = service_with_router(router)
+
+    response = asyncio.run(service.list_task_reviews("task-0"))
+
+    assert [item.review_id for item in response.items] == ["review-1"]
+    assert set(router.called) == {"task-0", "task-1", "task-2", "task-4"}
+    assert set(router.get_route_calls) == {"task-0", "task-1", "task-2", "task-3", "task-4"}

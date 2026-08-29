@@ -6,11 +6,23 @@ import threading
 from asyncio import to_thread
 from datetime import UTC, datetime
 from pathlib import Path
+
 from ruyi_agent.task_models import (
     TASK_ROUTE_STATES,
     TaskRouteRecord,
     TaskRouteState,
 )
+
+_ROUTE_COLUMNS = (
+    "task_id, agent_name, metadata_json, route_kind, upstream_task_id, "
+    "webhook_json, route_state, route_error, created_at, updated_at"
+)
+_ALLOWED_ROUTE_TRANSITIONS: dict[TaskRouteState, frozenset[TaskRouteState]] = {
+    "pending": frozenset({"pending", "active", "failed", "uncertain"}),
+    "active": frozenset({"active"}),
+    "failed": frozenset({"failed"}),
+    "uncertain": frozenset({"uncertain"}),
+}
 
 
 class GatewayRouteStore:
@@ -86,9 +98,13 @@ class GatewayRouteStore:
                         raise ValueError(
                             f"Gateway route binding conflict for task '{route.task_id}'"
                         )
-                    if str(existing[3]) == "active" and route.route_state != "active":
+                    existing_state = str(existing[3])
+                    if route.route_state not in _ALLOWED_ROUTE_TRANSITIONS[
+                        existing_state
+                    ]:
                         raise ValueError(
-                            f"Active Gateway route '{route.task_id}' cannot be downgraded"
+                            f"Gateway route '{route.task_id}' cannot transition "
+                            f"from {existing_state} to {route.route_state}"
                         )
                     existing_upstream = (
                         str(existing[2]) if existing[2] is not None else None
@@ -97,11 +113,6 @@ class GatewayRouteStore:
                         existing_upstream is not None
                         and route.upstream_task_id is not None
                         and existing_upstream != route.upstream_task_id
-                        and not (
-                            str(existing[3]) != "active"
-                            and route.route_kind == "remote_ref"
-                            and existing_upstream == route.task_id
-                        )
                     ):
                         raise ValueError(
                             f"Gateway route binding conflict for task '{route.task_id}'"
@@ -140,7 +151,7 @@ class GatewayRouteStore:
             agent_name=route.agent_name,
             metadata=dict(route.metadata),
             route_kind=route.route_kind,
-            upstream_task_id=route.task_id,
+            upstream_task_id=(route.task_id if route.route_kind == "local" else None),
             webhook=dict(route.webhook) if route.webhook is not None else None,
             route_state="pending",
         )
@@ -182,8 +193,8 @@ class GatewayRouteStore:
                 and route.upstream_task_id != upstream_task_id
                 and not (
                     route.route_kind == "remote_ref"
-                    and route.route_state != "active"
-                    and route.upstream_task_id == route.task_id
+                    and route.route_state == "pending"
+                    and route.upstream_task_id is None
                 )
             ):
                 raise ValueError(
@@ -279,60 +290,116 @@ class GatewayRouteStore:
             self._conn.execute("PRAGMA busy_timeout = 30000")
             if self._db_path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode = WAL")
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS gateway_task_routes (
-                    task_id TEXT PRIMARY KEY,
-                    agent_name TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL,
-                    route_kind TEXT NOT NULL,
-                    upstream_task_id TEXT NOT NULL,
-                    webhook_json TEXT,
-                    route_state TEXT NOT NULL DEFAULT 'active'
-                        CHECK (route_state IN ('pending', 'active', 'failed', 'uncertain')),
-                    route_error TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                table_names = {
+                    str(row[0])
+                    for row in self._conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                if (
+                    "gateway_task_routes" not in table_names
+                    and "gateway_task_routes_migrating" in table_names
+                ):
+                    self._conn.execute(
+                        "ALTER TABLE gateway_task_routes_migrating "
+                        "RENAME TO gateway_task_routes"
+                    )
+                self._create_route_table("gateway_task_routes")
+                self._conn.execute(
+                    "DROP TABLE IF EXISTS gateway_task_routes_migrating"
                 )
-                """
+                columns = {
+                    str(row[1]): row
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(gateway_task_routes)"
+                    ).fetchall()
+                }
+                additions = {
+                    "webhook_json": "TEXT",
+                    "route_state": "TEXT NOT NULL DEFAULT 'active'",
+                    "route_error": "TEXT",
+                    "created_at": "TEXT",
+                    "updated_at": "TEXT",
+                }
+                for column, declaration in additions.items():
+                    if column not in columns:
+                        self._conn.execute(
+                            f"ALTER TABLE gateway_task_routes "
+                            f"ADD COLUMN {column} {declaration}"
+                        )
+                now = datetime.now(UTC).isoformat()
+                self._conn.execute(
+                    """
+                    UPDATE gateway_task_routes
+                    SET created_at = ?
+                    WHERE created_at IS NULL OR trim(created_at) = ''
+                    """,
+                    (now,),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE gateway_task_routes
+                    SET updated_at = COALESCE(NULLIF(trim(updated_at), ''), created_at)
+                    WHERE updated_at IS NULL OR trim(updated_at) = ''
+                    """
+                )
+                columns = {
+                    str(row[1]): row
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(gateway_task_routes)"
+                    ).fetchall()
+                }
+                if int(columns["upstream_task_id"][3]) != 0:
+                    self._rebuild_route_table()
+                self._conn.execute(
+                    """
+                    UPDATE gateway_task_routes
+                    SET upstream_task_id = NULL
+                    WHERE route_kind = 'remote_ref'
+                        AND route_state != 'active'
+                        AND upstream_task_id = task_id
+                    """
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+
+    def _create_route_table(self, table_name: str) -> None:
+        self._conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                task_id TEXT PRIMARY KEY,
+                agent_name TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                route_kind TEXT NOT NULL,
+                upstream_task_id TEXT,
+                webhook_json TEXT,
+                route_state TEXT NOT NULL DEFAULT 'active'
+                    CHECK (route_state IN ('pending', 'active', 'failed', 'uncertain')),
+                route_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )
-            columns = {
-                row[1]
-                for row in self._conn.execute(
-                    "PRAGMA table_info(gateway_task_routes)"
-                ).fetchall()
-            }
-            if "webhook_json" not in columns:
-                self._conn.execute(
-                    "ALTER TABLE gateway_task_routes ADD COLUMN webhook_json TEXT"
-                )
-            if "route_state" not in columns:
-                self._conn.execute(
-                    "ALTER TABLE gateway_task_routes "
-                    "ADD COLUMN route_state TEXT NOT NULL DEFAULT 'active'"
-                )
-            if "route_error" not in columns:
-                self._conn.execute(
-                    "ALTER TABLE gateway_task_routes ADD COLUMN route_error TEXT"
-                )
-            now = datetime.now(UTC).isoformat()
-            if "created_at" not in columns:
-                self._conn.execute(
-                    "ALTER TABLE gateway_task_routes ADD COLUMN created_at TEXT"
-                )
-                self._conn.execute(
-                    "UPDATE gateway_task_routes SET created_at = ?",
-                    (now,),
-                )
-            if "updated_at" not in columns:
-                self._conn.execute(
-                    "ALTER TABLE gateway_task_routes ADD COLUMN updated_at TEXT"
-                )
-                self._conn.execute(
-                    "UPDATE gateway_task_routes SET updated_at = ?",
-                    (now,),
-                )
-            self._conn.commit()
+            """
+        )
+
+    def _rebuild_route_table(self) -> None:
+        temporary = "gateway_task_routes_migrating"
+        self._conn.execute(f"DROP TABLE IF EXISTS {temporary}")
+        self._create_route_table(temporary)
+        self._conn.execute(
+            f"""
+            INSERT INTO {temporary} ({_ROUTE_COLUMNS})
+            SELECT {_ROUTE_COLUMNS} FROM gateway_task_routes
+            """
+        )
+        self._conn.execute("DROP TABLE gateway_task_routes")
+        self._conn.execute(
+            f"ALTER TABLE {temporary} RENAME TO gateway_task_routes"
+        )
 
     def _row_to_route(
         self,

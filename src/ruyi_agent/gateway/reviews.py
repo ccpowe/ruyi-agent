@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import binascii
+import json
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from ruyi_agent.gateway.application import (
@@ -35,10 +41,12 @@ class GatewayReviewService:
         decisions: list[dict[str, Any]],
     ) -> TaskResponse:
         route = await self._context.router.get_route(task_id)
+        await self._context.router.require_active_route(route)
         review = self._context.router.get_pending_review(review_id)
         review_route = route
         if review is not None and review.task_id != task_id:
             review_route = await self._context.router.get_route(review.task_id)
+            await self._context.router.require_active_route(review_route)
         if review_route.route_kind == "remote_ref":
             await self._context.router.get_record(review_route)
             review = self._context.router.get_pending_review(review_id)
@@ -74,29 +82,43 @@ class GatewayReviewService:
                 code="invalid_request",
                 message="Query parameter 'limit' must be between 1 and 100",
             )
-        offset = self._listings.decode_cursor(cursor)
         pending_reviews = sorted(
             self._context.router.list_pending_reviews(),
             key=lambda item: (item.updated_at, item.review_id),
             reverse=True,
         )
-        page_records = pending_reviews[offset : offset + limit]
-        routes_by_id = await self._refresh_review_owner_routes(page_records)
+        scan_index = self._review_cursor_index(cursor, pending_reviews)
         items = []
-        for original in page_records:
-            pending = self._context.router.get_pending_review(original.review_id)
-            if pending is None or pending.task_id != original.task_id:
-                continue
-            route = routes_by_id.get(pending.task_id)
-            if route is None:
-                continue
-            record = self._context.router.ensure_record(route)
-            items.append(
-                self._projection.build_review(pending, record, route.metadata)
-            )
+        blocked = False
+        while len(items) < limit and scan_index < len(pending_reviews):
+            batch = pending_reviews[scan_index : scan_index + (limit - len(items))]
+            refreshed = await self._refresh_review_owner_routes(batch)
+            for original in batch:
+                if original.task_id in refreshed.unavailable_owner_ids:
+                    blocked = True
+                    break
+                scan_index += 1
+                pending = self._context.router.get_pending_review(
+                    original.review_id
+                )
+                if pending is None or pending.task_id != original.task_id:
+                    continue
+                route = refreshed.routes_by_id.get(pending.task_id)
+                if route is None:
+                    continue
+                record = self._context.router.ensure_record(route)
+                items.append(
+                    self._projection.build_review(
+                        pending,
+                        record,
+                        route.metadata,
+                    )
+                )
+            if blocked:
+                break
         next_cursor = (
-            self._listings.encode_cursor(offset + limit)
-            if offset + limit < len(pending_reviews)
+            self._encode_review_cursor(pending_reviews[scan_index])
+            if scan_index < len(pending_reviews)
             else None
         )
         return ReviewListResponse(items=items, next_cursor=next_cursor)
@@ -104,9 +126,9 @@ class GatewayReviewService:
     async def get_review(self, review_id: str) -> ReviewResponse:
         pending = self._context.router.get_pending_review(review_id)
         if pending is not None:
-            routes_by_id = await self._refresh_review_owner_routes([pending])
+            refreshed_routes = await self._refresh_review_owner_routes([pending])
             refreshed = self._context.router.get_pending_review(review_id)
-            route = routes_by_id.get(pending.task_id)
+            route = refreshed_routes.routes_by_id.get(pending.task_id)
             if (
                 refreshed is not None
                 and refreshed.task_id == pending.task_id
@@ -136,20 +158,22 @@ class GatewayReviewService:
             root_task_id=task_id if record.root_task_id == task_id else None,
             task_id=None if record.root_task_id == task_id else task_id,
         )
+        refreshed_routes = await self._refresh_review_owner_routes(
+            pending_reviews,
+            known_routes={task_id: route},
+        )
         items = []
         for pending in pending_reviews:
-            try:
-                owner_route = (
-                    route
-                    if pending.task_id == task_id
-                    else await self._context.router.get_route(pending.task_id)
-                )
-                owner = self._context.router.ensure_record(owner_route)
-            except GatewayTaskError:
+            current = self._context.router.get_pending_review(pending.review_id)
+            if current is None or current.task_id != pending.task_id:
                 continue
+            owner_route = refreshed_routes.routes_by_id.get(current.task_id)
+            if owner_route is None:
+                continue
+            owner = self._context.router.ensure_record(owner_route)
             items.append(
                 self._projection.build_review(
-                    pending,
+                    current,
                     owner,
                     owner_route.metadata,
                 )
@@ -159,21 +183,84 @@ class GatewayReviewService:
     async def _refresh_review_owner_routes(
         self,
         pending_reviews: list[PendingReviewRecord],
-    ) -> dict[str, TaskRouteRecord]:
-        """Refresh only deduplicated owner routes named by Pending Reviews."""
+        *,
+        known_routes: dict[str, TaskRouteRecord] | None = None,
+        refresh_known: bool = False,
+    ) -> _OwnerRefreshResult:
+        """Refresh exactly the deduplicated owners named by Pending Reviews."""
 
-        routes = []
-        seen_task_ids: set[str] = set()
-        for pending in pending_reviews:
-            if pending.task_id in seen_task_ids:
-                continue
-            seen_task_ids.add(pending.task_id)
+        routes_by_id: dict[str, TaskRouteRecord] = {}
+        unavailable_owner_ids: set[str] = set()
+        semaphore = asyncio.Semaphore(self._context.remote_listing_concurrency)
+
+        async def refresh(task_id: str) -> None:
             try:
-                routes.append(await self._context.router.get_route(pending.task_id))
-            except GatewayTaskError:
-                continue
-        return {
-            route.task_id: route
-            for route, task in await self._listings.collect_tasks(routes)
-            if task is not None
-        }
+                known = task_id in (known_routes or {})
+                route = (known_routes or {}).get(task_id)
+                if route is None:
+                    route = await self._context.router.get_route(task_id)
+                if route.route_state != "active":
+                    return
+                if known and not refresh_known:
+                    pass
+                elif route.route_kind == "remote_ref" or refresh_known:
+                    async with semaphore:
+                        await self._context.router.get_record(route)
+                else:
+                    await self._context.router.get_record(route)
+                routes_by_id[task_id] = route
+            except GatewayTaskError as exc:
+                if exc.code != "task_not_found":
+                    unavailable_owner_ids.add(task_id)
+
+        owner_ids = list(dict.fromkeys(item.task_id for item in pending_reviews))
+        if owner_ids:
+            await asyncio.gather(*(refresh(task_id) for task_id in owner_ids))
+        return _OwnerRefreshResult(routes_by_id, unavailable_owner_ids)
+
+    def _review_cursor_index(
+        self,
+        cursor: str | None,
+        records: list[PendingReviewRecord],
+    ) -> int:
+        if cursor is None:
+            return 0
+        try:
+            payload = json.loads(
+                base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+            )
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                raise ValueError
+            resume_key = (
+                datetime.fromisoformat(str(payload["updated_at"])),
+                str(payload["review_id"]),
+            )
+        except (KeyError, TypeError, ValueError, binascii.Error, UnicodeError):
+            # Accept cursors produced by the original offset implementation.
+            return self._listings.decode_cursor(cursor)
+        return next(
+            (
+                index
+                for index, record in enumerate(records)
+                if (record.updated_at, record.review_id) <= resume_key
+            ),
+            len(records),
+        )
+
+    def _encode_review_cursor(self, record: PendingReviewRecord) -> str:
+        payload = json.dumps(
+            {
+                "review_id": record.review_id,
+                "updated_at": record.updated_at.isoformat(),
+                "version": 1,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+@dataclass(frozen=True, slots=True)
+class _OwnerRefreshResult:
+    routes_by_id: dict[str, TaskRouteRecord]
+    unavailable_owner_ids: set[str]

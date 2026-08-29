@@ -38,6 +38,7 @@ def _record(
         depth=depth,
         created_at=now,
         updated_at=now,
+        run_count=1,
         route_kind=route_kind,
         upstream_task_id=upstream_task_id,
     )
@@ -127,6 +128,28 @@ class IdempotentRecordingControl(RecordingControl):
         return record
 
 
+class RecordThenFailControl(RecordingControl):
+    async def spawn_task(self, agent_name: str, task: str, **kwargs: Any) -> TaskRecord:
+        del task
+        task_id = str(kwargs["task_id"])
+        now = datetime.now(UTC)
+        record = TaskRecord(
+            task_id=task_id,
+            agent_name=agent_name,
+            state="pending",
+            thread_id=task_id,
+            parent_task_id=None,
+            root_task_id=task_id,
+            depth=1,
+            created_at=now,
+            updated_at=now,
+            run_count=0,
+            route_kind="local",
+        )
+        self.records[task_id] = record
+        raise RuntimeError("crashed before durable initial run")
+
+
 class FailingReservationStore:
     def __init__(self) -> None:
         self.reserve_calls = 0
@@ -147,6 +170,16 @@ class FlakyActivationStore(GatewayRouteStore):
             self.active_failures -= 1
             raise sqlite3.OperationalError("activation commit failed")
         return await super().atransition_route(task_id, **kwargs)
+
+
+class UnavailableFallbackStore(GatewayRouteStore):
+    async def atransition_route(self, task_id: str, **kwargs: object) -> TaskRouteRecord:
+        del task_id, kwargs
+        raise sqlite3.OperationalError("transition unavailable")
+
+    async def aget_route(self, task_id: str) -> TaskRouteRecord | None:
+        del task_id
+        raise sqlite3.OperationalError("fallback read unavailable")
 
 
 def test_router_creates_and_persists_local_route() -> None:
@@ -198,7 +231,7 @@ def test_route_store_rejects_identity_rebinding_without_overwrite() -> None:
                     upstream_task_id="upstream-2",
                 )
             )
-        with pytest.raises(ValueError, match="cannot be downgraded"):
+        with pytest.raises(ValueError, match="cannot transition"):
             store.transition_route("task-1", route_state="uncertain")
 
         assert store.get_route("task-1") == original
@@ -264,7 +297,8 @@ def test_route_reservation_failure_prevents_spawn_effect(route_kind: str) -> Non
             "task_id": "gateway-id",
             "route_state": "unpersisted",
             "task_queryable": False,
-            "create_retryable": False,
+            "create_retryable": True,
+            "effect_outcome": "not_started",
         }
 
     asyncio.run(scenario())
@@ -313,11 +347,56 @@ def test_remote_effect_failure_retains_queryable_route_identity(
                 "task_id": "gateway-id",
                 "task_url": "/tasks/gateway-id",
                 "route_state": expected_state,
-                "create_retryable": True,
+                "task_queryable": True,
+                "create_retryable": False,
+                "effect_outcome": (
+                    "uncertain" if expected_state == "uncertain" else "not_started"
+                ),
+                "downstream_idempotency_guaranteed": False,
+                "upstream_task_id": None,
             }
             with pytest.raises(GatewayTaskError) as unavailable:
                 await router.cancel(route)
             assert unavailable.value.code == "task_route_unavailable"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_create_error_reports_actual_unknown_fallback_persistence_state() -> None:
+    async def scenario() -> None:
+        control = FailingSpawnControl(
+            A2AClientError(
+                status_code=502,
+                code="upstream_gateway_error",
+                message="remote response lost",
+            )
+        )
+        store = UnavailableFallbackStore(":memory:")
+        try:
+            router = TaskRouter(control=control, route_store=store)  # type: ignore[arg-type]
+            with pytest.raises(GatewayTaskError) as caught:
+                await router.create_task(
+                    agent_name="remote",
+                    route_kind="remote_ref",
+                    input_content="hello",
+                    metadata={},
+                    webhook=None,
+                    delegation_context=None,
+                    task_id="gateway-id",
+                )
+
+            assert caught.value.details == {
+                "task_id": "gateway-id",
+                "route_state": "pending",
+                "task_queryable": False,
+                "create_retryable": False,
+                "effect_outcome": "uncertain",
+                "downstream_idempotency_guaranteed": False,
+                "upstream_task_id": None,
+            }
+            assert store.get_route("gateway-id") is not None
         finally:
             store.close()
 
@@ -349,6 +428,36 @@ def test_effectless_local_reservation_remains_queryable_but_not_routable() -> No
                 await router.send_input(reservation, "unsafe retry")
             assert caught.value.code == "task_route_unavailable"
             assert control.spawn_calls == 0
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_local_record_without_durable_run_never_promotes_uncertain_route() -> None:
+    async def scenario() -> None:
+        control = RecordThenFailControl()
+        store = GatewayRouteStore(":memory:")
+        try:
+            router = TaskRouter(control=control, route_store=store)  # type: ignore[arg-type]
+            with pytest.raises(GatewayTaskError):
+                await router.create_task(
+                    agent_name="main",
+                    route_kind="local",
+                    input_content="hello",
+                    metadata={},
+                    webhook=None,
+                    delegation_context=None,
+                    task_id="created-not-started",
+                )
+
+            route = await router.get_route("created-not-started")
+            queried = await router.get_record(route)
+            listed = await router.list_routes()
+            assert route.route_state == "uncertain"
+            assert queried.state == "interrupted"
+            assert listed[0].route_state == "uncertain"
+            assert store.get_route("created-not-started").route_state == "uncertain"  # type: ignore[union-attr]
         finally:
             store.close()
 
@@ -390,12 +499,14 @@ def test_effect_then_activation_failure_recovers_same_identity_without_respawn()
                 "route_state": "uncertain",
                 "task_queryable": True,
                 "create_retryable": False,
+                "effect_outcome": "completed",
             }
 
             record = await router.get_record(uncertain)
             recovered = await router.get_route("gateway-id")
             assert record.task_id == "gateway-id"
-            assert recovered.route_state == "active"
+            assert record.state == "interrupted"
+            assert recovered.route_state == "uncertain"
             assert spawn_calls == 1
         finally:
             store.close()
@@ -491,6 +602,64 @@ def test_route_store_migrates_legacy_rows_as_active_idempotently(
             assert route is not None
             assert route.route_state == "active"
             assert route.route_error is None
+        finally:
+            store.close()
+
+
+def test_route_store_repairs_partial_migration_and_empty_timestamps_each_open(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "partial-routes.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        """
+        CREATE TABLE gateway_task_routes_migrating (
+            task_id TEXT PRIMARY KEY,
+            agent_name TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            route_kind TEXT NOT NULL,
+            upstream_task_id TEXT NOT NULL,
+            webhook_json TEXT,
+            route_state TEXT NOT NULL DEFAULT 'active',
+            route_error TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO gateway_task_routes_migrating VALUES (
+            'task-1', 'remote', '{}', 'remote_ref', 'task-1', NULL,
+            'uncertain', 'lost response', '', NULL
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    for _ in range(3):
+        store = GatewayRouteStore(str(db_path))
+        try:
+            route = store.get_route("task-1")
+            assert route is not None
+            assert route.route_state == "uncertain"
+            assert route.upstream_task_id is None
+            with sqlite3.connect(db_path) as check:
+                columns = check.execute(
+                    "PRAGMA table_info(gateway_task_routes)"
+                ).fetchall()
+                assert next(row for row in columns if row[1] == "upstream_task_id")[3] == 0
+                assert check.execute(
+                    "SELECT created_at, updated_at FROM gateway_task_routes"
+                ).fetchone() == (
+                    route.created_at.isoformat(),
+                    route.updated_at.isoformat(),
+                )
+                assert check.execute(
+                    "SELECT name FROM sqlite_master WHERE name = "
+                    "'gateway_task_routes_migrating'"
+                ).fetchone() is None
         finally:
             store.close()
 

@@ -106,6 +106,48 @@ def test_gateway_command_store_recovers_interrupted_claim_on_restart(tmp_path) -
         second.close()
 
 
+def test_gateway_command_store_does_not_replay_unsafe_started_effect(tmp_path) -> None:
+    path = str(tmp_path / "gateway.sqlite")
+    first = GatewayCommandStore(path)
+    acquired = _claim(first)
+    assert acquired.claim_token is not None
+    first.mark_effect_started(
+        command_id=acquired.command_id,
+        claim_token=acquired.claim_token,
+        replay_safe=False,
+    )
+    first.close()
+
+    second = GatewayCommandStore(path)
+    try:
+        terminal = _claim(second)
+        assert terminal.status == "terminal"
+        assert terminal.command_id == acquired.command_id
+        assert terminal.task_id == acquired.task_id
+        assert terminal.error_json is not None
+        assert "idempotency_outcome_uncertain" in terminal.error_json
+    finally:
+        second.close()
+
+
+def test_gateway_command_store_replays_exact_terminal_error(tmp_path) -> None:
+    store = GatewayCommandStore(str(tmp_path / "gateway.sqlite"))
+    try:
+        acquired = _claim(store)
+        assert acquired.claim_token is not None
+        store.fail(
+            command_id=acquired.command_id,
+            claim_token=acquired.claim_token,
+            error_json='{"code":"rejected","message":"no"}',
+        )
+
+        terminal = _claim(store)
+        assert terminal.status == "terminal"
+        assert terminal.error_json == '{"code":"rejected","message":"no"}'
+    finally:
+        store.close()
+
+
 def test_gateway_command_store_preserves_principal_partition(tmp_path) -> None:
     store = GatewayCommandStore(str(tmp_path / "gateway.sqlite"))
     try:

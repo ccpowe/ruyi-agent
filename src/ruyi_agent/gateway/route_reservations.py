@@ -30,18 +30,34 @@ def reservation_record(route: TaskRouteRecord) -> TaskRecord:
 
 def with_route_identity(
     error: GatewayTaskError,
-    route: TaskRouteRecord,
-    idempotency_key: str | None,
+    route: TaskRouteRecord | None,
+    *,
+    task_id: str,
+    retryable: bool,
+    route_state: str | None = None,
+    effect_outcome: str,
+    downstream_idempotency_guaranteed: bool | None = None,
 ) -> GatewayTaskError:
     details = dict(error.details or {})
+    queryable = route is not None
+    durable_state = route.route_state if route is not None else route_state or "unknown"
     details.update(
         {
-            "task_id": route.task_id,
-            "task_url": f"/tasks/{route.task_id}",
-            "route_state": route.route_state,
-            "create_retryable": idempotency_key is not None,
+            "task_id": task_id,
+            "route_state": durable_state,
+            "task_queryable": queryable,
+            "create_retryable": retryable,
+            "effect_outcome": effect_outcome,
+            **({"task_url": f"/tasks/{task_id}"} if queryable else {}),
         }
     )
+    if downstream_idempotency_guaranteed is not None:
+        details["downstream_idempotency_guaranteed"] = (
+            downstream_idempotency_guaranteed
+        )
+        details["upstream_task_id"] = (
+            route.upstream_task_id if route is not None else None
+        )
     return GatewayTaskError(
         code=error.code,
         message=error.message,
@@ -54,8 +70,9 @@ def route_persistence_error(
     task_id: str,
     *,
     route_state: str,
-    idempotency_key: str | None,
     queryable: bool,
+    retryable: bool,
+    effect_outcome: str,
 ) -> GatewayTaskError:
     return GatewayTaskError(
         code="route_persistence_failed",
@@ -64,7 +81,8 @@ def route_persistence_error(
             "task_id": task_id,
             "route_state": route_state,
             "task_queryable": queryable,
-            "create_retryable": idempotency_key is not None,
+            "create_retryable": retryable,
+            "effect_outcome": effect_outcome,
             **({"task_url": f"/tasks/{task_id}"} if queryable else {}),
         },
     )

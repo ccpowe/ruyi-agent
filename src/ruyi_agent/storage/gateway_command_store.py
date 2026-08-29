@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import uuid
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 
-CommandClaimStatus = Literal["acquired", "busy", "replay"]
+CommandClaimStatus = Literal["acquired", "busy", "replay", "terminal"]
 
 
 class GatewayCommandConflictError(ValueError):
@@ -29,15 +30,16 @@ class GatewayCommandClaim:
     mailbox_message_id: str | None
     claim_token: str | None = None
     response_json: str | None = None
+    error_json: str | None = None
 
 
 class GatewayCommandStore:
     """Durable idempotency ledger for Gateway Task mutation commands.
 
     The Gateway currently has a single-process deployment contract. On opening the
-    store, claims left by the previous process are released so the same client
-    request can drive the persisted command again. Effects remain independently
-    deduplicated by their reserved task/message identities.
+    store, replay-safe interrupted claims are released. Claims that may have reached
+    a non-idempotent downstream create become terminal and retain their public Task
+    identity instead of replaying the effect.
     """
 
     def __init__(self, db_path: str) -> None:
@@ -73,7 +75,8 @@ class GatewayCommandStore:
                 row = self._conn.execute(
                     """
                     SELECT command_id, operation, target, request_hash, state,
-                        task_id, mailbox_message_id, claim_token, response_json
+                        task_id, mailbox_message_id, claim_token, response_json,
+                        error_json
                     FROM gateway_commands
                     WHERE principal_id = ? AND idempotency_key = ?
                     """,
@@ -140,6 +143,20 @@ class GatewayCommandStore:
                         mailbox_message_id=mailbox_message_id,
                         response_json=response_json,
                     )
+                if row["state"] == "failed":
+                    error_json = row["error_json"]
+                    if not isinstance(error_json, str) or not error_json:
+                        raise GatewayCommandStateError(
+                            f"Failed Gateway command '{command_id}' has no error"
+                        )
+                    self._conn.commit()
+                    return GatewayCommandClaim(
+                        status="terminal",
+                        command_id=command_id,
+                        task_id=task_id,
+                        mailbox_message_id=mailbox_message_id,
+                        error_json=error_json,
+                    )
                 if row["state"] == "processing":
                     self._conn.commit()
                     return GatewayCommandClaim(
@@ -188,7 +205,7 @@ class GatewayCommandStore:
                 """
                 UPDATE gateway_commands
                 SET state = 'succeeded', response_json = ?, claim_token = NULL,
-                    updated_at = ?
+                    error_json = NULL, updated_at = ?
                 WHERE command_id = ? AND state = 'processing' AND claim_token = ?
                 """,
                 (response_json, now, command_id, claim_token),
@@ -202,13 +219,78 @@ class GatewayCommandStore:
     async def acomplete(self, **kwargs: str) -> None:
         await to_thread(self.complete, **kwargs)
 
+    def mark_effect_started(
+        self,
+        *,
+        command_id: str,
+        claim_token: str,
+        replay_safe: bool,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE gateway_commands
+                SET effect_started = 1, replay_safe = ?, updated_at = ?
+                WHERE command_id = ? AND state = 'processing' AND claim_token = ?
+                """,
+                (int(replay_safe), now, command_id, claim_token),
+            )
+            self._conn.commit()
+            if cursor.rowcount != 1:
+                raise GatewayCommandStateError(
+                    f"Gateway command '{command_id}' is no longer owned by this claim"
+                )
+
+    async def amark_effect_started(
+        self,
+        *,
+        command_id: str,
+        claim_token: str,
+        replay_safe: bool,
+    ) -> None:
+        await to_thread(
+            self.mark_effect_started,
+            command_id=command_id,
+            claim_token=claim_token,
+            replay_safe=replay_safe,
+        )
+
+    def fail(
+        self,
+        *,
+        command_id: str,
+        claim_token: str,
+        error_json: str,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE gateway_commands
+                SET state = 'failed', error_json = ?, claim_token = NULL,
+                    updated_at = ?
+                WHERE command_id = ? AND state = 'processing' AND claim_token = ?
+                """,
+                (error_json, now, command_id, claim_token),
+            )
+            self._conn.commit()
+            if cursor.rowcount != 1:
+                raise GatewayCommandStateError(
+                    f"Gateway command '{command_id}' is no longer owned by this claim"
+                )
+
+    async def afail(self, **kwargs: str) -> None:
+        await to_thread(self.fail, **kwargs)
+
     def release(self, *, command_id: str, claim_token: str) -> None:
         now = datetime.now(UTC).isoformat()
         with self._lock:
             self._conn.execute(
                 """
                 UPDATE gateway_commands
-                SET state = 'pending', claim_token = NULL, updated_at = ?
+                SET state = 'pending', claim_token = NULL, effect_started = 0,
+                    updated_at = ?
                 WHERE command_id = ? AND state = 'processing' AND claim_token = ?
                 """,
                 (now, command_id, claim_token),
@@ -250,10 +332,43 @@ class GatewayCommandStore:
     def _recover_interrupted_claims(self) -> None:
         now = datetime.now(UTC).isoformat()
         with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT command_id, task_id
+                FROM gateway_commands
+                WHERE state = 'processing' AND effect_started = 1 AND replay_safe = 0
+                """
+            ).fetchall()
+            for row in rows:
+                error_json = json.dumps(
+                    {
+                        "code": "idempotency_outcome_uncertain",
+                        "message": (
+                            "The previous Gateway command may have reached a "
+                            "non-idempotent downstream service"
+                        ),
+                        "details": {
+                            "task_id": str(row["task_id"]),
+                            "create_retryable": False,
+                            "effect_outcome": "uncertain",
+                        },
+                    },
+                    sort_keys=True,
+                )
+                self._conn.execute(
+                    """
+                    UPDATE gateway_commands
+                    SET state = 'failed', claim_token = NULL, error_json = ?,
+                        updated_at = ?
+                    WHERE command_id = ? AND state = 'processing'
+                    """,
+                    (error_json, now, str(row["command_id"])),
+                )
             self._conn.execute(
                 """
                 UPDATE gateway_commands
-                SET state = 'pending', claim_token = NULL, updated_at = ?
+                SET state = 'pending', claim_token = NULL, effect_started = 0,
+                    updated_at = ?
                 WHERE state = 'processing'
                 """,
                 (now,),
@@ -287,10 +402,30 @@ class GatewayCommandStore:
                     mailbox_message_id TEXT,
                     claim_token TEXT,
                     response_json TEXT,
+                    error_json TEXT,
+                    effect_started INTEGER NOT NULL DEFAULT 0,
+                    replay_safe INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(principal_id, idempotency_key)
                 )
                 """
             )
+            columns = {
+                str(row[1])
+                for row in self._conn.execute(
+                    "PRAGMA table_info(gateway_commands)"
+                ).fetchall()
+            }
+            additions = {
+                "error_json": "TEXT",
+                "effect_started": "INTEGER NOT NULL DEFAULT 0",
+                "replay_safe": "INTEGER NOT NULL DEFAULT 1",
+            }
+            for column, declaration in additions.items():
+                if column not in columns:
+                    self._conn.execute(
+                        f"ALTER TABLE gateway_commands "
+                        f"ADD COLUMN {column} {declaration}"
+                    )
             self._conn.commit()

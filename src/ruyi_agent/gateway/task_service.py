@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -41,6 +41,16 @@ class GatewayTaskService:
         self._attachments = attachments
         self._projection = projection
 
+    def create_effect_replay_safe(self, agent_name: str) -> bool:
+        """Return whether a create can be replayed after losing its response.
+
+        Local creation is durably keyed by the supplied task identity.  The
+        remote-ref contract accepts an Idempotency-Key but does not advertise a
+        capability guarantee, so a response-lost create must remain terminal.
+        """
+
+        return self._agents.get_config(agent_name).kind != "remote_ref"
+
     async def create_effect(
         self,
         *,
@@ -51,6 +61,7 @@ class GatewayTaskService:
         metadata: dict[str, MetadataScalar],
         webhook: dict[str, MetadataScalar] | None,
         idempotency_key: str | None,
+        before_effect: Callable[[], Awaitable[None]] | None = None,
     ) -> TaskResponse:
         config = self._agents.get_config(agent_name)
         self._agents.ensure_public(agent_name, config)
@@ -68,6 +79,7 @@ class GatewayTaskService:
             webhook=webhook,
             delegation=delegation,
             idempotency_key=idempotency_key,
+            before_effect=before_effect,
         )
 
     async def _create_routed_task(
@@ -82,6 +94,7 @@ class GatewayTaskService:
         webhook: dict[str, MetadataScalar] | None,
         delegation: DelegationContext | None,
         idempotency_key: str | None,
+        before_effect: Callable[[], Awaitable[None]] | None,
     ) -> TaskResponse:
         if route_kind == "remote_ref":
             routed = await self._context.router.create_task(
@@ -94,6 +107,7 @@ class GatewayTaskService:
                 delegation_context=delegation,
                 task_id=task_id,
                 idempotency_key=idempotency_key,
+                before_effect=before_effect,
             )
             return self._projection.build_task(routed.record, routed.route.metadata)
 
@@ -115,6 +129,7 @@ class GatewayTaskService:
             delegation_context=delegation,
             task_id=task_id,
             idempotency_key=idempotency_key,
+            before_effect=before_effect,
         )
         return self._projection.build_task(routed.record, routed.route.metadata)
 
