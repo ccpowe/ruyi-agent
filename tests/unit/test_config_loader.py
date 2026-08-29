@@ -713,7 +713,7 @@ def test_build_local_worker_spec_resolves_tools_and_keeps_skill_names(
             "skills": ["frontend-skill"],
             "server_names": ["deepwiki"],
             "tool_names": ["exa.web_search_exa"],
-            "workers": ["local_helper", "remote_helper"],
+            "workers": ["local_helper", "remote_helper", "local_helper"],
             "permission_profile": "standard",
         }
     }
@@ -749,7 +749,11 @@ def test_build_local_worker_spec_resolves_tools_and_keeps_skill_names(
     assert worker.tools == fake_tools
     assert worker.skills == ["frontend-skill"]
     assert worker.permission_profile == "standard"
-    assert worker.delegation_targets == ("local_helper", "remote_helper")
+    assert worker.delegation_targets == (
+        "local_helper",
+        "remote_helper",
+        "local_helper",
+    )
 
 
 def test_build_local_worker_spec_keeps_special_skill_modes(monkeypatch) -> None:
