@@ -112,6 +112,7 @@ class PendingReviewRecord:
     created_at: datetime
     updated_at: datetime
     ingest_sequence: int = 0
+    cursor_order_updated_at: datetime | None = None
 
 
 @dataclass(slots=True)

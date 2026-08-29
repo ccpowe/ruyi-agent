@@ -4,7 +4,7 @@ import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -372,6 +372,7 @@ def test_task_store_review_transition_is_atomic_with_task_and_root_projection(
         assert store.get_pending_review("review-1") == replace(
             review,
             ingest_sequence=1,
+            cursor_order_updated_at=created_at,
         )
     finally:
         store.close()
@@ -593,6 +594,8 @@ def test_task_store_migrates_legacy_review_ingest_order_idempotently(
             ("review-a", 1),
             ("review-b", 2),
         ]
+        assert all(item.cursor_order_updated_at == created_at for item in first)
+        assert all(item.cursor_order_updated_at == created_at for item in second)
         connection = sqlite3.connect(db_path)
         try:
             columns = {
@@ -650,16 +653,22 @@ def test_task_store_preserves_review_sequence_and_allocates_replacement_order(
         persisted = store.get_pending_review("review-1")
         assert persisted is not None
         assert persisted.ingest_sequence == 1
+        assert persisted.cursor_order_updated_at == created_at
 
         store.update_review_transition(
             task,
-            pending_review=replace(first, updated_at=created_at),
+            pending_review=replace(
+                first,
+                updated_at=created_at + timedelta(minutes=1),
+            ),
             root_record=None,
             events=[],
         )
         unchanged = store.get_pending_review("review-1")
         assert unchanged is not None
         assert unchanged.ingest_sequence == 1
+        assert unchanged.updated_at == created_at + timedelta(minutes=1)
+        assert unchanged.cursor_order_updated_at == created_at
 
         replacement = replace(
             first,

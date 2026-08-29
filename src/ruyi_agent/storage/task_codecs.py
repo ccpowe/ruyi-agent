@@ -74,6 +74,7 @@ def row_to_pending_review(row: tuple[Any, ...]) -> PendingReviewRecord:
         created_at=parse_datetime(str(row[4])),
         updated_at=parse_datetime(str(row[5])),
         ingest_sequence=int(row[6]),
+        cursor_order_updated_at=parse_datetime(str(row[7])),
     )
 
 

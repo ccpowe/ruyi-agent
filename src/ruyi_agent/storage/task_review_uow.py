@@ -82,7 +82,8 @@ class TaskReviewUnitOfWork:
             row = connection.execute(
                 """
                 SELECT review_id, task_id, root_task_id, payload_json,
-                       created_at, updated_at, ingest_sequence
+                       created_at, updated_at, ingest_sequence,
+                       cursor_order_updated_at
                 FROM agent_task_pending_reviews
                 WHERE review_id = ?
                 """,
@@ -109,7 +110,8 @@ class TaskReviewUnitOfWork:
             rows = connection.execute(
                 f"""
                 SELECT review_id, task_id, root_task_id, payload_json,
-                       created_at, updated_at, ingest_sequence
+                       created_at, updated_at, ingest_sequence,
+                       cursor_order_updated_at
                 FROM agent_task_pending_reviews
                 {where}
                 ORDER BY ingest_sequence ASC, review_id ASC
@@ -126,7 +128,7 @@ class TaskReviewUnitOfWork:
     ) -> None:
         existing = connection.execute(
             """
-            SELECT review_id, ingest_sequence
+            SELECT review_id, ingest_sequence, cursor_order_updated_at
             FROM agent_task_pending_reviews
             WHERE task_id = ?
             """,
@@ -140,6 +142,7 @@ class TaskReviewUnitOfWork:
             return
         if existing is not None and existing[0] == pending_review.review_id:
             ingest_sequence = int(existing[1])
+            cursor_order_updated_at = str(existing[2])
         else:
             state = connection.execute(
                 """
@@ -161,6 +164,9 @@ class TaskReviewUnitOfWork:
                 """,
                 (ingest_sequence,),
             )
+            cursor_order_updated_at = serialize_datetime(
+                pending_review.cursor_order_updated_at or pending_review.updated_at
+            )
         connection.execute(
             "DELETE FROM agent_task_pending_reviews WHERE task_id = ?",
             (task_id,),
@@ -169,8 +175,8 @@ class TaskReviewUnitOfWork:
             """
             INSERT INTO agent_task_pending_reviews (
                 review_id, task_id, root_task_id, payload_json, created_at, updated_at,
-                ingest_sequence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ingest_sequence, cursor_order_updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 pending_review.review_id,
@@ -180,5 +186,6 @@ class TaskReviewUnitOfWork:
                 serialize_datetime(pending_review.created_at),
                 serialize_datetime(pending_review.updated_at),
                 ingest_sequence,
+                cursor_order_updated_at,
             ),
         )
