@@ -4,8 +4,7 @@ import asyncio
 import base64
 import json
 import socket
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from langchain_core.messages import HumanMessage, SystemMessage
 
 import ruyi_agent.integrations.openai_codex as openai_codex
@@ -127,27 +126,23 @@ class _CodexSSEHandler(BaseHTTPRequestHandler):
         return
 
 
-def test_codex_chat_model_streams_codex_sse_with_null_completed_output() -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _CodexSSEHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        model = CodexChatModel(
-            model="gpt-5.4",
-            api_key="codex-token",
-            base_url=f"http://127.0.0.1:{server.server_port}",
-            default_headers={},
-            codex_session_id="session-1",
-        )
+def test_codex_chat_model_streams_codex_sse_with_null_completed_output(
+    run_http_server,
+) -> None:
+    server = run_http_server(_CodexSSEHandler)
+    model = CodexChatModel(
+        model="gpt-5.4",
+        api_key="codex-token",
+        base_url=f"http://127.0.0.1:{server.server_port}",
+        default_headers={},
+        codex_session_id="session-1",
+    )
 
-        response = model.invoke([HumanMessage(content="Say hi.")])
+    response = model.invoke([HumanMessage(content="Say hi.")])
 
-        assert response.content == "ruyi codex ok"
-        assert _CodexSSEHandler.request_payload is not None
-        assert _CodexSSEHandler.request_payload["stream"] is True
-    finally:
-        server.shutdown()
-        thread.join(timeout=2)
+    assert response.content == "ruyi codex ok"
+    assert _CodexSSEHandler.request_payload is not None
+    assert _CodexSSEHandler.request_payload["stream"] is True
 
 
 class _DisconnectOnceCodexSSEHandler(_CodexSSEHandler):
@@ -191,54 +186,44 @@ class _MetadataThenDisconnectCodexSSEHandler(_CodexSSEHandler):
         super().do_POST()
 
 
-def test_codex_async_stream_retries_disconnect_before_first_event() -> None:
+def test_codex_async_stream_retries_disconnect_before_first_event(
+    run_http_server,
+) -> None:
     _DisconnectOnceCodexSSEHandler.request_count = 0
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _DisconnectOnceCodexSSEHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        model = CodexChatModel(
-            model="gpt-5.4",
-            api_key="codex-token",
-            base_url=f"http://127.0.0.1:{server.server_port}",
-            default_headers={},
-            codex_session_id="session-retry",
-            max_retries=1,
-        )
-
-        response = asyncio.run(model.ainvoke([HumanMessage(content="Say hi.")]))
-
-        assert response.content == "ruyi codex ok"
-        assert _DisconnectOnceCodexSSEHandler.request_count == 2
-    finally:
-        server.shutdown()
-        thread.join(timeout=2)
-
-
-def test_codex_async_stream_retries_after_metadata_but_before_effect() -> None:
-    _MetadataThenDisconnectCodexSSEHandler.request_count = 0
-    server = ThreadingHTTPServer(
-        ("127.0.0.1", 0), _MetadataThenDisconnectCodexSSEHandler
+    server = run_http_server(_DisconnectOnceCodexSSEHandler)
+    model = CodexChatModel(
+        model="gpt-5.4",
+        api_key="codex-token",
+        base_url=f"http://127.0.0.1:{server.server_port}",
+        default_headers={},
+        codex_session_id="session-retry",
+        max_retries=1,
     )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        model = CodexChatModel(
-            model="gpt-5.4",
-            api_key="codex-token",
-            base_url=f"http://127.0.0.1:{server.server_port}",
-            default_headers={},
-            codex_session_id="session-metadata-retry",
-            max_retries=1,
-        )
 
-        response = asyncio.run(model.ainvoke([HumanMessage(content="Say hi.")]))
+    response = asyncio.run(model.ainvoke([HumanMessage(content="Say hi.")]))
 
-        assert response.content == "ruyi codex ok"
-        assert _MetadataThenDisconnectCodexSSEHandler.request_count == 2
-    finally:
-        server.shutdown()
-        thread.join(timeout=2)
+    assert response.content == "ruyi codex ok"
+    assert _DisconnectOnceCodexSSEHandler.request_count == 2
+
+
+def test_codex_async_stream_retries_after_metadata_but_before_effect(
+    run_http_server,
+) -> None:
+    _MetadataThenDisconnectCodexSSEHandler.request_count = 0
+    server = run_http_server(_MetadataThenDisconnectCodexSSEHandler)
+    model = CodexChatModel(
+        model="gpt-5.4",
+        api_key="codex-token",
+        base_url=f"http://127.0.0.1:{server.server_port}",
+        default_headers={},
+        codex_session_id="session-metadata-retry",
+        max_retries=1,
+    )
+
+    response = asyncio.run(model.ainvoke([HumanMessage(content="Say hi.")]))
+
+    assert response.content == "ruyi codex ok"
+    assert _MetadataThenDisconnectCodexSSEHandler.request_count == 2
 
 
 class _CodexToolCallSSEHandler(BaseHTTPRequestHandler):
@@ -292,33 +277,29 @@ class _CodexToolCallSSEHandler(BaseHTTPRequestHandler):
         return
 
 
-def test_codex_chat_model_streams_tool_call_chunks_without_text() -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _CodexToolCallSSEHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        model = CodexChatModel(
-            model="gpt-5.4",
-            api_key="codex-token",
-            base_url=f"http://127.0.0.1:{server.server_port}",
-            default_headers={},
-            codex_session_id="session-1",
-        )
+def test_codex_chat_model_streams_tool_call_chunks_without_text(
+    run_http_server,
+) -> None:
+    server = run_http_server(_CodexToolCallSSEHandler)
+    model = CodexChatModel(
+        model="gpt-5.4",
+        api_key="codex-token",
+        base_url=f"http://127.0.0.1:{server.server_port}",
+        default_headers={},
+        codex_session_id="session-1",
+    )
 
-        response = model.invoke([HumanMessage(content="Search the web.")])
+    response = model.invoke([HumanMessage(content="Search the web.")])
 
-        assert response.content == ""
-        assert response.tool_calls == [
-            {
-                "name": "search_web",
-                "args": {"query": "Hacker News top 10"},
-                "id": "call_test",
-                "type": "tool_call",
-            }
-        ]
-    finally:
-        server.shutdown()
-        thread.join(timeout=2)
+    assert response.content == ""
+    assert response.tool_calls == [
+        {
+            "name": "search_web",
+            "args": {"query": "Hacker News top 10"},
+            "id": "call_test",
+            "type": "tool_call",
+        }
+    ]
 
 
 def test_resolve_codex_credentials_reads_ruyi_auth_json(tmp_path) -> None:

@@ -42,6 +42,14 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.coverage.run]
+source = ["ruyi_agent"]
+
+[tool.coverage.report]
+fail_under = 78
+show_missing = true
+skip_covered = true
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

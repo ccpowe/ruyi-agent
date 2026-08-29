@@ -3,8 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import sys
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from types import SimpleNamespace
 
 from scripts import probe_openai_codex
@@ -133,31 +132,27 @@ class _CodexSSEHandler(BaseHTTPRequestHandler):
         return
 
 
-def test_probe_live_response_consumes_codex_sse_with_null_completed_output() -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _CodexSSEHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        args = SimpleNamespace(
-            base_url=f"http://127.0.0.1:{server.server_port}",
-            timeout=20.0,
-            instructions="Answer directly.",
-            prompt="Say hi.",
-            client_request_id="",
-            session_id="session-1",
-        )
+def test_probe_live_response_consumes_codex_sse_with_null_completed_output(
+    run_http_server,
+) -> None:
+    server = run_http_server(_CodexSSEHandler)
+    args = SimpleNamespace(
+        base_url=f"http://127.0.0.1:{server.server_port}",
+        timeout=20.0,
+        instructions="Answer directly.",
+        prompt="Say hi.",
+        client_request_id="",
+        session_id="session-1",
+    )
 
-        result = probe_openai_codex.create_response(
-            args,
-            "access-token",
-            "gpt-5.4",
-            "acct-123",
-        )
+    result = probe_openai_codex.create_response(
+        args,
+        "access-token",
+        "gpt-5.4",
+        "acct-123",
+    )
 
-        assert result["output_text"] == "ruyi codex ok"
-    finally:
-        server.shutdown()
-        thread.join(timeout=2)
+    assert result["output_text"] == "ruyi codex ok"
 
 
 def test_save_ruyi_auth_json_preserves_metadata_and_syncs_pool(tmp_path) -> None:

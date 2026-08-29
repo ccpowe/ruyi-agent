@@ -27,8 +27,15 @@ jobs:
       - name: Install dependencies
         run: uv sync --dev
 
+      - name: Compile Python sources
+        run: uv run python -m compileall -q src scripts tests
+
       - name: Run test suite
-        run: uv run pytest
+        run: >
+          uv run pytest
+          --cov=ruyi_agent
+          -W error::ResourceWarning
+          -W error::pytest.PytestUnraisableExceptionWarning
 
   install-smoke:
     name: uv tool install and init (${{ matrix.os }})
