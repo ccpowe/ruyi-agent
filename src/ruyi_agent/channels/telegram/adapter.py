@@ -18,7 +18,9 @@ import httpx
 from ruyi_agent.channels.gateway_client import (
     GatewayHTTPClient,
     GatewayTaskClient,
+    gateway_task_from_payload,
 )
+from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTask
 from ruyi_agent.channels.turn import (
     AgentCommandTurn,
     ChannelTurnHandler,
@@ -242,7 +244,9 @@ def _format_telegram_markdown_v2(text: str) -> str:
     return _restore_placeholders(text, placeholders)
 
 
-def _split_telegram_message(text: str, limit: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> list[str]:
+def _split_telegram_message(
+    text: str, limit: int = TELEGRAM_MAX_MESSAGE_LENGTH
+) -> list[str]:
     if _utf16_len(text) <= limit:
         return [text]
 
@@ -358,7 +362,11 @@ class TelegramFallbackResolver:
         ordered: list[str] = []
         if self._sticky_ip:
             ordered.append(self._sticky_ip)
-        for ip in [*self._configured_ips, *self._discovered_ips, *TELEGRAM_FALLBACK_SEED_IPS]:
+        for ip in [
+            *self._configured_ips,
+            *self._discovered_ips,
+            *TELEGRAM_FALLBACK_SEED_IPS,
+        ]:
             if ip not in ordered:
                 ordered.append(ip)
         return ordered
@@ -390,7 +398,11 @@ class TelegramFallbackResolver:
                     if not isinstance(answer, dict):
                         continue
                     value = answer.get("data")
-                    if isinstance(value, str) and _is_ipv4(value) and value not in discovered:
+                    if (
+                        isinstance(value, str)
+                        and _is_ipv4(value)
+                        and value not in discovered
+                    ):
                         discovered.append(value)
         return discovered
 
@@ -427,7 +439,9 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         try:
             return await self._base_transport.handle_async_request(primary_request)
         except Exception as exc:
-            if request.url.host != TELEGRAM_API_HOST or not _looks_like_network_error(exc):
+            if request.url.host != TELEGRAM_API_HOST or not _looks_like_network_error(
+                exc
+            ):
                 raise
 
         fallback_ips = await self._resolver.get_fallback_ips()
@@ -435,7 +449,9 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         for ip in fallback_ips:
             fallback_request = self._build_fallback_request(request, ip, body)
             try:
-                response = await self._base_transport.handle_async_request(fallback_request)
+                response = await self._base_transport.handle_async_request(
+                    fallback_request
+                )
             except Exception as exc:
                 last_exc = exc
                 self._resolver.mark_failure(ip)
@@ -766,23 +782,10 @@ def _gateway_attachment_kind(kind: str) -> str:
 
 
 def _current_run_artifacts(
-    task: dict[str, Any],
+    task: GatewayTask,
     run_count: int,
-) -> list[dict[str, Any]]:
-    raw_artifacts = task.get("artifacts")
-    if not isinstance(raw_artifacts, list):
-        return []
-    artifacts: list[dict[str, Any]] = []
-    for item in raw_artifacts:
-        if not isinstance(item, dict):
-            continue
-        artifact_id = item.get("artifact_id")
-        if not isinstance(artifact_id, str) or not artifact_id:
-            continue
-        if item.get("run_count") != run_count:
-            continue
-        artifacts.append(item)
-    return artifacts
+) -> list[GatewayPublishedArtifact]:
+    return [item for item in task.artifacts if item.run_count == run_count]
 
 
 class TelegramBotAPIClient:
@@ -843,9 +846,14 @@ class TelegramBotAPIClient:
                 if isinstance(reply_to_message, dict)
                 else None
             )
-            if not all(isinstance(value, int) for value in [chat_id, user_id, message_id, update_id]):
+            if not all(
+                isinstance(value, int)
+                for value in [chat_id, user_id, message_id, update_id]
+            ):
                 continue
-            attachments, attachment_warnings = await self._extract_inbound_attachments(message)
+            attachments, attachment_warnings = await self._extract_inbound_attachments(
+                message
+            )
             if not text and not attachments:
                 continue
             messages.append(
@@ -857,10 +865,14 @@ class TelegramBotAPIClient:
                     message_id=message_id,
                     chat_type=chat_type if isinstance(chat_type, str) else "private",
                     message_thread_id=(
-                        message_thread_id if isinstance(message_thread_id, int) else None
+                        message_thread_id
+                        if isinstance(message_thread_id, int)
+                        else None
                     ),
                     reply_to_message_id=(
-                        reply_to_message_id if isinstance(reply_to_message_id, int) else None
+                        reply_to_message_id
+                        if isinstance(reply_to_message_id, int)
+                        else None
                     ),
                     attachments=attachments,
                     attachment_warnings=attachment_warnings,
@@ -871,7 +883,9 @@ class TelegramBotAPIClient:
     async def _extract_inbound_attachments(
         self,
         message: dict[str, Any],
-    ) -> tuple[list[TelegramInboundAttachment], list[TelegramAttachmentDownloadWarning]]:
+    ) -> tuple[
+        list[TelegramInboundAttachment], list[TelegramAttachmentDownloadWarning]
+    ]:
         specs: list[tuple[str, dict[str, Any], str | None, str | None]] = []
         document = message.get("document")
         if isinstance(document, dict):
@@ -963,7 +977,11 @@ class TelegramBotAPIClient:
             try:
                 response = await client.get(url)
             except httpx.HTTPError as exc:
-                error_cls = TelegramNetworkError if _looks_like_network_error(exc) else TelegramAPIError
+                error_cls = (
+                    TelegramNetworkError
+                    if _looks_like_network_error(exc)
+                    else TelegramAPIError
+                )
                 raise error_cls(
                     f"Telegram file download failed: file_id={file_id} error={exc}"
                 ) from exc
@@ -1042,7 +1060,11 @@ class TelegramBotAPIClient:
             try:
                 response = await client.post(f"/{method}", json=json)
             except httpx.HTTPError as exc:
-                error_cls = TelegramNetworkError if _looks_like_network_error(exc) else TelegramAPIError
+                error_cls = (
+                    TelegramNetworkError
+                    if _looks_like_network_error(exc)
+                    else TelegramAPIError
+                )
                 raise error_cls(
                     f"Telegram API request failed: method={method} error={exc}"
                 ) from exc
@@ -1050,8 +1072,16 @@ class TelegramBotAPIClient:
             payload = response.json()
         except ValueError as exc:
             raise TelegramAPIError("Telegram API returned invalid JSON") from exc
-        if not response.is_success or not isinstance(payload, dict) or not payload.get("ok"):
-            description = payload.get("description") if isinstance(payload, dict) else response.text
+        if (
+            not response.is_success
+            or not isinstance(payload, dict)
+            or not payload.get("ok")
+        ):
+            description = (
+                payload.get("description")
+                if isinstance(payload, dict)
+                else response.text
+            )
             raise TelegramAPIError(
                 f"Telegram API call failed: method={method} error={description}"
             )
@@ -1088,7 +1118,11 @@ class TelegramBotAPIClient:
             try:
                 response = await client.post(f"/{method}", data=data, files=files)
             except httpx.HTTPError as exc:
-                error_cls = TelegramNetworkError if _looks_like_network_error(exc) else TelegramAPIError
+                error_cls = (
+                    TelegramNetworkError
+                    if _looks_like_network_error(exc)
+                    else TelegramAPIError
+                )
                 raise error_cls(
                     f"Telegram API request failed: method={method} error={exc}"
                 ) from exc
@@ -1096,8 +1130,16 @@ class TelegramBotAPIClient:
             payload = response.json()
         except ValueError as exc:
             raise TelegramAPIError("Telegram API returned invalid JSON") from exc
-        if not response.is_success or not isinstance(payload, dict) or not payload.get("ok"):
-            description = payload.get("description") if isinstance(payload, dict) else response.text
+        if (
+            not response.is_success
+            or not isinstance(payload, dict)
+            or not payload.get("ok")
+        ):
+            description = (
+                payload.get("description")
+                if isinstance(payload, dict)
+                else response.text
+            )
             raise TelegramAPIError(
                 f"Telegram API call failed: method={method} error={description}"
             )
@@ -1205,7 +1247,9 @@ class TelegramAdapter:
                     )
                 except Exception:
                     fallback = (
-                        _strip_mdv2(chunk_text) if parse_mode == "MarkdownV2" else chunk_text
+                        _strip_mdv2(chunk_text)
+                        if parse_mode == "MarkdownV2"
+                        else chunk_text
                     )
                     await self._telegram_client.send_message(
                         chat_id=chat_id,
@@ -1308,13 +1352,13 @@ class TelegramAdapter:
         self,
         *,
         chat_id: int,
-        task: dict[str, Any],
+        task: GatewayTask,
     ) -> None:
-        task_id = str(task["task_id"])
-        run_count = self._task_run_count(task)
+        task_id = task.task_id
+        run_count = task.run_count
         for artifact in _current_run_artifacts(task, run_count):
-            artifact_id = str(artifact["artifact_id"])
-            filename = str(artifact.get("name") or artifact_id)
+            artifact_id = artifact.artifact_id
+            filename = artifact.name or artifact_id
             try:
                 downloaded = await self._gateway_client.download_task_artifact(
                     task_id=task_id,
@@ -1327,10 +1371,10 @@ class TelegramAdapter:
                     error=exc,
                 )
                 continue
-            caption = artifact.get("caption")
+            caption = artifact.caption
             attachment = self._attachment_from_gateway_artifact(
                 downloaded,
-                caption=caption if isinstance(caption, str) and caption else filename,
+                caption=caption or filename,
             )
             await self._send_attachment(chat_id=chat_id, attachment=attachment)
 
@@ -1560,12 +1604,12 @@ class TelegramAdapter:
             )
             return
 
-        async def before_continue(task: dict[str, Any]) -> None:
-            if task.get("status") not in TERMINAL_TASK_STATES:
+        async def before_continue(task: GatewayTask) -> None:
+            if task.status not in TERMINAL_TASK_STATES:
                 return
-            run_count = self._task_run_count(task)
+            run_count = task.run_count
             if self._has_active_watcher(
-                task_id=str(task["task_id"]),
+                task_id=task.task_id,
                 run_count=run_count,
             ):
                 await self._send_terminal_if_needed(
@@ -1602,27 +1646,24 @@ class TelegramAdapter:
             )
             return
         if outcome.kind == "active":
-            task_id = str(outcome.task["task_id"])
+            task_id = outcome.task.task_id
             self._ensure_watcher(
                 task_id=task_id,
                 chat_id=message.chat_id,
-                run_count=self._task_run_count(outcome.task),
+                run_count=outcome.task.run_count,
             )
             await self._send_message(
                 chat_id=message.chat_id,
-                text=(
-                    "当前任务仍在处理中，请稍后再试。"
-                    f"task_id={task_id}"
-                ),
+                text=(f"当前任务仍在处理中，请稍后再试。task_id={task_id}"),
                 reply_to_message_id=message.message_id,
             )
             return
         task = outcome.task
-        task_id = str(task["task_id"])
+        task_id = task.task_id
         self._ensure_watcher(
             task_id=task_id,
             chat_id=message.chat_id,
-            run_count=self._task_run_count(task),
+            run_count=task.run_count,
         )
         await self._send_message(
             chat_id=message.chat_id,
@@ -1667,21 +1708,21 @@ class TelegramAdapter:
                     if message.message_thread_id is not None
                     else None
                 ),
-                session_key_for_agent=lambda agent_name: (
-                    build_telegram_session_key(message, agent_name=agent_name)
+                session_key_for_agent=lambda agent_name: build_telegram_session_key(
+                    message, agent_name=agent_name
                 ),
-                metadata_for_session=lambda session_key: (
-                    self._build_message_metadata(message, session_key=session_key)
+                metadata_for_session=lambda session_key: self._build_message_metadata(
+                    message, session_key=session_key
                 ),
                 idempotency_key=f"telegram:update:{message.update_id}",
             )
         )
         if result.kind == "started" and result.task is not None:
-            task_id = str(result.task["task_id"])
+            task_id = result.task.task_id
             self._ensure_watcher(
                 task_id=task_id,
                 chat_id=message.chat_id,
-                run_count=self._task_run_count(result.task),
+                run_count=result.task.run_count,
             )
         await self._send_message(
             chat_id=message.chat_id,
@@ -1715,8 +1756,8 @@ class TelegramAdapter:
                     task,
                     message,
                 ),
-                session_key_for_agent=lambda agent_name: (
-                    build_telegram_session_key(message, agent_name=agent_name)
+                session_key_for_agent=lambda agent_name: build_telegram_session_key(
+                    message, agent_name=agent_name
                 ),
             )
         )
@@ -1775,12 +1816,10 @@ class TelegramAdapter:
 
     def _task_belongs_to_message(
         self,
-        task: dict[str, Any],
+        task: GatewayTask,
         message: TelegramMessage,
     ) -> bool:
-        metadata = task.get("metadata")
-        if not isinstance(metadata, dict):
-            return False
+        metadata = task.metadata
         if metadata.get("channel") != "telegram":
             return False
         if str(metadata.get("chat_id")) != str(message.chat_id):
@@ -1845,11 +1884,11 @@ class TelegramAdapter:
             )
             return
         task = result.task
-        task_id = str(task["task_id"])
+        task_id = task.task_id
         self._ensure_watcher(
             task_id=task_id,
             chat_id=message.chat_id,
-            run_count=self._task_run_count(task),
+            run_count=task.run_count,
         )
         await self._send_message(
             chat_id=message.chat_id,
@@ -1857,29 +1896,21 @@ class TelegramAdapter:
             reply_to_message_id=message.message_id,
         )
 
-    def _format_review_message(self, task: dict[str, Any]) -> str:
-        task_id = task.get("task_id")
-        pending_review = task.get("pending_review")
-        if not isinstance(pending_review, dict):
+    def _format_review_message(self, task: GatewayTask) -> str:
+        task_id = task.task_id
+        pending_review = task.pending_review
+        if pending_review is None:
             return f"任务等待审批，但缺少审批详情。\n\ntask_id={task_id}"
-        review_id = pending_review.get("review_id")
-        actions = pending_review.get("action_requests")
-        configs = pending_review.get("review_configs")
+        review_id = pending_review.review_id
+        actions = pending_review.action_requests
+        configs = pending_review.review_configs
         action_lines: list[str] = []
-        if isinstance(actions, list):
-            config_list = configs if isinstance(configs, list) else []
-            for index, action in enumerate(actions, start=1):
-                if not isinstance(action, dict):
-                    continue
-                config = (
-                    config_list[index - 1]
-                    if index - 1 < len(config_list)
-                    and isinstance(config_list[index - 1], dict)
-                    else {}
-                )
-                tool_name = action.get("name") or config.get("action_name") or "tool"
-                args = action.get("args")
-                action_lines.append(f"{index}. {tool_name} args={args}")
+        config_list = configs
+        for index, action in enumerate(actions, start=1):
+            config = config_list[index - 1] if index - 1 < len(config_list) else {}
+            tool_name = action.get("name") or config.get("action_name") or "tool"
+            args = action.get("args")
+            action_lines.append(f"{index}. {tool_name} args={args}")
         actions_text = "\n".join(action_lines) if action_lines else "(no actions)"
         return (
             "任务等待人工审批。\n"
@@ -1892,15 +1923,6 @@ class TelegramAdapter:
             f"指定拒绝：/reject {review_id} 原因"
         )
 
-    def _task_run_count(self, task: dict[str, Any]) -> int:
-        value = task.get("run_count")
-        if isinstance(value, int):
-            return value
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
-
     def _has_active_watcher(self, *, task_id: str, run_count: int) -> bool:
         return self._task_watch.is_active(task_id=task_id, run_count=run_count)
 
@@ -1908,10 +1930,11 @@ class TelegramAdapter:
         self,
         *,
         chat_id: int,
-        task: dict[str, Any],
+        task: GatewayTask | dict[str, Any],
     ) -> None:
-        task_id = str(task["task_id"])
-        run_count = self._task_run_count(task)
+        task = gateway_task_from_payload(task)
+        task_id = task.task_id
+        run_count = task.run_count
         delivered_run_count = self._delivered_terminal_runs.get(task_id, 0)
         if run_count <= delivered_run_count:
             return
@@ -1922,14 +1945,14 @@ class TelegramAdapter:
         await self._send_task_artifacts(chat_id=chat_id, task=task)
         self._delivered_terminal_runs[task_id] = run_count
 
-    def _format_terminal_message(self, task: dict[str, Any]) -> str:
-        status = task["status"]
-        task_id = task["task_id"]
+    def _format_terminal_message(self, task: GatewayTask) -> str:
+        status = task.status
+        task_id = task.task_id
         if status == "completed":
-            result = task.get("last_result") or "(empty result)"
+            result = task.last_result or "(empty result)"
             return f"{result}\n\ntask_id={task_id}"
         if status == "failed":
-            error = task.get("error") or "unknown error"
+            error = task.error or "unknown error"
             return f"任务失败：{error}\n\ntask_id={task_id}"
         if status == "cancelled":
             return f"任务已取消。\n\ntask_id={task_id}"
@@ -1964,7 +1987,9 @@ async def run_telegram_adapter() -> None:
             ),
             telegram_client=TelegramBotAPIClient(
                 bot_token=bot_token,
-                timeout=float(os.getenv("TELEGRAM_API_TIMEOUT", str(poll_timeout + 10))),
+                timeout=float(
+                    os.getenv("TELEGRAM_API_TIMEOUT", str(poll_timeout + 10))
+                ),
                 default_parse_mode=os.getenv(
                     "TELEGRAM_MESSAGE_PARSE_MODE",
                     "MarkdownV2",

@@ -17,7 +17,9 @@ from ruyi_agent.channels.gateway_client import (
     GatewayArtifact,
     GatewayHTTPClient,
     GatewayTaskClient,
+    gateway_task_from_payload,
 )
+from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTask
 from ruyi_agent.channels.turn import (
     AgentCommandTurn,
     ChannelTurnHandler,
@@ -39,6 +41,7 @@ DEFAULT_FEISHU_MEDIA_MAX_BYTES = 30 * 1024 * 1024
 DEFAULT_GATEWAY_BEARER_TOKEN = "dev-token"
 DEFAULT_CHANNEL_SESSION_DB = "data/channel_sessions.sqlite3"
 FEISHU_ACK_MODES = {"reaction", "message", "off"}
+
 
 @dataclass(slots=True)
 class FeishuMention:
@@ -219,23 +222,10 @@ def _build_feishu_markdown_card(markdown: str) -> dict[str, Any]:
 
 
 def _current_run_artifacts(
-    task: dict[str, Any],
+    task: GatewayTask,
     run_count: int,
-) -> list[dict[str, Any]]:
-    raw_artifacts = task.get("artifacts")
-    if not isinstance(raw_artifacts, list):
-        return []
-    artifacts: list[dict[str, Any]] = []
-    for item in raw_artifacts:
-        if not isinstance(item, dict):
-            continue
-        artifact_id = item.get("artifact_id")
-        if not isinstance(artifact_id, str) or not artifact_id:
-            continue
-        if item.get("run_count") != run_count:
-            continue
-        artifacts.append(item)
-    return artifacts
+) -> list[GatewayPublishedArtifact]:
+    return [item for item in task.artifacts if item.run_count == run_count]
 
 
 class FeishuEventStore:
@@ -447,7 +437,9 @@ class FeishuSDKClient:
         emoji_type: str,
     ) -> str | None:
         lark = _import_lark_oapi()
-        create_request_cls, create_body_cls, _, emoji_cls = _import_lark_reaction_types()
+        create_request_cls, create_body_cls, _, emoji_cls = (
+            _import_lark_reaction_types()
+        )
         client = self._get_client(lark)
         request = (
             create_request_cls.builder()
@@ -599,7 +591,9 @@ class FeishuSDKClient:
     def _get_client(self, lark: Any) -> Any:
         if self._client is not None:
             return self._client
-        builder = lark.Client.builder().app_id(self._app_id).app_secret(self._app_secret)
+        builder = (
+            lark.Client.builder().app_id(self._app_id).app_secret(self._app_secret)
+        )
         domain = _resolve_lark_domain(lark, self._domain)
         if domain is not None and hasattr(builder, "domain"):
             builder = builder.domain(domain)
@@ -628,7 +622,9 @@ def _import_lark_message_types() -> tuple[Any, Any, Any, Any]:
             ReplyMessageRequestBody,
         )
     except ImportError as exc:
-        raise FeishuAPIError("Installed lark-oapi does not expose im.v1 message API") from exc
+        raise FeishuAPIError(
+            "Installed lark-oapi does not expose im.v1 message API"
+        ) from exc
     return (
         CreateMessageRequest,
         CreateMessageRequestBody,
@@ -641,7 +637,9 @@ def _import_lark_file_types() -> tuple[Any, Any]:
     try:
         from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
     except ImportError as exc:
-        raise FeishuAPIError("Installed lark-oapi does not expose im.v1 file API") from exc
+        raise FeishuAPIError(
+            "Installed lark-oapi does not expose im.v1 file API"
+        ) from exc
     return CreateFileRequest, CreateFileRequestBody
 
 
@@ -672,8 +670,12 @@ def _resolve_lark_domain(lark: Any, domain: str) -> Any | None:
             return "https://open.larksuite.com"
         return "https://open.feishu.cn"
     if domain.lower() == "lark":
-        return getattr(domain_class, "Lark", None) or getattr(domain_class, "LARK", None)
-    return getattr(domain_class, "Feishu", None) or getattr(domain_class, "FEISHU", None)
+        return getattr(domain_class, "Lark", None) or getattr(
+            domain_class, "LARK", None
+        )
+    return getattr(domain_class, "Feishu", None) or getattr(
+        domain_class, "FEISHU", None
+    )
 
 
 def _sdk_object_to_dict(value: Any) -> dict[str, Any]:
@@ -730,7 +732,8 @@ def parse_feishu_message_event(payload: dict[str, Any]) -> FeishuMessage | None:
     text = _extract_feishu_text(msg_type, message.get("content")).strip()
     mentions = _parse_mentions(message.get("mentions"))
     return FeishuMessage(
-        event_id=_string_value(header.get("event_id")) or _string_value(payload.get("event_id")),
+        event_id=_string_value(header.get("event_id"))
+        or _string_value(payload.get("event_id")),
         message_id=message_id,
         chat_id=chat_id,
         chat_type=_string_value(message.get("chat_type")) or "p2p",
@@ -946,7 +949,9 @@ class FeishuAdapter:
                 return
 
         try:
-            session_key = build_feishu_session_key(message, agent_name=active_agent_name)
+            session_key = build_feishu_session_key(
+                message, agent_name=active_agent_name
+            )
         except UnsupportedFeishuChatTypeError:
             await self._send_message(
                 chat_id=message.chat_id,
@@ -965,12 +970,12 @@ class FeishuAdapter:
             )
             return
 
-        async def before_continue(task: dict[str, Any]) -> None:
-            if task.get("status") not in TERMINAL_TASK_STATES:
+        async def before_continue(task: GatewayTask) -> None:
+            if task.status not in TERMINAL_TASK_STATES:
                 return
-            run_count = self._task_run_count(task)
+            run_count = task.run_count
             if self._has_active_watcher(
-                task_id=str(task["task_id"]),
+                task_id=task.task_id,
                 run_count=run_count,
             ):
                 await self._send_terminal_if_needed(
@@ -1004,8 +1009,8 @@ class FeishuAdapter:
             )
             return
         if outcome.kind == "active":
-            task_id = str(outcome.task["task_id"])
-            run_count = self._task_run_count(outcome.task)
+            task_id = outcome.task.task_id
+            run_count = outcome.task.run_count
             await self._ack_running_task(
                 message=message,
                 task=outcome.task,
@@ -1017,17 +1022,17 @@ class FeishuAdapter:
             )
             return
         task = outcome.task
-        task_id = str(task["task_id"])
+        task_id = task.task_id
         await self._ack_task_accepted(
             task_id=task_id,
-            run_count=self._task_run_count(task),
+            run_count=task.run_count,
             message=message,
             fallback_text=f"已收到，task_id={task_id}",
         )
         self._ensure_watcher(
             task_id=task_id,
             chat_id=message.chat_id,
-            run_count=self._task_run_count(task),
+            run_count=task.run_count,
         )
 
     def _is_allowed_message(self, message: FeishuMessage) -> bool:
@@ -1042,7 +1047,10 @@ class FeishuAdapter:
             return True
         if self._group_policy == "disabled":
             return False
-        if self._group_policy == "allowlist" and message.chat_id not in self._allowed_groups:
+        if (
+            self._group_policy == "allowlist"
+            and message.chat_id not in self._allowed_groups
+        ):
             return False
         if self._require_mention and not self._mentions_self(message):
             return False
@@ -1120,9 +1128,9 @@ class FeishuAdapter:
         self,
         *,
         message: FeishuMessage,
-        task: dict[str, Any],
+        task: GatewayTask,
     ) -> None:
-        task_id = str(task["task_id"])
+        task_id = task.task_id
         if self._ack_mode == "message":
             await self._send_message(
                 chat_id=message.chat_id,
@@ -1133,7 +1141,7 @@ class FeishuAdapter:
         if self._ack_mode == "reaction":
             await self._add_task_processing_reaction(
                 task_id=task_id,
-                run_count=self._task_run_count(task),
+                run_count=task.run_count,
                 message_id=message.message_id,
             )
 
@@ -1287,11 +1295,15 @@ class FeishuAdapter:
             text=f"文件发送失败：{filename}\n{error}",
         )
 
-    async def _extract_attachments(self, text: str) -> tuple[str, list[FeishuAttachment]]:
+    async def _extract_attachments(
+        self, text: str
+    ) -> tuple[str, list[FeishuAttachment]]:
         stripped = re.sub(r"\n{3,}", "\n\n", text).strip()
         return stripped, []
 
-    def _attachment_from_gateway_artifact(self, artifact: GatewayArtifact) -> FeishuAttachment:
+    def _attachment_from_gateway_artifact(
+        self, artifact: GatewayArtifact
+    ) -> FeishuAttachment:
         return FeishuAttachment(
             filename=artifact.filename or "artifact",
             content=artifact.content,
@@ -1301,13 +1313,13 @@ class FeishuAdapter:
         self,
         *,
         chat_id: str,
-        task: dict[str, Any],
+        task: GatewayTask,
     ) -> None:
-        task_id = str(task["task_id"])
-        run_count = self._task_run_count(task)
+        task_id = task.task_id
+        run_count = task.run_count
         for artifact in _current_run_artifacts(task, run_count):
-            artifact_id = str(artifact["artifact_id"])
-            filename = str(artifact.get("name") or artifact_id)
+            artifact_id = artifact.artifact_id
+            filename = artifact.name or artifact_id
             try:
                 downloaded = await self._gateway_client.download_task_artifact(
                     task_id=task_id,
@@ -1372,11 +1384,11 @@ class FeishuAdapter:
                 chat_id=message.chat_id,
                 user_id=message.user_id,
                 thread_id=message.thread_id,
-                session_key_for_agent=lambda agent_name: (
-                    build_feishu_session_key(message, agent_name=agent_name)
+                session_key_for_agent=lambda agent_name: build_feishu_session_key(
+                    message, agent_name=agent_name
                 ),
-                metadata_for_session=lambda session_key: (
-                    self._build_message_metadata(message, session_key=session_key)
+                metadata_for_session=lambda session_key: self._build_message_metadata(
+                    message, session_key=session_key
                 ),
                 idempotency_key=(
                     f"feishu:event:{message.event_id or message.message_id}"
@@ -1391,17 +1403,17 @@ class FeishuAdapter:
             )
             return
         task = result.task
-        task_id = str(task["task_id"])
+        task_id = task.task_id
         await self._ack_task_accepted(
             task_id=task_id,
-            run_count=self._task_run_count(task),
+            run_count=task.run_count,
             message=message,
             fallback_text=result.message,
         )
         self._ensure_watcher(
             task_id=task_id,
             chat_id=message.chat_id,
-            run_count=self._task_run_count(task),
+            run_count=task.run_count,
         )
 
     async def _handle_resume_command(
@@ -1426,8 +1438,8 @@ class FeishuAdapter:
                     task,
                     message,
                 ),
-                session_key_for_agent=lambda agent_name: (
-                    build_feishu_session_key(message, agent_name=agent_name)
+                session_key_for_agent=lambda agent_name: build_feishu_session_key(
+                    message, agent_name=agent_name
                 ),
             )
         )
@@ -1462,12 +1474,10 @@ class FeishuAdapter:
 
     def _task_belongs_to_message(
         self,
-        task: dict[str, Any],
+        task: GatewayTask,
         message: FeishuMessage,
     ) -> bool:
-        metadata = task.get("metadata")
-        if not isinstance(metadata, dict):
-            return False
+        metadata = task.metadata
         if metadata.get("channel") != "feishu":
             return False
         if str(metadata.get("chat_id")) != message.chat_id:
@@ -1481,14 +1491,14 @@ class FeishuAdapter:
     def _ensure_watcher(self, *, task_id: str, chat_id: str, run_count: int) -> None:
         key = (task_id, run_count)
 
-        async def on_pending_review(task: dict[str, Any]) -> None:
+        async def on_pending_review(task: GatewayTask) -> None:
             await self._clear_task_reactions(key)
             await self._send_message(
                 chat_id=chat_id,
                 text=self._format_review_message(task),
             )
 
-        async def on_superseded(_: dict[str, Any]) -> None:
+        async def on_superseded(_: GatewayTask) -> None:
             await self._clear_task_reactions(key)
 
         async def on_error(_: Exception) -> None:
@@ -1540,7 +1550,7 @@ class FeishuAdapter:
             )
             return
         task = result.task
-        task_id = str(task["task_id"])
+        task_id = task.task_id
         if self._ack_mode == "message":
             await self._send_message(
                 chat_id=message.chat_id,
@@ -1554,38 +1564,30 @@ class FeishuAdapter:
             )
             await self._add_task_processing_reaction(
                 task_id=task_id,
-                run_count=self._task_run_count(task),
+                run_count=task.run_count,
                 message_id=message.message_id,
             )
         self._ensure_watcher(
             task_id=task_id,
             chat_id=message.chat_id,
-            run_count=self._task_run_count(task),
+            run_count=task.run_count,
         )
 
-    def _format_review_message(self, task: dict[str, Any]) -> str:
-        task_id = task.get("task_id")
-        pending_review = task.get("pending_review")
-        if not isinstance(pending_review, dict):
+    def _format_review_message(self, task: GatewayTask) -> str:
+        task_id = task.task_id
+        pending_review = task.pending_review
+        if pending_review is None:
             return f"任务等待审批，但缺少审批详情。\n\ntask_id={task_id}"
-        review_id = pending_review.get("review_id")
-        actions = pending_review.get("action_requests")
-        configs = pending_review.get("review_configs")
+        review_id = pending_review.review_id
+        actions = pending_review.action_requests
+        configs = pending_review.review_configs
         action_lines: list[str] = []
-        if isinstance(actions, list):
-            config_list = configs if isinstance(configs, list) else []
-            for index, action in enumerate(actions, start=1):
-                if not isinstance(action, dict):
-                    continue
-                config = (
-                    config_list[index - 1]
-                    if index - 1 < len(config_list)
-                    and isinstance(config_list[index - 1], dict)
-                    else {}
-                )
-                tool_name = action.get("name") or config.get("action_name") or "tool"
-                args = action.get("args")
-                action_lines.append(f"{index}. {tool_name} args={args}")
+        config_list = configs
+        for index, action in enumerate(actions, start=1):
+            config = config_list[index - 1] if index - 1 < len(config_list) else {}
+            tool_name = action.get("name") or config.get("action_name") or "tool"
+            args = action.get("args")
+            action_lines.append(f"{index}. {tool_name} args={args}")
         actions_text = "\n".join(action_lines) if action_lines else "(no actions)"
         return (
             "任务等待人工审批。\n"
@@ -1598,15 +1600,6 @@ class FeishuAdapter:
             f"指定拒绝：/reject {review_id} 原因"
         )
 
-    def _task_run_count(self, task: dict[str, Any]) -> int:
-        value = task.get("run_count")
-        if isinstance(value, int):
-            return value
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
-
     def _has_active_watcher(self, *, task_id: str, run_count: int) -> bool:
         return self._task_watch.is_active(task_id=task_id, run_count=run_count)
 
@@ -1614,10 +1607,11 @@ class FeishuAdapter:
         self,
         *,
         chat_id: str,
-        task: dict[str, Any],
+        task: GatewayTask | dict[str, Any],
     ) -> None:
-        task_id = str(task["task_id"])
-        run_count = self._task_run_count(task)
+        task = gateway_task_from_payload(task)
+        task_id = task.task_id
+        run_count = task.run_count
         delivered_run_count = self._delivered_terminal_runs.get(task_id, 0)
         if run_count <= delivered_run_count:
             await self._clear_task_reactions((task_id, run_count))
@@ -1630,17 +1624,17 @@ class FeishuAdapter:
         self._delivered_terminal_runs[task_id] = run_count
         await self._complete_task_reactions(
             key=(task_id, run_count),
-            status=str(task["status"]),
+            status=task.status,
         )
 
-    def _format_terminal_message(self, task: dict[str, Any]) -> str:
-        status = task["status"]
-        task_id = task["task_id"]
+    def _format_terminal_message(self, task: GatewayTask) -> str:
+        status = task.status
+        task_id = task.task_id
         if status == "completed":
-            result = task.get("last_result") or "(empty result)"
+            result = task.last_result or "(empty result)"
             return f"{result}\n\ntask_id={task_id}"
         if status == "failed":
-            error = task.get("error") or "unknown error"
+            error = task.error or "unknown error"
             return f"任务失败：{error}\n\ntask_id={task_id}"
         if status == "cancelled":
             return f"任务已取消。\n\ntask_id={task_id}"
@@ -1665,7 +1659,9 @@ def build_feishu_session_key(
 ) -> str:
     if not _is_feishu_group_chat(message.chat_type):
         return f"agent:{agent_name}:feishu:dm:{message.chat_id}"
-    thread_part = f":thread:{message.thread_id}" if message.thread_id is not None else ""
+    thread_part = (
+        f":thread:{message.thread_id}" if message.thread_id is not None else ""
+    )
     return (
         f"agent:{agent_name}:feishu:group:"
         f"{message.chat_id}{thread_part}:user:{message.user_id}"
@@ -1675,7 +1671,9 @@ def build_feishu_session_key(
 def build_feishu_identity_key(message: FeishuMessage) -> str:
     if not _is_feishu_group_chat(message.chat_type):
         return f"feishu:dm:{message.chat_id}"
-    thread_part = f":thread:{message.thread_id}" if message.thread_id is not None else ""
+    thread_part = (
+        f":thread:{message.thread_id}" if message.thread_id is not None else ""
+    )
     return f"feishu:group:{message.chat_id}{thread_part}:user:{message.user_id}"
 
 

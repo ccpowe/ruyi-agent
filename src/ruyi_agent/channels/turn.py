@@ -8,14 +8,18 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from ruyi_agent.channels.gateway_client import GatewayClientError, GatewayTaskClient
+from ruyi_agent.channels.gateway_client import (
+    GatewayClientError,
+    GatewayTaskClient,
+    gateway_agent_from_payload,
+    gateway_task_from_payload,
+)
+from ruyi_agent.channels.gateway_dto import GatewayTask
 from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 
 
 ACTIVE_RUN_STATES = frozenset({"pending", "running"})
-SETTLED_RUN_STATES = frozenset(
-    {"completed", "failed", "cancelled", "interrupted"}
-)
+SETTLED_RUN_STATES = frozenset({"completed", "failed", "cancelled", "interrupted"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +45,7 @@ class ChannelTurnResult:
     """Outcome that a Channel Adapter renders using platform capabilities."""
 
     kind: Literal["pending_review", "active", "started"]
-    task: dict[str, Any]
+    task: GatewayTask
     created: bool = False
 
 
@@ -72,7 +76,7 @@ class ReviewTurnResult:
         "submitted",
     ]
     message: str
-    task: dict[str, Any] | None = None
+    task: GatewayTask | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +102,7 @@ class AgentCommandResult:
     kind: Literal["listed", "unknown_agent", "switched", "started"]
     message: str
     agent_name: str | None = None
-    task: dict[str, Any] | None = None
+    task: GatewayTask | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +118,7 @@ class ResumeCommandTurn:
     chat_id: str
     user_id: str
     thread_id: str | None
-    task_belongs_to_turn: Callable[[dict[str, Any]], bool]
+    task_belongs_to_turn: Callable[[GatewayTask], bool]
     session_key_for_agent: Callable[[str], str]
 
 
@@ -124,10 +128,10 @@ class ResumeCommandResult:
 
     kind: Literal["listed", "no_tasks", "not_found", "forbidden", "resumed"]
     message: str
-    task: dict[str, Any] | None = None
+    task: GatewayTask | None = None
 
 
-BeforeContinue = Callable[[dict[str, Any]], Awaitable[None]]
+BeforeContinue = Callable[[GatewayTask], Awaitable[None]]
 
 
 class ChannelTurnIdempotencyConflictError(ValueError):
@@ -156,9 +160,7 @@ class ChannelTurnHandler:
         turn_request_hash = None
         if turn.idempotency_key is not None:
             turn_request_hash = _inbound_turn_request_hash(turn)
-            receipt = await self._session_store.aget_turn_receipt(
-                turn.idempotency_key
-            )
+            receipt = await self._session_store.aget_turn_receipt(turn.idempotency_key)
             if receipt is not None:
                 if (
                     receipt.platform != turn.platform
@@ -171,7 +173,7 @@ class ChannelTurnHandler:
                     )
                 return ChannelTurnResult(
                     kind="started",
-                    task=dict(receipt.response),
+                    task=gateway_task_from_payload(receipt.response),
                     created=receipt.operation == "create",
                 )
 
@@ -181,12 +183,12 @@ class ChannelTurnHandler:
             if latest_task is None:
                 latest_task = await self._find_latest_task(turn)
                 if latest_task is not None:
-                    await self._bind_session(turn, str(latest_task["task_id"]))
+                    await self._bind_session(turn, latest_task.task_id)
 
-        if latest_task is not None and _task_has_pending_review(latest_task):
+        if latest_task is not None and latest_task.has_pending_review:
             return ChannelTurnResult(kind="pending_review", task=latest_task)
 
-        if latest_task is not None and latest_task.get("status") in ACTIVE_RUN_STATES:
+        if latest_task is not None and latest_task.status in ACTIVE_RUN_STATES:
             return ChannelTurnResult(kind="active", task=latest_task)
 
         if latest_task is None:
@@ -198,24 +200,28 @@ class ChannelTurnHandler:
             }
             if turn.idempotency_key is not None:
                 create_kwargs["idempotency_key"] = turn.idempotency_key
-            task = await self._gateway_client.create_task(**create_kwargs)
+            task = gateway_task_from_payload(
+                await self._gateway_client.create_task(**create_kwargs)
+            )
             created = True
         else:
             if before_continue is not None:
                 await before_continue(latest_task)
             send_kwargs: dict[str, Any] = {
-                "task_id": str(latest_task["task_id"]),
+                "task_id": latest_task.task_id,
                 "content": turn.content,
                 "attachments": turn.attachments,
             }
             if turn.idempotency_key is not None:
                 send_kwargs["idempotency_key"] = turn.idempotency_key
-            task = await self._gateway_client.send_input(**send_kwargs)
+            task = gateway_task_from_payload(
+                await self._gateway_client.send_input(**send_kwargs)
+            )
             created = False
 
         await self._bind_session(
             turn,
-            str(task["task_id"]),
+            task.task_id,
             operation="create" if created else "send",
             request_hash=turn_request_hash,
             response=task,
@@ -226,11 +232,14 @@ class ChannelTurnHandler:
         """Resolve one Review Command against the Channel Session's Task."""
         latest_task = await self._find_session_task(turn.session_key)
         if latest_task is None:
-            items = await self._gateway_client.list_tasks(
-                agent_name=turn.fallback_agent_name,
-                metadata=turn.fallback_metadata,
-                limit=1,
-            )
+            items = [
+                gateway_task_from_payload(item)
+                for item in await self._gateway_client.list_tasks(
+                    agent_name=turn.fallback_agent_name,
+                    metadata=turn.fallback_metadata,
+                    limit=1,
+                )
+            ]
             latest_task = items[0] if items else None
             if latest_task is not None:
                 await self._bind_review_session(turn, latest_task)
@@ -240,8 +249,8 @@ class ChannelTurnHandler:
                 kind="no_task",
                 message="没有可审批的任务。",
             )
-        pending_review = latest_task.get("pending_review")
-        if not isinstance(pending_review, dict):
+        pending_review = latest_task.pending_review
+        if pending_review is None:
             return ReviewTurnResult(
                 kind="no_pending_review",
                 message="当前任务没有待审批项。",
@@ -249,17 +258,8 @@ class ChannelTurnHandler:
             )
 
         requested_review_id = turn.command.get("review_id")
-        review_id = str(requested_review_id or pending_review.get("review_id") or "")
-        if not review_id:
-            return ReviewTurnResult(
-                kind="missing_review_id",
-                message="待审批任务缺少 review_id。",
-                task=latest_task,
-            )
-        if (
-            requested_review_id is not None
-            and pending_review.get("review_id") != review_id
-        ):
+        review_id = str(requested_review_id or pending_review.review_id)
+        if requested_review_id is not None and pending_review.review_id != review_id:
             return ReviewTurnResult(
                 kind="review_not_found",
                 message=f"没有找到待审批 review：{review_id}",
@@ -269,13 +269,15 @@ class ChannelTurnHandler:
         decision: dict[str, Any] = {"type": turn.command["type"]}
         if turn.command.get("type") == "reject" and turn.command.get("message"):
             decision["message"] = turn.command["message"]
-        task = await self._gateway_client.submit_review_decision(
-            task_id=str(latest_task["task_id"]),
-            review_id=review_id,
-            decisions=[decision],
+        task = gateway_task_from_payload(
+            await self._gateway_client.submit_review_decision(
+                task_id=latest_task.task_id,
+                review_id=review_id,
+                decisions=[decision],
+            )
         )
         await self._bind_review_session(turn, task)
-        task_id = str(task["task_id"])
+        task_id = task.task_id
         return ReviewTurnResult(
             kind="submitted",
             message=f"审批已提交，task_id={task_id}",
@@ -288,13 +290,12 @@ class ChannelTurnHandler:
     ) -> AgentCommandResult:
         """List public Agents or switch the Channel Session's Active Agent."""
         parts = turn.text.split(maxsplit=2)
-        agents = await self._gateway_client.list_agents()
-        public_agents = [
-            agent
-            for agent in agents
-            if agent.get("public") is True and agent.get("name")
+        agents = [
+            gateway_agent_from_payload(agent)
+            for agent in await self._gateway_client.list_agents()
         ]
-        public_agent_names = {str(agent["name"]) for agent in public_agents}
+        public_agents = [agent for agent in agents if agent.public is True]
+        public_agent_names = {agent.name for agent in public_agents}
         if len(parts) == 1:
             lines = [
                 f"当前 agent：`{turn.active_agent_name}`",
@@ -303,11 +304,11 @@ class ChannelTurnHandler:
             ]
             for agent in sorted(
                 public_agents,
-                key=lambda item: str(item.get("name", "")),
+                key=lambda item: item.name,
             ):
-                name = str(agent["name"])
+                name = agent.name
                 marker = " *" if name == turn.active_agent_name else ""
-                description = str(agent.get("description") or "")
+                description = agent.description
                 suffix = f" - {description}" if description else ""
                 lines.append(f"- `{name}`{marker}{suffix}")
             lines.extend(["", "切换：`/agent <agent_name>`"])
@@ -336,9 +337,7 @@ class ChannelTurnHandler:
             return AgentCommandResult(
                 kind="switched",
                 agent_name=requested_name,
-                message=(
-                    f"已切换到 agent={requested_name}。发送消息即可开始新会话。"
-                ),
+                message=(f"已切换到 agent={requested_name}。发送消息即可开始新会话。"),
             )
 
         create_kwargs = {
@@ -348,17 +347,19 @@ class ChannelTurnHandler:
         }
         if turn.idempotency_key is not None:
             create_kwargs["idempotency_key"] = turn.idempotency_key
-        task = await self._gateway_client.create_task(**create_kwargs)
+        task = gateway_task_from_payload(
+            await self._gateway_client.create_task(**create_kwargs)
+        )
         await self._session_store.abind_session(
             session_key=agent_session_key,
             platform=turn.platform,
             agent_name=requested_name,
-            current_task_id=str(task["task_id"]),
+            current_task_id=task.task_id,
             chat_id=turn.chat_id,
             user_id=turn.user_id,
             thread_id=turn.thread_id,
         )
-        task_id = str(task["task_id"])
+        task_id = task.task_id
         return AgentCommandResult(
             kind="started",
             agent_name=requested_name,
@@ -375,11 +376,14 @@ class ChannelTurnHandler:
         """List resumable Tasks or bind one Task back to the Channel Session."""
         parts = turn.text.split(maxsplit=1)
         if len(parts) == 1:
-            items = await self._gateway_client.list_tasks(
-                agent_name=None,
-                metadata=turn.fallback_metadata,
-                limit=10,
-            )
+            items = [
+                gateway_task_from_payload(item)
+                for item in await self._gateway_client.list_tasks(
+                    agent_name=None,
+                    metadata=turn.fallback_metadata,
+                    limit=10,
+                )
+            ]
             if not items:
                 return ResumeCommandResult(
                     kind="no_tasks",
@@ -387,10 +391,10 @@ class ChannelTurnHandler:
                 )
             lines = ["最近会话："]
             for item in items:
-                task_id = str(item.get("task_id", ""))
-                agent_name = str(item.get("agent_name", ""))
-                status = str(item.get("status", ""))
-                result = str(item.get("last_result") or item.get("error") or "")
+                task_id = item.task_id
+                agent_name = item.agent_name
+                status = item.status
+                result = item.last_result or item.error or ""
                 preview = _single_line_preview(result) if result else ""
                 suffix = f"\n   {preview}" if preview else ""
                 lines.append(
@@ -403,7 +407,9 @@ class ChannelTurnHandler:
         if not task_id:
             return ResumeCommandResult(kind="not_found", message="没有找到会话。")
         try:
-            task = await self._gateway_client.get_task(task_id=task_id)
+            task = gateway_task_from_payload(
+                await self._gateway_client.get_task(task_id=task_id)
+            )
         except GatewayClientError as exc:
             if exc.status_code not in {404, 410}:
                 raise
@@ -420,7 +426,7 @@ class ChannelTurnHandler:
                 task=task,
             )
 
-        agent_name = str(task.get("agent_name") or turn.default_agent_name)
+        agent_name = task.agent_name or turn.default_agent_name
         await self._session_store.abind_session(
             session_key=turn.identity_key,
             platform=turn.platform,
@@ -448,13 +454,15 @@ class ChannelTurnHandler:
             task=task,
         )
 
-    async def _find_session_task(self, session_key: str) -> dict[str, Any] | None:
+    async def _find_session_task(self, session_key: str) -> GatewayTask | None:
         session = await self._session_store.aget_session(session_key)
         if session is None or not session.current_task_id:
             return None
         try:
-            return await self._gateway_client.get_task(
-                task_id=session.current_task_id,
+            return gateway_task_from_payload(
+                await self._gateway_client.get_task(
+                    task_id=session.current_task_id,
+                )
             )
         except GatewayClientError as exc:
             if exc.status_code not in {401, 403, 404, 410}:
@@ -462,12 +470,15 @@ class ChannelTurnHandler:
             await self._session_store.aunbind_session(session_key)
             return None
 
-    async def _find_latest_task(self, turn: InboundTurn) -> dict[str, Any] | None:
-        items = await self._gateway_client.list_tasks(
-            agent_name=turn.agent_name,
-            metadata=turn.fallback_metadata,
-            limit=1,
-        )
+    async def _find_latest_task(self, turn: InboundTurn) -> GatewayTask | None:
+        items = [
+            gateway_task_from_payload(item)
+            for item in await self._gateway_client.list_tasks(
+                agent_name=turn.agent_name,
+                metadata=turn.fallback_metadata,
+                limit=1,
+            )
+        ]
         return items[0] if items else None
 
     async def _bind_session(
@@ -477,7 +488,7 @@ class ChannelTurnHandler:
         *,
         operation: str | None = None,
         request_hash: str | None = None,
-        response: dict[str, Any] | None = None,
+        response: GatewayTask | None = None,
     ) -> None:
         record_turn = turn.idempotency_key is not None and operation is not None
         await self._session_store.abind_session(
@@ -491,27 +502,23 @@ class ChannelTurnHandler:
             turn_idempotency_key=turn.idempotency_key if record_turn else None,
             turn_operation=operation if record_turn else None,
             turn_request_hash=request_hash if record_turn else None,
-            turn_response=response if record_turn else None,
+            turn_response=response.to_payload() if record_turn and response else None,
         )
 
     async def _bind_review_session(
         self,
         turn: ReviewTurn,
-        task: dict[str, Any],
+        task: GatewayTask,
     ) -> None:
         await self._session_store.abind_session(
             session_key=turn.session_key,
             platform=turn.platform,
-            agent_name=str(task.get("agent_name") or turn.default_agent_name),
-            current_task_id=str(task["task_id"]),
+            agent_name=task.agent_name or turn.default_agent_name,
+            current_task_id=task.task_id,
             chat_id=turn.chat_id,
             user_id=turn.user_id,
             thread_id=turn.thread_id,
         )
-
-
-def _task_has_pending_review(task: dict[str, Any]) -> bool:
-    return isinstance(task.get("pending_review"), dict)
 
 
 def _inbound_turn_request_hash(turn: InboundTurn) -> str:

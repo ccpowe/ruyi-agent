@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
-
-from ruyi_agent.channels.gateway_client import GatewayTaskClient
+from ruyi_agent.channels.gateway_client import (
+    GatewayTaskClient,
+    gateway_task_from_payload,
+)
+from ruyi_agent.channels.gateway_dto import GatewayTask
 
 
 TERMINAL_TASK_STATES = {"completed", "failed", "cancelled", "interrupted"}
 
-TaskHook = Callable[[dict[str, Any]], Awaitable[None]]
+TaskHook = Callable[[GatewayTask], Awaitable[None]]
 ErrorHook = Callable[[Exception], Awaitable[None]]
 
 
@@ -77,15 +79,17 @@ class TaskWatchManager:
         grace_checks_remaining = self._terminal_review_grace_checks
         try:
             while True:
-                task = await self._gateway_client.get_task(task_id=task_id)
-                if task_run_count(task) > expected_run_count:
+                task = gateway_task_from_payload(
+                    await self._gateway_client.get_task(task_id=task_id)
+                )
+                if task.run_count > expected_run_count:
                     if hooks.on_superseded is not None:
                         await hooks.on_superseded(task)
                     return
-                if task_has_pending_review(task):
+                if task.has_pending_review:
                     await hooks.on_pending_review(task)
                     return
-                if task.get("status") in TERMINAL_TASK_STATES:
+                if task.status in TERMINAL_TASK_STATES:
                     if not terminal_sent:
                         await hooks.on_terminal(task)
                         terminal_sent = True
@@ -99,18 +103,3 @@ class TaskWatchManager:
             raise
         finally:
             self._watches.pop(key, None)
-
-
-def task_has_pending_review(task: dict[str, Any]) -> bool:
-    pending_review = task.get("pending_review")
-    return isinstance(pending_review, dict) and bool(pending_review)
-
-
-def task_run_count(task: dict[str, Any]) -> int:
-    value = task.get("run_count")
-    if isinstance(value, int):
-        return value
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0

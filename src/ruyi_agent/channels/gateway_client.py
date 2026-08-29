@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
+from pydantic import ValidationError
 
+from ruyi_agent.channels.gateway_dto import GatewayAgent, GatewayTask
 from ruyi_agent.gateway._http_transport import (
     GatewayHTTPTransport,
     GatewayTransportHTTPStatusError,
@@ -44,7 +46,7 @@ class GatewayClientError(Exception):
 
 
 class GatewayTaskClient(Protocol):
-    async def list_agents(self) -> list[dict[str, Any]]: ...
+    async def list_agents(self) -> list[GatewayAgent]: ...
 
     async def list_tasks(
         self,
@@ -53,7 +55,7 @@ class GatewayTaskClient(Protocol):
         metadata: dict[str, str],
         limit: int = 1,
         root_task_id: str | None = None,
-    ) -> list[dict[str, Any]]: ...
+    ) -> list[GatewayTask]: ...
 
     async def create_task(
         self,
@@ -63,7 +65,7 @@ class GatewayTaskClient(Protocol):
         metadata: dict[str, str],
         attachments: list[dict[str, str]] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> GatewayTask: ...
 
     async def send_input(
         self,
@@ -72,7 +74,7 @@ class GatewayTaskClient(Protocol):
         content: str,
         attachments: list[dict[str, str]] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> GatewayTask: ...
 
     async def download_artifact(self, *, path: str) -> GatewayArtifact: ...
 
@@ -83,7 +85,7 @@ class GatewayTaskClient(Protocol):
         artifact_id: str,
     ) -> GatewayArtifact: ...
 
-    async def get_task(self, *, task_id: str) -> dict[str, Any]: ...
+    async def get_task(self, *, task_id: str) -> GatewayTask: ...
 
     async def submit_review_decision(
         self,
@@ -91,7 +93,40 @@ class GatewayTaskClient(Protocol):
         task_id: str,
         review_id: str,
         decisions: list[dict[str, Any]],
-    ) -> dict[str, Any]: ...
+    ) -> GatewayTask: ...
+
+
+def gateway_task_from_payload(payload: Any) -> GatewayTask:
+    if isinstance(payload, GatewayTask):
+        return payload
+    try:
+        return GatewayTask.model_validate(payload)
+    except ValidationError as exc:
+        raise _invalid_gateway_payload("Task") from exc
+
+
+def gateway_agent_from_payload(payload: Any) -> GatewayAgent:
+    if isinstance(payload, GatewayAgent):
+        return payload
+    try:
+        return GatewayAgent.model_validate(payload)
+    except ValidationError as exc:
+        raise _invalid_gateway_payload("Agent") from exc
+
+
+def _invalid_gateway_payload(kind: str) -> GatewayClientError:
+    return GatewayClientError(
+        status_code=502,
+        code="gateway_error",
+        message=f"Gateway returned invalid {kind} payload",
+    )
+
+
+def _gateway_list_items(payload: dict[str, Any], *, kind: str) -> list[Any]:
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise _invalid_gateway_payload(f"{kind} list")
+    return items
 
 
 def _filename_from_content_disposition(value: str) -> str | None:
@@ -131,7 +166,7 @@ class GatewayHTTPClient:
         metadata: dict[str, str],
         limit: int = 1,
         root_task_id: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[GatewayTask]:
         params = {
             "limit": str(limit),
             **{f"metadata.{key}": value for key, value in metadata.items()},
@@ -141,13 +176,17 @@ class GatewayHTTPClient:
         if root_task_id is not None:
             params["root_task_id"] = root_task_id
         payload = await self._request("GET", "/tasks", params=params)
-        items = payload.get("items")
-        return items if isinstance(items, list) else []
+        return [
+            gateway_task_from_payload(item)
+            for item in _gateway_list_items(payload, kind="Task")
+        ]
 
-    async def list_agents(self) -> list[dict[str, Any]]:
+    async def list_agents(self) -> list[GatewayAgent]:
         payload = await self._request("GET", "/agents")
-        items = payload.get("items")
-        return items if isinstance(items, list) else []
+        return [
+            gateway_agent_from_payload(item)
+            for item in _gateway_list_items(payload, kind="Agent")
+        ]
 
     async def create_task(
         self,
@@ -157,15 +196,17 @@ class GatewayHTTPClient:
         metadata: dict[str, str],
         attachments: list[dict[str, str]] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> GatewayTask:
         input_payload: dict[str, Any] = {"content": content}
         if attachments:
             input_payload["attachments"] = attachments
-        return await self._request(
-            "POST",
-            f"/agents/{agent_name}/tasks",
-            json={"input": input_payload, "metadata": metadata},
-            idempotency_key=idempotency_key,
+        return gateway_task_from_payload(
+            await self._request(
+                "POST",
+                f"/agents/{agent_name}/tasks",
+                json={"input": input_payload, "metadata": metadata},
+                idempotency_key=idempotency_key,
+            )
         )
 
     async def send_input(
@@ -175,15 +216,17 @@ class GatewayHTTPClient:
         content: str,
         attachments: list[dict[str, str]] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> GatewayTask:
         input_payload: dict[str, Any] = {"content": content}
         if attachments:
             input_payload["attachments"] = attachments
-        return await self._request(
-            "POST",
-            f"/tasks/{task_id}/input",
-            json={"input": input_payload},
-            idempotency_key=idempotency_key,
+        return gateway_task_from_payload(
+            await self._request(
+                "POST",
+                f"/tasks/{task_id}/input",
+                json={"input": input_payload},
+                idempotency_key=idempotency_key,
+            )
         )
 
     async def download_artifact(self, *, path: str) -> GatewayArtifact:
@@ -224,8 +267,10 @@ class GatewayHTTPClient:
             content=response.content,
         )
 
-    async def get_task(self, *, task_id: str) -> dict[str, Any]:
-        return await self._request("GET", f"/tasks/{task_id}")
+    async def get_task(self, *, task_id: str) -> GatewayTask:
+        return gateway_task_from_payload(
+            await self._request("GET", f"/tasks/{task_id}")
+        )
 
     async def list_task_messages(
         self,
@@ -294,11 +339,13 @@ class GatewayHTTPClient:
         task_id: str,
         review_id: str,
         decisions: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        return await self._request(
-            "POST",
-            f"/tasks/{task_id}/reviews/{review_id}/decision",
-            json={"decisions": decisions},
+    ) -> GatewayTask:
+        return gateway_task_from_payload(
+            await self._request(
+                "POST",
+                f"/tasks/{task_id}/reviews/{review_id}/decision",
+                json={"decisions": decisions},
+            )
         )
 
     async def _request(

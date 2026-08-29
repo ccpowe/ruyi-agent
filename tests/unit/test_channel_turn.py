@@ -190,9 +190,7 @@ def test_channel_turn_continues_settled_session_task() -> None:
     async def before_continue(task: dict[str, Any]) -> None:
         observed.append(str(task["task_id"]))
 
-    result = asyncio.run(
-        handler.handle(make_turn(), before_continue=before_continue)
-    )
+    result = asyncio.run(handler.handle(make_turn(), before_continue=before_continue))
 
     assert result.kind == "started"
     assert result.created is False
@@ -315,7 +313,7 @@ def test_channel_turn_replays_persisted_receipt_before_operation_selection(
 
     assert replay.kind == "started"
     assert replay.created is True
-    assert replay.task == original_response
+    assert replay.task.to_payload() == original_response
     assert len(gateway.created) == 1
     assert gateway.sent == []
     second_store.close()
@@ -334,9 +332,7 @@ def test_channel_turn_rejects_key_reuse_for_different_request() -> None:
         match="different request",
     ):
         asyncio.run(
-            handler.handle(
-                make_turn(idempotency_key=key, content="different content")
-            )
+            handler.handle(make_turn(idempotency_key=key, content="different content"))
         )
 
     assert len(gateway.created) == 1
@@ -428,9 +424,7 @@ def test_channel_turn_submits_review_and_rebinds_session() -> None:
     handler = ChannelTurnHandler(gateway_client=gateway, session_store=sessions)
 
     result = asyncio.run(
-        handler.handle_review(
-            make_review_turn({"type": "reject", "message": "unsafe"})
-        )
+        handler.handle_review(make_review_turn({"type": "reject", "message": "unsafe"}))
     )
 
     assert result.kind == "submitted"
@@ -460,32 +454,43 @@ def test_channel_turn_review_reports_validation_failures() -> None:
         return result.kind
 
     assert asyncio.run(scenario(None, {"type": "approve"})) == "no_task"
-    assert asyncio.run(
-        scenario(
-            {"task_id": "task-1", "status": "completed"},
-            {"type": "approve"},
+    assert (
+        asyncio.run(
+            scenario(
+                {"task_id": "task-1", "status": "completed", "run_count": 1},
+                {"type": "approve"},
+            )
         )
-    ) == "no_pending_review"
-    assert asyncio.run(
-        scenario(
-            {
-                "task_id": "task-1",
-                "status": "waiting_for_human",
-                "pending_review": {},
-            },
-            {"type": "approve"},
+        == "no_pending_review"
+    )
+    with pytest.raises(GatewayClientError) as exc_info:
+        asyncio.run(
+            scenario(
+                {
+                    "task_id": "task-1",
+                    "status": "waiting_for_human",
+                    "run_count": 1,
+                    "pending_review": {},
+                },
+                {"type": "approve"},
+            )
         )
-    ) == "missing_review_id"
-    assert asyncio.run(
-        scenario(
-            {
-                "task_id": "task-1",
-                "status": "waiting_for_human",
-                "pending_review": {"review_id": "review-1"},
-            },
-            {"type": "approve", "review_id": "review-other"},
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.code == "gateway_error"
+    assert (
+        asyncio.run(
+            scenario(
+                {
+                    "task_id": "task-1",
+                    "status": "waiting_for_human",
+                    "run_count": 1,
+                    "pending_review": {"review_id": "review-1"},
+                },
+                {"type": "approve", "review_id": "review-other"},
+            )
         )
-    ) == "review_not_found"
+        == "review_not_found"
+    )
 
 
 def make_agent_turn(text: str) -> AgentCommandTurn:
@@ -585,14 +590,13 @@ def test_channel_turn_lists_resumable_tasks() -> None:
             "agent_name": "main",
             "status": "completed",
             "last_result": "a useful result",
+            "run_count": 1,
         }
     ]
     sessions = ChannelSessionStore(":memory:")
     handler = ChannelTurnHandler(gateway_client=gateway, session_store=sessions)
 
-    result = asyncio.run(
-        handler.handle_resume_command(make_resume_turn("/resume"))
-    )
+    result = asyncio.run(handler.handle_resume_command(make_resume_turn("/resume")))
 
     assert result.kind == "listed"
     assert "task_id=task-1 agent=main status=completed" in result.message
@@ -606,6 +610,7 @@ def test_channel_turn_resumes_owned_task_and_active_agent() -> None:
         "task_id": "task-1",
         "agent_name": "background_research",
         "status": "completed",
+        "run_count": 1,
     }
     sessions = ChannelSessionStore(":memory:")
     handler = ChannelTurnHandler(gateway_client=gateway, session_store=sessions)
@@ -628,6 +633,7 @@ def test_channel_turn_resume_rejects_missing_or_foreign_task() -> None:
         "task_id": "task-1",
         "agent_name": "main",
         "status": "completed",
+        "run_count": 1,
     }
     sessions = ChannelSessionStore(":memory:")
     handler = ChannelTurnHandler(gateway_client=gateway, session_store=sessions)
@@ -636,9 +642,7 @@ def test_channel_turn_resume_rejects_missing_or_foreign_task() -> None:
         handler.handle_resume_command(make_resume_turn("/resume missing"))
     )
     foreign = asyncio.run(
-        handler.handle_resume_command(
-            make_resume_turn("/resume task-1", belongs=False)
-        )
+        handler.handle_resume_command(make_resume_turn("/resume task-1", belongs=False))
     )
 
     assert missing.kind == "not_found"
