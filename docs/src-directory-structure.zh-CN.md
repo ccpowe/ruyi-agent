@@ -69,7 +69,7 @@ Channel Adapter 不直接管理 Task 状态，也不直接调用 `AgentControl`�
 
 ## `storage`
 
-- `task_store.py`：TaskRecord 生命周期。
+- `task_store.py`：TaskRecord 生命周期与权威 Pending Review 资源。
 - `gateway_route_store.py`：Local/Remote Route。
 - `channel_session_store.py`：Channel identity、Active Agent 和当前 Task。
 - `review_audit.py`：Review 决策审计。

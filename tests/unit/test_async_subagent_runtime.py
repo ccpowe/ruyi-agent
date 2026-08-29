@@ -1510,6 +1510,131 @@ def test_root_lifecycle_keeps_child_review_compatibility_projection(
     assert projection["review_id"] == review_id
 
 
+def test_review_creation_failure_restores_memory_and_durable_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    store = TaskStore(str(tmp_path / "tasks.sqlite"))
+    manager = async_subagent_runtime.TaskManager(store)
+    root = manager.create_task_record(
+        "root",
+        "background_research",
+        parent_task_id=None,
+        root_task_id="root",
+        depth=1,
+    )
+    manager.mark_completed(root.task_id, "root done")
+    child = manager.create_task_record(
+        "child",
+        "background_research",
+        parent_task_id=root.task_id,
+        root_task_id=root.task_id,
+        depth=2,
+    )
+
+    def fail_append(**kwargs):
+        del kwargs
+        raise RuntimeError("event append failed")
+
+    monkeypatch.setattr(store, "_append_task_event_locked", fail_append)
+    try:
+        with pytest.raises(RuntimeError, match="event append failed"):
+            manager.mark_waiting_for_human(
+                child.task_id,
+                {"review_id": "review-create-failure"},
+            )
+
+        persisted_child = store.get_task(child.task_id)
+        persisted_root = store.get_task(root.task_id)
+        assert persisted_child is not None
+        assert child.state == persisted_child.state == "pending"
+        assert child.pending_review is persisted_child.pending_review is None
+        assert persisted_root is not None
+        assert root.pending_review is persisted_root.pending_review is None
+        assert manager.get_pending_review("review-create-failure") is None
+        assert manager.list_pending_reviews(root_task_id=root.task_id) == []
+    finally:
+        assert manager.event_ledger is not None
+        manager.event_ledger.close()
+        store.close()
+
+
+def test_review_decision_failure_restores_memory_and_is_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    factory = ContentAwareInterruptingAgentFactory()
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    store = TaskStore(str(tmp_path / "tasks.sqlite"))
+    control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        checkpointer=object(),
+        backend=object(),
+        task_store=store,
+    )
+
+    async def scenario() -> tuple[str, str]:
+        root = await control.spawn_task("background_research", "root task")
+        if control.get_live_run(root.task_id) is not None:
+            await control.get_live_run(root.task_id)
+        child = await control.spawn_task(
+            "background_research",
+            "needs review",
+            parent_task_id=root.task_id,
+            parent_thread_id=root.thread_id,
+        )
+        if control.get_live_run(child.task_id) is not None:
+            await control.get_live_run(child.task_id)
+        review_id = child.pending_review["review_id"]
+        original_append = store._append_task_event_locked
+
+        def fail_append(**kwargs):
+            del kwargs
+            raise RuntimeError("event append failed")
+
+        monkeypatch.setattr(store, "_append_task_event_locked", fail_append)
+        with pytest.raises(RuntimeError, match="event append failed"):
+            await control.submit_review_decision(
+                review_id,
+                [{"type": "approve"}],
+            )
+        await asyncio.sleep(0)
+
+        in_memory_child = control.get_task_record(child.task_id)
+        in_memory_root = control.get_task_record(root.task_id)
+        persisted_child = store.get_task(child.task_id)
+        persisted_root = store.get_task(root.task_id)
+        assert persisted_child is not None
+        assert in_memory_child.state == persisted_child.state == "waiting_for_human"
+        assert in_memory_child.pending_review == persisted_child.pending_review
+        assert in_memory_child.pending_review["review_id"] == review_id
+        assert persisted_root is not None
+        assert in_memory_root.pending_review == persisted_root.pending_review
+        assert in_memory_root.pending_review["review_id"] == review_id
+        assert control.get_pending_review(review_id).task_id == child.task_id
+        assert control.get_live_run(child.task_id) is None
+
+        monkeypatch.setattr(store, "_append_task_event_locked", original_append)
+        retried = await control.submit_review_decision(
+            review_id,
+            [{"type": "approve"}],
+            wait=True,
+        )
+        assert retried.state == "completed"
+        with pytest.raises(async_subagent_runtime.UnknownWorkerTaskError):
+            control.get_pending_review(review_id)
+        assert control.get_task_record(root.task_id).pending_review is None
+        return review_id, retried.task_id
+
+    try:
+        review_id, child_task_id = asyncio.run(scenario())
+        assert review_id
+        assert child_task_id
+    finally:
+        asyncio.run(control.close())
+        store.close()
+
+
 def test_cleared_root_review_is_replayable_from_durable_cursor(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

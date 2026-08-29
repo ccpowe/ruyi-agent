@@ -59,8 +59,16 @@ The internal Gateway Task module that owns local/remote route persistence, runti
 _Avoid_: route helper, remote task utility
 
 **Review Command**:
-A channel command that resolves a pending human review for a gateway task.
+A channel command that resolves one Pending Review by `review_id`. It may be
+addressed through the owning Gateway Task or its delegation root.
 _Avoid_: approval message, HITL reply
+
+**Pending Review**:
+An independently identifiable, durable request for human review owned by one
+Gateway Task and grouped under its delegation root. It is authoritative review
+state; a root Task's single `pending_review` field is only the earliest-item
+compatibility projection.
+_Avoid_: root review mirror, approval slot
 
 **Task Watch**:
 The shared policy for observing one gateway task run after a channel turn until it reaches a pending review, is superseded by a newer run, or settles.
@@ -94,7 +102,10 @@ _Avoid_: default bot, current worker
 - A **Task Event Stream** observes one run without owning or cancelling its
   execution; durable lifecycle recovery and complete conversation recovery are
   separate from transient text deltas.
-- A **Review Command** resolves a pending review on one **Gateway Task**.
+- A **Gateway Task** owns at most one **Pending Review**, while its delegation
+  root may group Pending Reviews from multiple descendant Tasks.
+- A **Review Command** resolves one **Pending Review** through its owner or
+  delegation root without clearing unrelated Pending Reviews.
 - A **Task Watch** observes one run of one **Gateway Task**.
 - A **Task Mailbox** delivers input to one **Gateway Task** without defining
   workflow dependencies or collaboration policy.

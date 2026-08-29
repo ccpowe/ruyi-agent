@@ -55,3 +55,23 @@ class LiveRunRegistry:
 
     def discard(self, task_id: str) -> None:
         self._runs.pop(task_id, None)
+
+    def snapshot(self, task_id: str) -> tuple[LiveRun | None, bool]:
+        """Capture one registry entry for strong exception rollback."""
+
+        run = self._runs.get(task_id)
+        return run, run.cancel_requested if run is not None else False
+
+    def restore(
+        self,
+        task_id: str,
+        snapshot: tuple[LiveRun | None, bool],
+    ) -> None:
+        """Restore a previously captured registry entry without replacing its Task."""
+
+        run, cancel_requested = snapshot
+        if run is None:
+            self._runs.pop(task_id, None)
+            return
+        run.cancel_requested = cancel_requested
+        self._runs[task_id] = run

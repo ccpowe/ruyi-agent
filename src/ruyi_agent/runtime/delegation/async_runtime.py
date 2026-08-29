@@ -36,10 +36,11 @@ import asyncio
 import inspect
 import logging
 import uuid
-from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
+from contextlib import AbstractAsyncContextManager, contextmanager
+from copy import deepcopy
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 import httpx
@@ -905,6 +906,40 @@ class TaskManager:
             if root_changed and root is not None and root.task_id != record.task_id:
                 self._save(root)
 
+    @contextmanager
+    def _review_memory_transaction(
+        self,
+        *records: TaskRecord | None,
+    ) -> Iterator[None]:
+        """Restore process-local review state if its durable transaction fails."""
+
+        unique_records = {
+            record.task_id: record for record in records if record is not None
+        }
+        record_snapshots = {
+            task_id: deepcopy(record)
+            for task_id, record in unique_records.items()
+        }
+        review_snapshot = deepcopy(self._pending_reviews)
+        live_run_snapshots = {
+            task_id: self._live_runs.snapshot(task_id) for task_id in unique_records
+        }
+        try:
+            yield
+        except BaseException:
+            for task_id, record in unique_records.items():
+                snapshot = record_snapshots[task_id]
+                for field_info in fields(TaskRecord):
+                    setattr(
+                        record,
+                        field_info.name,
+                        deepcopy(getattr(snapshot, field_info.name)),
+                    )
+                self._live_runs.restore(task_id, live_run_snapshots[task_id])
+            self._pending_reviews.clear()
+            self._pending_reviews.update(review_snapshot)
+            raise
+
     def _clear_pending_review_and_save(self, record: TaskRecord) -> None:
         current = self._review_for_task(record.task_id)
         if current is None:
@@ -1123,14 +1158,16 @@ class TaskManager:
         """
         # 为什么单独标记 running：异步任务真正开始执行的时点需要被明确记录。
         record = self.get_task(task_id)
-        record.state = "running"
-        record.updated_at = _now()
-        self._live_runs.register(task_id, run_task)
-        record.run_count += 1
-        record.mailbox_suppressed = False
-        record.mailbox_delivered = False
-        record.error = None
-        self._clear_pending_review_and_save(record)
+        root = self._root_record(record)
+        with self._review_memory_transaction(record, root):
+            record.state = "running"
+            record.updated_at = _now()
+            self._live_runs.register(task_id, run_task)
+            record.run_count += 1
+            record.mailbox_suppressed = False
+            record.mailbox_delivered = False
+            record.error = None
+            self._clear_pending_review_and_save(record)
 
     def add_artifact(self, task_id: str, artifact: PublishedArtifact) -> None:
         """Append a published artifact manifest to a task."""
@@ -1176,39 +1213,44 @@ class TaskManager:
         current_review = self._review_for_task(record.task_id)
         if existing is not None and existing.task_id != record.task_id:
             raise ValueError(f"Pending review already exists: {review_id}")
-        record.state = "waiting_for_human"
-        record.updated_at = _now()
-        self._live_runs.discard(task_id)
-        record.pending_review = pending_review
-        record.error = None
-        review = PendingReviewRecord(
-            review_id=review_id,
-            task_id=record.task_id,
-            root_task_id=record.root_task_id,
-            payload=dict(pending_review),
-            created_at=(
-                current_review.created_at
-                if current_review is not None and current_review.review_id == review_id
-                else record.updated_at
-            ),
-            updated_at=record.updated_at,
-        )
-        reviews = [
-            item
-            for item in self.list_pending_reviews(root_task_id=record.root_task_id)
-            if item.task_id != record.task_id
-        ]
-        reviews.append(review)
-        root, root_changed = self._project_root_review(record, reviews)
-        self._persist_review_transition(
-            record,
-            pending_review=review,
-            root=root,
-            root_changed=root_changed,
-        )
-        if current_review is not None:
-            self._pending_reviews.pop(current_review.review_id, None)
-        self._pending_reviews[review.review_id] = review
+        root = self._root_record(record)
+        with self._review_memory_transaction(record, root):
+            record.state = "waiting_for_human"
+            record.updated_at = _now()
+            self._live_runs.discard(task_id)
+            record.pending_review = pending_review
+            record.error = None
+            review = PendingReviewRecord(
+                review_id=review_id,
+                task_id=record.task_id,
+                root_task_id=record.root_task_id,
+                payload=dict(pending_review),
+                created_at=(
+                    current_review.created_at
+                    if current_review is not None
+                    and current_review.review_id == review_id
+                    else record.updated_at
+                ),
+                updated_at=record.updated_at,
+            )
+            reviews = [
+                item
+                for item in self.list_pending_reviews(
+                    root_task_id=record.root_task_id
+                )
+                if item.task_id != record.task_id
+            ]
+            reviews.append(review)
+            root, root_changed = self._project_root_review(record, reviews)
+            self._persist_review_transition(
+                record,
+                pending_review=review,
+                root=root,
+                root_changed=root_changed,
+            )
+            if current_review is not None:
+                self._pending_reviews.pop(current_review.review_id, None)
+            self._pending_reviews[review.review_id] = review
 
     def mark_completed(self, task_id: str, result: str) -> None:
         """
@@ -1220,12 +1262,14 @@ class TaskManager:
         """
         # 为什么单独标记 completed：wait/check 依赖稳定的本轮状态和结果。
         record = self.get_task(task_id)
-        record.state = "completed"
-        record.result = normalize_task_event_text(result)
-        record.error = None
-        record.updated_at = _now()
-        self._live_runs.discard(task_id)
-        self._clear_pending_review_and_save(record)
+        root = self._root_record(record)
+        with self._review_memory_transaction(record, root):
+            record.state = "completed"
+            record.result = normalize_task_event_text(result)
+            record.error = None
+            record.updated_at = _now()
+            self._live_runs.discard(task_id)
+            self._clear_pending_review_and_save(record)
 
     def mark_failed(self, task_id: str, error: str) -> None:
         """
@@ -1237,11 +1281,13 @@ class TaskManager:
         """
         # 为什么单独标记 failed：失败应保留为结构化状态，而不是只在日志中消失。
         record = self.get_task(task_id)
-        record.state = "failed"
-        record.error = normalize_task_event_text(error)
-        record.updated_at = _now()
-        self._live_runs.discard(task_id)
-        self._clear_pending_review_and_save(record)
+        root = self._root_record(record)
+        with self._review_memory_transaction(record, root):
+            record.state = "failed"
+            record.error = normalize_task_event_text(error)
+            record.updated_at = _now()
+            self._live_runs.discard(task_id)
+            self._clear_pending_review_and_save(record)
 
     def mark_cancelled(self, task_id: str) -> None:
         """
@@ -1252,11 +1298,13 @@ class TaskManager:
         """
         # 为什么单独标记 cancelled：主动取消当前 run 不应和失败混在一起。
         record = self.get_task(task_id)
-        record.state = "cancelled"
-        record.updated_at = _now()
-        self._live_runs.discard(task_id)
-        record.error = None
-        self._clear_pending_review_and_save(record)
+        root = self._root_record(record)
+        with self._review_memory_transaction(record, root):
+            record.state = "cancelled"
+            record.updated_at = _now()
+            self._live_runs.discard(task_id)
+            record.error = None
+            self._clear_pending_review_and_save(record)
 
     def mark_interrupted(self, task_id: str, error: str) -> None:
         """
@@ -1266,13 +1314,27 @@ class TaskManager:
         用户显式 cancel_agent/cancel_task 产生的 cancelled。
         """
         record = self.get_task(task_id)
-        record.state = "interrupted"
-        record.error = normalize_task_event_text(error)
-        record.updated_at = _now()
-        self._live_runs.discard(task_id)
-        self._clear_pending_review_and_save(record)
+        root = self._root_record(record)
+        with self._review_memory_transaction(record, root):
+            record.state = "interrupted"
+            record.error = normalize_task_event_text(error)
+            record.updated_at = _now()
+            self._live_runs.discard(task_id)
+            self._clear_pending_review_and_save(record)
 
     def sync_remote_task(self, task_id: str, payload: dict[str, Any]) -> TaskRecord:
+        """Synchronize a remote Task with strong in-memory exception safety."""
+
+        record = self.get_task(task_id)
+        root = self._root_record(record)
+        with self._review_memory_transaction(record, root):
+            return self._sync_remote_task(task_id, payload)
+
+    def _sync_remote_task(
+        self,
+        task_id: str,
+        payload: dict[str, Any],
+    ) -> TaskRecord:
         """
         将远端任务 payload 同步到本地任务记录
 
