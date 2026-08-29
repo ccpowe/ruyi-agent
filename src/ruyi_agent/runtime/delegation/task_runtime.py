@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from functools import wraps
 from typing import Any, Protocol
 
 from ruyi_agent.runtime.delegation.context import DelegationContext, parse_inbound_metadata
@@ -37,6 +38,18 @@ from ruyi_agent.task_models import (
 )
 
 
+def _supervised_mutation(method: Any) -> Any:
+    """Keep one accepted Task mutation inside the runtime shutdown boundary."""
+
+    @wraps(method)
+    async def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return await self._control._run_supervisor.mutate(
+            lambda: method(self, *args, **kwargs)
+        )
+
+    return guarded
+
+
 class TaskRuntimeHost(Protocol):
     _mailbox: Any
     _max_delegation_depth: int
@@ -45,6 +58,7 @@ class TaskRuntimeHost(Protocol):
     _node_id: str
     _permission_default_profile: str
     _registry: Any
+    _run_supervisor: Any
     _task_manager: Any
 
     async def _allocate_remote_task(self, **kwargs: Any) -> TaskRecord: ...
@@ -64,8 +78,12 @@ class TaskRuntimeHost(Protocol):
         self, entry: RegisteredAgent, *, parent_task_id: str | None
     ) -> tuple[tuple[str, ...], str | None, str | None]: ...
     def _resolve_task_tree_context(self, **kwargs: Any) -> tuple[str, int, DelegationContext]: ...
-    def _resume_run(self, task_id: str, decisions: list[dict[str, Any]]) -> None: ...
-    def _start_run(self, task_id: str, user_input: str) -> None: ...
+    async def _resume_run(
+        self, task_id: str, decisions: list[dict[str, Any]]
+    ) -> asyncio.Task[None]: ...
+    async def _start_run(
+        self, task_id: str, user_input: str
+    ) -> asyncio.Task[None]: ...
 
 
 class TaskRuntime:
@@ -214,6 +232,7 @@ class TaskRuntime:
             raise UnknownWorkerTaskError(f"Unknown pending review: {review_id}")
         return record
 
+    @_supervised_mutation
     async def submit_review_decision(
         self,
         review_id: str,
@@ -236,8 +255,7 @@ class TaskRuntime:
             )
         if record.pending_review is None:
             raise ValueError(f"Review '{review_id}' has no pending payload")
-        self._control._resume_run(record.task_id, decisions)
-        run_task = self._control._task_manager.get_live_run(record.task_id)
+        run_task = await self._control._resume_run(record.task_id, decisions)
         if wait and run_task is not None:
             try:
                 await run_task
@@ -306,6 +324,7 @@ class TaskRuntime:
             )
         return record
 
+    @_supervised_mutation
     async def spawn_task(
         self,
         agent_name: str,
@@ -380,7 +399,7 @@ class TaskRuntime:
                     and existing.run_count == 0
                     and not self._control._task_manager.has_active_run(task_id)
                 ):
-                    self._control._start_run(task_id, task)
+                    await self._control._start_run(task_id, task)
                     return self._control._task_manager.get_task(task_id)
                 if not (
                     isinstance(entry, RemoteRefEntry)
@@ -449,9 +468,10 @@ class TaskRuntime:
                     idempotency_key=idempotency_key or task_id,
                 )
 
-            self._control._start_run(task_id, task)
+            await self._control._start_run(task_id, task)
             return self._control._task_manager.get_task(task_id)
 
+    @_supervised_mutation
     async def send_task_input(
         self,
         task_id: str,
@@ -509,7 +529,7 @@ class TaskRuntime:
                 raise TaskAlreadyRunningError(
                     f"Worker task is already running: {task_id}"
                 )
-            self._control._start_run(task_id, message)
+            await self._control._start_run(task_id, message)
             return self._control._task_manager.get_task(task_id)
 
         self._control._mailbox.publish_input(

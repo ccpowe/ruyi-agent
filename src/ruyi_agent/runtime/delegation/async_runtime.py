@@ -55,6 +55,10 @@ from ruyi_agent.runtime.delegation.registry import (
     RemoteRefEntry,
 )
 from ruyi_agent.runtime.delegation.remote_port import RemoteTaskPort
+from ruyi_agent.runtime.delegation.run_supervisor import (
+    RunSupervisor,
+    RuntimeClosingError,
+)
 from ruyi_agent.runtime.delegation.task_manager import TaskManager
 from ruyi_agent.runtime.delegation.task_runtime import TaskRuntime
 from ruyi_agent.runtime.delegation.tools import DelegationTools
@@ -112,6 +116,7 @@ class AgentControl:
         skill_catalog: Mapping[str, SkillEntry] | None = None,
         skill_syncer: SkillSyncer | None = None,
         unavailable_agents: dict[str, str] | None = None,
+        shutdown_grace_period: float = 5.0,
     ) -> None:
         if max_delegation_depth < 1:
             raise ValueError("max_delegation_depth must be at least 1")
@@ -149,7 +154,6 @@ class AgentControl:
         self._node_id = validate_node_id(node_id or f"node-{uuid.uuid4()}")
         self._root_budget_locks: dict[str, asyncio.Lock] = {}
         self._task_input_locks: dict[str, asyncio.Lock] = {}
-        self._mailbox_recovery_task: asyncio.Task[None] | None = None
         self._permission_default_profile = permission_default_profile
         self._permission_policy = permission_policy
         self._backend_kind = backend_kind
@@ -163,6 +167,10 @@ class AgentControl:
         self._agent_factory = create_runtime_agent
         self._httpx = httpx
 
+        self._run_supervisor = RunSupervisor(
+            self,
+            shutdown_grace_period=shutdown_grace_period,
+        )
         self._local_executor = LocalTaskExecutor(self)
         self._remote_port = RemoteTaskPort(self)
         self._delegation_policy = DelegationPolicy(self)
@@ -216,16 +224,15 @@ class AgentControl:
     async def _run_agent_turn(self, task_id: str, user_input: str) -> None:
         await self._local_executor._run_agent_turn(task_id, user_input)
 
-    def _start_run(self, task_id: str, user_input: str) -> None:
-        self._local_executor._start_run(task_id, user_input)
+    async def _start_run(
+        self,
+        task_id: str,
+        user_input: str,
+    ) -> asyncio.Task[None]:
+        return await self._local_executor._start_run(task_id, user_input)
 
-    def _start_mailbox_run(self, task_id: str) -> None:
-        self._local_executor._start_mailbox_run(task_id)
-
-    def _attach_mailbox_wakeup(
-        self, task_id: str, run_task: asyncio.Task[None]
-    ) -> None:
-        self._local_executor._attach_mailbox_wakeup(task_id, run_task)
+    async def _start_mailbox_run(self, task_id: str) -> asyncio.Task[None]:
+        return await self._local_executor._start_mailbox_run(task_id)
 
     async def _ensure_task_awake(self, task_id: str) -> TaskRecord:
         return await self._local_executor._ensure_task_awake(task_id)
@@ -242,8 +249,12 @@ class AgentControl:
         await self._local_executor.close()
         await self._settled_notifier.close()
 
-    def _resume_run(self, task_id: str, decisions: list[dict[str, Any]]) -> None:
-        self._local_executor._resume_run(task_id, decisions)
+    async def _resume_run(
+        self,
+        task_id: str,
+        decisions: list[dict[str, Any]],
+    ) -> asyncio.Task[None]:
+        return await self._local_executor._resume_run(task_id, decisions)
 
     # Delegation policy boundary.
     def _extract_parent_thread_id(self, config: RunnableConfig | None) -> str | None:
@@ -651,6 +662,8 @@ __all__ = [
     "RegisteredAgent",
     "RemoteExecutorNotImplementedError",
     "RemoteRefEntry",
+    "RunSupervisor",
+    "RuntimeClosingError",
     "TaskAlreadyRunningError",
     "TaskIdSchema",
     "TaskManager",

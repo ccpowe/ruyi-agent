@@ -17,7 +17,6 @@ from langgraph.types import Command, GraphOutput
 from ruyi_agent.config.system_tools import DELEGATION_SYSTEM_TOOLS
 from ruyi_agent.runtime.agent_turn import normalize_agent_turn
 from ruyi_agent.runtime.delegation.contracts import (
-    TaskAlreadyRunningError,
     _artifact_int,
     _artifact_optional_string,
     _artifact_string,
@@ -26,6 +25,7 @@ from ruyi_agent.runtime.delegation.contracts import (
     _published_artifact_to_dict,
 )
 from ruyi_agent.runtime.delegation.registry import LocalWorkerEntry, RegisteredAgent
+from ruyi_agent.runtime.delegation.run_supervisor import RuntimeClosingError
 from ruyi_agent.runtime.skills.resolver import resolve_skill_names
 from ruyi_agent.runtime.task_events import (
     assistant_delta_from_stream_part,
@@ -45,11 +45,11 @@ class LocalExecutionHost(Protocol):
     _checkpointer: Any
     _compiled_agents: dict[str, Any]
     _mailbox: Any
-    _mailbox_recovery_task: asyncio.Task[None] | None
     _permission_default_profile: str
     _permission_policy: Any
     _registry: Any
     _review_audit_store: Any
+    _run_supervisor: Any
     _skill_catalog: Any
     _skill_syncer: Any
     _task_input_locks: dict[str, asyncio.Lock]
@@ -61,9 +61,6 @@ class LocalExecutionHost(Protocol):
     def register_artifact(
         self, *, task_id: str, artifact: dict[str, Any]
     ) -> dict[str, Any]: ...
-    def _attach_mailbox_wakeup(
-        self, task_id: str, run_task: asyncio.Task[None]
-    ) -> None: ...
     def _audit_task_review(
         self,
         event_type: str,
@@ -77,7 +74,7 @@ class LocalExecutionHost(Protocol):
     async def _run_agent_payload(self, task_id: str, payload: Any) -> None: ...
     async def _run_agent_turn(self, task_id: str, user_input: str) -> None: ...
     async def _send_settled_webhook(self, task_id: str) -> None: ...
-    def _start_mailbox_run(self, task_id: str) -> None: ...
+    async def _start_mailbox_run(self, task_id: str) -> asyncio.Task[None]: ...
 
 
 class LocalTaskExecutor:
@@ -364,7 +361,11 @@ class LocalTaskExecutor:
             {"messages": [{"role": "user", "content": user_input}]},
         )
 
-    def _start_run(self, task_id: str, user_input: str) -> None:
+    async def _start_run(
+        self,
+        task_id: str,
+        user_input: str,
+    ) -> asyncio.Task[None]:
         """
         启动本地任务的一轮异步执行
 
@@ -376,41 +377,25 @@ class LocalTaskExecutor:
             TaskAlreadyRunningError: 该任务已有未结束的活跃 run
         """
         # 为什么单独启动 run：send_input 和首次 spawn 都需要走同一套任务启动约束。
-        if self._control._task_manager.has_active_run(task_id):
-            raise TaskAlreadyRunningError(f"Worker task is already running: {task_id}")
-        run_task = asyncio.create_task(self._control._run_agent_turn(task_id, user_input))
-        self._control._task_manager.mark_running(task_id, run_task)
-        self._control._attach_mailbox_wakeup(task_id, run_task)
-
-    def _start_mailbox_run(self, task_id: str) -> None:
-        """Start a run whose user input will be supplied by MailboxMiddleware."""
-        if self._control._task_manager.has_active_run(task_id):
-            raise TaskAlreadyRunningError(f"Worker task is already running: {task_id}")
-        run_task = asyncio.create_task(
-            self._control._run_agent_payload(task_id, {"messages": []})
+        return await self._control._run_supervisor.schedule(
+            task_id,
+            lambda: self._control._run_agent_turn(task_id, user_input),
         )
-        self._control._task_manager.mark_running(task_id, run_task)
-        self._control._attach_mailbox_wakeup(task_id, run_task)
 
-    def _attach_mailbox_wakeup(
-        self,
-        task_id: str,
-        run_task: asyncio.Task[None],
-    ) -> None:
-        """Recheck durable input after a run exits to close the final-answer race."""
-        if self._control._mailbox is None:
-            return
-
-        def schedule_wakeup(_: asyncio.Task[None]) -> None:
-            asyncio.create_task(self._control._ensure_task_awake(task_id))
-
-        run_task.add_done_callback(schedule_wakeup)
+    async def _start_mailbox_run(self, task_id: str) -> asyncio.Task[None]:
+        """Start a run whose user input will be supplied by MailboxMiddleware."""
+        return await self._control._run_supervisor.schedule(
+            task_id,
+            lambda: self._control._run_agent_payload(task_id, {"messages": []}),
+        )
 
     async def _ensure_task_awake(self, task_id: str) -> TaskRecord:
         """Start at most one mailbox-driven run when a resumable task has input."""
         lock = self._control._task_input_locks.setdefault(task_id, asyncio.Lock())
         async with lock:
             record = self._control._task_manager.get_task(task_id)
+            if not self._control._run_supervisor.is_accepting:
+                return record
             if self._control._mailbox is None or record.route_kind != "local":
                 return record
             if self._control._task_manager.has_active_run(task_id):
@@ -419,7 +404,10 @@ class LocalTaskExecutor:
                 return record
             if not self._control._mailbox.has_triggering_messages(task_id):
                 return record
-            self._control._start_mailbox_run(task_id)
+            try:
+                await self._control._start_mailbox_run(task_id)
+            except RuntimeClosingError:
+                return self._control._task_manager.get_task(task_id)
             return self._control._task_manager.get_task(task_id)
 
     async def wake_pending_mailbox_tasks(self) -> None:
@@ -431,7 +419,7 @@ class LocalTaskExecutor:
 
     def start_mailbox_recovery(self) -> None:
         """Periodically recover expired claims from interrupted runtimes."""
-        if self._control._mailbox is None or self._control._mailbox_recovery_task is not None:
+        if self._control._mailbox is None:
             return
 
         async def recover() -> None:
@@ -439,37 +427,29 @@ class LocalTaskExecutor:
                 await asyncio.sleep(5)
                 await self._control.wake_pending_mailbox_tasks()
 
-        self._control._mailbox_recovery_task = asyncio.create_task(recover())
+        self._control._run_supervisor.start_recovery(recover)
 
     async def close(self) -> None:
-        """Stop runtime-owned background maintenance tasks."""
-        if self._control._mailbox_recovery_task is not None:
-            self._control._mailbox_recovery_task.cancel()
-            try:
-                await self._control._mailbox_recovery_task
-            except asyncio.CancelledError:
-                pass
-            self._control._mailbox_recovery_task = None
+        """Drain runtime-owned work before closing the lifecycle event ledger."""
+        await self._control._run_supervisor.close()
         ledger = self._control._task_manager.event_ledger
         if ledger is not None:
             ledger.close()
 
-    def _resume_run(self, task_id: str, decisions: list[dict[str, Any]]) -> None:
+    async def _resume_run(
+        self,
+        task_id: str,
+        decisions: list[dict[str, Any]],
+    ) -> asyncio.Task[None]:
         record = self._control._task_manager.get_task(task_id)
-        if self._control._task_manager.has_active_run(task_id):
-            raise TaskAlreadyRunningError(f"Worker task is already running: {task_id}")
         review_id = (record.pending_review or {}).get("review_id")
-        run_task = asyncio.create_task(
-            self._control._run_agent_payload(
+        run_task = await self._control._run_supervisor.schedule(
+            task_id,
+            lambda: self._control._run_agent_payload(
                 task_id,
                 Command(resume={"decisions": decisions}),
-            )
+            ),
         )
-        try:
-            self._control._task_manager.mark_running(task_id, run_task)
-        except BaseException:
-            run_task.cancel()
-            raise
         self._control._audit_task_review(
             "task_review_resumed",
             record,
@@ -478,4 +458,4 @@ class LocalTaskExecutor:
                 "decisions": decisions,
             },
         )
-        self._control._attach_mailbox_wakeup(task_id, run_task)
+        return run_task

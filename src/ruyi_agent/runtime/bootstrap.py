@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
 from ipaddress import ip_address
 from pathlib import Path
@@ -165,121 +165,110 @@ async def bootstrap_application():
         else:
             print(f"[mcp] {status.server_name}: failed, error={status.error}")
 
-    route_store: GatewayRouteStore | None = None
-    command_store: GatewayCommandStore | None = None
-    task_store: TaskStore | None = None
-    mailbox_store: MailboxStore | None = None
-    review_audit_store: ReviewAuditStore | None = None
-    worker_control: AgentControl | None = None
     try:
         # checkpointer 和 route store 是进程级状态对象。两个 AgentControl 共享同一个
         # checkpointer，让 task 执行状态和主 agent 对话状态落在同一条持久化边界内。
         _ensure_sqlite_parent_dir(checkpoint_db)
         async with AsyncSqliteSaver.from_conn_string(checkpoint_db) as checkpointer:
-            route_store = GatewayRouteStore(route_db)
-            command_store = GatewayCommandStore(task_db)
-            task_store = TaskStore(task_db)
-            mailbox_store = MailboxStore(task_db)
-            mailbox = AgentMailbox(mailbox_store)
-            review_audit_store = ReviewAuditStore(review_audit_db)
-            unavailable_agents: dict[str, str] = {}
-            all_local_specs = await build_all_local_worker_specs(
-                agent_configs,
-                registry,
-                providers=llm_providers,
-                getenv=os.getenv,
-                home_dir=home_dir,
-                unavailable_errors=unavailable_agents,
-            )
-            all_remote_refs = await build_all_remote_refs(agent_configs)
+            # Keep every run dependency open until AgentControl has stopped
+            # recovery, drained/cancelled active runs, and persisted interruption.
+            with ExitStack() as stores:
+                route_store = GatewayRouteStore(route_db)
+                stores.callback(route_store.close)
+                command_store = GatewayCommandStore(task_db)
+                stores.callback(command_store.close)
+                task_store = TaskStore(task_db)
+                stores.callback(task_store.close)
+                mailbox_store = MailboxStore(task_db)
+                stores.callback(mailbox_store.close)
+                mailbox = AgentMailbox(mailbox_store)
+                review_audit_store = ReviewAuditStore(review_audit_db)
+                stores.callback(review_audit_store.close)
+                unavailable_agents: dict[str, str] = {}
+                all_local_specs = await build_all_local_worker_specs(
+                    agent_configs,
+                    registry,
+                    providers=llm_providers,
+                    getenv=os.getenv,
+                    home_dir=home_dir,
+                    unavailable_errors=unavailable_agents,
+                )
+                all_remote_refs = await build_all_remote_refs(agent_configs)
 
-            # worker_control 是内部调度控制面。它登记所有 local agent 和 remote_ref，
-            # 每个 agent 的声明式 delegation_targets 在编译时通过 registry 解析，
-            # 并由 scoped delegation tools 强制执行访问范围。
-            worker_control = AgentControl(
-                all_local_specs,
-                all_remote_refs,
-                checkpointer=checkpointer,
-                backend=agent_backend,
-                mailbox=mailbox,
-                webhook_url=webhook_url,
-                webhook_token=webhook_token,
-                max_delegation_depth=max_delegation_depth,
-                max_tasks_per_root=max_tasks_per_root,
-                node_id=node_id,
-                task_store=task_store,
-                permission_default_profile=permission_policy.default_profile,
-                permission_policy=permission_policy,
-                backend_kind=backend_runtime.kind,
-                workspace_root=home_dir,
-                review_audit_store=review_audit_store,
-                skill_catalog=skill_catalog,
-                skill_syncer=skill_syncer,
-                unavailable_agents=unavailable_agents,
-            )
-            await worker_control.wake_pending_mailbox_tasks()
-            worker_control.start_mailbox_recovery()
-            # Gateway Task Module 负责把任务路由到 public 本地 agent 或 remote_ref。
-            # public 本地 agent 也在 worker_control 里执行，
-            # 这样它的 delegation tools 与父 task 归属在同一个 TaskManager 内。
-            gateway_service = GatewayTaskModule(
-                main_agent_name=main_agent_name,
-                agent_configs=agent_configs,
-                control=worker_control,
-                route_store=route_store,
-                command_store=command_store,
-                unavailable_agents=unavailable_agents,
-            )
-            print("configured local agents:", sorted(all_local_specs.keys()))
-            print("configured remote refs:", sorted(all_remote_refs.keys()))
-            if unavailable_agents:
-                print("unavailable local agents:", sorted(unavailable_agents))
-            print(
-                "configured public gateway agents:",
-                sorted(
-                    name for name, config in agent_configs.items() if config.public
-                ),
-            )
-            print(
-                "configured delegation limits:",
-                f"max_depth={max_delegation_depth}",
-                f"max_tasks_per_root={max_tasks_per_root}",
-            )
-            print(f"configured backend: {backend_runtime.kind} ({home_dir})")
-            print("configured skills:", sorted(skill_catalog.keys()))
-            print(
-                "configured permission default profile:",
-                permission_policy.default_profile,
-            )
+                # worker_control 是内部调度控制面。它登记所有 local agent 和
+                # remote_ref，并强制执行声明式 delegation_targets 访问范围。
+                worker_control = AgentControl(
+                    all_local_specs,
+                    all_remote_refs,
+                    checkpointer=checkpointer,
+                    backend=agent_backend,
+                    mailbox=mailbox,
+                    webhook_url=webhook_url,
+                    webhook_token=webhook_token,
+                    max_delegation_depth=max_delegation_depth,
+                    max_tasks_per_root=max_tasks_per_root,
+                    node_id=node_id,
+                    task_store=task_store,
+                    permission_default_profile=permission_policy.default_profile,
+                    permission_policy=permission_policy,
+                    backend_kind=backend_runtime.kind,
+                    workspace_root=home_dir,
+                    review_audit_store=review_audit_store,
+                    skill_catalog=skill_catalog,
+                    skill_syncer=skill_syncer,
+                    unavailable_agents=unavailable_agents,
+                )
+                await worker_control.wake_pending_mailbox_tasks()
+                worker_control.start_mailbox_recovery()
+                gateway_service = GatewayTaskModule(
+                    main_agent_name=main_agent_name,
+                    agent_configs=agent_configs,
+                    control=worker_control,
+                    route_store=route_store,
+                    command_store=command_store,
+                    unavailable_agents=unavailable_agents,
+                )
+                print("configured local agents:", sorted(all_local_specs.keys()))
+                print("configured remote refs:", sorted(all_remote_refs.keys()))
+                if unavailable_agents:
+                    print("unavailable local agents:", sorted(unavailable_agents))
+                print(
+                    "configured public gateway agents:",
+                    sorted(
+                        name for name, config in agent_configs.items() if config.public
+                    ),
+                )
+                print(
+                    "configured delegation limits:",
+                    f"max_depth={max_delegation_depth}",
+                    f"max_tasks_per_root={max_tasks_per_root}",
+                )
+                print(f"configured backend: {backend_runtime.kind} ({home_dir})")
+                print("configured skills:", sorted(skill_catalog.keys()))
+                print(
+                    "configured permission default profile:",
+                    permission_policy.default_profile,
+                )
 
-            yield AppRuntime(
-                main_agent_name=main_agent_name,
-                agent_configs=agent_configs,
-                local_agent_specs=all_local_specs,
-                gateway_service=gateway_service,
-                worker_control=worker_control,
-                review_audit_store=review_audit_store,
-                checkpoint_db=checkpoint_db,
-                route_db=route_db,
-                task_db=task_db,
-                review_audit_db=review_audit_db,
-                permission_default_profile=permission_policy.default_profile,
-                skill_catalog=skill_catalog,
-                skill_syncer=skill_syncer,
-            )
+                try:
+                    yield AppRuntime(
+                        main_agent_name=main_agent_name,
+                        agent_configs=agent_configs,
+                        local_agent_specs=all_local_specs,
+                        gateway_service=gateway_service,
+                        worker_control=worker_control,
+                        review_audit_store=review_audit_store,
+                        checkpoint_db=checkpoint_db,
+                        route_db=route_db,
+                        task_db=task_db,
+                        review_audit_db=review_audit_db,
+                        permission_default_profile=permission_policy.default_profile,
+                        skill_catalog=skill_catalog,
+                        skill_syncer=skill_syncer,
+                    )
+                finally:
+                    await worker_control.close()
     finally:
-        if worker_control is not None:
-            await worker_control.close()
-        if route_store is not None:
-            route_store.close()
-        if command_store is not None:
-            command_store.close()
-        if task_store is not None:
-            task_store.close()
-        if mailbox_store is not None:
-            mailbox_store.close()
-        if review_audit_store is not None:
-            review_audit_store.close()
         backend_runtime.close()
 
 

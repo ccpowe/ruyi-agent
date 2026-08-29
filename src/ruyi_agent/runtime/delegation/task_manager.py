@@ -183,6 +183,11 @@ class TaskManager:
     def request_cancel(self, task_id: str) -> asyncio.Task[None] | None:
         return self._live_runs.request_cancel(task_id)
 
+    def discard_live_run(self, task_id: str) -> None:
+        """Release one process-local handle after supervised finalization."""
+
+        self._live_runs.discard(task_id)
+
     def _save(self, record: TaskRecord) -> None:
         """把当前任务记录写入持久化存储"""
         if self._store is not None:
