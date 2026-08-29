@@ -8,7 +8,7 @@ import pytest
 
 from ruyi_agent.gateway.errors import GatewayTaskError
 from ruyi_agent.gateway.tasks import GatewayTaskModule
-from ruyi_agent.task_models import TaskRecord, TaskRouteRecord
+from ruyi_agent.task_models import PendingReviewRecord, TaskRecord, TaskRouteRecord
 
 
 class ListingRouter:
@@ -52,6 +52,46 @@ class ListingRouter:
 
     def ensure_record(self, route: TaskRouteRecord) -> TaskRecord:
         return self.records[route.task_id]
+
+    def list_pending_reviews(
+        self,
+        *,
+        root_task_id: str | None = None,
+        task_id: str | None = None,
+    ) -> list[PendingReviewRecord]:
+        reviews: list[PendingReviewRecord] = []
+        for record in self.records.values():
+            payload = record.pending_review
+            if payload is None or "source_task_id" in payload:
+                continue
+            review_id = payload.get("review_id")
+            if not isinstance(review_id, str):
+                continue
+            if root_task_id is not None and record.root_task_id != root_task_id:
+                continue
+            if task_id is not None and record.task_id != task_id:
+                continue
+            reviews.append(
+                PendingReviewRecord(
+                    review_id=review_id,
+                    task_id=record.task_id,
+                    root_task_id=record.root_task_id,
+                    payload=dict(payload),
+                    created_at=record.updated_at,
+                    updated_at=record.updated_at,
+                )
+            )
+        return reviews
+
+    def get_pending_review(self, review_id: str) -> PendingReviewRecord | None:
+        return next(
+            (
+                review
+                for review in self.list_pending_reviews()
+                if review.review_id == review_id
+            ),
+            None,
+        )
 
 
 def route(
