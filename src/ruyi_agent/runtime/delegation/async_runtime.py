@@ -624,24 +624,24 @@ class AgentRegistry:
 
     def select_local_specs(
         self,
-        target_names: set[str],
+        target_names: Sequence[str],
     ) -> dict[str, LocalWorkerSpec]:
-        """Resolve the available local targets in one agent's declared scope."""
+        """Resolve local targets in declaration order, skipping unavailable entries."""
         return {
             name: entry.spec
-            for name, entry in self._entries.items()
-            if name in target_names and isinstance(entry, LocalWorkerEntry)
+            for name in target_names
+            if isinstance((entry := self._entries.get(name)), LocalWorkerEntry)
         }
 
     def select_remote_refs(
         self,
-        target_names: set[str],
+        target_names: Sequence[str],
     ) -> dict[str, RemoteRef]:
-        """Resolve the available remote targets in one agent's declared scope."""
+        """Resolve remote targets in declaration order."""
         return {
             name: entry.ref
-            for name, entry in self._entries.items()
-            if name in target_names and isinstance(entry, RemoteRefEntry)
+            for name in target_names
+            if isinstance((entry := self._entries.get(name)), RemoteRefEntry)
         }
 
     def register_task(
@@ -1440,7 +1440,8 @@ class AgentControl:
             return agent
 
         spec = self._registry.get_spec(agent_name)
-        allowed_targets = set(spec.delegation_targets)
+        declared_targets = spec.delegation_targets
+        allowed_targets = set(declared_targets)
         has_delegation_tools = (
             bool(allowed_targets)
             if spec.system_tools is None
@@ -1455,8 +1456,8 @@ class AgentControl:
             model=spec.model,
             system_prompt=spec.system_prompt,
             tools=spec.tools,
-            local_worker_specs=self._registry.select_local_specs(allowed_targets),
-            remote_refs=self._registry.select_remote_refs(allowed_targets),
+            local_worker_specs=self._registry.select_local_specs(declared_targets),
+            remote_refs=self._registry.select_remote_refs(declared_targets),
             worker_tools=worker_tools,
             memory=spec.memory,
             skills=spec.skills,

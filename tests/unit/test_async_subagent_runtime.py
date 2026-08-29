@@ -2592,7 +2592,7 @@ def test_build_tools_for_agent_limits_spawn_scope(
     assert allowed_record.task_id in wait_denied
 
 
-def test_compiling_agent_resolves_declared_scope_from_registry(
+def test_compiling_agent_resolves_declared_scope_in_target_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict = {}
@@ -2606,17 +2606,32 @@ def test_compiling_agent_resolves_declared_scope_from_registry(
         "create_runtime_agent",
         capture_factory,
     )
-    child = build_specs()["background_research"]
-    extra = LocalWorkerSpec(
-        name="extra",
-        description="not in scope",
-        system_prompt="prompt",
-        model=object(),
-        tools=[],
-        memory=[],
-        skills=[],
+    def local_spec(name: str) -> LocalWorkerSpec:
+        return LocalWorkerSpec(
+            name=name,
+            description=name,
+            system_prompt="prompt",
+            model=object(),
+            tools=[],
+            memory=[],
+            skills=[],
+        )
+
+    local_first = local_spec("local_first")
+    local_second = local_spec("local_second")
+    extra = local_spec("extra")
+    remote_first = RemoteRef(
+        name="remote_first",
+        description="remote first",
+        url="https://example.com/first",
+        remote_agent_name="first",
     )
-    remote_refs = build_test_remote_refs()
+    remote_second = RemoteRef(
+        name="remote_second",
+        description="remote second",
+        url="https://example.com/second",
+        remote_agent_name="second",
+    )
     main = LocalWorkerSpec(
         name="main",
         description="main",
@@ -2625,20 +2640,35 @@ def test_compiling_agent_resolves_declared_scope_from_registry(
         tools=[],
         memory=[],
         skills=[],
-        delegation_targets=("background_research", "remote_code_wiki"),
+        delegation_targets=(
+            "local_first",
+            "remote_first",
+            "local_second",
+            "remote_second",
+            "local_first",
+            "remote_first",
+        ),
         system_tools=frozenset({"spawn_agent", "list_agents"}),
     )
     control = async_subagent_runtime.AgentControl(
-        {"main": main, "background_research": child, "extra": extra},
-        remote_refs,
+        {
+            "main": main,
+            "local_second": local_second,
+            "local_first": local_first,
+            "extra": extra,
+        },
+        {
+            "remote_second": remote_second,
+            "remote_first": remote_first,
+        },
         checkpointer=object(),
         backend=object(),
     )
 
     control._get_or_create_agent("main")
 
-    assert set(captured["local_worker_specs"]) == {"background_research"}
-    assert set(captured["remote_refs"]) == {"remote_code_wiki"}
+    assert list(captured["local_worker_specs"]) == ["local_first", "local_second"]
+    assert list(captured["remote_refs"]) == ["remote_first", "remote_second"]
     assert {tool.name for tool in captured["worker_tools"]} == {
         "spawn_agent",
         "list_agents",
