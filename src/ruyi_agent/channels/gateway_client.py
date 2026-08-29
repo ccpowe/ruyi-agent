@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -10,16 +9,17 @@ from typing import Any, Protocol
 
 import httpx
 
+from ruyi_agent.gateway._http_transport import (
+    GatewayHTTPTransport,
+    GatewayTransportHTTPStatusError,
+    GatewayTransportInvalidJSONError,
+    GatewayTransportInvalidPayloadError,
+    GatewayTransportInvalidStreamError,
+    GatewayTransportStreamError,
+    gateway_bearer_auth_headers,
+)
 from ruyi_agent.gateway.sse import (
     GatewayTaskEvent,
-    MAX_SSE_ERROR_READ_SECONDS,
-    MAX_SSE_HANDSHAKE_SECONDS,
-    SSEProtocolError,
-    decode_sse_error_json,
-    has_identity_content_encoding,
-    iter_gateway_task_events,
-    iter_utf8_sse_lines,
-    read_bounded_sse_error_body,
 )
 from ruyi_agent.runtime.task_events import (
     MAX_SHORT_EVENT_TEXT_LENGTH,
@@ -117,6 +117,12 @@ class GatewayHTTPClient:
         self._bearer_token = bearer_token
         self._timeout = timeout
         self._transport = transport
+        self._http = GatewayHTTPTransport(
+            base_url=self._base_url,
+            timeout=timeout,
+            headers=gateway_bearer_auth_headers(bearer_token),
+            transport=transport,
+        )
 
     async def list_tasks(
         self,
@@ -187,7 +193,9 @@ class GatewayHTTPClient:
             json={"path": path},
         )
         content_disposition = response.headers.get("content-disposition", "")
-        filename = _filename_from_content_disposition(content_disposition) or Path(path).name
+        filename = (
+            _filename_from_content_disposition(content_disposition) or Path(path).name
+        )
         return GatewayArtifact(
             kind="file",
             filename=filename or "artifact",
@@ -206,7 +214,9 @@ class GatewayHTTPClient:
             f"/tasks/{task_id}/artifacts/{artifact_id}/download",
         )
         content_disposition = response.headers.get("content-disposition", "")
-        filename = _filename_from_content_disposition(content_disposition) or artifact_id
+        filename = (
+            _filename_from_content_disposition(content_disposition) or artifact_id
+        )
         return GatewayArtifact(
             kind="file",
             filename=filename or "artifact",
@@ -243,124 +253,40 @@ class GatewayHTTPClient:
     ) -> AsyncIterator[AsyncIterator[GatewayTaskEvent]]:
         """Open an opt-in Task SSE stream without expanding adapter protocols."""
 
-        headers = {
-            "Authorization": f"Bearer {self._bearer_token}",
-            "Accept": "text/event-stream",
-            "Accept-Encoding": "identity",
-        }
-        if last_event_id is not None:
-            headers["Last-Event-ID"] = last_event_id
-        timeout = httpx.Timeout(self._timeout, read=None)
-        async with httpx.AsyncClient(
-            base_url=self._base_url,
-            timeout=timeout,
-            headers=headers,
-            transport=self._transport,
-        ) as client:
-            response_context = client.stream(
-                "GET",
+        try:
+            async with self._http.stream_task_events(
                 f"/tasks/{task_id}/events",
-                params={"run_count": str(run_count)},
-            )
-            try:
-                async with asyncio.timeout(
-                    min(
-                        max(self._timeout, 0.001),
-                        MAX_SSE_HANDSHAKE_SECONDS,
-                    )
-                ):
-                    response = await response_context.__aenter__()
-            except (TimeoutError, httpx.HTTPError) as exc:
-                raise GatewayClientError(
-                    status_code=502,
-                    code="gateway_error",
-                    message="Gateway Task event stream failed",
-                ) from exc
-            try:
-                try:
-                    if response.status_code != 200:
-                        if not has_identity_content_encoding(
-                            response.headers.get("content-encoding", "")
-                        ):
-                            raise GatewayClientError(
-                                status_code=502,
-                                code="gateway_error",
-                                message="Gateway returned an invalid Task event error",
-                            )
-                        chunks = (
-                            response.aiter_bytes()
-                            if response.is_stream_consumed
-                            else response.aiter_raw()
-                        )
-                        body = await read_bounded_sse_error_body(
-                            chunks,
-                            timeout_seconds=min(
-                                max(self._timeout, 0.001),
-                                MAX_SSE_ERROR_READ_SECONDS,
-                            ),
-                        )
-                        try:
-                            payload = decode_sse_error_json(body)
-                        except SSEProtocolError as exc:
-                            raise GatewayClientError(
-                                status_code=502,
-                                code="gateway_error",
-                                message="Gateway returned invalid JSON",
-                            ) from exc
-                        if not isinstance(payload, dict):
-                            raise GatewayClientError(
-                                status_code=502,
-                                code="gateway_error",
-                                message="Gateway returned invalid payload",
-                            )
-                        error = payload.get("error")
-                        if isinstance(error, dict):
-                            raw_code = error.get("code")
-                            raw_message = error.get("message")
-                            raise GatewayClientError(
-                                status_code=response.status_code,
-                                code=(
-                                    normalize_task_event_text(raw_code)[
-                                        :MAX_SHORT_EVENT_TEXT_LENGTH
-                                    ]
-                                    if isinstance(raw_code, str)
-                                    else "gateway_error"
-                                ),
-                                message=(
-                                    normalize_task_event_text(raw_message)[
-                                        :MAX_SHORT_EVENT_TEXT_LENGTH
-                                    ]
-                                    if isinstance(raw_message, str)
-                                    else "Gateway request failed"
-                                ),
-                            )
-                        raise GatewayClientError(
-                            status_code=response.status_code,
-                            code="gateway_error",
-                            message="Gateway request failed",
-                        )
-                    content_type = response.headers.get("content-type", "")
-                    if content_type.partition(";")[0].strip().lower() != (
-                        "text/event-stream"
-                    ) or not has_identity_content_encoding(
-                        response.headers.get("content-encoding", "")
-                    ):
-                        raise GatewayClientError(
-                            status_code=502,
-                            code="gateway_error",
-                            message="Gateway returned an invalid Task event stream",
-                        )
-                except GatewayClientError:
-                    raise
-                except (httpx.HTTPError, SSEProtocolError) as exc:
-                    raise GatewayClientError(
-                        status_code=502,
-                        code="gateway_error",
-                        message="Gateway Task event stream failed",
-                    ) from exc
-                yield _iter_task_events(response)
-            finally:
-                await response_context.__aexit__(None, None, None)
+                run_count=run_count,
+                last_event_id=last_event_id,
+            ) as events:
+                yield _map_task_event_errors(events)
+        except GatewayTransportHTTPStatusError as exc:
+            raise _gateway_http_status_error(exc, sanitize=True) from exc
+        except GatewayTransportInvalidJSONError as exc:
+            raise GatewayClientError(
+                status_code=502,
+                code="gateway_error",
+                message="Gateway returned invalid JSON",
+            ) from exc
+        except GatewayTransportInvalidPayloadError as exc:
+            raise GatewayClientError(
+                status_code=502,
+                code="gateway_error",
+                message="Gateway returned invalid payload",
+            ) from exc
+        except GatewayTransportInvalidStreamError as exc:
+            label = "error" if exc.phase == "error_response" else "stream"
+            raise GatewayClientError(
+                status_code=502,
+                code="gateway_error",
+                message=f"Gateway returned an invalid Task event {label}",
+            ) from exc
+        except GatewayTransportStreamError as exc:
+            raise GatewayClientError(
+                status_code=502,
+                code="gateway_error",
+                message="Gateway Task event stream failed",
+            ) from exc
 
     async def submit_review_decision(
         self,
@@ -384,34 +310,28 @@ class GatewayHTTPClient:
         json: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        headers = {
-            "Authorization": f"Bearer {self._bearer_token}",
-            "Accept": "application/json",
-        }
-        if idempotency_key is not None:
-            headers["Idempotency-Key"] = idempotency_key
-        async with httpx.AsyncClient(
-            base_url=self._base_url,
-            timeout=self._timeout,
-            headers=headers,
-            transport=self._transport,
-        ) as client:
-            response = await client.request(method, path, params=params, json=json)
-        payload = self._decode_json(response)
-        if response.is_success:
-            return payload
-        error = payload.get("error") if isinstance(payload, dict) else None
-        if isinstance(error, dict):
-            raise GatewayClientError(
-                status_code=response.status_code,
-                code=str(error.get("code", "gateway_error")),
-                message=str(error.get("message", "Gateway request failed")),
+        try:
+            return await self._http.request_json(
+                method,
+                path,
+                params=params,
+                json=json,
+                idempotency_key=idempotency_key,
             )
-        raise GatewayClientError(
-            status_code=response.status_code,
-            code="gateway_error",
-            message="Gateway request failed",
-        )
+        except GatewayTransportHTTPStatusError as exc:
+            raise _gateway_http_status_error(exc) from exc
+        except GatewayTransportInvalidJSONError as exc:
+            raise GatewayClientError(
+                status_code=502,
+                code="gateway_error",
+                message="Gateway returned invalid JSON",
+            ) from exc
+        except GatewayTransportInvalidPayloadError as exc:
+            raise GatewayClientError(
+                status_code=502,
+                code="gateway_error",
+                message="Gateway returned invalid payload",
+            ) from exc
 
     async def _request_raw(
         self,
@@ -420,69 +340,74 @@ class GatewayHTTPClient:
         *,
         json: dict[str, Any] | None = None,
     ) -> httpx.Response:
-        headers = {
-            "Authorization": f"Bearer {self._bearer_token}",
-            "Accept": "*/*",
-        }
-        async with httpx.AsyncClient(
-            base_url=self._base_url,
-            timeout=self._timeout,
-            headers=headers,
-            transport=self._transport,
-        ) as client:
-            response = await client.request(method, path, json=json)
-        if response.is_success:
-            return response
-        payload = self._decode_json(response)
-        error = payload.get("error") if isinstance(payload, dict) else None
-        if isinstance(error, dict):
-            raise GatewayClientError(
-                status_code=response.status_code,
-                code=str(error.get("code", "gateway_error")),
-                message=str(error.get("message", "Gateway request failed")),
-            )
-        raise GatewayClientError(
-            status_code=response.status_code,
-            code="gateway_error",
-            message="Gateway request failed",
-        )
-
-    def _decode_json(self, response: httpx.Response) -> dict[str, Any]:
         try:
-            payload = response.json()
-        except ValueError as exc:
+            return await self._http.request_raw(method, path, json=json)
+        except GatewayTransportHTTPStatusError as exc:
+            raise _gateway_http_status_error(exc) from exc
+        except GatewayTransportInvalidJSONError as exc:
             raise GatewayClientError(
                 status_code=502,
                 code="gateway_error",
                 message="Gateway returned invalid JSON",
             ) from exc
-        if not isinstance(payload, dict):
+        except GatewayTransportInvalidPayloadError as exc:
             raise GatewayClientError(
                 status_code=502,
                 code="gateway_error",
                 message="Gateway returned invalid payload",
-            )
-        return payload
+            ) from exc
 
 
-async def _iter_task_events(
-    response: httpx.Response,
+async def _map_task_event_errors(
+    events: AsyncIterator[GatewayTaskEvent],
 ) -> AsyncIterator[GatewayTaskEvent]:
     try:
-        chunks = (
-            response.aiter_bytes()
-            if response.is_stream_consumed
-            else response.aiter_raw()
-        )
-        lines = iter_utf8_sse_lines(chunks)
-        async for event in iter_gateway_task_events(lines):
+        async for event in events:
             yield event
-            if event.event_type == "stream.end":
-                return
-        raise SSEProtocolError("Gateway Task event stream ended without stream.end")
-    except (httpx.HTTPError, SSEProtocolError) as exc:
+    except GatewayTransportStreamError as exc:
         raise GatewayClientError(
             status_code=502,
             code="gateway_error",
             message="Gateway Task event stream failed",
         ) from exc
+
+
+def _gateway_http_status_error(
+    exc: GatewayTransportHTTPStatusError,
+    *,
+    sanitize: bool = False,
+) -> GatewayClientError:
+    if not isinstance(exc.payload, dict):
+        return GatewayClientError(
+            status_code=502,
+            code="gateway_error",
+            message="Gateway returned invalid payload",
+        )
+    error = exc.payload.get("error")
+    if isinstance(error, dict):
+        raw_code = error.get("code")
+        raw_message = error.get("message")
+        if sanitize:
+            code = (
+                normalize_task_event_text(raw_code)[:MAX_SHORT_EVENT_TEXT_LENGTH]
+                if isinstance(raw_code, str)
+                else "gateway_error"
+            )
+            message = (
+                normalize_task_event_text(raw_message)[:MAX_SHORT_EVENT_TEXT_LENGTH]
+                if isinstance(raw_message, str)
+                else "Gateway request failed"
+            )
+        else:
+            code = str(error.get("code", "gateway_error"))
+            message = str(error.get("message", "Gateway request failed"))
+        return GatewayClientError(
+            status_code=exc.status_code,
+            code=code,
+            message=message,
+        )
+    return GatewayClientError(
+        status_code=exc.status_code,
+        code="gateway_error",
+        message="Gateway request failed",
+    )

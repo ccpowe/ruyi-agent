@@ -20,7 +20,6 @@ A2A Client - Agent-to-Agent 协议客户端
 
 from __future__ import annotations
 
-import asyncio
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -29,16 +28,17 @@ from typing import Any
 import httpx
 
 from ruyi_agent.config.loader import RemoteRef
+from ruyi_agent.gateway._http_transport import (
+    GatewayHTTPTransport,
+    GatewayTransportHTTPStatusError,
+    GatewayTransportInvalidJSONError,
+    GatewayTransportInvalidPayloadError,
+    GatewayTransportInvalidStreamError,
+    GatewayTransportStreamError,
+    gateway_bearer_auth_headers,
+)
 from ruyi_agent.gateway.sse import (
     GatewayTaskEvent,
-    MAX_SSE_ERROR_READ_SECONDS,
-    MAX_SSE_HANDSHAKE_SECONDS,
-    SSEProtocolError,
-    decode_sse_error_json,
-    has_identity_content_encoding,
-    iter_gateway_task_events,
-    iter_utf8_sse_lines,
-    read_bounded_sse_error_body,
 )
 from ruyi_agent.runtime.task_events import (
     MAX_SHORT_EVENT_TEXT_LENGTH,
@@ -216,95 +216,32 @@ class A2AClient:
     ) -> AsyncIterator[AsyncIterator[GatewayTaskEvent]]:
         """Open a downstream Task SSE stream and keep its response alive."""
 
-        headers = self._build_headers(remote_ref)
-        headers["Accept"] = "text/event-stream"
-        headers["Accept-Encoding"] = "identity"
-        if last_event_id is not None:
-            headers["Last-Event-ID"] = last_event_id
-        timeout = httpx.Timeout(self._timeout, read=None)
-        async with httpx.AsyncClient(
-            base_url=remote_ref.url,
-            timeout=timeout,
-            headers=headers,
-            transport=self._transports.get(remote_ref.url),
-        ) as client:
-            response_context = client.stream(
-                "GET",
+        transport = self._http_transport(remote_ref)
+        try:
+            async with transport.stream_task_events(
                 f"tasks/{task_id}/events",
-                params={"run_count": str(run_count)},
-            )
-            try:
-                async with asyncio.timeout(
-                    min(
-                        max(self._timeout, 0.001),
-                        MAX_SSE_HANDSHAKE_SECONDS,
-                    )
-                ):
-                    response = await response_context.__aenter__()
-            except (TimeoutError, httpx.HTTPError) as exc:
-                raise A2AClientError(
-                    status_code=502,
-                    code="upstream_gateway_error",
-                    message=f"Remote Task event stream failed for '{remote_ref.name}'",
-                ) from exc
-            try:
-                try:
-                    if response.status_code != 200:
-                        if not has_identity_content_encoding(
-                            response.headers.get("content-encoding", "")
-                        ):
-                            raise A2AClientError(
-                                status_code=502,
-                                code="upstream_gateway_error",
-                                message=(
-                                    f"Remote gateway for '{remote_ref.name}' "
-                                    "returned an invalid Task event error"
-                                ),
-                            )
-                        chunks = (
-                            response.aiter_bytes()
-                            if response.is_stream_consumed
-                            else response.aiter_raw()
-                        )
-                        body = await read_bounded_sse_error_body(
-                            chunks,
-                            timeout_seconds=min(
-                                max(self._timeout, 0.001),
-                                MAX_SSE_ERROR_READ_SECONDS,
-                            ),
-                        )
-                        raise _task_event_response_error(
-                            remote_ref,
-                            response,
-                            body,
-                        )
-                    content_type = response.headers.get("content-type", "")
-                    if content_type.partition(";")[0].strip().lower() != (
-                        "text/event-stream"
-                    ) or not has_identity_content_encoding(
-                        response.headers.get("content-encoding", "")
-                    ):
-                        raise A2AClientError(
-                            status_code=502,
-                            code="upstream_gateway_error",
-                            message=(
-                                f"Remote gateway for '{remote_ref.name}' returned "
-                                "an invalid Task event stream"
-                            ),
-                        )
-                except A2AClientError:
-                    raise
-                except (httpx.HTTPError, SSEProtocolError) as exc:
-                    raise A2AClientError(
-                        status_code=502,
-                        code="upstream_gateway_error",
-                        message=(
-                            f"Remote Task event stream failed for '{remote_ref.name}'"
-                        ),
-                    ) from exc
-                yield _iter_remote_task_events(response, remote_ref)
-            finally:
-                await response_context.__aexit__(None, None, None)
+                run_count=run_count,
+                last_event_id=last_event_id,
+            ) as events:
+                yield _map_remote_task_event_errors(events, remote_ref)
+        except GatewayTransportHTTPStatusError as exc:
+            raise _task_event_response_error(remote_ref, exc) from exc
+        except GatewayTransportInvalidStreamError as exc:
+            label = "error" if exc.phase == "error_response" else "stream"
+            raise A2AClientError(
+                status_code=502,
+                code="upstream_gateway_error",
+                message=(
+                    f"Remote gateway for '{remote_ref.name}' returned "
+                    f"an invalid Task event {label}"
+                ),
+            ) from exc
+        except (
+            GatewayTransportInvalidJSONError,
+            GatewayTransportInvalidPayloadError,
+            GatewayTransportStreamError,
+        ) as exc:
+            raise _remote_task_event_stream_error(remote_ref) from exc
 
     async def send_input(
         self,
@@ -425,83 +362,44 @@ class A2AClient:
         3. 响应是 JSON 但格式错误 → 502 upstream_gateway_error
         4. 远程网关返回错误 → 透传状态码和错误信息
         """
-        headers = self._build_headers(remote_ref)
-        if idempotency_key is not None:
-            headers["Idempotency-Key"] = idempotency_key
-
-        # 发送 HTTP 请求
         try:
-            async with httpx.AsyncClient(
-                base_url=remote_ref.url,
-                timeout=self._timeout,
-                headers=headers,
-                transport=self._transports.get(remote_ref.url),
-            ) as client:
-                response = await client.request(
-                    method,
-                    path,
-                    params=params,
-                    json=json,
-                )
+            return await self._http_transport(remote_ref).request_json(
+                method,
+                path,
+                params=params,
+                json=json,
+                idempotency_key=idempotency_key,
+            )
         except httpx.HTTPError as exc:
-            # 网络错误：连接失败、超时、DNS 解析失败等
             raise A2AClientError(
                 status_code=502,
                 code="upstream_gateway_error",
                 message=f"Remote gateway request failed for '{remote_ref.name}'",
             ) from exc
-
-        # 解析 JSON 响应
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            # 响应不是有效的 JSON
+        except GatewayTransportInvalidJSONError as exc:
             raise A2AClientError(
                 status_code=502,
                 code="upstream_gateway_error",
                 message=f"Remote gateway for '{remote_ref.name}' returned invalid JSON",
             ) from exc
-
-        # 处理成功响应（2xx）
-        if response.is_success:
-            if not isinstance(payload, dict):
-                # 响应是 JSON 但不是 dict（可能是 list 或其他类型）
-                raise A2AClientError(
-                    status_code=502,
-                    code="upstream_gateway_error",
-                    message=(
-                        f"Remote gateway for '{remote_ref.name}' returned an invalid "
-                        "response payload"
-                    ),
-                )
-            return payload
-
-        # 处理错误响应（4xx, 5xx）
-        # 尝试从响应中提取错误信息
-        error_payload = payload.get("error") if isinstance(payload, dict) else None
-        if isinstance(error_payload, dict):
-            # 远程网关返回了标准错误格式：{"error": {"code": "...", "message": "..."}}
+        except GatewayTransportInvalidPayloadError as exc:
             raise A2AClientError(
-                status_code=response.status_code,
-                code=str(error_payload.get("code", "upstream_gateway_error")),
-                message=str(
-                    error_payload.get(
-                        "message",
-                        f"Remote gateway request failed for '{remote_ref.name}'",
-                    )
+                status_code=502,
+                code="upstream_gateway_error",
+                message=(
+                    f"Remote gateway for '{remote_ref.name}' returned an invalid "
+                    "response payload"
                 ),
-                details=(
-                    error_payload.get("details")
-                    if isinstance(error_payload.get("details"), dict)
-                    else None
-                ),
-            )
+            ) from exc
+        except GatewayTransportHTTPStatusError as exc:
+            raise _remote_http_status_error(remote_ref, exc) from exc
 
-        # 远程网关返回了错误但格式不标准
-        raise A2AClientError(
-            status_code=502,
-            code="upstream_gateway_error",
-            message=f"Remote gateway request failed for '{remote_ref.name}'",
+    def _http_transport(self, remote_ref: RemoteRef) -> GatewayHTTPTransport:
+        return GatewayHTTPTransport(
+            base_url=remote_ref.url,
+            timeout=self._timeout,
+            headers=self._build_headers(remote_ref),
+            transport=self._transports.get(remote_ref.url),
         )
 
     def _build_headers(self, remote_ref: RemoteRef) -> dict[str, str]:
@@ -531,12 +429,11 @@ class A2AClient:
                 "token_env": "REMOTE_GATEWAY_TOKEN"
             }
         """
-        headers = {"Accept": "application/json"}
         auth = remote_ref.auth or {}
 
         # 如果没有配置认证，直接返回基础 headers
         if not auth:
-            return headers
+            return {}
 
         # 检查认证类型
         auth_type = auth.get("type")
@@ -571,45 +468,61 @@ class A2AClient:
                 ),
             )
 
-        # 添加 Authorization header
-        headers["Authorization"] = f"Bearer {token}"
-        return headers
+        return gateway_bearer_auth_headers(token)
 
 
-async def _iter_remote_task_events(
-    response: httpx.Response,
+def _remote_http_status_error(
+    remote_ref: RemoteRef,
+    exc: GatewayTransportHTTPStatusError,
+) -> A2AClientError:
+    error_payload = exc.payload.get("error") if isinstance(exc.payload, dict) else None
+    if isinstance(error_payload, dict):
+        return A2AClientError(
+            status_code=exc.status_code,
+            code=str(error_payload.get("code", "upstream_gateway_error")),
+            message=str(
+                error_payload.get(
+                    "message",
+                    f"Remote gateway request failed for '{remote_ref.name}'",
+                )
+            ),
+            details=(
+                error_payload.get("details")
+                if isinstance(error_payload.get("details"), dict)
+                else None
+            ),
+        )
+    return A2AClientError(
+        status_code=502,
+        code="upstream_gateway_error",
+        message=f"Remote gateway request failed for '{remote_ref.name}'",
+    )
+
+
+async def _map_remote_task_event_errors(
+    events: AsyncIterator[GatewayTaskEvent],
     remote_ref: RemoteRef,
 ) -> AsyncIterator[GatewayTaskEvent]:
     try:
-        chunks = (
-            response.aiter_bytes()
-            if response.is_stream_consumed
-            else response.aiter_raw()
-        )
-        lines = iter_utf8_sse_lines(chunks)
-        async for event in iter_gateway_task_events(lines):
+        async for event in events:
             yield event
-            if event.event_type == "stream.end":
-                return
-        raise SSEProtocolError("Remote Task event stream ended without stream.end")
-    except (httpx.HTTPError, SSEProtocolError) as exc:
-        raise A2AClientError(
-            status_code=502,
-            code="upstream_gateway_error",
-            message=f"Remote Task event stream failed for '{remote_ref.name}'",
-        ) from exc
+    except GatewayTransportStreamError as exc:
+        raise _remote_task_event_stream_error(remote_ref) from exc
+
+
+def _remote_task_event_stream_error(remote_ref: RemoteRef) -> A2AClientError:
+    return A2AClientError(
+        status_code=502,
+        code="upstream_gateway_error",
+        message=f"Remote Task event stream failed for '{remote_ref.name}'",
+    )
 
 
 def _task_event_response_error(
     remote_ref: RemoteRef,
-    response: httpx.Response,
-    body: bytes,
+    exc: GatewayTransportHTTPStatusError,
 ) -> A2AClientError:
-    try:
-        payload = decode_sse_error_json(body)
-    except SSEProtocolError:
-        payload = None
-    error = payload.get("error") if isinstance(payload, dict) else None
+    error = exc.payload.get("error") if isinstance(exc.payload, dict) else None
     code = error.get("code") if isinstance(error, dict) else None
     raw_message = error.get("message") if isinstance(error, dict) else None
     message = (
@@ -618,29 +531,25 @@ def _task_event_response_error(
         else None
     )
     if (
-        response.status_code == 400
+        exc.status_code == 400
         and code == "invalid_request"
         and isinstance(message, str)
     ) or (
-        response.status_code == 409
+        exc.status_code == 409
         and code == "task_run_mismatch"
         and isinstance(message, str)
     ):
         return A2AClientError(
-            status_code=response.status_code,
+            status_code=exc.status_code,
             code=code,
             message=message,
             details=(
                 _task_run_mismatch_details(error.get("details"))
-                if response.status_code == 409
+                if exc.status_code == 409
                 else None
             ),
         )
-    return A2AClientError(
-        status_code=502,
-        code="upstream_gateway_error",
-        message=f"Remote Task event stream failed for '{remote_ref.name}'",
-    )
+    return _remote_task_event_stream_error(remote_ref)
 
 
 def _task_run_mismatch_details(value: Any) -> dict[str, int] | None:
