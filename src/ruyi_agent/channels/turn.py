@@ -16,10 +16,11 @@ from ruyi_agent.channels.gateway_client import (
 )
 from ruyi_agent.channels.gateway_dto import GatewayTask
 from ruyi_agent.storage.channel_session_store import ChannelSessionStore
+from ruyi_agent.task_models import EXECUTING_TASK_STATES, SETTLED_TASK_STATES
 
 
-ACTIVE_RUN_STATES = frozenset({"pending", "running"})
-SETTLED_RUN_STATES = frozenset({"completed", "failed", "cancelled", "interrupted"})
+ACTIVE_RUN_STATES = EXECUTING_TASK_STATES
+SETTLED_RUN_STATES = SETTLED_TASK_STATES
 
 
 @dataclass(frozen=True, slots=True)

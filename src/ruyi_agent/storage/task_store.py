@@ -18,7 +18,7 @@ from ruyi_agent.storage.task_repository import (
 from ruyi_agent.storage.task_review_uow import TaskReviewUnitOfWork
 from ruyi_agent.storage.task_schema import initialize_task_database
 from ruyi_agent.storage.task_unit_of_work import TaskLifecycleUnitOfWork
-from ruyi_agent.task_models import PendingReviewRecord, TaskRecord
+from ruyi_agent.task_models import EXECUTING_TASK_STATES, PendingReviewRecord, TaskRecord
 
 __all__ = [
     "StoredTaskAlreadyExistsError",
@@ -235,7 +235,7 @@ class TaskStore:
 
 
 def task_record_for_restart(record: TaskRecord) -> TaskRecord:
-    if record.route_kind == "local" and record.state in {"pending", "running"}:
+    if record.route_kind == "local" and record.state in EXECUTING_TASK_STATES:
         return replace(
             record,
             state="interrupted",

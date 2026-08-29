@@ -2,11 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
 
-from ruyi_agent.task_models import MetadataScalar, TaskRouteRecord as TaskRouteRecord
+from ruyi_agent.task_models import (
+    MetadataScalar,
+    TaskRouteRecord as TaskRouteRecord,
+    TaskState,
+    parse_task_state,
+)
+
+
+ParsedTaskState: TypeAlias = Annotated[TaskState, BeforeValidator(parse_task_state)]
 
 
 @dataclass(slots=True)
@@ -50,15 +58,7 @@ class TaskResponse(BaseModel):
     parent_task_id: str | None
     root_task_id: str
     depth: int
-    status: Literal[
-        "pending",
-        "running",
-        "waiting_for_human",
-        "completed",
-        "failed",
-        "cancelled",
-        "interrupted",
-    ]
+    status: ParsedTaskState
     last_result: str | None
     error: str | None
     run_count: int
@@ -131,15 +131,7 @@ class TaskWebhookEvent(BaseModel):
     event_type: str
     task_id: str
     agent_name: str
-    status: Literal[
-        "pending",
-        "running",
-        "waiting_for_human",
-        "completed",
-        "failed",
-        "cancelled",
-        "interrupted",
-    ]
+    status: ParsedTaskState
     last_result: str | None = None
     error: str | None = None
     run_count: int

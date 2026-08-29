@@ -44,10 +44,12 @@ from ruyi_agent.runtime.task_events import (
 )
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
 from ruyi_agent.task_models import (
+    SETTLED_TASK_STATES,
     MetadataScalar,
     PendingReviewRecord,
     TaskRecord,
     TaskRouteRecord,
+    parse_task_state,
 )
 
 TASK_MESSAGE_CURSOR_VERSION = 1
@@ -614,9 +616,12 @@ class TaskRouter:
 def _public_state_end_reason(data: dict[str, Any]) -> str | None:
     if data.get("pending_review") or data.get("status") == "waiting_for_human":
         return "review_required"
-    status = data.get("status")
-    if status in {"completed", "failed", "cancelled", "interrupted"}:
-        return str(status)
+    try:
+        status = parse_task_state(data.get("status"))
+    except ValueError:
+        return None
+    if status in SETTLED_TASK_STATES:
+        return status
     return None
 
 

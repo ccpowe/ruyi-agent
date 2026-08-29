@@ -25,7 +25,12 @@ from ruyi_agent.runtime.task_event_contracts import (
 )
 from ruyi_agent.runtime.task_event_cursor import encode_task_event_cursor
 from ruyi_agent.storage.task_store import StoredTaskEvent
-from ruyi_agent.task_models import PublishedArtifact, TaskRecord
+from ruyi_agent.task_models import (
+    SETTLED_TASK_STATES,
+    PublishedArtifact,
+    TaskRecord,
+    parse_task_state,
+)
 
 
 def lifecycle_event_type(record: TaskRecord) -> TaskLifecycleEventType:
@@ -206,11 +211,14 @@ def end_reason_for_record(record: TaskRecord) -> str | None:
 def end_reason_from_data(data: dict[str, Any]) -> str | None:
     if data.get("pending_review"):
         return "review_required"
-    status = data.get("status")
+    try:
+        status = parse_task_state(data.get("status"))
+    except ValueError:
+        return None
     if status == "waiting_for_human":
         return "review_required"
-    if status in {"completed", "failed", "cancelled", "interrupted"}:
-        return str(status)
+    if status in SETTLED_TASK_STATES:
+        return status
     return None
 
 

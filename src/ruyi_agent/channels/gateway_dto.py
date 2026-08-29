@@ -4,14 +4,23 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from datetime import datetime
-from typing import Any, Literal, TypeVar
+from typing import Annotated, Any, Literal, TypeAlias, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+)
 
-from ruyi_agent.task_models import MetadataScalar
+from ruyi_agent.task_models import MetadataScalar, TaskState, parse_task_state
 
 
 ValueT = TypeVar("ValueT")
+ParsedTaskState: TypeAlias = Annotated[TaskState, BeforeValidator(parse_task_state)]
 
 
 class GatewayDTO(BaseModel, Mapping[str, Any]):
@@ -71,15 +80,7 @@ class GatewayTask(GatewayDTO):
     parent_task_id: StrictStr | None = None
     root_task_id: StrictStr = ""
     depth: StrictInt = Field(default=0, ge=0)
-    status: Literal[
-        "pending",
-        "running",
-        "waiting_for_human",
-        "completed",
-        "failed",
-        "cancelled",
-        "interrupted",
-    ]
+    status: ParsedTaskState
     last_result: StrictStr | None = None
     error: StrictStr | None = None
     run_count: StrictInt = Field(ge=0)

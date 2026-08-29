@@ -32,12 +32,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import threading
 import uuid
-from typing import Literal
+from typing import TypeAlias
 
 from ruyi_agent.storage.mailbox_store import MailboxStore
+from ruyi_agent.task_models import SETTLED_TASK_STATES, TaskState, parse_task_state
 
 
-TaskSettledStatus = Literal["completed", "failed", "cancelled", "interrupted"]
+TaskSettledStatus: TypeAlias = TaskState
 
 
 @dataclass(slots=True)
@@ -137,6 +138,10 @@ class AgentMailbox:
         Returns:
             新创建的 mailbox 消息；如果重复发布则返回 None
         """
+        parsed_status = parse_task_state(status, path="Mailbox settled status")
+        if parsed_status not in SETTLED_TASK_STATES:
+            raise ValueError("Mailbox settled status must be a settled Task state")
+        status = parsed_status
         key = (recipient_thread_id, child_task_id, run_count)
         with self._lock:
             # 为什么要去重：本地同步、远端 webhook 或状态轮询可能重复发布同一轮结果。

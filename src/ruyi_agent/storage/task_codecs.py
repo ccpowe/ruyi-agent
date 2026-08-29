@@ -4,7 +4,12 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-from ruyi_agent.task_models import PendingReviewRecord, PublishedArtifact, TaskRecord
+from ruyi_agent.task_models import (
+    PendingReviewRecord,
+    PublishedArtifact,
+    TaskRecord,
+    parse_task_state,
+)
 
 
 TASK_WRITE_COLUMNS = (
@@ -134,7 +139,7 @@ def row_to_task_record(row: tuple[Any, ...]) -> TaskRecord:
     return TaskRecord(
         task_id=row[0],
         agent_name=row[1],
-        state=row[2],
+        state=parse_task_state(row[2], path="Stored Task state"),
         thread_id=row[3],
         parent_task_id=row[4],
         root_task_id=row[5],

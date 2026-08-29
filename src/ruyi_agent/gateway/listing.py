@@ -13,7 +13,12 @@ from ruyi_agent.gateway.application import (
 )
 from ruyi_agent.gateway.errors import GatewayTaskError
 from ruyi_agent.gateway.models import TaskListResponse, TaskResponse
-from ruyi_agent.task_models import MetadataScalar, TaskRouteRecord
+from ruyi_agent.task_models import (
+    MetadataScalar,
+    TaskRouteRecord,
+    TaskState,
+    parse_task_state,
+)
 
 
 class GatewayListingService:
@@ -42,6 +47,7 @@ class GatewayListingService:
                 code="invalid_request",
                 message="Query parameter 'limit' must be between 1 and 100",
             )
+        parsed_status = self._parse_status(status)
         offset = self.decode_cursor(cursor)
         routes = [
             route
@@ -53,7 +59,7 @@ class GatewayListingService:
         for _route, item in await self.collect_tasks(routes):
             if item is None:
                 continue
-            if status is not None and item.status != status:
+            if parsed_status is not None and item.status != parsed_status:
                 continue
             if root_task_id is not None and item.root_task_id != root_task_id:
                 continue
@@ -136,3 +142,14 @@ class GatewayListingService:
             code="invalid_request",
             message="Query parameter 'cursor' is invalid",
         )
+
+    def _parse_status(self, status: str | None) -> TaskState | None:
+        if status is None:
+            return None
+        try:
+            return parse_task_state(status, path="Query parameter 'status'")
+        except ValueError as exc:
+            raise GatewayTaskError(
+                code="invalid_request",
+                message=str(exc),
+            ) from exc

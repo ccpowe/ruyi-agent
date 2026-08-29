@@ -18,6 +18,7 @@ from ruyi_agent.runtime.task_events import (
     TaskStreamEvent,
     normalize_task_event_text,
 )
+from ruyi_agent.task_models import TaskState, parse_task_state
 
 
 MAX_SSE_LINE_BYTES = 768 * 1024
@@ -46,15 +47,6 @@ SUPPORTED_TASK_EVENT_TYPES = LIFECYCLE_EVENT_TYPES | {
 _DURABLE_WIRE_EVENT_TYPES = LIFECYCLE_EVENT_TYPES | {
     "task.snapshot",
     "task.artifact_published",
-}
-_TASK_STATUSES = {
-    "pending",
-    "running",
-    "waiting_for_human",
-    "completed",
-    "failed",
-    "cancelled",
-    "interrupted",
 }
 _STREAM_END_REASONS = {
     "review_required",
@@ -436,9 +428,7 @@ def _validate_lifecycle_data(
         "observed_at",
     }
     _require_keys(raw, required, optional)
-    status = raw.get("status")
-    if not isinstance(status, str) or status not in _TASK_STATUSES:
-        raise SSEProtocolError("Remote Task event status is invalid")
+    status = _parse_remote_task_state(raw.get("status"))
     clean: dict[str, Any] = {
         "status": status,
         "last_result": _bounded_optional_text(raw.get("last_result"), "last_result"),
@@ -485,9 +475,7 @@ def _validate_artifact_event_data(raw: dict[str, Any]) -> dict[str, Any]:
         {"status", "updated_at", "artifact"},
         {"artifact_truncated"},
     )
-    status = raw.get("status")
-    if not isinstance(status, str) or status not in _TASK_STATUSES:
-        raise SSEProtocolError("Remote artifact event status is invalid")
+    status = _parse_remote_task_state(raw.get("status"))
     clean = {
         "status": status,
         "updated_at": _isoformat(_parse_timestamp(raw.get("updated_at"), "updated_at")),
@@ -498,6 +486,13 @@ def _validate_artifact_event_data(raw: dict[str, Any]) -> dict[str, Any]:
             raise SSEProtocolError("Remote artifact_truncated field is invalid")
         clean["artifact_truncated"] = True
     return clean
+
+
+def _parse_remote_task_state(value: object) -> TaskState:
+    try:
+        return parse_task_state(value, path="Remote Task event status")
+    except ValueError as exc:
+        raise SSEProtocolError("Remote Task event status is invalid") from exc
 
 
 def _validate_pending_review(value: Any) -> dict[str, Any] | None:
