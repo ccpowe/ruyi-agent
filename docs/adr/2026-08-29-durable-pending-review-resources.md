@@ -25,7 +25,9 @@ Introduce **Pending Review** as an authoritative durable resource in
 - the globally unique `review_id`;
 - the owning `task_id`;
 - the delegation `root_task_id`;
-- the review payload and creation/update timestamps.
+- the review payload and creation/update timestamps; and
+- a locally assigned, monotonically increasing `ingest_sequence` used only for
+  stable public enumeration.
 
 `task_id` is unique in this table: one Gateway Task can own at most one Pending
 Review at a time. A delegation root can contain many Pending Reviews owned by
@@ -66,6 +68,11 @@ Review, exposes no new live run, and can be retried with the same `review_id`.
 crash may omit an audit event, but audit persistence cannot create, hide, or
 resolve a Pending Review and is not part of the atomic state transition.
 
+The same `BEGIN IMMEDIATE` transaction increments a singleton ingest high-water
+mark and inserts a new Pending Review. Replacing the same `review_id` preserves
+its sequence. Deleting the newest review does not lower the high-water mark, so
+a later review cannot enter an older pagination snapshot by reusing a sequence.
+
 ## Recovery and Upgrade
 
 Pending Review rows are loaded independently from Task mirror fields on process
@@ -73,6 +80,18 @@ restart. When opening an older Task database, `TaskStore` backfills every
 `waiting_for_human` Task with a valid legacy `pending_review_json`, then rebuilds
 each root projection from the complete durable set. Stale child projections on
 settled roots are cleared when no authoritative resource remains.
+
+The upgrade also assigns deterministic ingest sequences to legacy rows in
+`(created_at, review_id)` order and persists the maximum in the singleton
+high-water record. Opening a partially migrated database repeats that repair
+idempotently before installing the unique sequence index.
+
+New review-list cursors use the local ingest high-water as an immutable snapshot
+frontier and the first unscanned review's identity/sequence as the resume point.
+They therefore do not depend on mutable remote timestamps. Legacy cursor
+versions remain readable; after locating their exact resume item (or applying
+their strict timestamp fallback when it disappeared), continuation switches to
+the ingest-sequence snapshot format.
 
 Local and `remote_ref` Tasks use the same resource model. Remote refresh and
 Review Command responses reconcile the local proxy Task and its Pending Review
@@ -97,4 +116,7 @@ Tests cover two sibling reviews in both decision orders, root-scoped public
 list/get/decision operations, process restart, legacy database backfill,
 single-review and remote compatibility, root projection advancement, injected
 failures during review creation and decision, in-memory rollback, absence of a
-live run after failed decision, and successful retry with the same review.
+live run after failed decision, and successful retry with the same review. They
+also cover idempotent sequence migration, high-water persistence after deletion
+and restart, backdated reviews discovered after a snapshot, transient owner
+failures, and legacy-cursor recovery without pagination gaps or duplicates.
