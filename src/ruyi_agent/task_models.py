@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, TypeAlias, cast
 
 
 TaskState: TypeAlias = Literal[
@@ -25,7 +25,17 @@ ACTIVE_TASK_STATES: frozenset[TaskState] = frozenset(
 SETTLED_TASK_STATES: frozenset[TaskState] = frozenset(
     {"completed", "failed", "cancelled", "interrupted"}
 )
+TASK_STATES: frozenset[TaskState] = ACTIVE_TASK_STATES | SETTLED_TASK_STATES
 RESUMABLE_TASK_STATES = SETTLED_TASK_STATES
+
+
+def parse_task_state(value: object, *, path: str = "task state") -> TaskState:
+    """Validate a persisted/transport value against the canonical Task states."""
+
+    if not isinstance(value, str) or value not in TASK_STATES:
+        allowed = ", ".join(sorted(TASK_STATES))
+        raise ValueError(f"{path} must be one of: {allowed}")
+    return cast(TaskState, value)
 
 
 @dataclass(frozen=True, slots=True)

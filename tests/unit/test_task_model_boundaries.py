@@ -12,7 +12,14 @@ from ruyi_agent.runtime.delegation.async_runtime import (
 from ruyi_agent.runtime.delegation.async_runtime import TaskRecord as RuntimeTaskRecord
 from ruyi_agent.runtime.delegation.live_runs import LiveRunRegistry
 from ruyi_agent.storage.task_store import TaskStore
-from ruyi_agent.task_models import PublishedArtifact, TaskRecord
+from ruyi_agent.task_models import (
+    ACTIVE_TASK_STATES,
+    SETTLED_TASK_STATES,
+    TASK_STATES,
+    PublishedArtifact,
+    TaskRecord,
+    parse_task_state,
+)
 
 
 def test_task_record_contains_only_persistence_safe_fields() -> None:
@@ -25,6 +32,15 @@ def test_task_record_contains_only_persistence_safe_fields() -> None:
 def test_async_runtime_keeps_legacy_model_imports_compatible() -> None:
     assert RuntimeTaskRecord is TaskRecord
     assert RuntimePublishedArtifact is PublishedArtifact
+
+
+def test_task_state_parser_and_sets_share_one_canonical_vocabulary() -> None:
+    assert ACTIVE_TASK_STATES | SETTLED_TASK_STATES == TASK_STATES
+    for state in TASK_STATES:
+        assert parse_task_state(state) is state
+
+    with pytest.raises(ValueError, match="status must be one of"):
+        parse_task_state("unknown", path="status")
 
 
 def test_storage_and_event_modules_do_not_import_async_runtime() -> None:
