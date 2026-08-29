@@ -380,7 +380,13 @@ class RemoteRefreshAfterRestartA2AClient:
         self.sent_inputs: list[str] = []
 
     async def create_task(
-        self, remote_ref, *, input_content: str, metadata: dict, attachments=None
+        self,
+        remote_ref,
+        *,
+        input_content: str,
+        metadata: dict,
+        attachments=None,
+        idempotency_key=None,
     ):
         return {
             "task_id": "remote-task-persisted",
@@ -430,7 +436,13 @@ class FlakyRemoteA2AClient:
         self.get_calls = 0
 
     async def create_task(
-        self, remote_ref, *, input_content: str, metadata: dict, attachments=None
+        self,
+        remote_ref,
+        *,
+        input_content: str,
+        metadata: dict,
+        attachments=None,
+        idempotency_key=None,
     ):
         return {
             "task_id": "remote-task-1",
@@ -473,7 +485,13 @@ class FlakyRemoteA2AClient:
 
 class AlwaysFailingRemoteA2AClient:
     async def create_task(
-        self, remote_ref, *, input_content: str, metadata: dict, attachments=None
+        self,
+        remote_ref,
+        *,
+        input_content: str,
+        metadata: dict,
+        attachments=None,
+        idempotency_key=None,
     ):
         return {
             "task_id": "remote-task-2",
@@ -504,7 +522,13 @@ class AlwaysFailingRemoteA2AClient:
 
 class ShouldNotCallRemoteA2AClient:
     async def create_task(
-        self, remote_ref, *, input_content: str, metadata: dict, attachments=None
+        self,
+        remote_ref,
+        *,
+        input_content: str,
+        metadata: dict,
+        attachments=None,
+        idempotency_key=None,
     ):
         raise AssertionError("remote create_task should not be called")
 
@@ -525,7 +549,13 @@ class SlowRemoteA2AClient:
         self.create_calls = 0
 
     async def create_task(
-        self, remote_ref, *, input_content: str, metadata: dict, attachments=None
+        self,
+        remote_ref,
+        *,
+        input_content: str,
+        metadata: dict,
+        attachments=None,
+        idempotency_key=None,
     ):
         self.create_calls += 1
         call_id = self.create_calls
@@ -558,7 +588,13 @@ class RecordingRemoteA2AClient:
         self.created_metadata: list[dict[str, object]] = []
 
     async def create_task(
-        self, remote_ref, *, input_content: str, metadata: dict, attachments=None
+        self,
+        remote_ref,
+        *,
+        input_content: str,
+        metadata: dict,
+        attachments=None,
+        idempotency_key=None,
     ):
         self.created_metadata.append(dict(metadata))
         return {
@@ -584,12 +620,92 @@ class RecordingRemoteA2AClient:
         raise AssertionError("remote cancel_task should not be called")
 
 
+class FailOnceRemoteCreateA2AClient:
+    def __init__(self) -> None:
+        self.idempotency_keys: list[str | None] = []
+
+    async def create_task(
+        self,
+        remote_ref,
+        *,
+        input_content: str,
+        metadata: dict,
+        attachments=None,
+        idempotency_key=None,
+    ):
+        del input_content, metadata, attachments
+        self.idempotency_keys.append(idempotency_key)
+        if len(self.idempotency_keys) == 1:
+            raise A2AClientError(
+                status_code=503,
+                code="upstream_unavailable",
+                message="remote create outcome is unknown",
+            )
+        return {
+            "task_id": "remote-task-replayed",
+            "agent_name": remote_ref.name,
+            "status": "running",
+            "last_result": None,
+            "error": None,
+            "run_count": 1,
+            "created_at": "2026-08-29T00:00:00Z",
+            "updated_at": "2026-08-29T00:00:01Z",
+        }
+
+
+class CancelledRemoteCreateA2AClient:
+    async def create_task(
+        self,
+        remote_ref,
+        *,
+        input_content: str,
+        metadata: dict,
+        attachments=None,
+        idempotency_key=None,
+    ):
+        del remote_ref, input_content, metadata, attachments, idempotency_key
+        raise asyncio.CancelledError
+
+
+class SuccessfulRemoteCreateA2AClient:
+    def __init__(self) -> None:
+        self.idempotency_keys: list[str | None] = []
+
+    async def create_task(
+        self,
+        remote_ref,
+        *,
+        input_content: str,
+        metadata: dict,
+        attachments=None,
+        idempotency_key=None,
+    ):
+        del input_content, metadata, attachments
+        self.idempotency_keys.append(idempotency_key)
+        return {
+            "task_id": "remote-task-after-restart",
+            "agent_name": remote_ref.name,
+            "status": "running",
+            "last_result": None,
+            "error": None,
+            "run_count": 1,
+            "created_at": "2026-08-29T00:00:00Z",
+            "updated_at": "2026-08-29T00:00:01Z",
+        }
+
+
 class ReviewRemoteA2AClient:
     def __init__(self) -> None:
         self.submitted: list[dict[str, object]] = []
 
     async def create_task(
-        self, remote_ref, *, input_content: str, metadata: dict, attachments=None
+        self,
+        remote_ref,
+        *,
+        input_content: str,
+        metadata: dict,
+        attachments=None,
+        idempotency_key=None,
     ):
         return {
             "task_id": "remote-review-task",
@@ -1729,6 +1845,254 @@ def test_concurrent_remote_spawns_cannot_exceed_root_budget(
     assert sum("Task budget exhausted" in result for result in results) == 1
     assert a2a_client.create_calls == 1
     assert len(records) == 2
+
+
+def test_restart_budget_uses_full_persisted_tree_not_lazy_task_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    factory = FakeAgentFactory()
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    db_path = tmp_path / "tasks.sqlite"
+    first_store = TaskStore(str(db_path))
+    first_control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        build_test_remote_refs(),
+        checkpointer=object(),
+        backend=object(),
+        task_store=first_store,
+        max_delegation_depth=4,
+        max_tasks_per_root=3,
+        node_id="node-a",
+    )
+
+    async def create_tree() -> tuple[str, str]:
+        root = await first_control.spawn_task(
+            "background_research", "root", task_id="root"
+        )
+        child = await first_control.spawn_task(
+            "background_research",
+            "child",
+            task_id="child",
+            parent_task_id=root.task_id,
+        )
+        grandchild = await first_control.spawn_task(
+            "background_research",
+            "grandchild",
+            task_id="grandchild",
+            parent_task_id=child.task_id,
+        )
+        for record in (root, child, grandchild):
+            run = first_control.get_live_run(record.task_id)
+            if run is not None:
+                await run
+        return root.task_id, child.task_id
+
+    root_task_id, child_task_id = asyncio.run(create_tree())
+    first_store.close()
+
+    second_store = TaskStore(str(db_path))
+    second_control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        build_test_remote_refs(),
+        checkpointer=object(),
+        backend=object(),
+        task_store=second_store,
+        max_delegation_depth=4,
+        max_tasks_per_root=3,
+        node_id="node-a",
+    )
+
+    async def attempt_after_lazy_restore() -> None:
+        second_control.get_task_record(root_task_id)
+        second_control.get_task_record(child_task_id)
+        assert len(second_control.list_task_records()) == 2
+        await second_control.spawn_task(
+            "background_research",
+            "must be denied",
+            task_id="fourth",
+            parent_task_id=root_task_id,
+        )
+
+    try:
+        with pytest.raises(async_subagent_runtime.MaxTasksPerRootError) as exc_info:
+            asyncio.run(attempt_after_lazy_restore())
+        assert exc_info.value.current_count == 3
+        assert second_store.count_tasks_under_root(root_task_id) == 3
+    finally:
+        second_store.close()
+
+
+def test_independent_agent_controls_atomically_compete_for_last_task_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    factory = FakeAgentFactory()
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    db_path = tmp_path / "tasks.sqlite"
+    first_store = TaskStore(str(db_path))
+    second_store = TaskStore(str(db_path))
+    first_control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        checkpointer=object(),
+        backend=object(),
+        task_store=first_store,
+        max_tasks_per_root=2,
+        node_id="node-a",
+    )
+    second_control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        checkpointer=object(),
+        backend=object(),
+        task_store=second_store,
+        max_tasks_per_root=2,
+        node_id="node-a",
+    )
+
+    async def scenario() -> list[object]:
+        root = await first_control.spawn_task(
+            "background_research", "root", task_id="root"
+        )
+        root_run = first_control.get_live_run(root.task_id)
+        if root_run is not None:
+            await root_run
+        return await asyncio.gather(
+            first_control.spawn_task(
+                "background_research",
+                "first contender",
+                task_id="child-a",
+                parent_task_id=root.task_id,
+            ),
+            second_control.spawn_task(
+                "background_research",
+                "second contender",
+                task_id="child-b",
+                parent_task_id=root.task_id,
+            ),
+            return_exceptions=True,
+        )
+
+    try:
+        results = asyncio.run(scenario())
+        assert (
+            sum(isinstance(item, async_subagent_runtime.TaskRecord) for item in results)
+            == 1
+        )
+        failures = [
+            item
+            for item in results
+            if isinstance(item, async_subagent_runtime.MaxTasksPerRootError)
+        ]
+        assert len(failures) == 1
+        assert failures[0].current_count == 2
+        assert first_store.count_tasks_under_root("root") == 2
+    finally:
+        first_store.close()
+        second_store.close()
+
+
+def test_failed_remote_create_keeps_explainable_record_and_retries_same_slot(
+    tmp_path,
+) -> None:
+    store = TaskStore(str(tmp_path / "tasks.sqlite"))
+    client = FailOnceRemoteCreateA2AClient()
+    control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        build_test_remote_refs(),
+        checkpointer=object(),
+        backend=object(),
+        task_store=store,
+        a2a_client=client,
+        max_tasks_per_root=1,
+        node_id="node-a",
+    )
+
+    async def scenario() -> async_subagent_runtime.TaskRecord:
+        with pytest.raises(A2AClientError):
+            await control.spawn_task(
+                "remote_code_wiki",
+                "remote work",
+                task_id="stable-remote",
+            )
+        failed = store.get_task("stable-remote")
+        assert failed is not None
+        assert failed.state == "failed"
+        assert failed.upstream_task_id is None
+        assert "before upstream binding" in (failed.error or "")
+        assert store.count_tasks_under_root("stable-remote") == 1
+
+        return await control.spawn_task(
+            "remote_code_wiki",
+            "remote work",
+            task_id="stable-remote",
+        )
+
+    try:
+        replayed = asyncio.run(scenario())
+        assert replayed.upstream_task_id == "remote-task-replayed"
+        assert store.count_tasks_under_root("stable-remote") == 1
+        assert client.idempotency_keys == ["stable-remote", "stable-remote"]
+    finally:
+        store.close()
+
+
+def test_remote_allocation_crash_window_recovers_from_persisted_placeholder(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "tasks.sqlite"
+    first_store = TaskStore(str(db_path))
+    first_control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        build_test_remote_refs(),
+        checkpointer=object(),
+        backend=object(),
+        task_store=first_store,
+        a2a_client=CancelledRemoteCreateA2AClient(),
+        max_tasks_per_root=1,
+        node_id="node-a",
+    )
+
+    async def leave_placeholder() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await first_control.spawn_task(
+                "remote_code_wiki",
+                "remote work",
+                task_id="stable-remote",
+            )
+
+    asyncio.run(leave_placeholder())
+    placeholder = first_store.get_task("stable-remote")
+    assert placeholder is not None
+    assert placeholder.state == "pending"
+    assert placeholder.upstream_task_id is None
+    first_store.close()
+
+    second_store = TaskStore(str(db_path))
+    client = SuccessfulRemoteCreateA2AClient()
+    second_control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        build_test_remote_refs(),
+        checkpointer=object(),
+        backend=object(),
+        task_store=second_store,
+        a2a_client=client,
+        max_tasks_per_root=1,
+        node_id="node-a",
+    )
+
+    try:
+        recovered = asyncio.run(
+            second_control.spawn_task(
+                "remote_code_wiki",
+                "remote work",
+                task_id="stable-remote",
+            )
+        )
+        assert recovered.upstream_task_id == "remote-task-after-restart"
+        assert second_store.count_tasks_under_root("stable-remote") == 1
+        assert client.idempotency_keys == ["stable-remote"]
+    finally:
+        second_store.close()
 
 
 def test_send_input_reuses_same_agent_thread(monkeypatch: pytest.MonkeyPatch) -> None:

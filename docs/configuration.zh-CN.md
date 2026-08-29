@@ -91,7 +91,7 @@ workspace = "C:/Users/name/project"
 | `gateway.bearer_token` | Gateway HTTP API 认证 token。本地默认 `dev-token`；对外暴露前必须改强 token。 |
 | `storage.*` | SQLite 状态文件路径。相对路径按 `.ruyi_agent/` 解析。 |
 | `runtime.max_delegation_depth` | 每个 root task 下最大委派深度。 |
-| `runtime.max_tasks_per_root` | 每个 root task 下最多创建的 subagent task 数量。 |
+| `runtime.max_tasks_per_root` | 每棵委托树允许创建并持久化的 Task 总数；root task 自身计入上限。 |
 | `channels.telegram.bot_token` | Telegram channel 必填，来自 BotFather。 |
 | `channels.telegram.default_agent` | Telegram 默认入口 agent，默认 `main`。 |
 | `channels.feishu.app_id` / `channels.feishu.app_secret` | Feishu/Lark channel 必填，来自开放平台应用。 |
@@ -99,6 +99,12 @@ workspace = "C:/Users/name/project"
 | `channels.feishu.default_agent` | Feishu/Lark 默认入口 agent，默认 `main`。 |
 | `channels.feishu.group_policy` | 群聊策略，默认 `disabled`；需要群聊时设为 `open` 并建议保留 mention 要求。 |
 | `channels.feishu.require_mention` | 群聊中是否要求 mention bot，默认 `true`。 |
+
+`max_tasks_per_root` 是累计 Task 身份预算，不是并发槽位：已经完成或失败的
+Task 仍计入总数。远程任务会先持久化本地 `remote_ref` 记录，再调用上游；
+如果上游创建失败，该记录会以 `failed` 状态保留并说明失败原因，进程在上游
+绑定完成前退出则保留无 `upstream_task_id` 的记录。同一稳定 `task_id` 重试会
+复用这条记录和同一远程幂等键，不会重复占用预算。
 
 ## Agent 配置
 

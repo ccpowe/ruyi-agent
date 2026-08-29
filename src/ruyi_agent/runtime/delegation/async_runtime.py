@@ -77,7 +77,12 @@ from ruyi_agent.runtime.task_events import (
     normalize_task_event_text,
     public_task_event_fingerprint,
 )
-from ruyi_agent.storage.task_store import TaskStore, task_record_for_restart
+from ruyi_agent.storage.task_store import (
+    StoredTaskAlreadyExistsError,
+    TaskRootBudgetExceededError as MaxTasksPerRootError,
+    TaskStore,
+    task_record_for_restart,
+)
 from ruyi_agent.control_plane.permissions import PermissionPolicy
 from ruyi_agent.storage.review_audit import ReviewAuditStore
 from ruyi_agent.runtime.skills.resolver import resolve_skill_names
@@ -212,34 +217,6 @@ class MaxDelegationDepthError(ValueError):
         self.current_depth = current_depth
         self.max_depth = max_depth
         super().__init__(f"current_depth={current_depth} max_depth={max_depth}")
-
-
-class MaxTasksPerRootError(ValueError):
-    """
-    单棵委托树的任务数量超过限制
-
-    Attributes:
-        root_task_id: 超出预算的委托树根任务 ID
-        current_count: 当前已登记的任务数量
-        max_tasks_per_root: 单棵委托树允许的最大任务数量
-    """
-
-    def __init__(
-        self,
-        *,
-        root_task_id: str,
-        current_count: int,
-        max_tasks_per_root: int,
-    ) -> None:
-        """保存任务预算错误的上下文字段"""
-        self.root_task_id = root_task_id
-        self.current_count = current_count
-        self.max_tasks_per_root = max_tasks_per_root
-        super().__init__(
-            "root_task_id="
-            f"{root_task_id} current_count={current_count} "
-            f"max_tasks_per_root={max_tasks_per_root}"
-        )
 
 
 def _now() -> datetime:
@@ -933,6 +910,14 @@ class TaskManager:
         )
         if task_id in self._tasks:
             raise ValueError(f"Task already exists: {task_id}")
+        if self._store is None and record.delegation_max_tasks_per_root is not None:
+            current_count = self.count_tasks_under_root(root_task_id)
+            if current_count >= record.delegation_max_tasks_per_root:
+                raise MaxTasksPerRootError(
+                    root_task_id=root_task_id,
+                    current_count=current_count,
+                    max_tasks_per_root=record.delegation_max_tasks_per_root,
+                )
         if self._event_ledger is not None:
             self._event_ledger.insert_task(
                 record,
@@ -1039,6 +1024,8 @@ class TaskManager:
         Returns:
             root_task_id 相同的任务数量
         """
+        if self._store is not None:
+            return self._store.count_tasks_under_root(root_task_id)
         return sum(
             1 for record in self._tasks.values() if record.root_task_id == root_task_id
         )
@@ -2062,38 +2049,26 @@ class AgentControl:
                 return parent.permission_profile
         return self._permission_default_profile
 
-    def _enforce_delegation_limits(
+    def _enforce_delegation_depth(
         self,
         *,
-        root_task_id: str,
         depth: int,
         max_depth: int,
-        max_tasks_per_root: int,
     ) -> None:
         """
-        校验委托深度和单树任务预算
+        校验委托深度
 
         Args:
-            root_task_id: 委托树根任务 ID
             depth: 即将创建任务的深度
             max_depth: 允许的最大深度
-            max_tasks_per_root: 单棵委托树最大任务数
 
         Raises:
             MaxDelegationDepthError: depth 超过 max_depth
-            MaxTasksPerRootError: 当前委托树任务数达到上限
         """
         if depth > max_depth:
             raise MaxDelegationDepthError(
                 current_depth=depth,
                 max_depth=max_depth,
-            )
-        current_count = self._task_manager.count_tasks_under_root(root_task_id)
-        if current_count >= max_tasks_per_root:
-            raise MaxTasksPerRootError(
-                root_task_id=root_task_id,
-                current_count=current_count,
-                max_tasks_per_root=max_tasks_per_root,
             )
 
     def _get_root_budget_lock(self, root_task_id: str) -> asyncio.Lock:
@@ -3014,13 +2989,62 @@ class AgentControl:
                 ):
                     self._start_run(task_id, task)
                     return self._task_manager.get_task(task_id)
-                return existing
-            self._enforce_delegation_limits(
-                root_task_id=root_task_id,
+                if not (
+                    isinstance(entry, RemoteRefEntry)
+                    and existing.upstream_task_id is None
+                ):
+                    return existing
+            self._enforce_delegation_depth(
                 depth=depth,
                 max_depth=task_context.max_depth,
-                max_tasks_per_root=task_context.max_tasks_per_root,
             )
+            self._registry.register_task(
+                task_id,
+                agent_name=agent_name,
+                parent_task_id=parent_task_id,
+            )
+            if existing is None:
+                try:
+                    record = self._task_manager.create_task_record(
+                        task_id,
+                        agent_name,
+                        parent_task_id=parent_task_id,
+                        root_task_id=root_task_id,
+                        depth=depth,
+                        route_kind=(
+                            "remote_ref"
+                            if isinstance(entry, RemoteRefEntry)
+                            else "local"
+                        ),
+                        parent_thread_id=parent_thread_id,
+                        webhook=webhook,
+                        delegation_context=task_context,
+                        permission_profile=permission_profile,
+                        effective_skill_names=effective_skill_names,
+                        skill_view_path=skill_view_path,
+                        skill_view_hash=skill_view_hash,
+                    )
+                except StoredTaskAlreadyExistsError:
+                    record = self._existing_idempotent_task(
+                        task_id=task_id,
+                        agent_name=agent_name,
+                        entry=entry,
+                        parent_task_id=parent_task_id,
+                        root_task_id=root_task_id,
+                        depth=depth,
+                        delegation_context=task_context,
+                    )
+                    if record is None:
+                        raise RuntimeError(
+                            f"Persisted Task disappeared during create: {task_id}"
+                        ) from None
+                    if not (
+                        isinstance(entry, RemoteRefEntry)
+                        and record.upstream_task_id is None
+                    ):
+                        return record
+            else:
+                record = existing
             if isinstance(entry, RemoteRefEntry):
                 create_kwargs: dict[str, Any] = {
                     "input_content": task,
@@ -3034,60 +3058,28 @@ class AgentControl:
                 webhook_config = self._build_webhook_config()
                 if webhook_config is not None:
                     create_kwargs["webhook"] = webhook_config
-                if idempotency_key is not None:
-                    create_kwargs["idempotency_key"] = idempotency_key
-                payload = await self._a2a_client.create_task(
-                    entry.ref,
-                    **create_kwargs,
-                )
-                upstream_task_id = payload.get("task_id")
-                if not isinstance(upstream_task_id, str) or not upstream_task_id:
-                    raise ValueError(
-                        f"Remote ref '{agent_name}' returned no task_id from remote gateway."
+                create_kwargs["idempotency_key"] = idempotency_key or task_id
+                try:
+                    payload = await self._a2a_client.create_task(
+                        entry.ref,
+                        **create_kwargs,
                     )
-                _validate_remote_task_state(task_id, payload)
-                self._registry.register_task(
-                    task_id,
-                    agent_name=agent_name,
-                    parent_task_id=parent_task_id,
-                )
-                self._task_manager.create_task_record(
-                    task_id,
-                    agent_name,
-                    parent_task_id=parent_task_id,
-                    root_task_id=root_task_id,
-                    depth=depth,
-                    route_kind="remote_ref",
-                    upstream_task_id=upstream_task_id,
-                    parent_thread_id=parent_thread_id,
-                    webhook=webhook,
-                    delegation_context=task_context,
-                    permission_profile=permission_profile,
-                    effective_skill_names=effective_skill_names,
-                    skill_view_path=skill_view_path,
-                    skill_view_hash=skill_view_hash,
-                )
+                    upstream_task_id = payload.get("task_id")
+                    if not isinstance(upstream_task_id, str) or not upstream_task_id:
+                        raise ValueError(
+                            f"Remote ref '{agent_name}' returned no task_id from remote gateway."
+                        )
+                    _validate_remote_task_state(task_id, payload)
+                except Exception as exc:
+                    self._task_manager.mark_failed(
+                        task_id,
+                        f"Remote task allocation failed before upstream binding: {exc}",
+                    )
+                    raise
+                record.upstream_task_id = upstream_task_id
+                record.thread_id = upstream_task_id
                 return self._task_manager.sync_remote_task(task_id, payload)
 
-            self._registry.register_task(
-                task_id,
-                agent_name=agent_name,
-                parent_task_id=parent_task_id,
-            )
-            self._task_manager.create_task_record(
-                task_id,
-                agent_name,
-                parent_task_id=parent_task_id,
-                root_task_id=root_task_id,
-                depth=depth,
-                parent_thread_id=parent_thread_id,
-                webhook=webhook,
-                delegation_context=task_context,
-                permission_profile=permission_profile,
-                effective_skill_names=effective_skill_names,
-                skill_view_path=skill_view_path,
-                skill_view_hash=skill_view_hash,
-            )
             self._start_run(task_id, task)
             return self._task_manager.get_task(task_id)
 

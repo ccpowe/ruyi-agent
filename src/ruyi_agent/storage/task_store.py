@@ -24,6 +24,34 @@ class StoredTaskEvent:
     data: dict[str, Any]
 
 
+class TaskRootBudgetExceededError(ValueError):
+    """A persisted delegation tree has reached its cumulative Task limit."""
+
+    def __init__(
+        self,
+        *,
+        root_task_id: str,
+        current_count: int,
+        max_tasks_per_root: int,
+    ) -> None:
+        self.root_task_id = root_task_id
+        self.current_count = current_count
+        self.max_tasks_per_root = max_tasks_per_root
+        super().__init__(
+            "root_task_id="
+            f"{root_task_id} current_count={current_count} "
+            f"max_tasks_per_root={max_tasks_per_root}"
+        )
+
+
+class StoredTaskAlreadyExistsError(sqlite3.IntegrityError):
+    """A stable Task identity already exists in persistent storage."""
+
+    def __init__(self, record: TaskRecord) -> None:
+        self.record = record
+        super().__init__(f"Task already exists: {record.task_id}")
+
+
 def _serialize_datetime(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
@@ -140,21 +168,35 @@ class TaskStore:
         """Upsert a task without SQLite's delete-and-reinsert REPLACE semantics."""
 
         with self._lock:
-            self._conn.execute(
-                self._insert_sql(upsert=True),
-                self._record_values(record),
-            )
-            self._conn.commit()
+            try:
+                self._begin_write_locked()
+                if not self._task_exists_locked(record.task_id):
+                    self._enforce_root_budget_locked(record)
+                self._conn.execute(
+                    self._insert_sql(upsert=True),
+                    self._record_values(record),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def insert_task(self, record: TaskRecord) -> None:
         """Insert a newly allocated task identity and reject duplicates."""
 
         with self._lock:
-            self._conn.execute(
-                self._insert_sql(upsert=False),
-                self._record_values(record),
-            )
-            self._conn.commit()
+            try:
+                self._begin_write_locked()
+                self._ensure_new_task_identity_locked(record.task_id)
+                self._enforce_root_budget_locked(record)
+                self._conn.execute(
+                    self._insert_sql(upsert=False),
+                    self._record_values(record),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def insert_task_with_event(
         self,
@@ -169,6 +211,9 @@ class TaskStore:
         encoded_data = _serialize_event_data(event_data)
         with self._lock:
             try:
+                self._begin_write_locked()
+                self._ensure_new_task_identity_locked(record.task_id)
+                self._enforce_root_budget_locked(record)
                 self._conn.execute(
                     self._insert_sql(upsert=False),
                     self._record_values(record),
@@ -419,6 +464,17 @@ class TaskStore:
             ).fetchall()
         return [self._row_to_task_record(row) for row in rows]
 
+    def count_tasks_under_root(self, root_task_id: str) -> int:
+        """Count every persisted Task in a delegation tree, including its root."""
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM agent_tasks WHERE root_task_id = ?",
+                (root_task_id,),
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -484,6 +540,12 @@ class TaskStore:
                 ON agent_task_events(task_id, run_count, event_id)
                 """
             )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agent_tasks_root_task_id
+                ON agent_tasks(root_task_id)
+                """
+            )
             self._ensure_column(
                 table="agent_tasks",
                 column="permission_profile",
@@ -522,6 +584,60 @@ class TaskStore:
             (task_id,),
         ).fetchone()
         return row is not None
+
+    def _begin_write_locked(self) -> None:
+        """Acquire SQLite's writer reservation before reading a Task budget."""
+
+        self._conn.execute("BEGIN IMMEDIATE")
+
+    def _ensure_new_task_identity_locked(self, task_id: str) -> None:
+        row = self._conn.execute(
+            f"""
+            SELECT
+                {self._select_columns()}
+            FROM agent_tasks
+            WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if row is not None:
+            raise StoredTaskAlreadyExistsError(self._row_to_task_record(row))
+
+    def _enforce_root_budget_locked(self, record: TaskRecord) -> None:
+        """Check a tree's durable count inside the Task insertion transaction."""
+
+        candidate_limit = record.delegation_max_tasks_per_root
+        if candidate_limit is None:
+            return
+        if candidate_limit < 1:
+            raise ValueError("delegation_max_tasks_per_root must be at least 1")
+        stored_limit_row = self._conn.execute(
+            """
+            SELECT MIN(delegation_max_tasks_per_root)
+            FROM agent_tasks
+            WHERE root_task_id = ?
+              AND delegation_max_tasks_per_root IS NOT NULL
+            """,
+            (record.root_task_id,),
+        ).fetchone()
+        stored_limit = (
+            int(stored_limit_row[0])
+            if stored_limit_row is not None and stored_limit_row[0] is not None
+            else candidate_limit
+        )
+        effective_limit = min(candidate_limit, stored_limit)
+        count_row = self._conn.execute(
+            "SELECT COUNT(*) FROM agent_tasks WHERE root_task_id = ?",
+            (record.root_task_id,),
+        ).fetchone()
+        assert count_row is not None
+        current_count = int(count_row[0])
+        if current_count >= effective_limit:
+            raise TaskRootBudgetExceededError(
+                root_task_id=record.root_task_id,
+                current_count=current_count,
+                max_tasks_per_root=effective_limit,
+            )
 
     def _append_task_event_locked(
         self,

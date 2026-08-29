@@ -226,6 +226,7 @@ class StaticRemoteA2AClient:
         self.created_inputs: list[str] = []
         self.created_metadata: list[dict[str, object]] = []
         self.created_attachments: list[list[dict[str, object]] | None] = []
+        self.created_idempotency_keys: list[str | None] = []
         self.sent_inputs: list[str] = []
         self.sent_attachments: list[list[dict[str, object]] | None] = []
         self.cancelled: list[str] = []
@@ -238,10 +239,12 @@ class StaticRemoteA2AClient:
         metadata: dict[str, object],
         attachments: list[dict[str, object]] | None = None,
         webhook: dict[str, object] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, object]:
         self.created_inputs.append(input_content)
         self.created_metadata.append(dict(metadata))
         self.created_attachments.append(attachments)
+        self.created_idempotency_keys.append(idempotency_key)
         return {
             "task_id": "upstream-1",
             "agent_name": remote_ref.name,
@@ -329,6 +332,7 @@ class UnhashableStatusRemoteA2AClient(StaticRemoteA2AClient):
         metadata: dict[str, object],
         attachments: list[dict[str, object]] | None = None,
         webhook: dict[str, object] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, object]:
         payload = await super().create_task(
             remote_ref,
@@ -336,6 +340,7 @@ class UnhashableStatusRemoteA2AClient(StaticRemoteA2AClient):
             metadata=metadata,
             attachments=attachments,
             webhook=webhook,
+            idempotency_key=idempotency_key,
         )
         payload["status"] = []
         return payload
@@ -354,10 +359,12 @@ class ReviewRemoteA2AClient(StaticRemoteA2AClient):
         metadata: dict[str, object],
         attachments: list[dict[str, object]] | None = None,
         webhook: dict[str, object] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, object]:
         self.created_inputs.append(input_content)
         self.created_metadata.append(dict(metadata))
         self.created_attachments.append(attachments)
+        self.created_idempotency_keys.append(idempotency_key)
         return {
             "task_id": "upstream-review-task",
             "agent_name": remote_ref.name,
@@ -2927,7 +2934,11 @@ def test_public_remote_ref_maps_unhashable_status_to_upstream_error(
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "upstream_gateway_error"
     assert factory.control is not None
-    assert factory.control.list_task_records() == []
+    records = factory.control.list_task_records()
+    assert len(records) == 1
+    assert records[0].state == "failed"
+    assert records[0].upstream_task_id is None
+    assert "before upstream binding" in (records[0].error or "")
 
 
 def test_public_remote_ref_forwards_attachments_to_remote_gateway(
