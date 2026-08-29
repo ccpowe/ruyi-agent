@@ -258,10 +258,15 @@ def _disk_uri_aliases(db_path: Path) -> list[str]:
     dot_directory.mkdir(exist_ok=True)
     dotted_path = quote(f"{dot_directory}/../{db_path.name}", safe="/")
     return [
-        f"file:{encoded_path}?mode=rwc&cache=shared",
-        f"file://{encoded_path}?cache=shared&mode=rwc",
-        f"file://localhost{encoded_path}?cache=shared&mode=rwc",
-        f"file:{dotted_path}?cache=shared&mode=rwc",
+        f"file:{encoded_path}?mode=rwc&cache=shared&label=a+b",
+        f"file://{encoded_path}?cache=private&cache=shared"
+        "&label=old&label=a%2Bb&mode=rwc",
+        f"file://localhost{encoded_path}?ca%63he=private&cache=shared"
+        "&la%62el=old&label=a+b&mode=rwc",
+        f"file:{dotted_path}?label=a%2Bb&cache=shared&mode=rwc",
+        f"file:{encoded_path}?label=old&la%62el=a+b&mode=rwc"
+        "&cache=private&ca%63he=shared",
+        f"file://localhost{encoded_path}?label=a+b&mode=rwc&cache=shared",
     ]
 
 
@@ -381,10 +386,13 @@ def test_database_identity_canonicalizes_query_without_losing_semantics(
         f"{uri}label=a+b"
     ) != task_database_module._database_identity(f"{uri}label=a%20b")
     assert task_database_module._database_identity(
-        f"{uri}mode=rwc&cache=private&label=x&cache=shared"
+        f"{uri}mode=rwc&cache=private&label=old&cache=shared&la%62el=a%2Bb"
     ) == task_database_module._database_identity(
-        f"{uri}cache=private&cache=shared&label=x&mode=rwc"
+        f"{uri}label=a+b&cache=shared&mode=rwc"
     )
+    assert task_database_module._database_identity(
+        f"{uri}cache=private&cache=shared"
+    ) == task_database_module._database_identity(f"{uri}cache=shared")
     assert task_database_module._database_identity(
         f"{uri}cache=private&cache=shared"
     ) != task_database_module._database_identity(f"{uri}cache=shared&cache=private")
@@ -536,9 +544,9 @@ def test_named_memory_aliases_serialize_but_distinct_names_do_not(
     )
     name = f"round8-{tmp_path.name}"
     aliases = [
-        f"file:{name}?mode=memory&cache=shared",
-        f"file:{name.replace('-', '%2D', 1)}?cache=shared&mode=memory",
-    ] * 4
+        f"file:{name}?mode=memory&cache=private&cache=shared&label=old&la%62el=current",
+        f"file:{name.replace('-', '%2D', 1)}?label=current&cache=shared&mode=memory",
+    ] * 6
     anchor = sqlite3.connect(aliases[0], uri=True)
     try:
         _open_aliases_concurrently(aliases, TaskStore)
@@ -548,6 +556,14 @@ def test_named_memory_aliases_serialize_but_distinct_names_do_not(
     finally:
         anchor.close()
     assert tracker.peak == 1
+
+    tracker.peak = 0
+    shared_private_boundary = [
+        f"file:{name}-boundary?mode=memory&cache=private&cache=shared",
+        f"file:{name}-boundary?mode=memory&cache=shared&cache=private",
+    ]
+    _open_aliases_concurrently(shared_private_boundary, TaskStore)
+    assert tracker.peak >= 2
 
     tracker.peak = 0
     distinct_names = [

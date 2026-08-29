@@ -93,10 +93,10 @@ def _file_uri_parts(db_path: str) -> tuple[str, bytes, list[tuple[bytes, bytes]]
 
 
 def _canonical_query(query: list[tuple[bytes, bytes]]) -> str:
-    # SQLite gives repeated parameters order-sensitive semantics. Python's sort is
-    # stable, so this normalizes distinct parameter order without reordering values
-    # for the same decoded key.
-    ordered = sorted(query, key=lambda parameter: parameter[0])
+    # SQLite exposes the final value for a repeated, percent-decoded key. Fold
+    # before sorting so an overridden value cannot split equivalent URI aliases.
+    effective = {key: value for key, value in query}
+    ordered = sorted(effective.items())
     return "&".join(
         f"{quote_from_bytes(key, safe='')}={quote_from_bytes(value, safe='')}"
         for key, value in ordered

@@ -32,9 +32,10 @@ filesystem path after URI percent decoding; empty and `localhost` authorities,
 relative paths, dot segments, and ignored fragments therefore do not split the
 lock. URI query pairs remain part of the identity because they can change the
 target VFS or connection behavior. Distinct decoded keys are sorted, while the
-relative order of repeated keys is retained because SQLite gives repeated
-parameters order-sensitive semantics. This parsing does not use HTML form
-rules: a literal `+` stays distinct from `%20`.
+final value of each repeated decoded key replaces its earlier values, matching
+SQLite's effective URI parameter lookup. Thus an overridden value cannot split
+the startup lock from an alias that supplies only the final value. This parsing
+does not use HTML form rules: a literal `+` stays distinct from `%20`.
 
 Named `mode=memory` databases retain their decoded URI path instead of being
 resolved as filesystem paths. A non-empty named memory URI with
@@ -77,5 +78,8 @@ ordinary, percent-encoded, relative, `localhost`, and reordered-query spellings.
 They observe a peak of one inside the complete startup boundary for equivalent
 aliases, a peak of at least two for different databases, and the same
 serialization/isolation behavior for shared named-memory aliases and distinct
-memory names. Repeated query keys, literal plus signs, and percent-encoded paths
-have explicit identity assertions.
+memory names. Twelve-thread rounds mix aliases containing overridden `cache`
+and percent-decoded application parameters with aliases containing only their
+final values. Repeated query keys, literal plus signs, and percent-encoded paths
+have explicit identity assertions; shared/private final memory-cache values
+remain separate database boundaries.
