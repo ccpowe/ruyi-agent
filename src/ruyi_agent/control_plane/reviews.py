@@ -32,7 +32,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
-from ruyi_agent.runtime.delegation.async_runtime import TaskRecord
+from ruyi_agent.task_models import TaskRecord
 from ruyi_agent.control_plane.contracts import (
     ReviewActionSnapshot,
     ReviewDecision,

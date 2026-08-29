@@ -29,9 +29,7 @@ from ruyi_agent.gateway.sse import (
 )
 from ruyi_agent.runtime.delegation.async_runtime import (
     AgentControl,
-    PublishedArtifact,
     TaskManager,
-    TaskRecord,
 )
 from ruyi_agent.runtime.task_events import (
     InvalidTaskEventCursorError,
@@ -48,6 +46,7 @@ from ruyi_agent.runtime.task_events import (
     lifecycle_event_data,
 )
 from ruyi_agent.storage.task_store import TaskStore
+from ruyi_agent.task_models import PublishedArtifact, TaskRecord
 
 
 def _record(*, task_id: str = "task-1") -> TaskRecord:

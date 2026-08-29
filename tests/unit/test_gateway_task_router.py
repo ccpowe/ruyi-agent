@@ -8,8 +8,8 @@ import pytest
 
 from ruyi_agent.gateway.models import TaskRouteRecord
 from ruyi_agent.gateway.routing import TaskRouter
-from ruyi_agent.runtime.delegation.async_runtime import TaskRecord
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
+from ruyi_agent.task_models import TaskRecord
 
 
 def _record(

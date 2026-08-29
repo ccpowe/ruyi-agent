@@ -8,17 +8,12 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 from langchain_core.messages import AIMessageChunk
 
 from ruyi_agent.storage.task_store import StoredTaskEvent, TaskStore
-
-if TYPE_CHECKING:
-    from ruyi_agent.runtime.delegation.async_runtime import (
-        PublishedArtifact,
-        TaskRecord,
-    )
+from ruyi_agent.task_models import PublishedArtifact, TaskRecord
 
 
 TASK_EVENT_CURSOR_VERSION = 1

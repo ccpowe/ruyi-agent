@@ -7,10 +7,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from ruyi_agent.runtime.delegation.async_runtime import TaskRecord
+from ruyi_agent.task_models import PublishedArtifact, TaskRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,8 +86,6 @@ def _parse_artifacts(value: str | None) -> list[Any]:
         return []
     if not isinstance(raw_items, list):
         return []
-    from ruyi_agent.runtime.delegation.async_runtime import PublishedArtifact
-
     artifacts = []
     for item in raw_items:
         if not isinstance(item, dict):
@@ -721,8 +718,6 @@ class TaskStore:
         """
 
     def _row_to_task_record(self, row: tuple[Any, ...]) -> TaskRecord:
-        from ruyi_agent.runtime.delegation.async_runtime import TaskRecord
-
         webhook_json = row[17]
         webhook = json.loads(webhook_json) if webhook_json else None
         if not isinstance(webhook, dict):
@@ -746,7 +741,6 @@ class TaskStore:
             updated_at=_parse_datetime(row[8]),
             result=row[9],
             error=row[10],
-            active_run=None,
             run_count=row[11],
             route_kind=row[12],
             upstream_task_id=row[13],
@@ -776,8 +770,7 @@ def task_record_for_restart(record: TaskRecord) -> TaskRecord:
         return replace(
             record,
             state="interrupted",
-            active_run=None,
             updated_at=datetime.now(UTC),
             error=record.error or "Task interrupted: local process restarted.",
         )
-    return replace(record, active_run=None)
+    return replace(record)

@@ -224,8 +224,8 @@ def test_remote_gateway_retry_survives_lost_create_and_input_responses(
             downstream_records = downstream_control.list_persisted_task_records()
             assert len(downstream_records) == 1
             downstream_record = downstream_records[0]
-            if downstream_record.active_run is not None:
-                await downstream_record.active_run
+            if downstream_control.get_live_run(downstream_record.task_id) is not None:
+                await downstream_control.get_live_run(downstream_record.task_id)
 
             input_headers = {
                 "Authorization": "Bearer upstream-secret",
@@ -254,8 +254,8 @@ def test_remote_gateway_retry_survives_lost_create_and_input_responses(
             assert replayed_input.json() == recovered_input.json()
             assert replayed_input.headers["idempotency-replayed"] == "true"
             downstream_record = downstream_control.list_persisted_task_records()[0]
-            if downstream_record.active_run is not None:
-                await downstream_record.active_run
+            if downstream_control.get_live_run(downstream_record.task_id) is not None:
+                await downstream_control.get_live_run(downstream_record.task_id)
             return proxy_task_id, downstream_record.task_id
 
     try:

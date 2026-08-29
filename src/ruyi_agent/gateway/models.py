@@ -6,17 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-MetadataScalar = str | int | float | bool | None
-
-
-@dataclass(slots=True)
-class TaskRouteRecord:
-    task_id: str
-    agent_name: str
-    metadata: dict[str, MetadataScalar]
-    route_kind: str
-    upstream_task_id: str
-    webhook: dict[str, MetadataScalar] | None = None
+from ruyi_agent.task_models import MetadataScalar, TaskRouteRecord
 
 
 @dataclass(slots=True)

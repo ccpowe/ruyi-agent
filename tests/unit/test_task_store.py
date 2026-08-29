@@ -6,8 +6,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from ruyi_agent.runtime.delegation.async_runtime import PublishedArtifact, TaskRecord
 from ruyi_agent.storage.task_store import TaskStore
+from ruyi_agent.task_models import PublishedArtifact, TaskRecord
 
 
 def test_task_store_persists_skill_view_fields(tmp_path) -> None:

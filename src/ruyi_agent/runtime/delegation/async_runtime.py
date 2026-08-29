@@ -37,7 +37,7 @@ import inspect
 import logging
 import uuid
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -53,7 +53,6 @@ from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.config.loader import LocalWorkerSpec, RemoteRef
 from ruyi_agent.runtime.delegation.context import (
     DelegationContext,
-    MetadataScalar,
     build_child_context,
     build_root_context,
     inject_context_metadata,
@@ -83,6 +82,15 @@ from ruyi_agent.storage.review_audit import ReviewAuditStore
 from ruyi_agent.runtime.skills.resolver import resolve_skill_names
 from ruyi_agent.runtime.skills.sync import SkillSyncer
 from ruyi_agent.runtime.skills.types import SkillEntry
+from ruyi_agent.runtime.delegation.live_runs import LiveRunRegistry
+from ruyi_agent.task_models import (
+    ACTIVE_TASK_STATES,
+    RESUMABLE_TASK_STATES,
+    SETTLED_TASK_STATES,
+    MetadataScalar,
+    PublishedArtifact,
+    TaskRecord,
+)
 
 logger = logging.getLogger(__name__)
 _MISSING_STREAM_VALUE = object()
@@ -227,11 +235,6 @@ class MaxTasksPerRootError(ValueError):
         )
 
 
-ACTIVE_TASK_STATES = {"pending", "running", "waiting_for_human"}
-SETTLED_TASK_STATES = {"completed", "failed", "cancelled", "interrupted"}
-RESUMABLE_TASK_STATES = SETTLED_TASK_STATES
-
-
 def _now() -> datetime:
     """返回当前 UTC 时间"""
     # 为什么抽成单独时间入口：任务状态和测试都依赖统一时间语义，避免时间来源散落各处。
@@ -370,28 +373,6 @@ def _published_artifact_to_dict(artifact: PublishedArtifact) -> dict[str, Any]:
 
 
 @dataclass(slots=True)
-class AgentRecord:
-    """
-    agent 与 task 的轻量关系记录
-
-    Attributes:
-        name: agent 名称
-        description: agent 描述
-        kind: agent 类型（worker/remote_ref）
-        runtime: 运行时位置或类型
-        task_id: 关联任务 ID
-        parent_task_id: 父任务 ID（如果存在）
-    """
-
-    name: str
-    description: str
-    kind: str
-    runtime: str
-    task_id: str
-    parent_task_id: str | None = None
-
-
-@dataclass(slots=True)
 class RegisteredAgent:
     """
     已注册 agent 目标
@@ -405,19 +386,6 @@ class RegisteredAgent:
     name: str
     description: str
     kind: str
-
-
-@dataclass(frozen=True, slots=True)
-class PublishedArtifact:
-    """A small file published by a task for channel delivery."""
-
-    artifact_id: str
-    path: str
-    name: str
-    caption: str | None
-    content_type: str
-    size: int
-    run_count: int
 
 
 @dataclass(slots=True)
@@ -442,79 +410,6 @@ class RemoteRefEntry(RegisteredAgent):
     """
 
     ref: RemoteRef
-
-
-@dataclass(slots=True)
-class TaskRecord:
-    """
-    委托任务状态记录
-
-    保存一个本地或远端委托任务的完整生命周期状态。TaskManager 负责创建和
-    修改这些记录，HTTP 层和 agent 工具层都基于它返回任务视图。
-
-    Attributes:
-        task_id: 当前 runtime 内部的任务 ID
-        agent_name: 执行该任务的 agent 目标名称
-        state: 任务状态（pending/running/completed/failed/cancelled 等）
-        thread_id: agent 会话 thread ID，本地任务默认等于 task_id
-        parent_task_id: 父任务 ID
-        root_task_id: 委托树根任务 ID
-        depth: 当前任务在委托树中的深度
-        created_at: 任务创建时间
-        updated_at: 任务最后更新时间
-        result: 最近一次成功 run 的结果摘要
-        error: 最近一次失败或中断 run 的错误摘要
-        active_run: 本地任务当前活跃的 asyncio task
-        run_count: 当前任务已执行的轮次数
-        route_kind: 执行路由（local/remote_ref）
-        upstream_task_id: 远端网关上的原始任务 ID
-        parent_thread_id: 接收 mailbox 通知的父 thread ID
-        mailbox_suppressed: 是否禁止当前 run 的 mailbox 投递
-        mailbox_delivered: 是否已经投递过当前 run 的 mailbox 消息
-        webhook: run settled webhook 配置
-        cancel_requested: 是否由显式 cancel_task 请求触发取消
-        delegation_root_id: 跨网关传递的委托根 ID
-        delegation_max_depth: 跨网关传递的最大委托深度
-        delegation_max_tasks_per_root: 跨网关传递的单树任务预算
-        delegation_visited_nodes: 跨网关委托已访问节点
-        permission_profile: 当前任务运行使用的权限 profile
-        effective_skill_names: 当前任务实际可见的 skill 名称
-        skill_view_path: 同步到 backend 后的 skill view 目录
-        skill_view_hash: skill view 内容指纹
-        pending_review: worker 等待人工审批时的 review payload
-        artifacts: 当前 task 已发布的结构化产物清单
-    """
-
-    task_id: str
-    agent_name: str
-    state: str
-    thread_id: str
-    parent_task_id: str | None
-    root_task_id: str
-    depth: int
-    created_at: datetime
-    updated_at: datetime
-    result: str | None = None
-    error: str | None = None
-    active_run: asyncio.Task[None] | None = None
-    run_count: int = 0
-    route_kind: str = "local"
-    upstream_task_id: str | None = None
-    parent_thread_id: str | None = None
-    mailbox_suppressed: bool = False
-    mailbox_delivered: bool = False
-    webhook: dict[str, Any] | None = None
-    cancel_requested: bool = False
-    delegation_root_id: str | None = None
-    delegation_max_depth: int | None = None
-    delegation_max_tasks_per_root: int | None = None
-    delegation_visited_nodes: tuple[str, ...] = ()
-    permission_profile: str = ""
-    effective_skill_names: tuple[str, ...] = ()
-    skill_view_path: str | None = None
-    skill_view_hash: str | None = None
-    pending_review: dict[str, Any] | None = None
-    artifacts: list[PublishedArtifact] = field(default_factory=list)
 
 
 class AgentRegistry:
@@ -764,6 +659,7 @@ class TaskManager:
         """初始化空任务表"""
         # 为什么有 task manager：异步子任务的状态、结果、取消和等待必须由一个中心层统一管理。
         self._tasks: dict[str, TaskRecord] = {}
+        self._live_runs = LiveRunRegistry()
         self._store = store
         self._event_ledger = TaskEventLedger(store) if store is not None else None
 
@@ -840,7 +736,21 @@ class TaskManager:
         return record
 
     def _has_live_active_run(self, record: TaskRecord) -> bool:
-        return record.active_run is not None and not record.active_run.done()
+        return self._live_runs.is_active(record.task_id)
+
+    def get_live_run(self, task_id: str) -> asyncio.Task[None] | None:
+        """Return the process-local run handle without polluting TaskRecord."""
+
+        return self._live_runs.get_task(task_id)
+
+    def has_active_run(self, task_id: str) -> bool:
+        return self._live_runs.is_active(task_id)
+
+    def was_cancel_requested(self, task_id: str) -> bool:
+        return self._live_runs.was_cancel_requested(task_id)
+
+    def request_cancel(self, task_id: str) -> asyncio.Task[None] | None:
+        return self._live_runs.request_cancel(task_id)
 
     def _save(self, record: TaskRecord) -> None:
         """把当前任务记录写入持久化存储"""
@@ -1110,11 +1020,10 @@ class TaskManager:
         record = self.get_task(task_id)
         record.state = "running"
         record.updated_at = _now()
-        record.active_run = run_task
+        self._live_runs.register(task_id, run_task)
         record.run_count += 1
         record.mailbox_suppressed = False
         record.mailbox_delivered = False
-        record.cancel_requested = False
         self._clear_mirrored_pending_review_from_root(record)
         record.pending_review = None
         record.error = None
@@ -1159,7 +1068,7 @@ class TaskManager:
             pending_review["review_id"] = str(uuid.uuid4())
         record.state = "waiting_for_human"
         record.updated_at = _now()
-        record.active_run = None
+        self._live_runs.discard(task_id)
         record.pending_review = pending_review
         record.error = None
         self._save_lifecycle(record)
@@ -1179,7 +1088,7 @@ class TaskManager:
         record.result = normalize_task_event_text(result)
         record.error = None
         record.updated_at = _now()
-        record.active_run = None
+        self._live_runs.discard(task_id)
         self._clear_mirrored_pending_review_from_root(record)
         record.pending_review = None
         self._save_lifecycle(record)
@@ -1197,7 +1106,7 @@ class TaskManager:
         record.state = "failed"
         record.error = normalize_task_event_text(error)
         record.updated_at = _now()
-        record.active_run = None
+        self._live_runs.discard(task_id)
         self._clear_mirrored_pending_review_from_root(record)
         record.pending_review = None
         self._save_lifecycle(record)
@@ -1213,8 +1122,7 @@ class TaskManager:
         record = self.get_task(task_id)
         record.state = "cancelled"
         record.updated_at = _now()
-        record.active_run = None
-        record.cancel_requested = False
+        self._live_runs.discard(task_id)
         self._clear_mirrored_pending_review_from_root(record)
         record.pending_review = None
         record.error = None
@@ -1231,8 +1139,7 @@ class TaskManager:
         record.state = "interrupted"
         record.error = normalize_task_event_text(error)
         record.updated_at = _now()
-        record.active_run = None
-        record.cancel_requested = False
+        self._live_runs.discard(task_id)
         self._clear_mirrored_pending_review_from_root(record)
         record.pending_review = None
         self._save_lifecycle(record)
@@ -1282,7 +1189,7 @@ class TaskManager:
             payload.get("updated_at"),
             fallback=record.updated_at,
         )
-        record.active_run = None
+        self._live_runs.discard(task_id)
         if record.state == "waiting_for_human" and record.pending_review is not None:
             self._mirror_pending_review_to_root(record)
         else:
@@ -1638,8 +1545,7 @@ class AgentControl:
             if self._mailbox is not None:
                 self._mailbox.acknowledge_task(task_id, record.thread_id)
         except asyncio.CancelledError as exc:
-            latest = self._task_manager.get_task(task_id)
-            if latest.cancel_requested:
+            if self._task_manager.was_cancel_requested(task_id):
                 self._task_manager.mark_cancelled(task_id)
             else:
                 self._task_manager.mark_interrupted(
@@ -1711,8 +1617,7 @@ class AgentControl:
             TaskAlreadyRunningError: 该任务已有未结束的活跃 run
         """
         # 为什么单独启动 run：send_input 和首次 spawn 都需要走同一套任务启动约束。
-        record = self._task_manager.get_task(task_id)
-        if record.active_run is not None and not record.active_run.done():
+        if self._task_manager.has_active_run(task_id):
             raise TaskAlreadyRunningError(f"Worker task is already running: {task_id}")
         run_task = asyncio.create_task(self._run_agent_turn(task_id, user_input))
         self._task_manager.mark_running(task_id, run_task)
@@ -1720,8 +1625,7 @@ class AgentControl:
 
     def _start_mailbox_run(self, task_id: str) -> None:
         """Start a run whose user input will be supplied by MailboxMiddleware."""
-        record = self._task_manager.get_task(task_id)
-        if record.active_run is not None and not record.active_run.done():
+        if self._task_manager.has_active_run(task_id):
             raise TaskAlreadyRunningError(f"Worker task is already running: {task_id}")
         run_task = asyncio.create_task(
             self._run_agent_payload(task_id, {"messages": []})
@@ -1750,7 +1654,7 @@ class AgentControl:
             record = self._task_manager.get_task(task_id)
             if self._mailbox is None or record.route_kind != "local":
                 return record
-            if record.active_run is not None and not record.active_run.done():
+            if self._task_manager.has_active_run(task_id):
                 return record
             if record.state not in RESUMABLE_TASK_STATES:
                 return record
@@ -1793,7 +1697,7 @@ class AgentControl:
 
     def _resume_run(self, task_id: str, decisions: list[dict[str, Any]]) -> None:
         record = self._task_manager.get_task(task_id)
-        if record.active_run is not None and not record.active_run.done():
+        if self._task_manager.has_active_run(task_id):
             raise TaskAlreadyRunningError(f"Worker task is already running: {task_id}")
         run_task = asyncio.create_task(
             self._run_agent_payload(
@@ -2700,6 +2604,17 @@ class AgentControl:
         """
         return self._task_manager.get_task(task_id)
 
+    def get_live_run(self, task_id: str) -> asyncio.Task[None] | None:
+        """Return a local run handle from the runtime-only registry.
+
+        Task status consumers should normally use ``get_task_record``. This
+        method exists for runtime coordination and diagnostics that must await
+        the currently scheduled run without coupling persistence to asyncio.
+        """
+
+        self._task_manager.get_task(task_id)
+        return self._task_manager.get_live_run(task_id)
+
     def open_local_task_event_stream(
         self,
         task_id: str,
@@ -2831,10 +2746,10 @@ class AgentControl:
         if record.pending_review is None:
             raise ValueError(f"Review '{review_id}' has no pending payload")
         self._resume_run(record.task_id, decisions)
-        resumed = self._task_manager.get_task(record.task_id)
-        if wait and resumed.active_run is not None:
+        run_task = self._task_manager.get_live_run(record.task_id)
+        if wait and run_task is not None:
             try:
-                await resumed.active_run
+                await run_task
             except asyncio.CancelledError:
                 pass
         return self._task_manager.get_task(record.task_id)
@@ -3054,7 +2969,7 @@ class AgentControl:
                     isinstance(entry, LocalWorkerEntry)
                     and existing.state == "pending"
                     and existing.run_count == 0
-                    and existing.active_run is None
+                    and not self._task_manager.has_active_run(task_id)
                 ):
                     self._start_run(task_id, task)
                     return self._task_manager.get_task(task_id)
@@ -3243,14 +3158,15 @@ class AgentControl:
                 task_id=record.upstream_task_id or task_id,
             )
             return self._task_manager.sync_remote_task(task_id, payload)
-        if record.active_run is None or record.active_run.done():
+        run_task = self._task_manager.get_live_run(task_id)
+        if run_task is None or run_task.done():
             if record.state in ACTIVE_TASK_STATES:
                 self._task_manager.mark_cancelled(task_id)
             return self._task_manager.get_task(task_id)
-        record.cancel_requested = True
-        record.active_run.cancel()
+        run_task = self._task_manager.request_cancel(task_id)
+        assert run_task is not None
         try:
-            await record.active_run
+            await run_task
         except asyncio.CancelledError:
             pass
         return self._task_manager.get_task(task_id)
@@ -3348,9 +3264,10 @@ class AgentControl:
             except ValueError as exc:
                 return str(exc)
         while True:
-            if record.active_run is not None:
+            run_task = self._task_manager.get_live_run(task_id)
+            if run_task is not None:
                 try:
-                    await record.active_run
+                    await run_task
                 except asyncio.CancelledError:
                     pass
             record = self._task_manager.get_task(task_id)

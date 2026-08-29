@@ -1,0 +1,92 @@
+"""Persistence-safe models shared by Task runtime and control-plane layers."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Literal, TypeAlias
+
+
+TaskState: TypeAlias = Literal[
+    "pending",
+    "running",
+    "waiting_for_human",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+]
+TaskRouteKind: TypeAlias = Literal["local", "remote_ref"]
+MetadataScalar: TypeAlias = str | int | float | bool | None
+
+ACTIVE_TASK_STATES: frozenset[TaskState] = frozenset(
+    {"pending", "running", "waiting_for_human"}
+)
+SETTLED_TASK_STATES: frozenset[TaskState] = frozenset(
+    {"completed", "failed", "cancelled", "interrupted"}
+)
+RESUMABLE_TASK_STATES = SETTLED_TASK_STATES
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedArtifact:
+    """A small file published by a Task for channel delivery."""
+
+    artifact_id: str
+    path: str
+    name: str
+    caption: str | None
+    content_type: str
+    size: int
+    run_count: int
+
+
+@dataclass(slots=True)
+class TaskRecord:
+    """Durable state for one local or remote Gateway Task.
+
+    Process-local execution handles deliberately do not belong here. Live
+    ``asyncio.Task`` objects are owned by ``LiveRunRegistry`` in the runtime
+    layer and are keyed by ``task_id``.
+    """
+
+    task_id: str
+    agent_name: str
+    state: TaskState
+    thread_id: str
+    parent_task_id: str | None
+    root_task_id: str
+    depth: int
+    created_at: datetime
+    updated_at: datetime
+    result: str | None = None
+    error: str | None = None
+    run_count: int = 0
+    route_kind: TaskRouteKind = "local"
+    upstream_task_id: str | None = None
+    parent_thread_id: str | None = None
+    mailbox_suppressed: bool = False
+    mailbox_delivered: bool = False
+    webhook: dict[str, Any] | None = None
+    delegation_root_id: str | None = None
+    delegation_max_depth: int | None = None
+    delegation_max_tasks_per_root: int | None = None
+    delegation_visited_nodes: tuple[str, ...] = ()
+    permission_profile: str = ""
+    effective_skill_names: tuple[str, ...] = ()
+    skill_view_path: str | None = None
+    skill_view_hash: str | None = None
+    pending_review: dict[str, Any] | None = None
+    artifacts: list[PublishedArtifact] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class TaskRouteRecord:
+    """Durable binding between a local Task identity and its execution route."""
+
+    task_id: str
+    agent_name: str
+    metadata: dict[str, MetadataScalar]
+    route_kind: TaskRouteKind
+    upstream_task_id: str
+    webhook: dict[str, MetadataScalar] | None = None

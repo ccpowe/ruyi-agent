@@ -36,7 +36,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-MetadataScalar = str | int | float | bool | None
+from ruyi_agent.task_models import MetadataScalar
 
 CONTEXT_VERSION = 1
 CONTEXT_VERSION_FIELD = "_deepagents_context_version"

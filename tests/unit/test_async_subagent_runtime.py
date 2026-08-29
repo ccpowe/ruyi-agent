@@ -746,8 +746,8 @@ def test_spawn_task_materializes_skill_view_and_passes_it_to_agent(
             ),
         )
         record = await control.spawn_task("main", "use frontend skill")
-        if record.active_run is not None:
-            await record.active_run
+        if control.get_live_run(record.task_id) is not None:
+            await control.get_live_run(record.task_id)
         return control.get_task_record(record.task_id)
 
     record = asyncio.run(run())
@@ -806,15 +806,15 @@ def test_spawn_task_inherits_parent_effective_skills(
             ),
         )
         parent = await control.spawn_task("main", "parent")
-        if parent.active_run is not None:
-            await parent.active_run
+        if control.get_live_run(parent.task_id) is not None:
+            await control.get_live_run(parent.task_id)
         child = await control.spawn_task(
             "worker",
             "child",
             parent_task_id=parent.task_id,
         )
-        if child.active_run is not None:
-            await child.active_run
+        if control.get_live_run(child.task_id) is not None:
+            await control.get_live_run(child.task_id)
         return (
             control.get_task_record(parent.task_id),
             control.get_task_record(child.task_id),
@@ -883,7 +883,7 @@ def test_local_runtime_consumes_astream_and_publishes_safe_deltas(
         )
         try:
             record = await control.spawn_task("background_research", "stream this")
-            run_task = record.active_run
+            run_task = control.get_live_run(record.task_id)
             while not factory.created:
                 await asyncio.sleep(0)
             agent = factory.created[0]
@@ -937,7 +937,7 @@ def test_local_runtime_uses_checkpoint_when_stream_has_no_values(
         )
         try:
             record = await control.spawn_task("background_research", "stream this")
-            run_task = record.active_run
+            run_task = control.get_live_run(record.task_id)
             while not factory.created:
                 await asyncio.sleep(0)
             agent = factory.created[0]
@@ -974,7 +974,7 @@ def test_local_runtime_does_not_invoke_again_after_stream_failure(
         )
         try:
             record = await control.spawn_task("background_research", "stream this")
-            run_task = record.active_run
+            run_task = control.get_live_run(record.task_id)
             while not factory.created:
                 await asyncio.sleep(0)
             agent = factory.created[0]
@@ -1016,8 +1016,8 @@ def test_register_artifact_attaches_manifest_to_task_run(
                 "size": 12,
             },
         )
-        if record.active_run is not None:
-            await record.active_run
+        if control.get_live_run(record.task_id) is not None:
+            await control.get_live_run(record.task_id)
         assert artifact["artifact_id"].startswith("art_")
         return control.get_task_record(record.task_id)
 
@@ -1049,8 +1049,8 @@ def test_wait_agent_reports_worker_human_review_without_tool_interrupt(
 
     async def scenario() -> tuple[str, async_subagent_runtime.TaskRecord]:
         record = await control.spawn_task("background_research", "needs review")
-        if record.active_run is not None:
-            await record.active_run
+        if control.get_live_run(record.task_id) is not None:
+            await control.get_live_run(record.task_id)
         waiting = control.get_task_record(record.task_id)
         assert waiting.state == "waiting_for_human"
         status = await control.wait_agent(record.task_id)
@@ -1092,8 +1092,8 @@ def test_worker_interrupts_are_read_from_state_snapshot(
 
     async def scenario() -> tuple[str, async_subagent_runtime.TaskRecord]:
         record = await control.spawn_task("background_research", "fetch hn")
-        if record.active_run is not None:
-            await record.active_run
+        if control.get_live_run(record.task_id) is not None:
+            await control.get_live_run(record.task_id)
         waiting = control.get_task_record(record.task_id)
         assert waiting.state == "waiting_for_human"
         status = await control.wait_agent(record.task_id)
@@ -1173,16 +1173,16 @@ def test_child_review_is_mirrored_to_root_task(
         async_subagent_runtime.TaskRecord,
     ]:
         root = await control.spawn_task("background_research", "root task")
-        if root.active_run is not None:
-            await root.active_run
+        if control.get_live_run(root.task_id) is not None:
+            await control.get_live_run(root.task_id)
         child = await control.spawn_task(
             "background_research",
             "needs review",
             parent_task_id=root.task_id,
             parent_thread_id=root.thread_id,
         )
-        if child.active_run is not None:
-            await child.active_run
+        if control.get_live_run(child.task_id) is not None:
+            await control.get_live_run(child.task_id)
         return control.get_task_record(root.task_id), control.get_task_record(
             child.task_id
         )
@@ -1212,16 +1212,16 @@ def test_submit_review_prefers_waiting_child_over_root_mirror(
         async_subagent_runtime.TaskRecord,
     ]:
         root = await control.spawn_task("background_research", "root task")
-        if root.active_run is not None:
-            await root.active_run
+        if control.get_live_run(root.task_id) is not None:
+            await control.get_live_run(root.task_id)
         child = await control.spawn_task(
             "background_research",
             "needs review",
             parent_task_id=root.task_id,
             parent_thread_id=root.thread_id,
         )
-        if child.active_run is not None:
-            await child.active_run
+        if control.get_live_run(child.task_id) is not None:
+            await control.get_live_run(child.task_id)
         waiting_child = control.get_task_record(child.task_id)
         updated_child = await control.submit_review_decision(
             waiting_child.pending_review["review_id"],
@@ -1254,16 +1254,16 @@ def test_cleared_root_review_is_replayable_from_durable_cursor(
         )
         try:
             root = await control.spawn_task("background_research", "root task")
-            if root.active_run is not None:
-                await root.active_run
+            if control.get_live_run(root.task_id) is not None:
+                await control.get_live_run(root.task_id)
             child = await control.spawn_task(
                 "background_research",
                 "needs review",
                 parent_task_id=root.task_id,
                 parent_thread_id=root.thread_id,
             )
-            if child.active_run is not None:
-                await child.active_run
+            if control.get_live_run(child.task_id) is not None:
+                await control.get_live_run(child.task_id)
 
             root = control.get_task_record(root.task_id)
             assert root.pending_review is not None
@@ -1312,8 +1312,8 @@ def test_submit_review_decision_default_does_not_wait_for_resumed_run(
 
     async def scenario() -> str:
         record = await control.spawn_task("background_research", "needs review")
-        assert record.active_run is not None
-        await record.active_run
+        assert control.get_live_run(record.task_id) is not None
+        await control.get_live_run(record.task_id)
         waiting = control.get_task_record(record.task_id)
         assert waiting.state == "waiting_for_human"
         updated = await control.submit_review_decision(
@@ -1321,11 +1321,11 @@ def test_submit_review_decision_default_does_not_wait_for_resumed_run(
             [{"type": "approve"}],
         )
         assert updated.state == "running"
-        assert updated.active_run is not None
+        assert control.get_live_run(updated.task_id) is not None
         await factory.created[0].resume_started.wait()
-        updated.active_run.cancel()
+        control.get_live_run(updated.task_id).cancel()
         try:
-            await updated.active_run
+            await control.get_live_run(updated.task_id)
         except asyncio.CancelledError:
             pass
         return "running"
@@ -1389,8 +1389,8 @@ def test_sync_remote_waiting_review_is_mirrored_to_root_task(
         async_subagent_runtime.TaskRecord,
     ]:
         root = await control.spawn_task("background_research", "root task")
-        if root.active_run is not None:
-            await root.active_run
+        if control.get_live_run(root.task_id) is not None:
+            await control.get_live_run(root.task_id)
         child = await control.spawn_task(
             "remote_code_wiki",
             "needs review",
@@ -1423,8 +1423,8 @@ def test_root_spawn_records_depth_1_and_self_as_root(
 
     async def scenario() -> async_subagent_runtime.TaskRecord:
         record = await control.spawn_task("background_research", "root task")
-        assert record.active_run is not None
-        await record.active_run
+        assert control.get_live_run(record.task_id) is not None
+        await control.get_live_run(record.task_id)
         return record
 
     record = asyncio.run(scenario())
@@ -1457,10 +1457,10 @@ def test_nested_spawn_inherits_root_and_increments_depth(
             parent_task_id=root.task_id,
             parent_thread_id=root.thread_id,
         )
-        assert root.active_run is not None
-        assert child.active_run is not None
-        root_run = root.active_run
-        child_run = child.active_run
+        assert control.get_live_run(root.task_id) is not None
+        assert control.get_live_run(child.task_id) is not None
+        root_run = control.get_live_run(root.task_id)
+        child_run = control.get_live_run(child.task_id)
         await root_run
         await child_run
         return root, child
@@ -1820,7 +1820,7 @@ def test_cancel_idle_completed_task_is_noop_and_followup_reuses_same_thread(
 
     async def scenario() -> tuple[str, str]:
         record = await control.spawn_task("background_research", "first task")
-        await record.active_run
+        await control.get_live_run(record.task_id)
         cancelled = await control.cancel_task(record.task_id)
         assert cancelled.state == "completed"
         sent = await control.send_input(record.task_id, "resume after cancel")
@@ -1874,11 +1874,11 @@ def test_cancel_waiting_for_human_marks_current_run_cancelled(
 
     async def scenario() -> async_subagent_runtime.TaskRecord:
         record = await control.spawn_task("background_research", "needs review")
-        assert record.active_run is not None
-        await record.active_run
+        assert control.get_live_run(record.task_id) is not None
+        await control.get_live_run(record.task_id)
         waiting = control.get_task_record(record.task_id)
         assert waiting.state == "waiting_for_human"
-        assert waiting.active_run is None
+        assert control.get_live_run(waiting.task_id) is None
         return await control.cancel_task(record.task_id)
 
     record = asyncio.run(scenario())
@@ -1906,10 +1906,10 @@ def test_passive_run_cancellation_marks_task_interrupted(
     async def scenario() -> async_subagent_runtime.TaskRecord:
         record = await control.spawn_task("background_research", "block")
         await agent.started.wait()
-        assert record.active_run is not None
-        record.active_run.cancel()
+        assert control.get_live_run(record.task_id) is not None
+        control.get_live_run(record.task_id).cancel()
         try:
-            await record.active_run
+            await control.get_live_run(record.task_id)
         except asyncio.CancelledError:
             pass
         return control.get_task_record(record.task_id)
@@ -1957,7 +1957,7 @@ def test_task_store_restores_local_running_task_as_interrupted(
     second_control.load_tasks_for_thread("main-thread")
     restored = second_control.get_task_record("local-running-task")
     assert restored.state == "interrupted"
-    assert restored.active_run is None
+    assert second_control.get_live_run(restored.task_id) is None
     listing = asyncio.run(second_control.list_agents())
     assert "task_id=local-running-task" in listing
     assert "state=interrupted" in listing
@@ -1992,8 +1992,8 @@ def test_task_store_reload_preserves_live_local_run(
         await agent.started.wait()
         control.load_tasks_for_thread("main-thread")
         reloaded = control.get_task_record(record.task_id)
-        assert reloaded.active_run is not None
-        assert not reloaded.active_run.done()
+        assert control.get_live_run(reloaded.task_id) is not None
+        assert not control.get_live_run(reloaded.task_id).done()
         state = reloaded.state
         error = reloaded.error
         await control.cancel_task(record.task_id)
@@ -2108,8 +2108,8 @@ def test_background_local_task_publishes_terminal_message_to_mailbox(
             "research this",
             parent_thread_id="main-thread",
         )
-        assert record.active_run is not None
-        await record.active_run
+        assert control.get_live_run(record.task_id) is not None
+        await control.get_live_run(record.task_id)
         return mailbox.drain("main-thread")
 
     messages = asyncio.run(scenario())
@@ -2142,13 +2142,13 @@ def test_background_local_task_publishes_each_settled_run_to_mailbox(
             "first run",
             parent_thread_id="main-thread",
         )
-        assert record.active_run is not None
-        await record.active_run
+        assert control.get_live_run(record.task_id) is not None
+        await control.get_live_run(record.task_id)
         first_messages = mailbox.drain("main-thread")
 
         followup = await control.send_task_input(record.task_id, "second run")
-        assert followup.active_run is not None
-        await followup.active_run
+        assert control.get_live_run(followup.task_id) is not None
+        await control.get_live_run(followup.task_id)
         second_messages = mailbox.drain("main-thread")
         return first_messages, second_messages
 
@@ -2199,8 +2199,8 @@ def test_send_input_to_active_run_queues_mailbox_message(
         continued_state = continued.state
         messages = mailbox.drain(record.thread_id)
         agent.release.set()
-        assert record.active_run is not None
-        await record.active_run
+        assert control.get_live_run(record.task_id) is not None
+        await control.get_live_run(record.task_id)
         return continued_state, messages
 
     state, messages = asyncio.run(scenario())
@@ -2247,11 +2247,11 @@ def test_send_input_to_settled_task_wakes_mailbox_run(
 
     async def scenario() -> tuple[int, list[dict]]:
         record = await control.spawn_task("background_research", "first")
-        assert record.active_run is not None
-        await record.active_run
+        assert control.get_live_run(record.task_id) is not None
+        await control.get_live_run(record.task_id)
         continued = await control.send_task_input(record.task_id, "follow up")
-        assert continued.active_run is not None
-        await continued.active_run
+        assert control.get_live_run(continued.task_id) is not None
+        await control.get_live_run(continued.task_id)
         await asyncio.sleep(0)
         return control._task_manager.get_task(record.task_id).run_count, agent.calls
 
@@ -2290,8 +2290,8 @@ def test_restart_loads_persisted_task_and_wakes_pending_mailbox_input(
 
     async def create_persisted_task() -> tuple[str, str]:
         record = await first_control.spawn_task("background_research", "first")
-        assert record.active_run is not None
-        await record.active_run
+        assert first_control.get_live_run(record.task_id) is not None
+        await first_control.get_live_run(record.task_id)
         await asyncio.sleep(0)
         first_mailbox.publish_input(
             recipient_task_id=record.task_id,
@@ -2339,8 +2339,8 @@ def test_restart_loads_persisted_task_and_wakes_pending_mailbox_input(
     async def recover() -> int:
         await second_control.wake_pending_mailbox_tasks()
         record = second_control._task_manager.get_task(task_id)
-        assert record.active_run is not None
-        await record.active_run
+        assert second_control.get_live_run(record.task_id) is not None
+        await second_control.get_live_run(record.task_id)
         return record.run_count
 
     try:
@@ -2402,8 +2402,8 @@ def test_mailbox_delivery_flags_are_persisted(
             "background result",
             parent_thread_id="main-thread",
         )
-        assert delivered.active_run is not None
-        await delivered.active_run
+        assert control.get_live_run(delivered.task_id) is not None
+        await control.get_live_run(delivered.task_id)
 
         suppressed = await control.spawn_task(
             "background_research",
@@ -2629,16 +2629,16 @@ def test_child_task_can_send_input_to_direct_parent_but_cannot_cancel_it(
 
     async def scenario() -> tuple[str, str, str, str]:
         parent = await control.spawn_task("parent", "parent run")
-        assert parent.active_run is not None
-        await parent.active_run
+        assert control.get_live_run(parent.task_id) is not None
+        await control.get_live_run(parent.task_id)
         child = await control.spawn_task(
             "child",
             "child run",
             parent_task_id=parent.task_id,
             parent_thread_id=parent.thread_id,
         )
-        assert child.active_run is not None
-        await child.active_run
+        assert control.get_live_run(child.task_id) is not None
+        await control.get_live_run(child.task_id)
         tools = control.build_tools_for("child")
         send_tool = next(tool for tool in tools if tool.name == "send_input")
         list_tool = next(tool for tool in tools if tool.name == "list_agents")

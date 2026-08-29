@@ -12,7 +12,6 @@ from typing import Any, Literal
 
 from ruyi_agent.gateway.errors import GatewayTaskError
 from ruyi_agent.gateway.sse import SSEProtocolError, task_stream_event_from_gateway
-from ruyi_agent.gateway.models import MetadataScalar, TaskRouteRecord
 from ruyi_agent.integrations.a2a.client import A2AClientError
 from ruyi_agent.runtime.delegation.async_runtime import (
     AgentControl,
@@ -21,7 +20,6 @@ from ruyi_agent.runtime.delegation.async_runtime import (
     MaxTasksPerRootError,
     RemoteExecutorNotImplementedError,
     TaskAlreadyRunningError,
-    TaskRecord,
     UnknownAgentTargetError,
     UnknownWorkerTaskError,
 )
@@ -45,6 +43,7 @@ from ruyi_agent.runtime.task_events import (
     TaskStreamEvent,
 )
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
+from ruyi_agent.task_models import MetadataScalar, TaskRecord, TaskRouteRecord
 
 TASK_MESSAGE_CURSOR_VERSION = 1
 MAX_TASK_MESSAGE_CURSOR_LENGTH = 4096

@@ -118,7 +118,7 @@ def _agent_config(name: str, *, kind: str = "local") -> dict[str, object]:
 
 async def _wait_for_run(control: AgentControl, task_id: str) -> None:
     record = control.get_task_record(task_id)
-    active_run = record.active_run
+    active_run = control.get_live_run(record.task_id)
     if active_run is not None:
         await active_run
 

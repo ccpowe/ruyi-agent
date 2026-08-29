@@ -5,10 +5,7 @@ import sqlite3
 import threading
 from asyncio import to_thread
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from ruyi_agent.gateway.models import TaskRouteRecord
+from ruyi_agent.task_models import TaskRouteRecord
 
 
 class GatewayRouteStore:
@@ -186,8 +183,6 @@ class GatewayRouteStore:
         self,
         row: tuple[str, str, str, str, str, str | None],
     ) -> TaskRouteRecord:
-        from ruyi_agent.gateway.models import TaskRouteRecord
-
         metadata_json = row[2]
         metadata = json.loads(metadata_json)
         webhook_json = row[5]

@@ -40,7 +40,6 @@ from ruyi_agent.gateway.models import (
     AgentRefResponse,
     AttachmentInput,
     GatewayArtifact,
-    MetadataScalar,
     PreparedInput,
     PublishedArtifactResponse,
     ReviewListResponse,
@@ -50,17 +49,18 @@ from ruyi_agent.gateway.models import (
     TaskMessageResponse,
     TaskMessageToolCallResponse,
     TaskResponse,
-    TaskRouteRecord,
     TaskWebhookEvent,
 )
 from ruyi_agent.gateway.routing import TaskRouter
-from ruyi_agent.runtime.delegation.async_runtime import (
-    AgentControl,
-    PublishedArtifact,
-    TaskRecord,
-)
+from ruyi_agent.runtime.delegation.async_runtime import AgentControl
 from ruyi_agent.runtime.task_events import TaskStreamEvent
 from ruyi_agent.runtime.delegation.context import DelegationContext
+from ruyi_agent.task_models import (
+    MetadataScalar,
+    PublishedArtifact,
+    TaskRecord,
+    TaskRouteRecord,
+)
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
 from ruyi_agent.storage.gateway_command_store import (
     GatewayCommandClaim,

@@ -1530,24 +1530,24 @@ def test_gateway_exposes_subagent_task_created_by_public_root(
         # Route persistence is now executed via asyncio.to_thread to avoid blocking
         # the FastAPI event loop. That yields control and allows very fast tasks to
         # complete before this assertion runs.
-        if parent.active_run is not None:
-            await parent.active_run
+        if control.get_live_run(parent.task_id) is not None:
+            await control.get_live_run(parent.task_id)
         child_records = [
             record
             for record in control.list_task_records()
             if record.agent_name == "background_research"
         ]
         for record in child_records:
-            if record.active_run is not None:
-                await record.active_run
+            if control.get_live_run(record.task_id) is not None:
+                await control.get_live_run(record.task_id)
         child_response = await service.get_task(child_records[0].task_id)
         continued_child = await service.send_input(
             child_records[0].task_id,
             "follow-up",
         )
         continued_record = control.get_task_record(child_records[0].task_id)
-        if continued_record.active_run is not None:
-            await continued_record.active_run
+        if control.get_live_run(continued_record.task_id) is not None:
+            await control.get_live_run(continued_record.task_id)
         task_tree = await service.list_tasks(
             agent_name=None,
             status=None,
@@ -3104,16 +3104,16 @@ def test_review_submit_accepts_root_task_mirrored_review(
     async def seed_review() -> None:
         nonlocal child_review_id, root_task_id
         root = await control.spawn_task("background_research", "root task")
-        if root.active_run is not None:
-            await root.active_run
+        if control.get_live_run(root.task_id) is not None:
+            await control.get_live_run(root.task_id)
         child = await control.spawn_task(
             "background_research",
             "needs review",
             parent_task_id=root.task_id,
             parent_thread_id=root.thread_id,
         )
-        if child.active_run is not None:
-            await child.active_run
+        if control.get_live_run(child.task_id) is not None:
+            await control.get_live_run(child.task_id)
         root_task_id = root.task_id
         child_review_id = control.get_task_record(child.task_id).pending_review[
             "review_id"
