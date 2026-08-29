@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
@@ -7,6 +8,7 @@ import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import quote_from_bytes, unquote_to_bytes, urlsplit
 
 
 _INITIALIZATION_LOCKS_GUARD = threading.Lock()
@@ -16,12 +18,16 @@ _INITIALIZATION_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = (
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 _WAL_RETRY_INITIAL_DELAY_SECONDS = 0.005
 _WAL_RETRY_MAX_DELAY_SECONDS = 0.1
+_URI_PATH_SAFE = "/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
 
 
 @contextmanager
 def database_initialization_lock(db_path: str) -> Iterator[None]:
     """Serialize complete startup for connections to the same SQLite database."""
 
+    if _is_private_database(db_path):
+        yield
+        return
     identity = _database_identity(db_path)
     with _INITIALIZATION_LOCKS_GUARD:
         lock = _INITIALIZATION_LOCKS.get(identity)
@@ -49,17 +55,86 @@ def configure_connection_for_initialization(
 
 
 def _database_identity(db_path: str) -> str:
-    if db_path.startswith("file:") or db_path == ":memory:":
-        return db_path
-    return str(Path(db_path).expanduser().resolve())
+    if not db_path.startswith("file:"):
+        if db_path in {"", ":memory:"}:
+            return "sqlite-private"
+        return f"sqlite-file:{Path(db_path).resolve()}"
+
+    authority, path, query = _file_uri_parts(db_path)
+    query_identity = _canonical_query(query)
+    if _uri_is_memory(path, query):
+        identity = f"sqlite-memory:{quote_from_bytes(path, safe='/:')}"
+    elif authority in {"", "localhost"}:
+        filesystem_path = os.fsdecode(path)
+        identity = f"sqlite-file:{Path(filesystem_path).resolve()}"
+    else:
+        identity = (
+            f"sqlite-uri:{authority}:{quote_from_bytes(path, safe=_URI_PATH_SAFE)}"
+        )
+    if query_identity:
+        return f"{identity}?{query_identity}"
+    return identity
+
+
+def _file_uri_parts(db_path: str) -> tuple[str, bytes, list[tuple[bytes, bytes]]]:
+    parsed = urlsplit(db_path)
+    path = unquote_to_bytes(parsed.path).split(b"\x00", 1)[0]
+    query = []
+    if parsed.query:
+        for parameter in parsed.query.split("&"):
+            key, separator, value = parameter.partition("=")
+            query.append(
+                (
+                    unquote_to_bytes(key),
+                    unquote_to_bytes(value if separator else ""),
+                )
+            )
+    return parsed.netloc, path, query
+
+
+def _canonical_query(query: list[tuple[bytes, bytes]]) -> str:
+    # SQLite gives repeated parameters order-sensitive semantics. Python's sort is
+    # stable, so this normalizes distinct parameter order without reordering values
+    # for the same decoded key.
+    ordered = sorted(query, key=lambda parameter: parameter[0])
+    return "&".join(
+        f"{quote_from_bytes(key, safe='')}={quote_from_bytes(value, safe='')}"
+        for key, value in ordered
+    )
+
+
+def _last_uri_parameter(
+    query: list[tuple[bytes, bytes]],
+    key: bytes,
+) -> bytes | None:
+    values = [value for candidate, value in query if candidate == key]
+    return values[-1] if values else None
+
+
+def _uri_is_memory(path: bytes, query: list[tuple[bytes, bytes]]) -> bool:
+    return path == b":memory:" or _last_uri_parameter(query, b"mode") == b"memory"
+
+
+def _is_private_database(db_path: str) -> bool:
+    if db_path in {"", ":memory:"}:
+        return True
+    if not db_path.startswith("file:"):
+        return False
+    _authority, path, query = _file_uri_parts(db_path)
+    if not path:
+        return True
+    return _uri_is_memory(path, query) and (
+        _last_uri_parameter(query, b"cache") != b"shared"
+    )
 
 
 def _is_memory_database(db_path: str) -> bool:
-    normalized = db_path.lower()
-    return normalized == ":memory:" or (
-        normalized.startswith("file:")
-        and (normalized.startswith("file::memory:") or "mode=memory" in normalized)
-    )
+    if db_path == ":memory:":
+        return True
+    if not db_path.startswith("file:"):
+        return False
+    _authority, path, query = _file_uri_parts(db_path)
+    return _uri_is_memory(path, query)
 
 
 def _enable_write_ahead_log(connection: sqlite3.Connection) -> None:
@@ -88,8 +163,9 @@ class TaskDatabase:
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        parent = Path(db_path).expanduser().resolve().parent
-        parent.mkdir(parents=True, exist_ok=True)
+        if db_path not in {"", ":memory:"} and not db_path.startswith("file:"):
+            parent = Path(db_path).expanduser().resolve().parent
+            parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
             db_path,

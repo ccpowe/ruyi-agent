@@ -26,6 +26,22 @@ Store startup is one operation per canonical database identity:
    30-second busy-timeout deadline; and
 4. retain `BEGIN IMMEDIATE` for the complete idempotent schema migration.
 
+The identity follows SQLite URI filename semantics rather than the caller's raw
+spelling. Ordinary and `file:` disk paths are resolved to the same absolute
+filesystem path after URI percent decoding; empty and `localhost` authorities,
+relative paths, dot segments, and ignored fragments therefore do not split the
+lock. URI query pairs remain part of the identity because they can change the
+target VFS or connection behavior. Distinct decoded keys are sorted, while the
+relative order of repeated keys is retained because SQLite gives repeated
+parameters order-sensitive semantics. This parsing does not use HTML form
+rules: a literal `+` stays distinct from `%20`.
+
+Named `mode=memory` databases retain their decoded URI path instead of being
+resolved as filesystem paths. A non-empty named memory URI with
+`cache=shared` uses the shared initialization lock; private or temporary memory
+connections bypass the registry because each connection owns a different
+database.
+
 `GatewayCommandStore` keeps interrupted-command recovery under the same startup
 lock. Constructor failures close their connection while preserving the original
 exception, even if cleanup itself fails.
@@ -43,6 +59,9 @@ protocol.
   replaced by coordination errors.
 - Initialization locks are weakly retained by database identity, so opening
   many temporary database paths does not create an unbounded registry.
+- Equivalent URI aliases cannot race at WAL, migration, or interrupted-command
+  recovery boundaries, while distinct disk and named-memory databases can
+  still initialize in parallel.
 
 ## Verification
 
@@ -52,3 +71,11 @@ database. They verify the migrated schema, backfills, recovery, uniqueness, and
 integrity. Separate injected SQLite failures assert that the first worker's
 real error is re-raised rather than a barrier error and that all 12 constructor
 connections are closed.
+
+URI alias tests run complete Task and Gateway Command store constructors through
+ordinary, percent-encoded, relative, `localhost`, and reordered-query spellings.
+They observe a peak of one inside the complete startup boundary for equivalent
+aliases, a peak of at least two for different databases, and the same
+serialization/isolation behavior for shared named-memory aliases and distinct
+memory names. Repeated query keys, literal plus signs, and percent-encoded paths
+have explicit identity assertions.

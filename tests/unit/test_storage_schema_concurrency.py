@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Callable, cast
+from urllib.parse import quote
 
 import pytest
 
@@ -20,6 +24,7 @@ from ruyi_agent.storage.task_store import TaskStore
 NOW = "2026-08-30T00:00:00+00:00"
 THREAD_COUNT = 12
 STRESS_ROUND_COUNT = 60
+URI_STRESS_ROUND_COUNT = 6
 
 
 def _create_legacy_task_database(db_path: Path) -> None:
@@ -206,6 +211,60 @@ def _open_stores_concurrently(
         raise first_failure[0]
 
 
+def _open_aliases_concurrently(
+    aliases: list[str],
+    factory: Callable[[str], object],
+) -> None:
+    barrier = threading.Barrier(len(aliases))
+
+    def open_store(alias: str) -> None:
+        barrier.wait(timeout=30)
+        store = factory(alias)
+        try:
+            count = getattr(store, "count_commands", None)
+            if count is not None:
+                assert count() == 1
+        finally:
+            getattr(store, "close")()
+
+    with ThreadPoolExecutor(max_workers=len(aliases)) as executor:
+        futures = [executor.submit(open_store, alias) for alias in aliases]
+        for future in futures:
+            future.result()
+
+
+class _PeakTracker:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active = 0
+        self.peak = 0
+
+    @contextmanager
+    def hold(self) -> Iterator[None]:
+        with self._lock:
+            self._active += 1
+            self.peak = max(self.peak, self._active)
+        try:
+            time.sleep(0.02)
+            yield
+        finally:
+            with self._lock:
+                self._active -= 1
+
+
+def _disk_uri_aliases(db_path: Path) -> list[str]:
+    encoded_path = quote(str(db_path), safe="/")
+    dot_directory = db_path.parent / "uri-dot"
+    dot_directory.mkdir(exist_ok=True)
+    dotted_path = quote(f"{dot_directory}/../{db_path.name}", safe="/")
+    return [
+        f"file:{encoded_path}?mode=rwc&cache=shared",
+        f"file://{encoded_path}?cache=shared&mode=rwc",
+        f"file://localhost{encoded_path}?cache=shared&mode=rwc",
+        f"file:{dotted_path}?cache=shared&mode=rwc",
+    ]
+
+
 def _column_names(connection: sqlite3.Connection, table: str) -> list[str]:
     return [
         str(row[1])
@@ -259,6 +318,244 @@ def test_wal_negotiation_preserves_non_lock_sqlite_error() -> None:
         )
 
     assert connection.calls == 1
+
+
+def test_database_identity_canonicalizes_equivalent_disk_uri_spellings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_directory = tmp_path / "uri identity"
+    database_directory.mkdir()
+    dot_directory = database_directory / "dot"
+    dot_directory.mkdir()
+    db_path = database_directory / "tasks #1.sqlite"
+    encoded_path = quote(str(db_path), safe="/")
+    dotted_path = quote(f"{dot_directory}/../{db_path.name}", safe="/")
+    identities = {
+        task_database_module._database_identity(candidate)
+        for candidate in (
+            str(db_path),
+            f"file:{encoded_path}",
+            f"file://{encoded_path}",
+            f"file://localhost{encoded_path}",
+            f"file:{dotted_path}",
+        )
+    }
+
+    assert len(identities) == 1
+
+    monkeypatch.chdir(database_directory)
+    relative_identities = {
+        task_database_module._database_identity(candidate)
+        for candidate in (
+            db_path.name,
+            f"file:{quote(db_path.name)}",
+            f"file:./{quote(db_path.name)}",
+            f"file:dot/../{quote(db_path.name)}",
+        )
+    }
+    assert relative_identities == identities
+
+    tilde_directory = database_directory / "~"
+    tilde_directory.mkdir()
+    assert task_database_module._database_identity(
+        "~/tilde.sqlite"
+    ) == task_database_module._database_identity("file:~/tilde.sqlite")
+    assert task_database_module._database_identity(
+        f"file:{encoded_path}#ignored"
+    ) == task_database_module._database_identity(str(db_path))
+
+
+def test_database_identity_canonicalizes_query_without_losing_semantics(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "query.sqlite"
+    uri = f"file:{quote(str(db_path), safe='/')}?"
+
+    assert task_database_module._database_identity(
+        f"{uri}mode=rwc&ca%63he=shared&label=a%2Bb"
+    ) == task_database_module._database_identity(
+        f"{uri}label=a+b&cache=shared&mode=rwc"
+    )
+    assert task_database_module._database_identity(
+        f"{uri}label=a+b"
+    ) != task_database_module._database_identity(f"{uri}label=a%20b")
+    assert task_database_module._database_identity(
+        f"{uri}mode=rwc&cache=private&label=x&cache=shared"
+    ) == task_database_module._database_identity(
+        f"{uri}cache=private&cache=shared&label=x&mode=rwc"
+    )
+    assert task_database_module._database_identity(
+        f"{uri}cache=private&cache=shared"
+    ) != task_database_module._database_identity(f"{uri}cache=shared&cache=private")
+    assert task_database_module._database_identity(
+        f"{uri}mode=ro"
+    ) != task_database_module._database_identity(f"{uri}mode=rwc")
+
+
+def test_database_identity_preserves_sqlite_named_memory_names() -> None:
+    shared_aliases = (
+        "file:round8-memory?mode=memory&cache=shared",
+        "file:round8%2Dmemory?cache=shared&mode=memory",
+    )
+    absolute_aliases = (
+        "file:/round8-memory?mode=memory&cache=shared",
+        "file:///round8%2Dmemory?cache=shared&mode=memory",
+        "file://localhost/round8-memory?cache=shared&mode=memory",
+    )
+
+    assert (
+        len(
+            {task_database_module._database_identity(alias) for alias in shared_aliases}
+        )
+        == 1
+    )
+    assert (
+        len(
+            {
+                task_database_module._database_identity(alias)
+                for alias in absolute_aliases
+            }
+        )
+        == 1
+    )
+    assert task_database_module._database_identity(
+        shared_aliases[0]
+    ) != task_database_module._database_identity(
+        "file:./round8-memory?mode=memory&cache=shared"
+    )
+    assert task_database_module._database_identity(
+        shared_aliases[0]
+    ) != task_database_module._database_identity(
+        "file:other-memory?mode=memory&cache=shared"
+    )
+
+
+def test_task_store_uri_aliases_share_complete_initialization_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = _PeakTracker()
+    original_lock = task_database_module.database_initialization_lock
+
+    @contextmanager
+    def tracked_lock(db_path: str) -> Iterator[None]:
+        with original_lock(db_path):
+            with tracker.hold():
+                yield
+
+    monkeypatch.setattr(
+        task_database_module,
+        "database_initialization_lock",
+        tracked_lock,
+    )
+
+    for round_index in range(URI_STRESS_ROUND_COUNT):
+        db_path = tmp_path / "task uri alias" / f"legacy-{round_index}.sqlite"
+        db_path.parent.mkdir(exist_ok=True)
+        _create_legacy_task_database(db_path)
+        aliases = _disk_uri_aliases(db_path) * 2
+        _open_aliases_concurrently(aliases, TaskStore)
+
+    assert tracker.peak == 1
+
+
+def test_command_store_uri_aliases_share_recovery_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = _PeakTracker()
+    original_lock = gateway_command_store_module.database_initialization_lock
+
+    @contextmanager
+    def tracked_lock(db_path: str) -> Iterator[None]:
+        with original_lock(db_path):
+            with tracker.hold():
+                yield
+
+    monkeypatch.setattr(
+        gateway_command_store_module,
+        "database_initialization_lock",
+        tracked_lock,
+    )
+
+    for round_index in range(URI_STRESS_ROUND_COUNT):
+        db_path = tmp_path / "command uri alias" / f"legacy-{round_index}.sqlite"
+        db_path.parent.mkdir(exist_ok=True)
+        _create_legacy_command_database(db_path)
+        aliases = _disk_uri_aliases(db_path) * 2
+        _open_aliases_concurrently(aliases, GatewayCommandStore)
+
+    assert tracker.peak == 1
+
+
+def test_distinct_disk_databases_initialize_in_parallel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = _PeakTracker()
+    original_lock = task_database_module.database_initialization_lock
+
+    @contextmanager
+    def tracked_lock(db_path: str) -> Iterator[None]:
+        with original_lock(db_path):
+            with tracker.hold():
+                yield
+
+    monkeypatch.setattr(
+        task_database_module,
+        "database_initialization_lock",
+        tracked_lock,
+    )
+    paths = [tmp_path / f"distinct-{index}.sqlite" for index in range(2)]
+    for db_path in paths:
+        _create_legacy_task_database(db_path)
+
+    _open_aliases_concurrently([str(path) for path in paths], TaskStore)
+
+    assert tracker.peak >= 2
+
+
+def test_named_memory_aliases_serialize_but_distinct_names_do_not(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = _PeakTracker()
+    original_lock = task_database_module.database_initialization_lock
+
+    @contextmanager
+    def tracked_lock(db_path: str) -> Iterator[None]:
+        with original_lock(db_path):
+            with tracker.hold():
+                yield
+
+    monkeypatch.setattr(
+        task_database_module,
+        "database_initialization_lock",
+        tracked_lock,
+    )
+    name = f"round8-{tmp_path.name}"
+    aliases = [
+        f"file:{name}?mode=memory&cache=shared",
+        f"file:{name.replace('-', '%2D', 1)}?cache=shared&mode=memory",
+    ] * 4
+    anchor = sqlite3.connect(aliases[0], uri=True)
+    try:
+        _open_aliases_concurrently(aliases, TaskStore)
+        assert anchor.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'agent_tasks'"
+        ).fetchone() == ("agent_tasks",)
+    finally:
+        anchor.close()
+    assert tracker.peak == 1
+
+    tracker.peak = 0
+    distinct_names = [
+        f"file:{name}-{index}?mode=memory&cache=shared" for index in range(2)
+    ]
+    _open_aliases_concurrently(distinct_names, TaskStore)
+
+    assert tracker.peak >= 2
 
 
 def test_legacy_task_schema_initializes_concurrently_without_partial_migration(
