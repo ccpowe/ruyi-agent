@@ -60,7 +60,7 @@ def _parse_provider(provider_name: str, raw_provider: object) -> LLMProviderSpec
 
 
 def _optional_string(value: object, *, path: str) -> str | None:
-    if value is None:
+    if value is None or (isinstance(value, str) and not value.strip()):
         return None
     return _non_empty_string(value, path=path)
 

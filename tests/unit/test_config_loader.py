@@ -701,6 +701,28 @@ def test_load_llm_provider_configs_parses_providers(tmp_path: Path) -> None:
     }
 
 
+def test_load_llm_provider_configs_keeps_blank_optional_codex_fields_compatible(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "llm_providers.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[providers.codex]",
+                'kind = "openai_codex"',
+                'base_url = ""',
+                'api_key_env = ""',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    providers = config_loader.load_llm_provider_configs(config_path)
+
+    assert providers["codex"].base_url is None
+    assert providers["codex"].api_key_env is None
+
+
 def test_load_llm_provider_configs_rejects_unexpected_fields(tmp_path: Path) -> None:
     config_path = tmp_path / "llm_providers.toml"
     config_path.write_text(
