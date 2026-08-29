@@ -347,7 +347,8 @@ def _sanitize_remote_settled_outbox(
     rows = connection.execute(
         """
         SELECT outbox.outbox_key, outbox.task_id, outbox.run_count,
-               outbox.content, outbox.status, task.state, task.run_count
+               outbox.content, outbox.status, outbox.settled_status,
+               task.state, task.run_count
         FROM agent_task_settled_outbox AS outbox
         JOIN agent_tasks AS task ON task.task_id = outbox.task_id
         WHERE task.route_kind = 'remote_ref'
@@ -360,6 +361,7 @@ def _sanitize_remote_settled_outbox(
         outbox_run_count,
         content,
         status,
+        settled_status,
         task_state,
         task_run_count,
     ) in rows:
@@ -367,6 +369,7 @@ def _sanitize_remote_settled_outbox(
         public_content = _public_remote_settlement_content(
             content=str(content),
             old_error=remote_errors.get(task_id),
+            settled_status=str(settled_status),
             task_state=str(task_state),
             is_current_run=int(outbox_run_count) == int(task_run_count),
         )
@@ -392,7 +395,7 @@ def _sanitize_remote_mailbox_messages(
         """
         SELECT message.message_id, message.child_task_id,
                message.child_run_count, message.content, message.status,
-               task.task_id, task.state, task.run_count
+               message.settled_status, task.task_id, task.state, task.run_count
         FROM agent_mailbox_messages AS message
         JOIN agent_tasks AS task
           ON message.child_task_id IN (task.task_id, task.upstream_task_id)
@@ -406,6 +409,7 @@ def _sanitize_remote_mailbox_messages(
         child_run_count,
         content,
         status,
+        settled_status,
         task_id_value,
         task_state,
         task_run_count,
@@ -414,6 +418,9 @@ def _sanitize_remote_mailbox_messages(
         public_content = _public_remote_settlement_content(
             content=str(content),
             old_error=remote_errors.get(task_id),
+            settled_status=(
+                str(settled_status) if settled_status is not None else None
+            ),
             task_state=str(task_state),
             is_current_run=(
                 child_run_count is not None
@@ -437,10 +444,13 @@ def _public_remote_settlement_content(
     *,
     content: str,
     old_error: str | None,
+    settled_status: str | None,
     task_state: str,
     is_current_run: bool,
 ) -> str:
     if old_error is not None and content == old_error:
+        return REMOTE_TASK_PUBLIC_ERROR
+    if settled_status in {"failed", "interrupted"}:
         return REMOTE_TASK_PUBLIC_ERROR
     if is_current_run and task_state in {"failed", "interrupted"}:
         return REMOTE_TASK_PUBLIC_ERROR
