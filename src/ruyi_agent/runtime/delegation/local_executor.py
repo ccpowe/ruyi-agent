@@ -9,6 +9,7 @@ independent from Gateway and remote transport policy.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from typing import Any, Protocol
 
@@ -25,7 +26,10 @@ from ruyi_agent.runtime.delegation.contracts import (
     _published_artifact_to_dict,
 )
 from ruyi_agent.runtime.delegation.registry import LocalWorkerEntry, RegisteredAgent
-from ruyi_agent.runtime.delegation.run_supervisor import RuntimeClosingError
+from ruyi_agent.runtime.delegation.run_supervisor import (
+    MutationPermit,
+    RuntimeClosingError,
+)
 from ruyi_agent.runtime.skills.resolver import resolve_skill_names
 from ruyi_agent.runtime.task_events import (
     assistant_delta_from_stream_part,
@@ -34,6 +38,7 @@ from ruyi_agent.runtime.task_events import (
 from ruyi_agent.task_models import RESUMABLE_TASK_STATES, PublishedArtifact, TaskRecord
 
 _MISSING_STREAM_VALUE = object()
+logger = logging.getLogger(__name__)
 
 
 class LocalExecutionHost(Protocol):
@@ -365,6 +370,8 @@ class LocalTaskExecutor:
         self,
         task_id: str,
         user_input: str,
+        *,
+        permit: MutationPermit | None = None,
     ) -> asyncio.Task[None]:
         """
         启动本地任务的一轮异步执行
@@ -380,6 +387,7 @@ class LocalTaskExecutor:
         return await self._control._run_supervisor.schedule(
             task_id,
             lambda: self._control._run_agent_turn(task_id, user_input),
+            permit=permit,
         )
 
     async def _start_mailbox_run(self, task_id: str) -> asyncio.Task[None]:
@@ -431,15 +439,24 @@ class LocalTaskExecutor:
 
     async def close(self) -> None:
         """Drain runtime-owned work before closing the lifecycle event ledger."""
-        await self._control._run_supervisor.close()
-        ledger = self._control._task_manager.event_ledger
-        if ledger is not None:
-            ledger.close()
+        cancelled = False
+        try:
+            await self._control._run_supervisor.close()
+        except asyncio.CancelledError:
+            cancelled = True
+        finally:
+            ledger = self._control._task_manager.event_ledger
+            if ledger is not None:
+                ledger.close()
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _resume_run(
         self,
         task_id: str,
         decisions: list[dict[str, Any]],
+        *,
+        permit: MutationPermit | None = None,
     ) -> asyncio.Task[None]:
         record = self._control._task_manager.get_task(task_id)
         review_id = (record.pending_review or {}).get("review_id")
@@ -449,13 +466,20 @@ class LocalTaskExecutor:
                 task_id,
                 Command(resume={"decisions": decisions}),
             ),
+            permit=permit,
         )
-        self._control._audit_task_review(
-            "task_review_resumed",
-            record,
-            payload={
-                "review_id": review_id,
-                "decisions": decisions,
-            },
-        )
+        try:
+            self._control._audit_task_review(
+                "task_review_resumed",
+                record,
+                payload={
+                    "review_id": review_id,
+                    "decisions": decisions,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Non-authoritative review audit failed after resume commit: %s",
+                review_id,
+            )
         return run_task

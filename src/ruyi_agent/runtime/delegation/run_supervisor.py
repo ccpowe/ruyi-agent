@@ -5,8 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from contextvars import ContextVar
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol
 
 from ruyi_agent.runtime.delegation.contracts import TaskAlreadyRunningError
 
@@ -14,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 RunFactory = Callable[[], Awaitable[None]]
 MaintenanceFactory = Callable[[], Awaitable[None]]
-MutationResult = TypeVar("MutationResult")
 
 
 class RuntimeClosingError(RuntimeError):
@@ -30,13 +28,37 @@ class RunSupervisorHost(Protocol):
     async def _ensure_task_awake(self, task_id: str) -> Any: ...
 
 
+class MutationPermit:
+    """Explicit, stack-local admission for one short mutation critical section."""
+
+    __slots__ = ("_active", "_supervisor")
+
+    def __init__(self, supervisor: RunSupervisor) -> None:
+        self._supervisor = supervisor
+        self._active = True
+
+
+class OperationPermit:
+    """Ownership for one cancellable caller Task performing external I/O."""
+
+    __slots__ = ("_active", "_supervisor", "task")
+
+    def __init__(
+        self,
+        supervisor: RunSupervisor,
+        task: asyncio.Task[Any],
+    ) -> None:
+        self._supervisor = supervisor
+        self.task = task
+        self._active = True
+
+
 class RunSupervisor:
-    """Own every local run from gated creation through shutdown finalization.
+    """Own local runs and their shutdown boundary.
 
     A newly created ``asyncio.Task`` waits behind an event until ``mark_running``
-    commits. This makes the durable transition the release point for model and
-    tool effects while still allowing the live handle to be stored atomically
-    with that transition.
+    commits. Mutation admission is represented by an explicit permit and is
+    never inherited by a detached Task or done callback.
     """
 
     def __init__(
@@ -49,101 +71,161 @@ class RunSupervisor:
             raise ValueError("shutdown_grace_period must not be negative")
         self._control = control
         self._shutdown_grace_period = shutdown_grace_period
-        self._admission_condition = asyncio.Condition()
-        self._admitted: ContextVar[bool] = ContextVar(
-            f"run-supervisor-admitted:{id(self)}",
-            default=False,
-        )
+        self._lifecycle_condition = asyncio.Condition()
+        self._schedule_lock = asyncio.Lock()
         self._active_mutations = 0
-        self._mutation_lock = asyncio.Lock()
-        self._close_lock = asyncio.Lock()
+        self._operations: set[asyncio.Task[Any]] = set()
         self._runs: dict[str, asyncio.Task[None]] = {}
         self._maintenance: set[asyncio.Task[None]] = set()
         self._recovery_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
         self._closing = False
         self._closed = False
 
     @property
     def is_accepting(self) -> bool:
-        """Whether new local runs and maintenance work may be scheduled."""
+        """Whether a new mutation may enter the runtime."""
 
         return not self._closing and not self._closed
 
     @property
     def active_run_count(self) -> int:
-        """Return the number of run handles still owned by this supervisor."""
+        """Return the number of run handles that have not actually finished."""
 
         return sum(not task.done() for task in self._runs.values())
 
-    def ensure_accepting(self) -> None:
-        """Reject a new runtime mutation after the shutdown boundary."""
+    def get_run(self, task_id: str) -> asyncio.Task[None] | None:
+        """Return the supervisor-owned handle until the asyncio Task is done."""
 
-        if not self.is_accepting:
-            raise RuntimeClosingError("Agent runtime is closing")
+        return self._runs.get(task_id)
 
-    async def mutate(
-        self,
-        factory: Callable[[], Awaitable[MutationResult]],
-    ) -> MutationResult:
-        """Admit one mutation before shutdown and keep its dependencies open."""
+    async def acquire_mutation(self) -> MutationPermit:
+        """Admit one short submission/scheduling critical section."""
 
-        if self._admitted.get():
-            return await factory()
-        async with self._admission_condition:
-            self.ensure_accepting()
+        async with self._lifecycle_condition:
+            if not self.is_accepting:
+                raise RuntimeClosingError("Agent runtime is closing")
             self._active_mutations += 1
-        token = self._admitted.set(True)
+            return MutationPermit(self)
+
+    async def release_mutation(self, permit: MutationPermit) -> None:
+        """Release a mutation permit exactly once."""
+
+        async with self._lifecycle_condition:
+            if permit._supervisor is not self:
+                raise RuntimeError("Mutation permit belongs to another supervisor")
+            if not permit._active:
+                return
+            permit._active = False
+            self._active_mutations -= 1
+            if self._active_mutations == 0:
+                self._lifecycle_condition.notify_all()
+
+    async def promote_to_operation(
+        self,
+        permit: MutationPermit,
+    ) -> OperationPermit:
+        """Atomically replace a short mutation with tracked external I/O."""
+
+        current = asyncio.current_task()
+        if current is None:
+            raise RuntimeError("Tracked operations require an asyncio Task")
+        async with self._lifecycle_condition:
+            self._validate_mutation_permit(permit)
+            if not self.is_accepting:
+                raise RuntimeClosingError("Agent runtime is closing")
+            permit._active = False
+            self._active_mutations -= 1
+            self._operations.add(current)
+            if self._active_mutations == 0:
+                self._lifecycle_condition.notify_all()
+            return OperationPermit(self, current)
+
+    async def wait_for_lock(
+        self,
+        permit: MutationPermit,
+        lock: asyncio.Lock,
+    ) -> MutationPermit:
+        """Wait for a coordination lock as cancellable work, then re-admit."""
+
+        operation = await self.promote_to_operation(permit)
+        acquired = False
         try:
-            return await factory()
-        finally:
-            self._admitted.reset(token)
-            async with self._admission_condition:
-                self._active_mutations -= 1
-                if self._active_mutations == 0:
-                    self._admission_condition.notify_all()
+            await lock.acquire()
+            acquired = True
+            async with self._lifecycle_condition:
+                if operation._supervisor is not self or not operation._active:
+                    raise RuntimeError("Operation permit is no longer active")
+                operation._active = False
+                self._operations.discard(operation.task)
+                if not self.is_accepting:
+                    raise RuntimeClosingError("Agent runtime is closing")
+                self._active_mutations += 1
+                return MutationPermit(self)
+        except BaseException:
+            if acquired:
+                lock.release()
+            await self.release_operation(operation)
+            raise
+
+    async def release_operation(self, permit: OperationPermit) -> None:
+        """Stop tracking one external operation after success or cancellation."""
+
+        async with self._lifecycle_condition:
+            if permit._supervisor is not self or not permit._active:
+                return
+            permit._active = False
+            self._operations.discard(permit.task)
 
     async def schedule(
         self,
         task_id: str,
         run_factory: RunFactory,
         *,
+        permit: MutationPermit | None = None,
         wake_mailbox: bool = True,
     ) -> asyncio.Task[None]:
         """Persist and release one local run without an execution-before-save gap."""
 
-        async with self._mutation_lock:
-            if not self.is_accepting and not self._admitted.get():
-                raise RuntimeClosingError("Agent runtime is closing")
-            if self._control._task_manager.has_active_run(task_id):
-                raise TaskAlreadyRunningError(
-                    f"Worker task is already running: {task_id}"
-                )
+        owned_permit = permit is None
+        if permit is None:
+            permit = await self.acquire_mutation()
+        try:
+            async with self._schedule_lock:
+                async with self._lifecycle_condition:
+                    self._validate_mutation_permit(permit)
+                current = self._runs.get(task_id)
+                if current is not None and not current.done():
+                    raise TaskAlreadyRunningError(
+                        f"Worker task is already running: {task_id}"
+                    )
 
-            release = asyncio.Event()
-            run_task = asyncio.create_task(
-                self._run_after_release(release, run_factory),
-                name=f"ruyi-task-run:{task_id}",
-            )
-            try:
-                self._control._task_manager.mark_running(task_id, run_task)
-            except BaseException:
-                # The gated coroutine has not invoked run_factory, so cancelling
-                # and awaiting it cannot execute model, tool, or payload code.
-                run_task.cancel()
-                await asyncio.gather(run_task, return_exceptions=True)
-                self._control._task_manager.discard_live_run(task_id)
-                raise
-
-            self._runs[task_id] = run_task
-            run_task.add_done_callback(
-                lambda finished: self._run_finished(
-                    task_id,
-                    finished,
-                    wake_mailbox=wake_mailbox,
+                release = asyncio.Event()
+                run_task = asyncio.create_task(
+                    self._run_after_release(release, run_factory),
+                    name=f"ruyi-task-run:{task_id}",
                 )
-            )
-            release.set()
-            return run_task
+                try:
+                    self._control._task_manager.mark_running(task_id, run_task)
+                except BaseException:
+                    run_task.cancel()
+                    await asyncio.gather(run_task, return_exceptions=True)
+                    self._control._task_manager.discard_live_run(task_id)
+                    raise
+
+                self._runs[task_id] = run_task
+                run_task.add_done_callback(
+                    lambda finished: self._run_finished(
+                        task_id,
+                        finished,
+                        wake_mailbox=wake_mailbox,
+                    )
+                )
+                release.set()
+                return run_task
+        finally:
+            if owned_permit:
+                await self.release_mutation(permit)
 
     def start_recovery(self, factory: MaintenanceFactory) -> None:
         """Start the single runtime recovery loop as tracked maintenance."""
@@ -168,51 +250,72 @@ class RunSupervisor:
         return self._create_maintenance_task(factory, name=name)
 
     async def close(self) -> None:
-        """Stop recovery, drain runs, cancel stragglers, and consume failures."""
+        """Finish shared cleanup before propagating caller cancellation."""
 
-        async with self._close_lock:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_impl(),
+                name="ruyi-runtime-shutdown",
+            )
+        close_task = self._close_task
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(close_task)
+                break
+            except asyncio.CancelledError:
+                if close_task.cancelled():
+                    raise
+                cancelled = True
+                continue
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close_impl(self) -> None:
+        async with self._lifecycle_condition:
             if self._closed:
                 return
-            async with self._admission_condition:
-                self._closing = True
-                while self._active_mutations:
-                    await self._admission_condition.wait()
-            async with self._mutation_lock:
-                recovery = self._recovery_task
-                maintenance = tuple(self._maintenance)
-                runs = dict(self._runs)
-
-            await self._cancel_and_gather(
-                tuple(
-                    task
-                    for task in maintenance
-                    if task is not asyncio.current_task()
-                )
+            self._closing = True
+            operations = tuple(
+                task for task in self._operations if task is not asyncio.current_task()
             )
-            if recovery is not None:
-                self._recovery_task = None
 
-            active = tuple(task for task in runs.values() if not task.done())
-            if active and self._shutdown_grace_period > 0:
-                _, pending = await asyncio.wait(
-                    active,
-                    timeout=self._shutdown_grace_period,
-                )
-            else:
-                pending = set(active)
-            for task in pending:
-                task.cancel()
-            if runs:
-                await asyncio.gather(*runs.values(), return_exceptions=True)
+        # Cancel external I/O before waiting for short mutations. A remote
+        # operation can own a delegation-budget lock that an admitted mutation
+        # is waiting to enter; reversing this order would deadlock shutdown.
+        await self._cancel_and_gather(operations)
+        async with self._lifecycle_condition:
+            self._operations.difference_update(operations)
+            while self._active_mutations:
+                await self._lifecycle_condition.wait()
 
-            # A run normally persists ``interrupted`` from its CancelledError
-            # handler. Retry while stores are still open if that transition
-            # failed, then release the process-local handle regardless.
-            for task_id in runs:
-                self._finalize_interrupted(task_id)
-            self._runs.clear()
-            self._maintenance.clear()
-            self._closed = True
+        async with self._schedule_lock:
+            maintenance = tuple(self._maintenance)
+            runs = dict(self._runs)
+
+        await self._cancel_and_gather(
+            tuple(task for task in maintenance if task is not asyncio.current_task())
+        )
+        self._recovery_task = None
+
+        active = tuple(task for task in runs.values() if not task.done())
+        if active and self._shutdown_grace_period > 0:
+            _, pending = await asyncio.wait(
+                active,
+                timeout=self._shutdown_grace_period,
+            )
+        else:
+            pending = set(active)
+        for task in pending:
+            task.cancel()
+        if runs:
+            await asyncio.gather(*runs.values(), return_exceptions=True)
+
+        for task_id in runs:
+            self._finalize_interrupted(task_id)
+        self._runs.clear()
+        self._maintenance.clear()
+        self._closed = True
 
     async def _run_after_release(
         self,
@@ -259,12 +362,19 @@ class RunSupervisor:
         task.add_done_callback(finished)
         return task
 
-    async def _cancel_and_gather(self, tasks: tuple[asyncio.Task[None], ...]) -> None:
+    async def _cancel_and_gather(
+        self,
+        tasks: tuple[asyncio.Task[Any], ...],
+    ) -> None:
         for task in tasks:
             if not task.done():
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _validate_mutation_permit(self, permit: MutationPermit) -> None:
+        if permit._supervisor is not self or not permit._active:
+            raise RuntimeError("Mutation permit is no longer active")
 
     def _finalize_interrupted(
         self,
@@ -275,10 +385,7 @@ class RunSupervisor:
         try:
             record = self._control._task_manager.get_task(task_id)
             if record.state == "running":
-                self._control._task_manager.mark_interrupted(
-                    task_id,
-                    error,
-                )
+                self._control._task_manager.mark_interrupted(task_id, error)
         except Exception:
             logger.exception(
                 "Failed to persist interrupted state during runtime shutdown: %s",
@@ -308,4 +415,9 @@ class RunSupervisor:
         return error
 
 
-__all__ = ["RunSupervisor", "RuntimeClosingError"]
+__all__ = [
+    "MutationPermit",
+    "OperationPermit",
+    "RunSupervisor",
+    "RuntimeClosingError",
+]

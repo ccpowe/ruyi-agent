@@ -56,6 +56,7 @@ from ruyi_agent.runtime.delegation.registry import (
 )
 from ruyi_agent.runtime.delegation.remote_port import RemoteTaskPort
 from ruyi_agent.runtime.delegation.run_supervisor import (
+    MutationPermit,
     RunSupervisor,
     RuntimeClosingError,
 )
@@ -228,8 +229,14 @@ class AgentControl:
         self,
         task_id: str,
         user_input: str,
+        *,
+        permit: MutationPermit | None = None,
     ) -> asyncio.Task[None]:
-        return await self._local_executor._start_run(task_id, user_input)
+        return await self._local_executor._start_run(
+            task_id,
+            user_input,
+            permit=permit,
+        )
 
     async def _start_mailbox_run(self, task_id: str) -> asyncio.Task[None]:
         return await self._local_executor._start_mailbox_run(task_id)
@@ -253,8 +260,14 @@ class AgentControl:
         self,
         task_id: str,
         decisions: list[dict[str, Any]],
+        *,
+        permit: MutationPermit | None = None,
     ) -> asyncio.Task[None]:
-        return await self._local_executor._resume_run(task_id, decisions)
+        return await self._local_executor._resume_run(
+            task_id,
+            decisions,
+            permit=permit,
+        )
 
     # Delegation policy boundary.
     def _extract_parent_thread_id(self, config: RunnableConfig | None) -> str | None:

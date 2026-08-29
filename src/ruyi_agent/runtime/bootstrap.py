@@ -218,39 +218,41 @@ async def bootstrap_application():
                     skill_syncer=skill_syncer,
                     unavailable_agents=unavailable_agents,
                 )
-                await worker_control.wake_pending_mailbox_tasks()
-                worker_control.start_mailbox_recovery()
-                gateway_service = GatewayTaskModule(
-                    main_agent_name=main_agent_name,
-                    agent_configs=agent_configs,
-                    control=worker_control,
-                    route_store=route_store,
-                    command_store=command_store,
-                    unavailable_agents=unavailable_agents,
-                )
-                print("configured local agents:", sorted(all_local_specs.keys()))
-                print("configured remote refs:", sorted(all_remote_refs.keys()))
-                if unavailable_agents:
-                    print("unavailable local agents:", sorted(unavailable_agents))
-                print(
-                    "configured public gateway agents:",
-                    sorted(
-                        name for name, config in agent_configs.items() if config.public
-                    ),
-                )
-                print(
-                    "configured delegation limits:",
-                    f"max_depth={max_delegation_depth}",
-                    f"max_tasks_per_root={max_tasks_per_root}",
-                )
-                print(f"configured backend: {backend_runtime.kind} ({home_dir})")
-                print("configured skills:", sorted(skill_catalog.keys()))
-                print(
-                    "configured permission default profile:",
-                    permission_policy.default_profile,
-                )
-
                 try:
+                    await worker_control.wake_pending_mailbox_tasks()
+                    worker_control.start_mailbox_recovery()
+                    gateway_service = GatewayTaskModule(
+                        main_agent_name=main_agent_name,
+                        agent_configs=agent_configs,
+                        control=worker_control,
+                        route_store=route_store,
+                        command_store=command_store,
+                        unavailable_agents=unavailable_agents,
+                    )
+                    print("configured local agents:", sorted(all_local_specs.keys()))
+                    print("configured remote refs:", sorted(all_remote_refs.keys()))
+                    if unavailable_agents:
+                        print("unavailable local agents:", sorted(unavailable_agents))
+                    print(
+                        "configured public gateway agents:",
+                        sorted(
+                            name
+                            for name, config in agent_configs.items()
+                            if config.public
+                        ),
+                    )
+                    print(
+                        "configured delegation limits:",
+                        f"max_depth={max_delegation_depth}",
+                        f"max_tasks_per_root={max_tasks_per_root}",
+                    )
+                    print(f"configured backend: {backend_runtime.kind} ({home_dir})")
+                    print("configured skills:", sorted(skill_catalog.keys()))
+                    print(
+                        "configured permission default profile:",
+                        permission_policy.default_profile,
+                    )
+
                     yield AppRuntime(
                         main_agent_name=main_agent_name,
                         agent_configs=agent_configs,

@@ -724,7 +724,6 @@ class TaskManager:
         with self._review_memory_transaction(record, root):
             record.state = "waiting_for_human"
             record.updated_at = _now()
-            self._live_runs.discard(task_id)
             record.pending_review = pending_review
             record.error = None
             review = PendingReviewRecord(
@@ -780,7 +779,6 @@ class TaskManager:
             record.result = normalize_task_event_text(result)
             record.error = None
             record.updated_at = _now()
-            self._live_runs.discard(task_id)
             self._clear_pending_review_and_save(record)
 
     def mark_failed(self, task_id: str, error: str) -> None:
@@ -798,7 +796,6 @@ class TaskManager:
             record.state = "failed"
             record.error = normalize_task_event_text(error)
             record.updated_at = _now()
-            self._live_runs.discard(task_id)
             self._clear_pending_review_and_save(record)
 
     def mark_cancelled(self, task_id: str) -> None:
@@ -814,7 +811,6 @@ class TaskManager:
         with self._review_memory_transaction(record, root):
             record.state = "cancelled"
             record.updated_at = _now()
-            self._live_runs.discard(task_id)
             record.error = None
             self._clear_pending_review_and_save(record)
 
@@ -831,7 +827,6 @@ class TaskManager:
             record.state = "interrupted"
             record.error = normalize_task_event_text(error)
             record.updated_at = _now()
-            self._live_runs.discard(task_id)
             self._clear_pending_review_and_save(record)
 
     def sync_remote_task(self, task_id: str, payload: dict[str, Any]) -> TaskRecord:

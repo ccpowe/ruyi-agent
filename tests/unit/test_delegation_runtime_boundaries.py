@@ -74,7 +74,13 @@ def test_agent_control_forwards_to_local_and_remote_ports(monkeypatch) -> None:
     control = _control()
     local_calls: list[tuple[str, str]] = []
 
-    async def local_start(task_id: str, message: str) -> None:
+    async def local_start(
+        task_id: str,
+        message: str,
+        *,
+        permit: object | None = None,
+    ) -> None:
+        del permit
         local_calls.append((task_id, message))
 
     monkeypatch.setattr(
@@ -90,9 +96,7 @@ def test_agent_control_forwards_to_local_and_remote_ports(monkeypatch) -> None:
 
     asyncio.run(control._start_run("local-1", "hello"))
     assert local_calls == [("local-1", "hello")]
-    assert asyncio.run(control.refresh_task("remote-1")) == {
-        "task_id": "remote-1"
-    }
+    assert asyncio.run(control.refresh_task("remote-1")) == {"task_id": "remote-1"}
 
 
 def test_remote_network_effects_do_not_leak_into_task_coordinator() -> None:
@@ -125,9 +129,7 @@ def test_run_creation_and_mark_running_are_owned_by_supervisor() -> None:
 def test_runtime_boundary_modules_and_facade_stay_within_line_budgets() -> None:
     package = Path(async_runtime.__file__).parent
     production_modules = [
-        path
-        for path in package.glob("*.py")
-        if path.name != "__init__.py"
+        path for path in package.glob("*.py") if path.name != "__init__.py"
     ]
     oversized = {
         path.name: len(path.read_text(encoding="utf-8").splitlines())

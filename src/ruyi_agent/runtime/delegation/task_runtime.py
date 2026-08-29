@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from functools import wraps
 from typing import Any, Protocol
 
-from ruyi_agent.runtime.delegation.context import DelegationContext, parse_inbound_metadata
+from ruyi_agent.runtime.delegation.context import (
+    DelegationContext,
+    parse_inbound_metadata,
+)
 from ruyi_agent.runtime.delegation.contracts import (
     DurableTaskMailboxRequiredError,
     TaskAlreadyRunningError,
@@ -23,6 +25,7 @@ from ruyi_agent.runtime.delegation.registry import (
     RegisteredAgent,
     RemoteRefEntry,
 )
+from ruyi_agent.runtime.delegation.run_supervisor import MutationPermit
 from ruyi_agent.runtime.message_history import TaskMessageSnapshot
 from ruyi_agent.runtime.task_events import (
     TaskEventSubscription,
@@ -38,18 +41,6 @@ from ruyi_agent.task_models import (
 )
 
 
-def _supervised_mutation(method: Any) -> Any:
-    """Keep one accepted Task mutation inside the runtime shutdown boundary."""
-
-    @wraps(method)
-    async def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
-        return await self._control._run_supervisor.mutate(
-            lambda: method(self, *args, **kwargs)
-        )
-
-    return guarded
-
-
 class TaskRuntimeHost(Protocol):
     _mailbox: Any
     _max_delegation_depth: int
@@ -63,13 +54,17 @@ class TaskRuntimeHost(Protocol):
 
     async def _allocate_remote_task(self, **kwargs: Any) -> TaskRecord: ...
     async def _cancel_remote_task(self, record: TaskRecord) -> TaskRecord: ...
-    def _delegation_context_from_record(self, record: TaskRecord) -> DelegationContext: ...
+    def _delegation_context_from_record(
+        self, record: TaskRecord
+    ) -> DelegationContext: ...
     def _enforce_delegation_depth(self, *, depth: int, max_depth: int) -> None: ...
     def _existing_idempotent_task(self, **kwargs: Any) -> TaskRecord | None: ...
     async def _ensure_task_awake(self, task_id: str) -> TaskRecord: ...
     def _get_root_budget_lock(self, root_task_id: str) -> asyncio.Lock: ...
     async def _refresh_remote_task_with_retries(self, task_id: str) -> TaskRecord: ...
-    async def _send_remote_task_input(self, record: TaskRecord, **kwargs: Any) -> TaskRecord: ...
+    async def _send_remote_task_input(
+        self, record: TaskRecord, **kwargs: Any
+    ) -> TaskRecord: ...
     async def _submit_remote_review_decision(
         self, record: TaskRecord, **kwargs: Any
     ) -> TaskRecord: ...
@@ -77,12 +72,22 @@ class TaskRuntimeHost(Protocol):
     def _resolve_task_skill_view(
         self, entry: RegisteredAgent, *, parent_task_id: str | None
     ) -> tuple[tuple[str, ...], str | None, str | None]: ...
-    def _resolve_task_tree_context(self, **kwargs: Any) -> tuple[str, int, DelegationContext]: ...
+    def _resolve_task_tree_context(
+        self, **kwargs: Any
+    ) -> tuple[str, int, DelegationContext]: ...
     async def _resume_run(
-        self, task_id: str, decisions: list[dict[str, Any]]
+        self,
+        task_id: str,
+        decisions: list[dict[str, Any]],
+        *,
+        permit: MutationPermit | None = None,
     ) -> asyncio.Task[None]: ...
     async def _start_run(
-        self, task_id: str, user_input: str
+        self,
+        task_id: str,
+        user_input: str,
+        *,
+        permit: MutationPermit | None = None,
     ) -> asyncio.Task[None]: ...
 
 
@@ -144,7 +149,7 @@ class TaskRuntime:
         """
 
         self._control._task_manager.get_task(task_id)
-        return self._control._task_manager.get_live_run(task_id)
+        return self._control._run_supervisor.get_run(task_id)
 
     def open_local_task_event_stream(
         self,
@@ -184,7 +189,6 @@ class TaskRuntime:
             thread_id=record.thread_id,
             checkpoint_id=checkpoint_id,
         )
-
 
     def list_task_records(self) -> list[TaskRecord]:
         """
@@ -232,7 +236,6 @@ class TaskRuntime:
             raise UnknownWorkerTaskError(f"Unknown pending review: {review_id}")
         return record
 
-    @_supervised_mutation
     async def submit_review_decision(
         self,
         review_id: str,
@@ -240,28 +243,43 @@ class TaskRuntime:
         *,
         wait: bool = False,
     ) -> TaskRecord:
-        record = self._control.get_task_by_review_id(review_id)
-        if record.route_kind == "remote_ref":
-            return await self._control._submit_remote_review_decision(
-                record,
-                review_id=review_id,
-                decisions=decisions,
+        permit = await self._control._run_supervisor.acquire_mutation()
+        try:
+            record = self._control.get_task_by_review_id(review_id)
+            if record.route_kind == "remote_ref":
+                operation = await self._control._run_supervisor.promote_to_operation(
+                    permit
+                )
+                try:
+                    return await self._control._submit_remote_review_decision(
+                        record,
+                        review_id=review_id,
+                        decisions=decisions,
+                    )
+                finally:
+                    await self._control._run_supervisor.release_operation(operation)
+            if record.route_kind != "local":
+                raise ValueError(f"Unsupported review route={record.route_kind}")
+            if record.state != "waiting_for_human":
+                raise ValueError(
+                    f"Review '{review_id}' is not pending; task state={record.state}"
+                )
+            if record.pending_review is None:
+                raise ValueError(f"Review '{review_id}' has no pending payload")
+            task_id = record.task_id
+            run_task = await self._control._resume_run(
+                task_id,
+                decisions,
+                permit=permit,
             )
-        if record.route_kind != "local":
-            raise ValueError(f"Unsupported review route={record.route_kind}")
-        if record.state != "waiting_for_human":
-            raise ValueError(
-                f"Review '{review_id}' is not pending; task state={record.state}"
-            )
-        if record.pending_review is None:
-            raise ValueError(f"Review '{review_id}' has no pending payload")
-        run_task = await self._control._resume_run(record.task_id, decisions)
+        finally:
+            await self._control._run_supervisor.release_mutation(permit)
         if wait and run_task is not None:
             try:
                 await run_task
             except asyncio.CancelledError:
                 pass
-        return self._control._task_manager.get_task(record.task_id)
+        return self._control._task_manager.get_task(task_id)
 
     def prepare_delegation_metadata(
         self,
@@ -285,7 +303,6 @@ class TaskRuntime:
             local_max_depth=self._control._max_delegation_depth,
             local_max_tasks_per_root=self._control._max_tasks_per_root,
         )
-
 
     def _existing_idempotent_task(
         self,
@@ -324,7 +341,6 @@ class TaskRuntime:
             )
         return record
 
-    @_supervised_mutation
     async def spawn_task(
         self,
         agent_name: str,
@@ -338,6 +354,39 @@ class TaskRuntime:
         attachments: list[dict[str, Any]] | None = None,
         webhook: dict[str, Any] | None = None,
         delegation_context: DelegationContext | None = None,
+    ) -> TaskRecord:
+        permit = await self._control._run_supervisor.acquire_mutation()
+        try:
+            return await self._spawn_task_admitted(
+                agent_name,
+                task,
+                task_id=task_id,
+                idempotency_key=idempotency_key,
+                parent_task_id=parent_task_id,
+                parent_thread_id=parent_thread_id,
+                metadata=metadata,
+                attachments=attachments,
+                webhook=webhook,
+                delegation_context=delegation_context,
+                permit=permit,
+            )
+        finally:
+            await self._control._run_supervisor.release_mutation(permit)
+
+    async def _spawn_task_admitted(
+        self,
+        agent_name: str,
+        task: str,
+        *,
+        task_id: str | None,
+        idempotency_key: str | None,
+        parent_task_id: str | None,
+        parent_thread_id: str | None,
+        metadata: dict[str, Any] | None,
+        attachments: list[dict[str, Any]] | None,
+        webhook: dict[str, Any] | None,
+        delegation_context: DelegationContext | None,
+        permit: MutationPermit,
     ) -> TaskRecord:
         """
         创建结构化委托任务
@@ -382,7 +431,12 @@ class TaskRuntime:
         effective_skill_names, skill_view_path, skill_view_hash = (
             self._control._resolve_task_skill_view(entry, parent_task_id=parent_task_id)
         )
-        async with self._control._get_root_budget_lock(root_task_id):
+        budget_lock = self._control._get_root_budget_lock(root_task_id)
+        permit = await self._control._run_supervisor.wait_for_lock(
+            permit,
+            budget_lock,
+        )
+        try:
             existing = self._control._existing_idempotent_task(
                 task_id=task_id,
                 agent_name=agent_name,
@@ -399,7 +453,11 @@ class TaskRuntime:
                     and existing.run_count == 0
                     and not self._control._task_manager.has_active_run(task_id)
                 ):
-                    await self._control._start_run(task_id, task)
+                    await self._control._start_run(
+                        task_id,
+                        task,
+                        permit=permit,
+                    )
                     return self._control._task_manager.get_task(task_id)
                 if not (
                     isinstance(entry, RemoteRefEntry)
@@ -458,20 +516,28 @@ class TaskRuntime:
             else:
                 record = existing
             if isinstance(entry, RemoteRefEntry):
-                return await self._control._allocate_remote_task(
-                    record=record,
-                    entry=entry,
-                    input_content=task,
-                    delegation_context=task_context,
-                    metadata=metadata,
-                    attachments=attachments,
-                    idempotency_key=idempotency_key or task_id,
+                operation = await self._control._run_supervisor.promote_to_operation(
+                    permit
                 )
+                try:
+                    return await self._control._allocate_remote_task(
+                        record=record,
+                        entry=entry,
+                        input_content=task,
+                        delegation_context=task_context,
+                        metadata=metadata,
+                        attachments=attachments,
+                        idempotency_key=idempotency_key or task_id,
+                    )
+                finally:
+                    await self._control._run_supervisor.release_operation(operation)
 
-            await self._control._start_run(task_id, task)
+            await self._control._start_run(task_id, task, permit=permit)
             return self._control._task_manager.get_task(task_id)
+        finally:
+            await self._control._run_supervisor.release_mutation(permit)
+            budget_lock.release()
 
-    @_supervised_mutation
     async def send_task_input(
         self,
         task_id: str,
@@ -500,50 +566,65 @@ class TaskRuntime:
             A2AClientError: 远端 send_input 失败
         """
         # 为什么提供结构化继续接口：Gateway 需要直接把状态机错误映射到 HTTP 错误码。
-        record = self._control._task_manager.get_task(task_id)
-        if record.route_kind == "remote_ref":
-            if record.state in ACTIVE_TASK_STATES:
-                record = await self._control._refresh_remote_task_with_retries(task_id)
-            return await self._control._send_remote_task_input(
-                record,
-                message=message,
-                attachments=attachments,
-                idempotency_key=idempotency_key,
-            )
-        if record.state == "waiting_for_human":
-            raise TaskAlreadyRunningError(
-                f"Worker task is waiting for review: {task_id}"
-            )
-        if record.state not in ACTIVE_TASK_STATES | RESUMABLE_TASK_STATES:
-            raise ValueError(
-                f"Task '{task_id}' cannot receive input in state={record.state}"
-            )
-        if idempotency_key is not None and (
-            self._control._mailbox is None or not self._control._mailbox.is_durable
-        ):
-            raise DurableTaskMailboxRequiredError(
-                "Idempotent local input requires a durable Task Mailbox"
-            )
-        if self._control._mailbox is None:
-            if record.state in ACTIVE_TASK_STATES:
-                raise TaskAlreadyRunningError(
-                    f"Worker task is already running: {task_id}"
+        permit = await self._control._run_supervisor.acquire_mutation()
+        wake_mailbox = False
+        try:
+            record = self._control._task_manager.get_task(task_id)
+            if record.route_kind == "remote_ref":
+                operation = await self._control._run_supervisor.promote_to_operation(
+                    permit
                 )
-            await self._control._start_run(task_id, message)
-            return self._control._task_manager.get_task(task_id)
+                try:
+                    if record.state in ACTIVE_TASK_STATES:
+                        record = await self._control._refresh_remote_task_with_retries(
+                            task_id
+                        )
+                    return await self._control._send_remote_task_input(
+                        record,
+                        message=message,
+                        attachments=attachments,
+                        idempotency_key=idempotency_key,
+                    )
+                finally:
+                    await self._control._run_supervisor.release_operation(operation)
+            if record.state == "waiting_for_human":
+                raise TaskAlreadyRunningError(
+                    f"Worker task is waiting for review: {task_id}"
+                )
+            if record.state not in ACTIVE_TASK_STATES | RESUMABLE_TASK_STATES:
+                raise ValueError(
+                    f"Task '{task_id}' cannot receive input in state={record.state}"
+                )
+            if idempotency_key is not None and (
+                self._control._mailbox is None or not self._control._mailbox.is_durable
+            ):
+                raise DurableTaskMailboxRequiredError(
+                    "Idempotent local input requires a durable Task Mailbox"
+                )
+            if self._control._mailbox is None:
+                if record.state in ACTIVE_TASK_STATES:
+                    raise TaskAlreadyRunningError(
+                        f"Worker task is already running: {task_id}"
+                    )
+                await self._control._start_run(task_id, message, permit=permit)
+                return self._control._task_manager.get_task(task_id)
 
-        self._control._mailbox.publish_input(
-            recipient_task_id=record.task_id,
-            recipient_thread_id=record.thread_id,
-            content=message,
-            trigger_run=True,
-            idempotency_key=idempotency_key,
-            message_id=mailbox_message_id,
-        )
-        # Active runs consume this at their next before_model boundary. Settled
-        # tasks are resumed immediately; the done callback covers the race where
-        # an active run settles after the message was queued.
-        return await self._control._ensure_task_awake(task_id)
+            self._control._mailbox.publish_input(
+                recipient_task_id=record.task_id,
+                recipient_thread_id=record.thread_id,
+                content=message,
+                trigger_run=True,
+                idempotency_key=idempotency_key,
+                message_id=mailbox_message_id,
+            )
+            wake_mailbox = True
+        finally:
+            await self._control._run_supervisor.release_mutation(permit)
+        # Waking can take a scheduling lock, so it begins a fresh admission
+        # after the durable publish critical section has been released.
+        if wake_mailbox:
+            return await self._control._ensure_task_awake(task_id)
+        raise AssertionError("Local mailbox input did not select a wakeup path")
 
     async def cancel_task(self, task_id: str) -> TaskRecord:
         """
@@ -563,20 +644,37 @@ class TaskRuntime:
             A2AClientError: 远端取消失败
         """
         # 为什么提供结构化取消接口：HTTP 层要返回最新 task 视图，而不是人类可读文本。
-        record = self._control._task_manager.get_task(task_id)
-        if record.route_kind == "remote_ref":
-            if record.state not in ACTIVE_TASK_STATES:
-                return record
-            return await self._control._cancel_remote_task(record)
-        run_task = self._control._task_manager.get_live_run(task_id)
-        if run_task is None or run_task.done():
-            if record.state in ACTIVE_TASK_STATES:
-                self._control._task_manager.mark_cancelled(task_id)
-            return self._control._task_manager.get_task(task_id)
-        run_task = self._control._task_manager.request_cancel(task_id)
-        assert run_task is not None
+        permit = await self._control._run_supervisor.acquire_mutation()
+        operation = None
+        try:
+            record = self._control._task_manager.get_task(task_id)
+            if record.route_kind == "remote_ref":
+                if record.state not in ACTIVE_TASK_STATES:
+                    return record
+                operation = await self._control._run_supervisor.promote_to_operation(
+                    permit
+                )
+                try:
+                    return await self._control._cancel_remote_task(record)
+                finally:
+                    await self._control._run_supervisor.release_operation(operation)
+            run_task = self._control._run_supervisor.get_run(task_id)
+            if run_task is None or run_task.done():
+                if record.state in ACTIVE_TASK_STATES:
+                    self._control._task_manager.mark_cancelled(task_id)
+                return self._control._task_manager.get_task(task_id)
+            requested = self._control._task_manager.request_cancel(task_id)
+            assert requested is run_task
+            operation = await self._control._run_supervisor.promote_to_operation(permit)
+        finally:
+            await self._control._run_supervisor.release_mutation(permit)
         try:
             await run_task
         except asyncio.CancelledError:
-            pass
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+        finally:
+            assert operation is not None
+            await self._control._run_supervisor.release_operation(operation)
         return self._control._task_manager.get_task(task_id)
