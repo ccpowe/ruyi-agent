@@ -50,7 +50,7 @@ def create_runtime_agent(
     system_prompt: str | SystemMessage | None = None,
     local_worker_specs: dict[str, LocalWorkerSpec] | None = None,
     remote_refs: dict[str, RemoteRef] | None = None,
-    build_worker_tools: Callable[[], list[Any]] | None = None,
+    worker_tools: list[Any] | None = None,
     skills: Any = None,
     memory: list[str] | None = None,
     checkpointer: Any | None = None,
@@ -83,7 +83,7 @@ def create_runtime_agent(
         memory=memory,
         local_worker_specs=local_worker_specs,
         remote_refs=remote_refs,
-        build_worker_tools=build_worker_tools,  # ???
+        worker_tools=worker_tools,
         mailbox=mailbox,
         load_tasks_for_thread=load_tasks_for_thread,
         permission_policy=permission_policy,

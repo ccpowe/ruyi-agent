@@ -129,14 +129,15 @@ class ReviewInterruptingAgentFactory:
 
 
 class DelegatingFakeAgent:
-    def __init__(self, build_worker_tools=None) -> None:
-        self.build_worker_tools = build_worker_tools
+    def __init__(self, worker_tools=None) -> None:
+        self.worker_tools = worker_tools
 
     async def ainvoke(self, payload, *, config, version):
-        if self.build_worker_tools is None:
+        if self.worker_tools is None:
             return {"messages": [{"role": "assistant", "content": "child done"}]}
-        tools = self.build_worker_tools()
-        spawn_tool = next(tool for tool in tools if tool.name == "spawn_agent")
+        spawn_tool = next(
+            tool for tool in self.worker_tools if tool.name == "spawn_agent"
+        )
         result = await spawn_tool.ainvoke(
             {
                 "agent_name": "background_research",
@@ -149,18 +150,19 @@ class DelegatingFakeAgent:
 
 class DelegatingAgentFactory:
     def __call__(self, **kwargs):
-        return DelegatingFakeAgent(kwargs.get("build_worker_tools"))
+        return DelegatingFakeAgent(kwargs.get("worker_tools"))
 
 
 class RemoteBackDelegatingFakeAgent:
-    def __init__(self, build_worker_tools=None) -> None:
-        self.build_worker_tools = build_worker_tools
+    def __init__(self, worker_tools=None) -> None:
+        self.worker_tools = worker_tools
 
     async def ainvoke(self, payload, *, config, version):
-        if self.build_worker_tools is None:
+        if self.worker_tools is None:
             return {"messages": [{"role": "assistant", "content": "no tools"}]}
-        tools = self.build_worker_tools()
-        spawn_tool = next(tool for tool in tools if tool.name == "spawn_agent")
+        spawn_tool = next(
+            tool for tool in self.worker_tools if tool.name == "spawn_agent"
+        )
         result = await spawn_tool.ainvoke(
             {
                 "agent_name": "back_to_a",
@@ -173,7 +175,7 @@ class RemoteBackDelegatingFakeAgent:
 
 class RemoteBackDelegatingAgentFactory:
     def __call__(self, **kwargs):
-        return RemoteBackDelegatingFakeAgent(kwargs.get("build_worker_tools"))
+        return RemoteBackDelegatingFakeAgent(kwargs.get("worker_tools"))
 
 
 class MemoryBackend:
@@ -1493,11 +1495,7 @@ def test_gateway_exposes_subagent_task_created_by_public_root(
         tools=[],
         memory=[],
         skills=[],
-        delegation_local_worker_specs={"background_research": child_spec},
-    )
-    control_ref: dict[str, async_subagent_runtime.AgentControl] = {}
-    parent_spec.build_delegation_tools = lambda: control_ref["control"].build_tools_for(
-        "main"
+        delegation_targets=("background_research",),
     )
     control = async_subagent_runtime.AgentControl(
         {
@@ -1508,7 +1506,6 @@ def test_gateway_exposes_subagent_task_created_by_public_root(
         checkpointer=object(),
         backend=object(),
     )
-    control_ref["control"] = control
     service = GatewayTaskModule(
         main_agent_name="main",
         agent_configs=build_agent_configs(),
@@ -3216,7 +3213,6 @@ def test_remote_a_to_b_to_a_loop_is_rejected_by_visited_nodes(
     a_root_app = FastAPI()
     a_root_app.mount("/a2a", a_app)
 
-    b_control_ref: dict[str, async_subagent_runtime.AgentControl] = {}
     b_spec = LocalWorkerSpec(
         name="code_wiki",
         description="node b code wiki",
@@ -3225,10 +3221,7 @@ def test_remote_a_to_b_to_a_loop_is_rejected_by_visited_nodes(
         tools=[],
         memory=[],
         skills=[],
-        delegation_remote_refs={"back_to_a": b_to_a_ref},
-    )
-    b_spec.build_delegation_tools = lambda: b_control_ref["control"].build_tools_for(
-        "code_wiki"
+        delegation_targets=("back_to_a",),
     )
     b_control = async_subagent_runtime.AgentControl(
         {"code_wiki": b_spec},
@@ -3238,7 +3231,6 @@ def test_remote_a_to_b_to_a_loop_is_rejected_by_visited_nodes(
         a2a_client=A2AClient(transports=transports_b),
         node_id="node-b",
     )
-    b_control_ref["control"] = b_control
     b_service = GatewayTaskModule(
         main_agent_name="code_wiki",
         agent_configs={

@@ -713,7 +713,7 @@ def test_build_local_worker_spec_resolves_tools_and_keeps_skill_names(
             "skills": ["frontend-skill"],
             "server_names": ["deepwiki"],
             "tool_names": ["exa.web_search_exa"],
-            "workers": [],
+            "workers": ["local_helper", "remote_helper"],
             "permission_profile": "standard",
         }
     }
@@ -749,6 +749,7 @@ def test_build_local_worker_spec_resolves_tools_and_keeps_skill_names(
     assert worker.tools == fake_tools
     assert worker.skills == ["frontend-skill"]
     assert worker.permission_profile == "standard"
+    assert worker.delegation_targets == ("local_helper", "remote_helper")
 
 
 def test_build_local_worker_spec_keeps_special_skill_modes(monkeypatch) -> None:
@@ -994,8 +995,11 @@ def test_build_all_local_worker_specs_builds_every_local_agent(monkeypatch) -> N
     )
 
     assert sorted(specs) == ["main", "worker"]
-    assert specs["main"].delegation_local_worker_specs is None
-    assert specs["worker"].delegation_local_worker_specs is None
+    assert specs["main"].delegation_targets == ("worker",)
+    assert specs["worker"].delegation_targets == ()
+    assert not hasattr(specs["main"], "delegation_local_worker_specs")
+    assert not hasattr(specs["main"], "delegation_remote_refs")
+    assert not hasattr(specs["main"], "build_delegation_tools")
 
 
 def test_build_all_and_public_remote_refs_use_distinct_scopes() -> None:
@@ -1034,77 +1038,9 @@ def test_build_all_and_public_remote_refs_use_distinct_scopes() -> None:
 
     all_refs = asyncio.run(config_loader.build_all_remote_refs(agent_configs))
     public_refs = asyncio.run(config_loader.build_public_remote_refs(agent_configs))
-    main_refs = config_loader.select_remote_refs_for_agent(
-        "main",
-        agent_configs,
-        all_refs,
-    )
 
     assert sorted(all_refs) == ["private_remote", "public_remote"]
     assert list(public_refs) == ["public_remote"]
-    assert list(main_refs) == ["private_remote"]
-
-
-def test_select_agent_worker_scopes_are_per_agent() -> None:
-    local_specs = {
-        "main": config_loader.LocalWorkerSpec(
-            name="main",
-            description="main",
-            system_prompt="prompt",
-            model=object(),
-            tools=[],
-            memory=[],
-            skills=[],
-        ),
-        "worker": config_loader.LocalWorkerSpec(
-            name="worker",
-            description="worker",
-            system_prompt="prompt",
-            model=object(),
-            tools=[],
-            memory=[],
-            skills=[],
-        ),
-        "checker": config_loader.LocalWorkerSpec(
-            name="checker",
-            description="checker",
-            system_prompt="prompt",
-            model=object(),
-            tools=[],
-            memory=[],
-            skills=[],
-        ),
-    }
-    remote_refs = {
-        "remote": config_loader.RemoteRef(
-            name="remote",
-            description="remote",
-            url="https://example.com/a2a",
-            remote_agent_name="remote",
-        )
-    }
-    agent_configs = {
-        "main": {"kind": "local", "workers": ["worker", "remote"]},
-        "worker": {"kind": "local", "workers": ["checker"]},
-        "checker": {"kind": "local", "workers": []},
-        "remote": {"kind": "remote_ref"},
-    }
-
-    assert sorted(
-        config_loader.select_local_worker_specs_for_agent(
-            "main", agent_configs, local_specs
-        )
-    ) == ["worker"]
-    assert sorted(
-        config_loader.select_remote_refs_for_agent(
-            "main", agent_configs, remote_refs
-        )
-    ) == ["remote"]
-    assert sorted(
-        config_loader.select_local_worker_specs_for_agent(
-            "worker", agent_configs, local_specs
-        )
-    ) == ["checker"]
 
 
 def test_load_agent_configs_rejects_remote_ref_with_local_only_fields(

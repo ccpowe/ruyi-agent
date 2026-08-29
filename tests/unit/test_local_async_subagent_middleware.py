@@ -27,7 +27,7 @@ def test_worker_delegation_lists_local_workers_and_remote_refs() -> None:
                 remote_agent_name="code_wiki",
             )
         },
-        build_tools=lambda: [SimpleNamespace(name="spawn_agent")],
+        tools=[SimpleNamespace(name="spawn_agent")],
     )
 
     assert [tool.name for tool in middleware.tools] == ["spawn_agent"]
@@ -43,7 +43,7 @@ def test_worker_delegation_allows_parent_communication_without_child_targets() -
     middleware = WorkerDelegationMiddleware(
         specs={},
         remote_refs={},
-        build_tools=lambda: [
+        tools=[
             SimpleNamespace(name="send_input"),
             SimpleNamespace(name="list_agents"),
         ],
@@ -67,15 +67,15 @@ def test_worker_delegation_rejects_missing_tools() -> None:
                     skills=[],
                 )
             },
-            build_tools=None,
+            tools=None,
         )
     except ValueError as exc:
-        assert "Worker delegation tool factory must be provided" in str(exc)
+        assert "Worker delegation tools must be provided" in str(exc)
     else:
         raise AssertionError("expected WorkerDelegationMiddleware to reject no tools")
 
 
-def test_worker_delegation_rejects_empty_tool_factory_result() -> None:
+def test_worker_delegation_rejects_empty_tools() -> None:
     try:
         WorkerDelegationMiddleware(
             specs={
@@ -89,9 +89,9 @@ def test_worker_delegation_rejects_empty_tool_factory_result() -> None:
                     skills=[],
                 )
             },
-            build_tools=lambda: [],
+            tools=[],
         )
     except ValueError as exc:
-        assert "returned no tools" in str(exc)
+        assert "must not be empty" in str(exc)
     else:
         raise AssertionError("expected WorkerDelegationMiddleware to reject no tools")

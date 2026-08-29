@@ -71,19 +71,19 @@ class WorkerDelegationMiddleware(AgentMiddleware[object, ContextT, ResponseT]):
         *,
         specs: dict[str, LocalWorkerSpec],
         remote_refs: dict[str, RemoteRef] | None = None,
-        build_tools: Callable[[], list[Any]] | None = None,
+        tools: list[Any] | None = None,
         system_prompt: str | None = WORKER_DELEGATION_SYSTEM_PROMPT,
     ) -> None:
         super().__init__()
-        if build_tools is None:
-            msg = "Worker delegation tool factory must be provided"
+        if tools is None:
+            msg = "Worker delegation tools must be provided"
             raise ValueError(msg)
 
         self._specs = specs
         self._remote_refs = remote_refs or {}
-        self.tools = build_tools()
+        self.tools = tools
         if not self.tools:
-            msg = "Worker delegation tool factory returned no tools"
+            msg = "Worker delegation tools must not be empty"
             raise ValueError(msg)
         tool_names = {tool.name for tool in self.tools}
         resolved_prompt = system_prompt

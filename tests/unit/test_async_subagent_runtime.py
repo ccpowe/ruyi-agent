@@ -2483,6 +2483,7 @@ def test_build_tools_for_agent_limits_spawn_scope(
         tools=[],
         memory=[],
         skills=[],
+        delegation_targets=("background_research", "remote_code_wiki"),
     )
     background_spec = build_specs()["background_research"]
     extra_spec = LocalWorkerSpec(
@@ -2501,10 +2502,6 @@ def test_build_tools_for_agent_limits_spawn_scope(
         url="https://example.com/other",
         remote_agent_name="other",
     )
-    main_spec.delegation_local_worker_specs = {
-        "background_research": background_spec,
-    }
-    main_spec.delegation_remote_refs = remote_refs
     control = async_subagent_runtime.AgentControl(
         {
             "main": main_spec,
@@ -2595,6 +2592,94 @@ def test_build_tools_for_agent_limits_spawn_scope(
     assert allowed_record.task_id in wait_denied
 
 
+def test_compiling_agent_resolves_declared_scope_from_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    def capture_factory(**kwargs):
+        captured.update(kwargs)
+        return FakeAgent()
+
+    monkeypatch.setattr(
+        async_subagent_runtime,
+        "create_runtime_agent",
+        capture_factory,
+    )
+    child = build_specs()["background_research"]
+    extra = LocalWorkerSpec(
+        name="extra",
+        description="not in scope",
+        system_prompt="prompt",
+        model=object(),
+        tools=[],
+        memory=[],
+        skills=[],
+    )
+    remote_refs = build_test_remote_refs()
+    main = LocalWorkerSpec(
+        name="main",
+        description="main",
+        system_prompt="prompt",
+        model=object(),
+        tools=[],
+        memory=[],
+        skills=[],
+        delegation_targets=("background_research", "remote_code_wiki"),
+        system_tools=frozenset({"spawn_agent", "list_agents"}),
+    )
+    control = async_subagent_runtime.AgentControl(
+        {"main": main, "background_research": child, "extra": extra},
+        remote_refs,
+        checkpointer=object(),
+        backend=object(),
+    )
+
+    control._get_or_create_agent("main")
+
+    assert set(captured["local_worker_specs"]) == {"background_research"}
+    assert set(captured["remote_refs"]) == {"remote_code_wiki"}
+    assert {tool.name for tool in captured["worker_tools"]} == {
+        "spawn_agent",
+        "list_agents",
+    }
+
+
+def test_declared_but_unavailable_target_returns_clear_error() -> None:
+    main = LocalWorkerSpec(
+        name="main",
+        description="main",
+        system_prompt="prompt",
+        model=object(),
+        tools=[],
+        memory=[],
+        skills=[],
+        delegation_targets=("unavailable_worker",),
+    )
+    control = async_subagent_runtime.AgentControl(
+        {"main": main},
+        {},
+        checkpointer=object(),
+        backend=object(),
+        unavailable_agents={
+            "unavailable_worker": "missing provider credential",
+        },
+    )
+    spawn_tool = next(
+        tool for tool in control.build_tools_for("main") if tool.name == "spawn_agent"
+    )
+
+    message = asyncio.run(
+        spawn_tool.ainvoke(
+            {"agent_name": "unavailable_worker", "task": "try unavailable"}
+        )
+    )
+
+    assert "Agent target 'unavailable_worker' is unavailable" in message
+    assert "missing provider credential" in message
+    assert "Available:" in message
+
+
 def test_child_task_can_send_input_to_direct_parent_but_cannot_cancel_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2608,6 +2693,7 @@ def test_child_task_can_send_input_to_direct_parent_but_cannot_cancel_it(
         tools=[],
         memory=[],
         skills=[],
+        delegation_targets=("child",),
     )
     child_spec = LocalWorkerSpec(
         name="child",
@@ -2619,7 +2705,6 @@ def test_child_task_can_send_input_to_direct_parent_but_cannot_cancel_it(
         skills=[],
         system_tools=frozenset({"send_input", "list_agents"}),
     )
-    parent_spec.delegation_local_worker_specs = {"child": child_spec}
     control = async_subagent_runtime.AgentControl(
         {"parent": parent_spec, "child": child_spec},
         {},
