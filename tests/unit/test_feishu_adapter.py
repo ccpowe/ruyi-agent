@@ -1030,6 +1030,116 @@ def test_adapter_releases_failed_handler_claim_and_allows_retry() -> None:
     assert len(gateway.created) == 1
 
 
+def test_release_failure_does_not_replace_original_handler_error() -> None:
+    class ReleaseFailureStore(FeishuEventStore):
+        async def arelease_claim(
+            self,
+            event_key: str,
+            *,
+            claim_token: str,
+        ) -> bool:
+            del event_key, claim_token
+            raise RuntimeError("release failed")
+
+    class HandlerFailureAdapter(FeishuAdapter):
+        async def _handle_claimed_message(self, message: FeishuMessage) -> None:
+            del message
+            raise LookupError("original handler failure")
+
+    event_store = ReleaseFailureStore(":memory:")
+    adapter = HandlerFailureAdapter(
+        gateway_client=FakeGatewayClient(),
+        feishu_client=FakeFeishuClient(),
+        default_agent_name="main",
+        event_store=event_store,
+    )
+    message = build_message("hello", event_id="event-release-failure")
+
+    try:
+        try:
+            asyncio.run(adapter.handle_message(message))
+        except LookupError as exc:
+            assert str(exc) == "original handler failure"
+        else:
+            raise AssertionError("Expected the original handler failure")
+        assert event_store.claim_message_result(message).status == "busy"
+    finally:
+        event_store.close()
+
+
+def test_cancelled_handler_releases_claim_despite_repeated_cancellation() -> None:
+    class BlockingReleaseStore(FeishuEventStore):
+        def __init__(self) -> None:
+            super().__init__(":memory:")
+            self.release_started = asyncio.Event()
+            self.release_allowed = asyncio.Event()
+            self.release_finished = asyncio.Event()
+
+        async def arelease_claim(
+            self,
+            event_key: str,
+            *,
+            claim_token: str,
+        ) -> bool:
+            self.release_started.set()
+            await self.release_allowed.wait()
+            released = await super().arelease_claim(
+                event_key,
+                claim_token=claim_token,
+            )
+            self.release_finished.set()
+            return released
+
+    class BlockingHandlerAdapter(FeishuAdapter):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.handler_started = asyncio.Event()
+            self.handler_allowed = asyncio.Event()
+
+        async def _handle_claimed_message(self, message: FeishuMessage) -> None:
+            del message
+            self.handler_started.set()
+            await self.handler_allowed.wait()
+
+    event_store = BlockingReleaseStore()
+    adapter = BlockingHandlerAdapter(
+        gateway_client=FakeGatewayClient(),
+        feishu_client=FakeFeishuClient(),
+        default_agent_name="main",
+        event_store=event_store,
+    )
+    message = build_message("hello", event_id="event-cancelled")
+
+    async def scenario() -> None:
+        handling = asyncio.create_task(adapter.handle_message(message))
+        await adapter.handler_started.wait()
+        handling.cancel()
+        await event_store.release_started.wait()
+        handling.cancel()
+        try:
+            await handling
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("Expected handler cancellation")
+
+        event_store.release_allowed.set()
+        await asyncio.wait_for(event_store.release_finished.wait(), timeout=1.0)
+        reclaimed = event_store.claim_message_result(message)
+        assert reclaimed.status == "claimed"
+        assert reclaimed.event_key is not None
+        assert reclaimed.claim_token is not None
+        assert event_store.release_claim(
+            reclaimed.event_key,
+            claim_token=reclaimed.claim_token,
+        )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        event_store.close()
+
+
 def test_adapter_reports_lost_lease_instead_of_succeeding() -> None:
     class MarkFailureStore(FeishuEventStore):
         async def amark_processed(

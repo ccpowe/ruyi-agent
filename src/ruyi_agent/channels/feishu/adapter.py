@@ -8,6 +8,7 @@ import re
 import sqlite3
 import threading
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -138,6 +139,11 @@ def _utc_now() -> datetime:
 
 def _utc_now_iso() -> str:
     return _utc_now().isoformat()
+
+
+def _consume_cleanup_result(task: asyncio.Task[Any]) -> None:
+    with suppress(BaseException):
+        task.result()
 
 
 def _env_list(name: str) -> list[str]:
@@ -982,10 +988,15 @@ class FeishuAdapter:
         try:
             await self._handle_claimed_message(message)
         except BaseException:
-            await self._event_store.arelease_claim(
-                claim.event_key,
-                claim_token=claim.claim_token,
-            )
+            with suppress(BaseException):
+                release_task = asyncio.create_task(
+                    self._event_store.arelease_claim(
+                        claim.event_key,
+                        claim_token=claim.claim_token,
+                    )
+                )
+                release_task.add_done_callback(_consume_cleanup_result)
+                await asyncio.shield(release_task)
             raise
         marked = await self._event_store.amark_processed(
             claim.event_key,
