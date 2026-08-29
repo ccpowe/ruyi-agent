@@ -11,7 +11,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
+from uuid import uuid4
 
 from ruyi_agent.channels.gateway_client import (
     GatewayArtifact,
@@ -131,8 +132,12 @@ class UnsupportedFeishuChatTypeError(ValueError):
     pass
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 def _utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+    return _utc_now().isoformat()
 
 
 def _env_list(name: str) -> list[str]:
@@ -238,6 +243,18 @@ def _current_run_artifacts(
     return artifacts
 
 
+@dataclass(frozen=True, slots=True)
+class FeishuEventClaim:
+    status: Literal["claimed", "processed", "busy"]
+    event_key: str | None = None
+    claimed_at: str | None = None
+    claim_token: str | None = None
+
+
+def _feishu_event_key(message: FeishuMessage) -> str | None:
+    return message.event_id or message.message_id or None
+
+
 class FeishuEventStore:
     def __init__(self, db_path: str, *, claim_timeout_seconds: float = 300.0) -> None:
         self._db_path = db_path
@@ -252,73 +269,145 @@ class FeishuEventStore:
         self._init_db()
 
     def claim_message(self, message: FeishuMessage) -> bool:
-        event_key = message.event_id or message.message_id
+        return self.claim_message_result(message).status == "claimed"
+
+    def claim_message_result(self, message: FeishuMessage) -> FeishuEventClaim:
+        event_key = _feishu_event_key(message)
         if not event_key:
-            return True
-        now_dt = datetime.now(UTC)
+            return FeishuEventClaim(status="claimed")
+        now_dt = _utc_now()
         now = now_dt.isoformat()
+        new_claim_token = uuid4().hex
         with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT processed_at, claimed_at
-                FROM feishu_processed_events
-                WHERE event_key = ?
-                """,
-                (event_key,),
-            ).fetchone()
-            if row is None:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    """
+                    SELECT processed_at, claimed_at, claim_token
+                    FROM feishu_processed_events
+                    WHERE event_key = ?
+                    """,
+                    (event_key,),
+                ).fetchone()
+                if row is None:
+                    self._conn.execute(
+                        """
+                        INSERT INTO feishu_processed_events (
+                            event_key,
+                            chat_id,
+                            message_id,
+                            first_seen_at,
+                            claimed_at,
+                            claim_token,
+                            processed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+                        """,
+                        (
+                            event_key,
+                            message.chat_id,
+                            message.message_id,
+                            now,
+                            now,
+                            new_claim_token,
+                        ),
+                    )
+                    self._conn.commit()
+                    return FeishuEventClaim(
+                        status="claimed",
+                        event_key=event_key,
+                        claimed_at=now,
+                        claim_token=new_claim_token,
+                    )
+
+                processed_at, claimed_at, claim_token = row
+                if processed_at:
+                    self._conn.commit()
+                    return FeishuEventClaim(
+                        status="processed",
+                        event_key=event_key,
+                    )
+                if claim_token and not self._claim_expired(claimed_at, now_dt):
+                    self._conn.commit()
+                    return FeishuEventClaim(status="busy", event_key=event_key)
+
                 self._conn.execute(
                     """
-                    INSERT INTO feishu_processed_events (
-                        event_key,
-                        chat_id,
-                        message_id,
-                        first_seen_at,
-                        claimed_at,
-                        processed_at
-                    ) VALUES (?, ?, ?, ?, ?, NULL)
+                    UPDATE feishu_processed_events
+                    SET chat_id = ?, message_id = ?, claimed_at = ?, claim_token = ?
+                    WHERE event_key = ? AND processed_at IS NULL
                     """,
-                    (event_key, message.chat_id, message.message_id, now, now),
+                    (
+                        message.chat_id,
+                        message.message_id,
+                        now,
+                        new_claim_token,
+                        event_key,
+                    ),
                 )
                 self._conn.commit()
-                return True
-            processed_at, claimed_at = row
-            if processed_at:
-                return False
-            if not self._claim_expired(claimed_at, now_dt):
-                return False
+                return FeishuEventClaim(
+                    status="claimed",
+                    event_key=event_key,
+                    claimed_at=now,
+                    claim_token=new_claim_token,
+                )
+            except BaseException:
+                self._conn.rollback()
+                raise
+
+    def mark_processed(self, event_key: str, *, claim_token: str) -> bool:
+        now = _utc_now_iso()
+        with self._lock:
             cursor = self._conn.execute(
                 """
                 UPDATE feishu_processed_events
-                SET chat_id = ?, message_id = ?, claimed_at = ?
-                WHERE event_key = ? AND processed_at IS NULL
+                SET claimed_at = NULL, claim_token = NULL, processed_at = ?
+                WHERE event_key = ?
+                    AND claim_token = ?
+                    AND processed_at IS NULL
                 """,
-                (message.chat_id, message.message_id, now, event_key),
+                (now, event_key, claim_token),
             )
             self._conn.commit()
             return cursor.rowcount > 0
 
-    def mark_processed(self, message: FeishuMessage) -> None:
-        event_key = message.event_id or message.message_id
-        if not event_key:
-            return
-        now = _utc_now_iso()
+    def release_claim(self, event_key: str, *, claim_token: str) -> bool:
         with self._lock:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 """
                 UPDATE feishu_processed_events
-                SET processed_at = ?
+                SET claimed_at = NULL, claim_token = NULL
                 WHERE event_key = ?
+                    AND claim_token = ?
+                    AND processed_at IS NULL
                 """,
-                (now, event_key),
+                (event_key, claim_token),
             )
             self._conn.commit()
+            return cursor.rowcount > 0
 
     async def aclaim_message(self, message: FeishuMessage) -> bool:
         return await asyncio.to_thread(self.claim_message, message)
 
-    async def amark_processed(self, message: FeishuMessage) -> None:
-        await asyncio.to_thread(self.mark_processed, message)
+    async def aclaim_message_result(
+        self,
+        message: FeishuMessage,
+    ) -> FeishuEventClaim:
+        return await asyncio.to_thread(self.claim_message_result, message)
+
+    async def amark_processed(self, event_key: str, *, claim_token: str) -> bool:
+        return await asyncio.to_thread(
+            self.mark_processed,
+            event_key,
+            claim_token=claim_token,
+        )
+
+    async def arelease_claim(self, event_key: str, *, claim_token: str) -> bool:
+        return await asyncio.to_thread(
+            self.release_claim,
+            event_key,
+            claim_token=claim_token,
+        )
 
     def _ensure_parent_dir(self) -> None:
         if self._db_path == ":memory:":
@@ -339,6 +428,7 @@ class FeishuEventStore:
                     message_id TEXT NOT NULL,
                     first_seen_at TEXT NOT NULL,
                     claimed_at TEXT,
+                    claim_token TEXT,
                     processed_at TEXT
                 )
                 """
@@ -352,6 +442,10 @@ class FeishuEventStore:
             if "claimed_at" not in columns:
                 self._conn.execute(
                     "ALTER TABLE feishu_processed_events ADD COLUMN claimed_at TEXT"
+                )
+            if "claim_token" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE feishu_processed_events ADD COLUMN claim_token TEXT"
                 )
             self._conn.commit()
 
@@ -877,11 +971,31 @@ class FeishuAdapter:
         await self._feishu_client.run(self.handle_message)
 
     async def handle_message(self, message: FeishuMessage) -> None:
-        claimed = await self._event_store.aclaim_message(message)
-        if not claimed:
+        claim = await self._event_store.aclaim_message_result(message)
+        if claim.status != "claimed":
             return
-        await self._handle_claimed_message(message)
-        await self._event_store.amark_processed(message)
+        if claim.event_key is None:
+            await self._handle_claimed_message(message)
+            return
+        if claim.claim_token is None:
+            raise RuntimeError("Claimed Feishu event is missing its owner token")
+        try:
+            await self._handle_claimed_message(message)
+        except BaseException:
+            await self._event_store.arelease_claim(
+                claim.event_key,
+                claim_token=claim.claim_token,
+            )
+            raise
+        marked = await self._event_store.amark_processed(
+            claim.event_key,
+            claim_token=claim.claim_token,
+        )
+        if not marked:
+            raise RuntimeError(
+                "Feishu event lease was lost before processing could be recorded: "
+                f"event_key={claim.event_key}"
+            )
 
     async def _handle_claimed_message(self, message: FeishuMessage) -> None:
         if not self._is_allowed_message(message):
