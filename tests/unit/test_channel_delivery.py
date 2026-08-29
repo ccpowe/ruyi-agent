@@ -582,7 +582,7 @@ def test_lease_heartbeat_blocks_second_instance_during_slow_send(
     asyncio.run(scenario())
 
 
-def test_fenced_lease_loss_cancels_effect_and_stops_later_steps(
+def test_accepted_then_blocked_send_may_repeat_after_fenced_lease_loss(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -598,6 +598,7 @@ def test_fenced_lease_loss_cancels_effect_and_stops_later_steps(
             effects.append(value)
 
         async def blocked_send(_: GatewayTask) -> None:
+            effects.append("first-accepted")
             first_started.set()
             try:
                 await asyncio.Event().wait()
@@ -664,7 +665,20 @@ def test_fenced_lease_loss_cancels_effect_and_stops_later_steps(
         await asyncio.wait_for(first_cancelled.wait(), timeout=1)
         await asyncio.gather(first.wait(), second.wait())
 
-        assert effects == ["second-message", "second-artifact"]
+        assert effects == [
+            "first-accepted",
+            "second-message",
+            "second-artifact",
+        ]
+        intent_id = delivery_intent_id(
+            platform="telegram",
+            session_key="telegram:session-1",
+            task_id="task-1",
+            run_count=1,
+        )
+        assert second_store.step_delivered(
+            intent_id, step_key="terminal:1:message"
+        )
         await first.close()
         await second.close()
         first_store.close()
@@ -782,7 +796,15 @@ def test_adapter_start_failure_compensates_and_can_retry(
             )
 
         original_hooks = adapter._recovery_hooks
+        original_list = store.alist_recoverable
+        listing_started = asyncio.Event()
+        allow_listing = asyncio.Event()
         hook_calls = 0
+
+        async def gated_list(*, platform: str):
+            listing_started.set()
+            await allow_listing.wait()
+            return await original_list(platform=platform)
 
         def fail_second(intent):
             nonlocal hook_calls
@@ -792,9 +814,22 @@ def test_adapter_start_failure_compensates_and_can_retry(
             return original_hooks(intent)
 
         adapter._recovery_hooks = fail_second  # type: ignore[method-assign]
-        with pytest.raises(RuntimeError, match="recovery hook failed"):
-            await adapter.start()
-        assert not adapter._started
+        store.alist_recoverable = gated_list  # type: ignore[method-assign]
+        first_start = asyncio.create_task(adapter.start())
+        await listing_started.wait()
+        second_start = asyncio.create_task(adapter.start())
+        await asyncio.sleep(0)
+        allow_listing.set()
+        outcomes = await asyncio.gather(
+            first_start, second_start, return_exceptions=True
+        )
+        assert all(
+            isinstance(outcome, RuntimeError)
+            and str(outcome) == "recovery hook failed"
+            for outcome in outcomes
+        )
+        assert hook_calls == 2
+        assert not adapter._lifecycle.started
         assert all(
             store.get(intent.intent_id).lease_token is None  # type: ignore[union-attr]
             for intent in intents
@@ -805,10 +840,85 @@ def test_adapter_start_failure_compensates_and_can_retry(
         )
 
         adapter._recovery_hooks = original_hooks  # type: ignore[method-assign]
-        assert await adapter.start() == 2
+        listing_started.clear()
+        allow_listing.clear()
+        first_retry = asyncio.create_task(adapter.start())
+        await listing_started.wait()
+        second_retry = asyncio.create_task(adapter.start())
+        await asyncio.sleep(0)
+        allow_listing.set()
+        assert await asyncio.gather(first_retry, second_retry) == [2, 2]
+        store.alist_recoverable = original_list  # type: ignore[method-assign]
+        assert await adapter.start() == 0
         await adapter.wait_for_watchers()
         assert len(transport.sent_messages) == 2
         await adapter.close()
+        await adapter.close()
+        store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("platform", ["telegram", "feishu"])
+def test_adapter_close_wins_race_with_inflight_startup(
+    tmp_path: Path,
+    platform: str,
+) -> None:
+    async def scenario() -> None:
+        store = ChannelDeliveryStore(str(tmp_path / f"{platform}-close.sqlite3"))
+        intent = store.ensure_watch(
+            platform=platform,
+            session_key=f"{platform}:session-1",
+            chat_id="1",
+            task_id="task-1",
+            run_count=1,
+        )
+        running = gateway_task("running").to_payload()
+        if platform == "telegram":
+            gateway = TelegramGateway()
+            gateway.tasks["task-1"] = running
+            adapter: TelegramAdapter | FeishuAdapter = TelegramAdapter(
+                gateway_client=gateway,
+                telegram_client=FakeTelegramClient(),
+                default_agent_name="main",
+                delivery_store=store,
+                task_poll_interval=60,
+            )
+        else:
+            gateway = FeishuGateway()
+            gateway.tasks["task-1"] = running
+            adapter = FeishuAdapter(
+                gateway_client=gateway,
+                feishu_client=FakeFeishuClient(),
+                default_agent_name="main",
+                delivery_store=store,
+                task_poll_interval=60,
+                ack_mode="off",
+            )
+
+        original_recover = adapter._delivery.recover
+        recovery_started = asyncio.Event()
+
+        async def blocked_after_recover(hooks_for):
+            recovered = await original_recover(hooks_for)
+            recovery_started.set()
+            await asyncio.Event().wait()
+            return recovered
+
+        adapter._delivery.recover = blocked_after_recover  # type: ignore[method-assign]
+        starting = asyncio.create_task(adapter.start())
+        await recovery_started.wait()
+        assert adapter._delivery.is_active(task_id="task-1", run_count=1)
+        await adapter.close()
+        with pytest.raises(RuntimeError, match="closed during startup"):
+            await starting
+
+        assert adapter._lifecycle.closed
+        assert not adapter._lifecycle.started
+        assert not adapter._delivery.is_active(task_id="task-1", run_count=1)
+        assert store.get(intent.intent_id).lease_token is None  # type: ignore[union-attr]
+        with pytest.raises(RuntimeError, match="is closed"):
+            await adapter.start()
         await adapter.close()
         store.close()
 

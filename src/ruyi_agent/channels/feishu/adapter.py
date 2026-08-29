@@ -30,6 +30,7 @@ from ruyi_agent.channels.feishu.identity import (
     build_feishu_session_key,
 )
 from ruyi_agent.channels.feishu.receipts import FeishuEventClaim, FeishuEventStore
+from ruyi_agent.channels.adapter_lifecycle import ChannelAdapterLifecycle
 from ruyi_agent.channels.gateway_client import GatewayTaskClient
 from ruyi_agent.channels.gateway_dto import GatewayTask
 from ruyi_agent.channels.media import warn_deprecated_media_root
@@ -151,8 +152,7 @@ class FeishuAdapter:
             feishu_client=self._feishu_client,
             max_bytes=media_max_bytes,
         )
-        self._started = False
-        self._closed = False
+        self._lifecycle = ChannelAdapterLifecycle(adapter_name="FeishuAdapter")
         self._task_reactions: dict[tuple[str, int], list[FeishuReactionReceipt]] = {}
 
     async def run_forever(self) -> None:
@@ -163,18 +163,14 @@ class FeishuAdapter:
             await self.close()
 
     async def start(self) -> int:
-        if self._closed:
-            raise RuntimeError("FeishuAdapter is closed")
-        if self._started:
-            return 0
-        recovered = await self._delivery.recover(self._recovery_hooks)
-        self._started = True
-        return recovered
+        return await self._lifecycle.start(
+            lambda: self._delivery.recover(self._recovery_hooks)
+        )
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        await self._lifecycle.close(self._shutdown)
+
+    async def _shutdown(self) -> None:
         await self._delivery.close()
         if self._owns_delivery_store:
             self._delivery_store.close()

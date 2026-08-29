@@ -9,6 +9,7 @@ from typing import Any
 
 from ruyi_agent.channels.gateway_client import GatewayTaskClient
 from ruyi_agent.channels.gateway_dto import GatewayTask
+from ruyi_agent.channels.adapter_lifecycle import ChannelAdapterLifecycle
 from ruyi_agent.channels.media import warn_deprecated_media_root
 from ruyi_agent.channels.presentation import (
     ChannelDeliveryCoordinator,
@@ -198,22 +199,17 @@ class TelegramAdapter:
             telegram_client=self._telegram_client,
             max_bytes=media_max_bytes,
         )
-        self._started = False
-        self._closed = False
+        self._lifecycle = ChannelAdapterLifecycle(adapter_name="TelegramAdapter")
 
     async def start(self) -> int:
-        if self._closed:
-            raise RuntimeError("TelegramAdapter is closed")
-        if self._started:
-            return 0
-        recovered = await self._delivery.recover(self._recovery_hooks)
-        self._started = True
-        return recovered
+        return await self._lifecycle.start(
+            lambda: self._delivery.recover(self._recovery_hooks)
+        )
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        await self._lifecycle.close(self._shutdown)
+
+    async def _shutdown(self) -> None:
         await self._delivery.close()
         if self._owns_delivery_store:
             self._delivery_store.close()

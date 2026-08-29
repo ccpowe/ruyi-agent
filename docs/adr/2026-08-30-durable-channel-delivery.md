@@ -39,11 +39,21 @@ late review.
 Only one owner may claim a live intent. Every state and delivery-step write is
 conditioned on its lease token, so an expired owner cannot acknowledge work
 after a newer owner takes over. External platform sends and uploads run under a
-lease heartbeat; lease loss cancels the current effect and prevents subsequent
-steps. Shutdown stops new watches, cancels and gathers all owned watcher tasks,
-releases leases, and only then lets runners close the SQLite stores and
-platform clients. Startup recovery compensates a partially started batch by
-cancelling its new watches and releasing their leases before it may be retried.
+lease heartbeat; lease loss cancels the local await task and prevents that
+owner from starting subsequent steps. It cannot retract an effect already
+accepted by a remote platform. Shutdown stops new watches, cancels and gathers
+all owned watcher tasks, releases leases, and only then lets runners close the
+SQLite stores and platform clients. Startup recovery compensates a partially
+started batch by cancelling its new watches and releasing their leases before
+it may be retried.
+
+Adapter startup is single-flight: concurrent `start()` callers await the same
+recovery task and observe the same result. A failed recovery remains the sole
+in-flight startup until its compensation completes. Once `close()` begins it
+wins the lifecycle race, rejects new starts, cancels and awaits in-flight
+startup, and then performs the ordered coordinator/store shutdown. Cancelling
+one start caller does not cancel the shared recovery; close is the only owner
+that does so.
 
 Gateway query failures are distinct from Gateway Task terminal failures.
 Network errors, timeouts, HTTP 408/429 and 5xx responses use bounded exponential
@@ -59,11 +69,15 @@ partial artifact failure does not resend the terminal message or earlier
 artifacts. A new `run_count` and a new review identity get independent keys.
 
 Telegram and Feishu APIs do not expose an idempotency key for these send
-operations. Consequently, a process crash after a platform accepts a send but
-before its step commit can still produce a duplicate on recovery. The visible
+operations. Every ambiguous remote-acceptance window is therefore
+at-least-once: the process may crash after acceptance, the request may time
+out, its caller may be cancelled, or lease loss may cancel the local await
+after the platform has already committed the effect. None of those events can
+retract the remote effect. Without a committed local step, a new fenced owner
+must retry and may visibly duplicate the message or artifact. The visible
 `task_id`, `run_count`/review identity, stable artifact identity, fenced claim,
 and per-step ledger are the explicit deduplication boundary; this ADR does not
-claim impossible platform exactly-once delivery.
+claim platform exactly-once delivery.
 
 Both Channel runners pass their configured `media_max_bytes` to inbound
 platform downloads and Gateway artifact downloads. Downloads validate the
@@ -95,5 +109,7 @@ emit a warning when it is supplied.
 Tests cover transient retry and exhaustion, stale run projections, restart
 during terminal grace, sequential and concurrent review reopens, atomic startup
 recovery for both adapters, heartbeat/fence interleavings, settled-input races,
-partial artifact failure, idempotent close, and missing, invalid, repeated,
-forged-short, and oversized streamed media bodies.
+partial artifact failure, concurrent startup and start/close races, an
+accepted-then-blocked send that is intentionally retried after lease loss,
+idempotent close, and missing, invalid, repeated, forged-short, and oversized
+streamed media bodies.
