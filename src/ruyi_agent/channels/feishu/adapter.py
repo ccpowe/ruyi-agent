@@ -49,10 +49,13 @@ from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 __all__ = [
     "FeishuAdapter",
     "FeishuAPIError",
+    "FeishuAttachment",
+    "FeishuClient",
     "FeishuEventClaim",
     "FeishuEventStore",
     "FeishuMention",
     "FeishuMessage",
+    "FeishuReactionReceipt",
     "FeishuSDKClient",
     "UnsupportedFeishuChatTypeError",
     "build_feishu_identity_key",

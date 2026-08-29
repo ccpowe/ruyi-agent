@@ -191,7 +191,6 @@ def _current_run_artifacts(
     return [item for item in task.artifacts if item.run_count == run_count]
 
 
-@dataclass(frozen=True, slots=True)
 class FeishuSDKClient:
     def __init__(
         self,

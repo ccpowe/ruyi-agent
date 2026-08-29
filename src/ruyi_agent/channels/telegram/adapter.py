@@ -60,15 +60,23 @@ from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 
 
 __all__ = [
+    "KrokiMermaidRenderer",
+    "MermaidRenderError",
     "TelegramAdapter",
+    "TelegramAPIError",
+    "TelegramAttachment",
     "TelegramAttachmentDownloadWarning",
     "TelegramBotAPIClient",
+    "TelegramClient",
     "TelegramFallbackResolver",
     "TelegramFallbackTransport",
     "TelegramInboundAttachment",
     "TelegramMessage",
+    "TelegramNetworkError",
+    "TelegramPollResult",
     "TelegramUpdateClaim",
     "TelegramUpdateStore",
+    "UnsupportedTelegramChatTypeError",
     "_format_telegram_markdown_v2",
     "_looks_like_network_error",
     "_split_telegram_message",
