@@ -15,9 +15,10 @@ def initialize_task_database(database: TaskDatabase) -> None:
         if database.db_path != ":memory:":
             connection.execute("PRAGMA journal_mode = WAL")
         _create_tables(connection)
-        _create_indexes(connection)
         _ensure_legacy_columns(connection)
         backfill_pending_reviews(connection)
+        _backfill_pending_review_ingest_sequences(connection)
+        _create_indexes(connection)
         connection.commit()
 
 
@@ -77,7 +78,16 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
+            ingest_sequence INTEGER,
             FOREIGN KEY(task_id) REFERENCES agent_tasks(task_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_task_review_ingest_state (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            last_sequence INTEGER NOT NULL CHECK(last_sequence >= 0)
         )
         """
     )
@@ -120,6 +130,18 @@ def _create_tables(connection: sqlite3.Connection) -> None:
 
 
 def _create_indexes(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_task_pending_reviews_ingest
+        ON agent_task_pending_reviews(ingest_sequence)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_task_pending_reviews_root_ingest
+        ON agent_task_pending_reviews(root_task_id, ingest_sequence, review_id)
+        """
+    )
     connection.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_agent_task_pending_reviews_root
@@ -167,6 +189,12 @@ def _ensure_legacy_columns(connection: sqlite3.Connection) -> None:
             column=column,
             definition=definition,
         )
+    _ensure_column(
+        connection,
+        table="agent_task_pending_reviews",
+        column="ingest_sequence",
+        definition="INTEGER",
+    )
 
 
 def _ensure_column(
@@ -206,8 +234,9 @@ def backfill_pending_reviews(connection: sqlite3.Connection) -> None:
         connection.execute(
             """
             INSERT OR IGNORE INTO agent_task_pending_reviews (
-                review_id, task_id, root_task_id, payload_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                review_id, task_id, root_task_id, payload_json, created_at, updated_at,
+                ingest_sequence
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL)
             """,
             (
                 review_id,
@@ -266,3 +295,63 @@ def backfill_pending_reviews(connection: sqlite3.Connection) -> None:
                 "UPDATE agent_tasks SET pending_review_json = NULL WHERE task_id = ?",
                 (task_id,),
             )
+
+
+def _backfill_pending_review_ingest_sequences(
+    connection: sqlite3.Connection,
+) -> None:
+    """Assign stable local order to legacy reviews before adding uniqueness."""
+
+    rows = connection.execute(
+        """
+        SELECT review_id, ingest_sequence
+        FROM agent_task_pending_reviews
+        ORDER BY created_at ASC, review_id ASC
+        """
+    ).fetchall()
+    positive_sequences = [
+        int(row[1]) for row in rows if isinstance(row[1], int) and int(row[1]) > 0
+    ]
+    state = connection.execute(
+        """
+        SELECT last_sequence
+        FROM agent_task_review_ingest_state
+        WHERE singleton = 1
+        """
+    ).fetchone()
+    persisted_high_water = int(state[0]) if state is not None else 0
+    next_sequence = (
+        max(
+            max(positive_sequences, default=0),
+            persisted_high_water,
+        )
+        + 1
+    )
+    used: set[int] = set()
+    for review_id, raw_sequence in rows:
+        sequence = int(raw_sequence) if isinstance(raw_sequence, int) else 0
+        if sequence > 0 and sequence not in used:
+            used.add(sequence)
+            continue
+        if next_sequence > 2**63 - 1:
+            raise OverflowError("Pending Review ingest sequence is exhausted")
+        connection.execute(
+            """
+            UPDATE agent_task_pending_reviews
+            SET ingest_sequence = ?
+            WHERE review_id = ?
+            """,
+            (next_sequence, review_id),
+        )
+        used.add(next_sequence)
+        next_sequence += 1
+    high_water = max(max(used, default=0), persisted_high_water)
+    connection.execute(
+        """
+        INSERT INTO agent_task_review_ingest_state (singleton, last_sequence)
+        VALUES (1, ?)
+        ON CONFLICT(singleton) DO UPDATE SET
+            last_sequence = MAX(last_sequence, excluded.last_sequence)
+        """,
+        (high_water,),
+    )

@@ -369,7 +369,10 @@ def test_task_store_review_transition_is_atomic_with_task_and_root_projection(
             **payload,
             "source_task_id": "child",
         }
-        assert store.get_pending_review("review-1") == review
+        assert store.get_pending_review("review-1") == replace(
+            review,
+            ingest_sequence=1,
+        )
     finally:
         store.close()
 
@@ -516,3 +519,187 @@ def test_task_store_backfills_all_legacy_reviews_and_rebuilds_root_projection(
         }
     finally:
         reopened.close()
+
+
+def test_task_store_migrates_legacy_review_ingest_order_idempotently(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "tasks.sqlite"
+    created_at = datetime(2026, 8, 29, tzinfo=UTC)
+    store = TaskStore(str(db_path))
+    for task_id in ("task-a", "task-b"):
+        store.insert_task(
+            TaskRecord(
+                task_id=task_id,
+                agent_name="main",
+                state="waiting_for_human",
+                thread_id=task_id,
+                parent_task_id=None,
+                root_task_id=task_id,
+                depth=0,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+        )
+    store.close()
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP TABLE agent_task_pending_reviews")
+        connection.execute(
+            """
+            CREATE TABLE agent_task_pending_reviews (
+                review_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL UNIQUE,
+                root_task_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES agent_tasks(task_id)
+            )
+            """
+        )
+        for suffix in ("b", "a"):
+            connection.execute(
+                """
+                INSERT INTO agent_task_pending_reviews (
+                    review_id, task_id, root_task_id, payload_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"review-{suffix}",
+                    f"task-{suffix}",
+                    f"task-{suffix}",
+                    f'{{"review_id":"review-{suffix}"}}',
+                    created_at.isoformat(),
+                    created_at.isoformat(),
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    reopened = TaskStore(str(db_path))
+    first = reopened.list_pending_reviews()
+    reopened.close()
+    reopened_again = TaskStore(str(db_path))
+    try:
+        second = reopened_again.list_pending_reviews()
+        assert [(item.review_id, item.ingest_sequence) for item in first] == [
+            ("review-a", 1),
+            ("review-b", 2),
+        ]
+        assert [(item.review_id, item.ingest_sequence) for item in second] == [
+            ("review-a", 1),
+            ("review-b", 2),
+        ]
+        connection = sqlite3.connect(db_path)
+        try:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(agent_task_pending_reviews)"
+                ).fetchall()
+            }
+            indexes = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA index_list(agent_task_pending_reviews)"
+                ).fetchall()
+            }
+        finally:
+            connection.close()
+        assert "ingest_sequence" in columns
+        assert "idx_agent_task_pending_reviews_ingest" in indexes
+    finally:
+        reopened_again.close()
+
+
+def test_task_store_preserves_review_sequence_and_allocates_replacement_order(
+    tmp_path,
+) -> None:
+    store = TaskStore(str(tmp_path / "tasks.sqlite"))
+    created_at = datetime(2026, 8, 29, tzinfo=UTC)
+    task = TaskRecord(
+        task_id="task-1",
+        agent_name="main",
+        state="waiting_for_human",
+        thread_id="task-1",
+        parent_task_id=None,
+        root_task_id="task-1",
+        depth=0,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    store.insert_task(task)
+    first = PendingReviewRecord(
+        review_id="review-1",
+        task_id=task.task_id,
+        root_task_id=task.root_task_id,
+        payload={"review_id": "review-1"},
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    try:
+        store.update_review_transition(
+            task,
+            pending_review=first,
+            root_record=None,
+            events=[],
+        )
+        persisted = store.get_pending_review("review-1")
+        assert persisted is not None
+        assert persisted.ingest_sequence == 1
+
+        store.update_review_transition(
+            task,
+            pending_review=replace(first, updated_at=created_at),
+            root_record=None,
+            events=[],
+        )
+        unchanged = store.get_pending_review("review-1")
+        assert unchanged is not None
+        assert unchanged.ingest_sequence == 1
+
+        replacement = replace(
+            first,
+            review_id="review-2",
+            payload={"review_id": "review-2"},
+        )
+        store.update_review_transition(
+            task,
+            pending_review=replacement,
+            root_record=None,
+            events=[],
+        )
+        persisted_replacement = store.get_pending_review("review-2")
+        assert persisted_replacement is not None
+        assert persisted_replacement.ingest_sequence == 2
+
+        store.update_review_transition(
+            task,
+            pending_review=None,
+            root_record=None,
+            events=[],
+        )
+        store.close()
+        store = TaskStore(str(tmp_path / "tasks.sqlite"))
+        restored_task = store.get_task(task.task_id)
+        assert restored_task is not None
+        task = restored_task
+        third = replace(
+            first,
+            review_id="review-3",
+            payload={"review_id": "review-3"},
+        )
+        store.update_review_transition(
+            task,
+            pending_review=third,
+            root_record=None,
+            events=[],
+        )
+        persisted_third = store.get_pending_review("review-3")
+        assert persisted_third is not None
+        assert persisted_third.ingest_sequence == 3
+    finally:
+        store.close()

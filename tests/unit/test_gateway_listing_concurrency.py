@@ -105,6 +105,7 @@ class ListingRouter:
                     payload=dict(payload),
                     created_at=record.updated_at,
                     updated_at=record.updated_at,
+                    ingest_sequence=int(record.updated_at.timestamp() * 1_000_000),
                 )
             )
         return reviews
@@ -378,6 +379,7 @@ def test_review_owner_refresh_deduplicates_repeated_owner_records() -> None:
             payload={"action_requests": [], "review_configs": []},
             created_at=now + timedelta(seconds=index),
             updated_at=now + timedelta(seconds=index),
+            ingest_sequence=index + 1,
         )
         for index in range(2)
     ]
@@ -515,6 +517,7 @@ def test_review_snapshot_pages_are_exactly_once_after_owner_timestamp_changes() 
             payload={"action_requests": [], "review_configs": []},
             created_at=now + timedelta(seconds=index),
             updated_at=now + timedelta(seconds=index),
+            ingest_sequence=index + 1,
         )
         for index in range(5)
     ]
@@ -547,8 +550,9 @@ def test_review_snapshot_pages_are_exactly_once_after_owner_timestamp_changes() 
             task_id="task-5",
             root_task_id="task-5",
             payload={"action_requests": [], "review_configs": []},
-            created_at=now + timedelta(minutes=10),
-            updated_at=now + timedelta(minutes=10),
+            created_at=now - timedelta(minutes=10),
+            updated_at=now - timedelta(minutes=10),
+            ingest_sequence=6,
         )
     ]
     cursor = first.next_cursor
@@ -567,6 +571,59 @@ def test_review_snapshot_pages_are_exactly_once_after_owner_timestamp_changes() 
     assert len(sequence) == len(set(sequence))
 
 
+def test_review_snapshot_excludes_backdated_ingest_after_highest_is_deleted() -> None:
+    now = datetime(2026, 8, 29, tzinfo=UTC)
+    pending_reviews = [
+        PendingReviewRecord(
+            review_id=f"review-{index}",
+            task_id=f"task-{index}",
+            root_task_id=f"task-{index}",
+            payload={"action_requests": [], "review_configs": []},
+            created_at=now + timedelta(seconds=index),
+            updated_at=now + timedelta(seconds=index),
+            ingest_sequence=index + 1,
+        )
+        for index in range(5)
+    ]
+    router = ListingRouter(
+        [route(index) for index in range(6)],
+        {
+            f"task-{index}": record(index, state="waiting_for_human")
+            for index in range(6)
+        },
+        pending_reviews=pending_reviews,
+    )
+    service = service_with_router(router)
+
+    first = asyncio.run(service.list_reviews(cursor=None, limit=1))
+    assert [item.review_id for item in first.items] == ["review-4"]
+    assert first.next_cursor is not None
+    decoded_cursor = json.loads(base64.urlsafe_b64decode(first.next_cursor))
+    assert decoded_cursor["version"] == 4
+    assert decoded_cursor["snapshot_ingest_sequence"] == 5
+
+    router.pending_reviews = pending_reviews[:-1] + [
+        PendingReviewRecord(
+            review_id="review-backdated-after-snapshot",
+            task_id="task-5",
+            root_task_id="task-5",
+            payload={"action_requests": [], "review_configs": []},
+            created_at=now - timedelta(days=1),
+            updated_at=now - timedelta(days=1),
+            ingest_sequence=6,
+        )
+    ]
+    sequence: list[str] = []
+    cursor = first.next_cursor
+    while cursor is not None:
+        page = asyncio.run(service.list_reviews(cursor=cursor, limit=2))
+        sequence.extend(item.review_id for item in page.items)
+        cursor = page.next_cursor
+
+    assert sequence == ["review-3", "review-2", "review-1", "review-0"]
+    assert "review-backdated-after-snapshot" not in sequence
+
+
 def test_review_cursor_uses_sort_key_fallback_only_if_resume_review_disappears() -> (
     None
 ):
@@ -579,6 +636,7 @@ def test_review_cursor_uses_sort_key_fallback_only_if_resume_review_disappears()
             payload={"action_requests": [], "review_configs": []},
             created_at=now + timedelta(seconds=index),
             updated_at=now + timedelta(seconds=index),
+            ingest_sequence=index + 1,
         )
         for index in range(3)
     ]
@@ -602,6 +660,51 @@ def test_review_cursor_uses_sort_key_fallback_only_if_resume_review_disappears()
     resumed = asyncio.run(service.list_reviews(cursor=first.next_cursor, limit=2))
 
     assert [item.review_id for item in resumed.items] == ["review-0"]
+
+
+def test_v2_review_cursor_missing_resume_upgrades_without_duplicates_or_gaps() -> None:
+    now = datetime(2026, 8, 29, tzinfo=UTC)
+    pending_reviews = [
+        PendingReviewRecord(
+            review_id=f"review-{index}",
+            task_id=f"task-{index}",
+            root_task_id=f"task-{index}",
+            payload={"action_requests": [], "review_configs": []},
+            created_at=now + timedelta(seconds=index),
+            updated_at=now + timedelta(seconds=index),
+            ingest_sequence=index + 1,
+        )
+        for index in range(5)
+        if index != 3
+    ]
+    router = ListingRouter(
+        [route(index) for index in range(5)],
+        {
+            f"task-{index}": record(index, state="waiting_for_human")
+            for index in range(5)
+        },
+        pending_reviews=pending_reviews,
+    )
+    service = service_with_router(router)
+    cursor = base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "fallback_updated_at": (now + timedelta(seconds=3)).isoformat(),
+                "resume_review_id": "review-3",
+                "version": 2,
+            },
+            separators=(",", ":"),
+        ).encode()
+    ).decode()
+
+    sequence: list[str] = []
+    while cursor is not None:
+        page = asyncio.run(service.list_reviews(cursor=cursor, limit=1))
+        sequence.extend(item.review_id for item in page.items)
+        cursor = page.next_cursor
+
+    assert sequence == ["review-2", "review-1", "review-0"]
+    assert len(sequence) == len(set(sequence))
 
 
 @pytest.mark.parametrize(
@@ -628,6 +731,18 @@ def test_review_cursor_uses_sort_key_fallback_only_if_resume_review_disappears()
             "resume_review_id": "review-1",
             "fallback_updated_at": "2026-08-29T00:00:00+00:00",
             "extra": 1,
+        },
+        {
+            "version": 4,
+            "resume_review_id": "review-1",
+            "fallback_ingest_sequence": True,
+            "snapshot_ingest_sequence": 1,
+        },
+        {
+            "version": 4,
+            "resume_review_id": "review-1",
+            "fallback_ingest_sequence": 1,
+            "snapshot_ingest_sequence": 0,
         },
         2**63,
     ],

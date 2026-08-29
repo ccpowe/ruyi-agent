@@ -229,9 +229,7 @@ class GatewayReviewService:
             return _ReviewCursorPage(
                 records=records,
                 scan_index=0,
-                snapshot_frontier=(
-                    _review_sort_key(records[0]) if records else None
-                ),
+                snapshot_frontier=_review_snapshot_frontier(records),
             )
         try:
             payload = _decode_review_cursor_payload(cursor)
@@ -241,18 +239,42 @@ class GatewayReviewService:
                 return _ReviewCursorPage(
                     records=records,
                     scan_index=payload,
-                    snapshot_frontier=(
-                        _review_sort_key(records[0]) if records else None
-                    ),
+                    snapshot_frontier=_review_snapshot_frontier(records),
                 )
             if not isinstance(payload, dict):
                 raise ValueError
-            snapshot_frontier: tuple[datetime, str] | None = None
+            if set(payload) == {
+                "fallback_ingest_sequence",
+                "resume_review_id",
+                "snapshot_ingest_sequence",
+                "version",
+            }:
+                if type(payload["version"]) is not int or payload["version"] != 4:
+                    raise ValueError
+                review_id = _parse_cursor_review_id(payload["resume_review_id"])
+                fallback_sequence = _parse_cursor_sequence(
+                    payload["fallback_ingest_sequence"]
+                )
+                snapshot_frontier = _parse_cursor_sequence(
+                    payload["snapshot_ingest_sequence"]
+                )
+                records = [
+                    record
+                    for record in records
+                    if record.ingest_sequence <= snapshot_frontier
+                ]
+                return _resume_sequence_page(
+                    records,
+                    review_id=review_id,
+                    fallback_sequence=fallback_sequence,
+                    snapshot_frontier=snapshot_frontier,
+                )
             if set(payload) == {"review_id", "updated_at", "version"}:
                 if type(payload["version"]) is not int or payload["version"] != 1:
                     raise ValueError
-                review_id = payload["review_id"]
+                review_id = _parse_cursor_review_id(payload["review_id"])
                 raw_fallback_at = payload["updated_at"]
+                legacy_timestamp_field = "updated_at"
             elif set(payload) == {
                 "fallback_updated_at",
                 "resume_review_id",
@@ -260,8 +282,9 @@ class GatewayReviewService:
             }:
                 if type(payload["version"]) is not int or payload["version"] != 2:
                     raise ValueError
-                review_id = payload["resume_review_id"]
+                review_id = _parse_cursor_review_id(payload["resume_review_id"])
                 raw_fallback_at = payload["fallback_updated_at"]
+                legacy_timestamp_field = "updated_at"
             elif set(payload) == {
                 "fallback_created_at",
                 "resume_review_id",
@@ -271,29 +294,22 @@ class GatewayReviewService:
             }:
                 if type(payload["version"]) is not int or payload["version"] != 3:
                     raise ValueError
-                review_id = payload["resume_review_id"]
+                review_id = _parse_cursor_review_id(payload["resume_review_id"])
                 raw_fallback_at = payload["fallback_created_at"]
-                snapshot_review_id = payload["snapshot_review_id"]
-                if (
-                    not isinstance(snapshot_review_id, str)
-                    or not 1 <= len(snapshot_review_id) <= 512
-                ):
-                    raise ValueError
-                snapshot_frontier = (
+                snapshot_review_id = _parse_cursor_review_id(
+                    payload["snapshot_review_id"]
+                )
+                legacy_snapshot_frontier = (
                     _parse_cursor_timestamp(payload["snapshot_created_at"]),
                     snapshot_review_id,
                 )
                 records = [
                     record
                     for record in records
-                    if _review_sort_key(record) <= snapshot_frontier
+                    if (record.created_at, record.review_id) <= legacy_snapshot_frontier
                 ]
+                legacy_timestamp_field = "created_at"
             else:
-                raise ValueError
-            if (
-                not isinstance(review_id, str)
-                or not 1 <= len(review_id) <= 512
-            ):
                 raise ValueError
             fallback_at = _parse_cursor_timestamp(raw_fallback_at)
             for index, record in enumerate(records):
@@ -301,27 +317,22 @@ class GatewayReviewService:
                     return _ReviewCursorPage(
                         records=records,
                         scan_index=index,
-                        snapshot_frontier=(
-                            snapshot_frontier
-                            or (_review_sort_key(records[0]) if records else None)
-                        ),
+                        snapshot_frontier=_review_snapshot_frontier(records),
                     )
             fallback_key = (fallback_at, review_id)
-            scan_index = next(
-                (
-                    index
-                    for index, record in enumerate(records)
-                    if _review_sort_key(record) < fallback_key
-                ),
-                len(records),
-            )
+            records = [
+                record
+                for record in records
+                if (
+                    getattr(record, legacy_timestamp_field),
+                    record.review_id,
+                )
+                < fallback_key
+            ]
             return _ReviewCursorPage(
                 records=records,
-                scan_index=scan_index,
-                snapshot_frontier=(
-                    snapshot_frontier
-                    or (_review_sort_key(records[0]) if records else None)
-                ),
+                scan_index=0,
+                snapshot_frontier=_review_snapshot_frontier(records),
             )
         except Exception as exc:
             raise GatewayTaskError(
@@ -333,17 +344,18 @@ class GatewayReviewService:
         self,
         record: PendingReviewRecord,
         *,
-        snapshot_frontier: tuple[datetime, str] | None,
+        snapshot_frontier: int | None,
     ) -> str:
         if snapshot_frontier is None:
             raise ValueError("Review cursor snapshot frontier is missing")
+        _parse_cursor_sequence(record.ingest_sequence)
+        _parse_cursor_sequence(snapshot_frontier)
         payload = json.dumps(
             {
-                "fallback_created_at": record.created_at.isoformat(),
+                "fallback_ingest_sequence": record.ingest_sequence,
                 "resume_review_id": record.review_id,
-                "snapshot_created_at": snapshot_frontier[0].isoformat(),
-                "snapshot_review_id": snapshot_frontier[1],
-                "version": 3,
+                "snapshot_ingest_sequence": snapshot_frontier,
+                "version": 4,
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -376,11 +388,48 @@ class _OwnerRefreshResult:
 class _ReviewCursorPage:
     records: list[PendingReviewRecord]
     scan_index: int
-    snapshot_frontier: tuple[datetime, str] | None
+    snapshot_frontier: int | None
 
 
-def _review_sort_key(record: PendingReviewRecord) -> tuple[datetime, str]:
-    return record.created_at, record.review_id
+def _review_sort_key(record: PendingReviewRecord) -> tuple[int, str]:
+    return record.ingest_sequence, record.review_id
+
+
+def _review_snapshot_frontier(records: list[PendingReviewRecord]) -> int | None:
+    return records[0].ingest_sequence if records else None
+
+
+def _resume_sequence_page(
+    records: list[PendingReviewRecord],
+    *,
+    review_id: str,
+    fallback_sequence: int,
+    snapshot_frontier: int,
+) -> _ReviewCursorPage:
+    for index, record in enumerate(records):
+        if record.review_id == review_id:
+            return _ReviewCursorPage(records, index, snapshot_frontier)
+    scan_index = next(
+        (
+            index
+            for index, record in enumerate(records)
+            if record.ingest_sequence < fallback_sequence
+        ),
+        len(records),
+    )
+    return _ReviewCursorPage(records, scan_index, snapshot_frontier)
+
+
+def _parse_cursor_review_id(raw: object) -> str:
+    if not isinstance(raw, str) or not 1 <= len(raw) <= 512:
+        raise ValueError
+    return raw
+
+
+def _parse_cursor_sequence(raw: object) -> int:
+    if type(raw) is not int or not 1 <= raw <= 2**63 - 1:
+        raise ValueError
+    return raw
 
 
 def _parse_cursor_timestamp(raw: object) -> datetime:

@@ -111,6 +111,7 @@ class PendingReviewRecord:
     payload: dict[str, Any]
     created_at: datetime
     updated_at: datetime
+    ingest_sequence: int = 0
 
 
 @dataclass(slots=True)

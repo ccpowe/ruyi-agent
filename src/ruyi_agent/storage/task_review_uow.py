@@ -11,7 +11,10 @@ from ruyi_agent.storage.task_codecs import (
     serialize_json_object,
 )
 from ruyi_agent.storage.task_database import TaskDatabase
-from ruyi_agent.storage.task_event_repository import StoredTaskEvent, serialize_event_data
+from ruyi_agent.storage.task_event_repository import (
+    StoredTaskEvent,
+    serialize_event_data,
+)
 from ruyi_agent.storage.task_repository import TaskRepository
 from ruyi_agent.storage.settled_outbox import (
     SettledOutboxIntent,
@@ -52,7 +55,7 @@ class TaskReviewUnitOfWork:
             (event_record, event_type, serialize_event_data(data), created_at)
             for event_record, event_type, data, created_at in events
         ]
-        with self._database.transaction() as connection:
+        with self._database.transaction(immediate=True) as connection:
             self._tasks.update_locked(connection, record)
             self._replace_review_locked(connection, record.task_id, pending_review)
             if root_record is not None and root_record.task_id != record.task_id:
@@ -79,7 +82,7 @@ class TaskReviewUnitOfWork:
             row = connection.execute(
                 """
                 SELECT review_id, task_id, root_task_id, payload_json,
-                       created_at, updated_at
+                       created_at, updated_at, ingest_sequence
                 FROM agent_task_pending_reviews
                 WHERE review_id = ?
                 """,
@@ -106,10 +109,10 @@ class TaskReviewUnitOfWork:
             rows = connection.execute(
                 f"""
                 SELECT review_id, task_id, root_task_id, payload_json,
-                       created_at, updated_at
+                       created_at, updated_at, ingest_sequence
                 FROM agent_task_pending_reviews
                 {where}
-                ORDER BY created_at ASC, review_id ASC
+                ORDER BY ingest_sequence ASC, review_id ASC
                 """,
                 params,
             ).fetchall()
@@ -121,17 +124,53 @@ class TaskReviewUnitOfWork:
         task_id: str,
         pending_review: PendingReviewRecord | None,
     ) -> None:
+        existing = connection.execute(
+            """
+            SELECT review_id, ingest_sequence
+            FROM agent_task_pending_reviews
+            WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if pending_review is None:
+            connection.execute(
+                "DELETE FROM agent_task_pending_reviews WHERE task_id = ?",
+                (task_id,),
+            )
+            return
+        if existing is not None and existing[0] == pending_review.review_id:
+            ingest_sequence = int(existing[1])
+        else:
+            state = connection.execute(
+                """
+                SELECT last_sequence
+                FROM agent_task_review_ingest_state
+                WHERE singleton = 1
+                """
+            ).fetchone()
+            if state is None:
+                raise RuntimeError("Pending Review ingest state is missing")
+            ingest_sequence = int(state[0]) + 1
+            if ingest_sequence > 2**63 - 1:
+                raise OverflowError("Pending Review ingest sequence is exhausted")
+            connection.execute(
+                """
+                UPDATE agent_task_review_ingest_state
+                SET last_sequence = ?
+                WHERE singleton = 1
+                """,
+                (ingest_sequence,),
+            )
         connection.execute(
             "DELETE FROM agent_task_pending_reviews WHERE task_id = ?",
             (task_id,),
         )
-        if pending_review is None:
-            return
         connection.execute(
             """
             INSERT INTO agent_task_pending_reviews (
-                review_id, task_id, root_task_id, payload_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                review_id, task_id, root_task_id, payload_json, created_at, updated_at,
+                ingest_sequence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 pending_review.review_id,
@@ -140,5 +179,6 @@ class TaskReviewUnitOfWork:
                 serialize_json_object(pending_review.payload),
                 serialize_datetime(pending_review.created_at),
                 serialize_datetime(pending_review.updated_at),
+                ingest_sequence,
             ),
         )

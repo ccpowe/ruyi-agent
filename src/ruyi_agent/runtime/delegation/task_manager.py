@@ -86,6 +86,13 @@ class TaskManager:
             review.review_id: review
             for review in (store.list_pending_reviews() if store is not None else [])
         }
+        self._next_review_ingest_sequence = (
+            max(
+                (review.ingest_sequence for review in self._pending_reviews.values()),
+                default=0,
+            )
+            + 1
+        )
 
     @property
     def event_ledger(self) -> TaskEventLedger | None:
@@ -242,7 +249,7 @@ class TaskManager:
         root_task_id: str | None = None,
         task_id: str | None = None,
     ) -> list[PendingReviewRecord]:
-        """List authoritative pending reviews in stable creation order."""
+        """List authoritative pending reviews in stable local ingest order."""
 
         if self._store is not None:
             reviews = self._store.list_pending_reviews(
@@ -258,7 +265,10 @@ class TaskManager:
             if (root_task_id is None or review.root_task_id == root_task_id)
             and (task_id is None or review.task_id == task_id)
         ]
-        return sorted(reviews, key=lambda item: (item.created_at, item.review_id))
+        return sorted(
+            reviews,
+            key=lambda item: (item.ingest_sequence, item.review_id),
+        )
 
     def get_pending_review(self, review_id: str) -> PendingReviewRecord | None:
         """Return one authoritative pending review by identity."""
@@ -273,6 +283,31 @@ class TaskManager:
     def _review_for_task(self, task_id: str) -> PendingReviewRecord | None:
         reviews = self.list_pending_reviews(task_id=task_id)
         return reviews[0] if reviews else None
+
+    def _review_ingest_sequence(
+        self,
+        current_review: PendingReviewRecord | None,
+        review_id: str,
+    ) -> int:
+        if (
+            current_review is not None
+            and current_review.review_id == review_id
+            and current_review.ingest_sequence > 0
+        ):
+            return current_review.ingest_sequence
+        if self._store is not None:
+            return 0
+        sequence = self._next_review_ingest_sequence
+        self._next_review_ingest_sequence += 1
+        return sequence
+
+    def _persisted_review(
+        self,
+        review: PendingReviewRecord,
+    ) -> PendingReviewRecord:
+        if self._store is None:
+            return review
+        return self._store.get_pending_review(review.review_id) or review
 
     def _root_record(self, record: TaskRecord) -> TaskRecord | None:
         if record.root_task_id == record.task_id:
@@ -370,6 +405,7 @@ class TaskManager:
             for task_id, record in unique_records.items()
         }
         review_snapshot = deepcopy(self._pending_reviews)
+        next_review_ingest_sequence = self._next_review_ingest_sequence
         live_run_snapshots = {
             task_id: self._live_runs.snapshot(task_id) for task_id in unique_records
         }
@@ -387,6 +423,7 @@ class TaskManager:
                 self._live_runs.restore(task_id, live_run_snapshots[task_id])
             self._pending_reviews.clear()
             self._pending_reviews.update(review_snapshot)
+            self._next_review_ingest_sequence = next_review_ingest_sequence
             raise
 
     def _clear_pending_review_and_save(self, record: TaskRecord) -> None:
@@ -697,6 +734,10 @@ class TaskManager:
                     else record.updated_at
                 ),
                 updated_at=record.updated_at,
+                ingest_sequence=self._review_ingest_sequence(
+                    current_review,
+                    review_id,
+                ),
             )
             reviews = [
                 item
@@ -715,6 +756,7 @@ class TaskManager:
             )
             if current_review is not None:
                 self._pending_reviews.pop(current_review.review_id, None)
+            review = self._persisted_review(review)
             self._pending_reviews[review.review_id] = review
 
     def mark_completed(self, task_id: str, result: str) -> None:
@@ -883,6 +925,10 @@ class TaskManager:
                     else record.updated_at
                 ),
                 updated_at=record.updated_at,
+                ingest_sequence=self._review_ingest_sequence(
+                    current_review,
+                    review_id,
+                ),
             )
             reviews = [
                 item
@@ -900,6 +946,7 @@ class TaskManager:
             )
             if current_review is not None:
                 self._pending_reviews.pop(current_review.review_id, None)
+            review = self._persisted_review(review)
             self._pending_reviews[review.review_id] = review
         elif current_review is not None:
             remaining = [
