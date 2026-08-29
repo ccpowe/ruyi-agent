@@ -80,6 +80,7 @@ SAFE_ATTACHMENT_CHARS = set(
 )
 DEFAULT_GATEWAY_PRINCIPAL = "gateway-bearer"
 COMMAND_WAIT_TIMEOUT_SECONDS = 30.0
+DEFAULT_REMOTE_LISTING_CONCURRENCY = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +123,10 @@ class GatewayTaskModule:
         attachment_max_bytes: int = DEFAULT_ATTACHMENT_MAX_BYTES,
         artifact_max_bytes: int = DEFAULT_ARTIFACT_MAX_BYTES,
         unavailable_agents: dict[str, str] | None = None,
+        remote_listing_concurrency: int = DEFAULT_REMOTE_LISTING_CONCURRENCY,
     ) -> None:
+        if remote_listing_concurrency <= 0:
+            raise ValueError("remote_listing_concurrency must be positive")
         self._main_agent_name = main_agent_name
         self._agent_configs = agent_configs
         self._control = control
@@ -136,6 +140,7 @@ class GatewayTaskModule:
         self._attachment_max_bytes = attachment_max_bytes
         self._artifact_max_bytes = artifact_max_bytes
         self._unavailable_agents = dict(unavailable_agents or {})
+        self._remote_listing_concurrency = remote_listing_concurrency
 
     def list_agents(self) -> list[AgentRefResponse]:
         """
@@ -750,10 +755,10 @@ class GatewayTaskModule:
 
         查询流程：
         1. 从 route_store 获取所有任务路由
-        2. 对每个路由获取最新任务状态（远程任务会主动刷新）
-        3. 应用过滤条件（agent_name, status, metadata）
-        4. 按更新时间倒序排序
-        5. 分页返回
+        2. 按 Route 上的 agent_name 和 metadata 预过滤
+        3. 以有界并发刷新剩余的远程任务
+        4. 按最新状态和 root_task_id 过滤
+        5. 按更新时间倒序排序并分页返回
 
         Args:
             agent_name: 按 agent 名称过滤
@@ -772,20 +777,23 @@ class GatewayTaskModule:
             )
 
         offset = self._decode_cursor(cursor)
+        routes = [
+            route
+            for route in await self._router.list_routes()
+            if (agent_name is None or route.agent_name == agent_name)
+            and self._metadata_matches(route.metadata, metadata_filters)
+        ]
         items: list[TaskResponse] = []
 
-        # 遍历所有路由，获取任务状态并应用过滤
-        for route in await self._router.list_routes():
-            item = await self._get_task_for_listing(route)
+        # Agent and metadata are durable Route fields, so avoid a remote refresh
+        # when they already exclude the Task. Status and root identity belong to
+        # the fresh Task snapshot and remain post-refresh filters.
+        for _route, item in await self._collect_tasks_for_listing(routes):
             if item is None:  # 任务已被删除
-                continue
-            if agent_name is not None and route.agent_name != agent_name:
                 continue
             if status is not None and item.status != status:
                 continue
             if root_task_id is not None and item.root_task_id != root_task_id:
-                continue
-            if not self._metadata_matches(route.metadata, metadata_filters):
                 continue
             items.append(item)
 
@@ -811,8 +819,8 @@ class GatewayTaskModule:
 
         offset = self._decode_cursor(cursor)
         items: list[ReviewResponse] = []
-        for route in await self._router.list_routes():
-            task = await self._get_task_for_listing(route)
+        routes = await self._router.list_routes()
+        for route, task in await self._collect_tasks_for_listing(routes):
             if task is None or task.pending_review is None:
                 continue
             record = self._router.ensure_record(route)
@@ -831,8 +839,8 @@ class GatewayTaskModule:
         return ReviewListResponse(items=page, next_cursor=next_cursor)
 
     async def get_review(self, review_id: str) -> ReviewResponse:
-        for route in await self._router.list_routes():
-            task = await self._get_task_for_listing(route)
+        routes = await self._router.list_routes()
+        for route, task in await self._collect_tasks_for_listing(routes):
             if task is None or task.pending_review is None:
                 continue
             if task.pending_review.get("review_id") != review_id:
@@ -1127,6 +1135,40 @@ class GatewayTaskModule:
         except GatewayTaskError:
             return None
         return self._build_task_response(record, route.metadata)
+
+    async def _collect_tasks_for_listing(
+        self,
+        routes: list[TaskRouteRecord],
+    ) -> list[tuple[TaskRouteRecord, TaskResponse | None]]:
+        """Collect fresh Task snapshots with bounded remote concurrency.
+
+        Local routes do not perform network I/O and are read immediately. A
+        failed remote refresh keeps the historical listing behavior: that
+        route is omitted by ``_get_task_for_listing`` while healthy Local and
+        Remote Tasks remain available.
+        """
+
+        results: list[tuple[TaskRouteRecord, TaskResponse | None] | None] = [
+            None
+        ] * len(routes)
+        semaphore = asyncio.Semaphore(self._remote_listing_concurrency)
+
+        async def collect_remote(index: int, route: TaskRouteRecord) -> None:
+            async with semaphore:
+                results[index] = (route, await self._get_task_for_listing(route))
+
+        remote_calls: list[Awaitable[None]] = []
+        for index, route in enumerate(routes):
+            if route.route_kind == "remote_ref":
+                remote_calls.append(collect_remote(index, route))
+            else:
+                results[index] = (
+                    route,
+                    await self._get_task_for_listing(route),
+                )
+        if remote_calls:
+            await asyncio.gather(*remote_calls)
+        return [item for item in results if item is not None]
 
     async def handle_task_webhook(self, event: TaskWebhookEvent) -> dict[str, Any]:
         """
