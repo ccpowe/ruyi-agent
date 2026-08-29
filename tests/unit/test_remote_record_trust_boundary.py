@@ -27,6 +27,8 @@ PRIVATE_TASK_ID = "upstream-private-task"
 PRIVATE_URL = f"https://private.invalid/tasks/{PRIVATE_TASK_ID}"
 PRIVATE_ERROR = f"private message for {PRIVATE_TASK_ID} at {PRIVATE_URL}"
 PUBLIC_ERROR = "Remote Gateway Task failed"
+ATTACKER_TASK_ID = "different-private-task"
+ATTACKER_RESULT = "forged result from different-private-task"
 
 
 def _failed_payload() -> dict[str, object]:
@@ -125,6 +127,223 @@ def _assert_no_private_value(value: object) -> None:
     assert PRIVATE_ERROR not in serialized
     assert PRIVATE_URL not in serialized
     assert PRIVATE_TASK_ID not in serialized
+
+
+def _bound_payload(
+    *,
+    task_id: str,
+    status: str,
+    run_count: int,
+    result: str | None = None,
+    review_id: str | None = None,
+) -> dict[str, object]:
+    pending_review: dict[str, object] | None = None
+    if review_id is not None:
+        pending_review = {
+            "review_id": review_id,
+            "source_task_id": task_id,
+            "action_requests": [{"name": "execute"}],
+            "review_configs": [],
+        }
+    return {
+        "task_id": task_id,
+        "agent_name": "remote_code_wiki",
+        "status": status,
+        "last_result": result,
+        "error": None,
+        "run_count": run_count,
+        "created_at": "2026-08-30T00:00:00Z",
+        "updated_at": "2026-08-30T00:00:01Z",
+        "pending_review": pending_review,
+    }
+
+
+def _seed_bound_operation(
+    control: async_subagent_runtime.AgentControl,
+    *,
+    operation: str,
+    task_id: str,
+) -> None:
+    _seed_remote_record(control, task_id=task_id)
+    manager = control._task_manager  # noqa: SLF001
+    if operation == "review":
+        manager.sync_remote_task(
+            task_id,
+            _bound_payload(
+                task_id=PRIVATE_TASK_ID,
+                status="waiting_for_human",
+                run_count=1,
+                review_id="review-1",
+            ),
+        )
+    elif operation == "cancel":
+        manager.sync_remote_task(
+            task_id,
+            _bound_payload(
+                task_id=PRIVATE_TASK_ID,
+                status="running",
+                run_count=1,
+            ),
+        )
+    else:
+        manager.sync_remote_task(
+            task_id,
+            _bound_payload(
+                task_id=PRIVATE_TASK_ID,
+                status="completed",
+                run_count=1,
+                result="original result",
+            ),
+        )
+    if operation == "refresh":
+        manager.begin_external_operation(
+            task_id,
+            operation="send",
+            identity="refresh-reconciliation",
+            allow_replay=True,
+        )
+
+
+@pytest.mark.parametrize("operation", ["refresh", "review", "send", "cancel"])
+@pytest.mark.parametrize("matching_identity", [False, True])
+def test_bound_remote_operation_validates_response_identity_before_sync(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    operation: str,
+    matching_identity: bool,
+) -> None:
+    """Four real A2A paths fence a cross-Task response before persistence."""
+
+    monkeypatch.setenv("REMOTE_CODE_WIKI_TOKEN", "remote-secret")
+
+    async def scenario() -> tuple[object, object, list[dict[str, object]], object]:
+        dispatched = asyncio.Event()
+        release_response = asyncio.Event()
+        requests: list[httpx.Request] = []
+        returned_task_id = (
+            PRIVATE_TASK_ID if matching_identity else ATTACKER_TASK_ID
+        )
+        if matching_identity:
+            status = {
+                "refresh": "completed",
+                "review": "running",
+                "send": "completed",
+                "cancel": "cancelled",
+            }[operation]
+            run_count = 1 if operation == "cancel" else 2
+            payload = _bound_payload(
+                task_id=returned_task_id,
+                status=status,
+                run_count=run_count,
+                result=(
+                    f"verified {operation}"
+                    if operation in {"refresh", "send"}
+                    else None
+                ),
+            )
+        else:
+            payload = _bound_payload(
+                task_id=returned_task_id,
+                status="failed",
+                run_count=99,
+                result=ATTACKER_RESULT,
+                review_id="attacker-review",
+            )
+            payload["error"] = PRIVATE_ERROR
+
+        async def dispatch(request: httpx.Request) -> httpx.Response:
+            assert f"/tasks/{PRIVATE_TASK_ID}" in request.url.path
+            requests.append(request)
+            dispatched.set()
+            await release_response.wait()
+            return httpx.Response(200, json=payload)
+
+        control, task_store, mailbox_store, _mailbox = _control(
+            str(tmp_path / f"identity-{operation}-{matching_identity}.sqlite"),
+            a2a_client=A2AClient(
+                transports={
+                    "https://example.com/a2a": httpx.MockTransport(dispatch),
+                }
+            ),
+        )
+        task_id = f"proxy-{operation}"
+        _seed_bound_operation(control, operation=operation, task_id=task_id)
+        if operation == "refresh":
+            call = control.refresh_task(task_id)
+        elif operation == "review":
+            call = control.submit_review_decision(
+                "review-1",
+                [{"type": "approve"}],
+            )
+        elif operation == "send":
+            call = control.send_task_input(
+                task_id,
+                "continue",
+                idempotency_key="send-1",
+            )
+        else:
+            call = control.cancel_task(task_id)
+        mutation = asyncio.create_task(call)
+        try:
+            await dispatched.wait()
+            before = task_store.get_task(task_id)
+            before_outbox = task_store.list_settled_outbox()
+            assert before is not None
+            release_response.set()
+            if matching_identity:
+                outcome: object = await mutation
+            else:
+                with pytest.raises(ValueError) as raised:
+                    await mutation
+                assert ATTACKER_TASK_ID not in str(raised.value)
+                assert PRIVATE_TASK_ID not in str(raised.value)
+                outcome = raised.value
+            after = task_store.get_task(task_id)
+            after_outbox = task_store.list_settled_outbox()
+            assert after is not None
+            if not matching_identity:
+                assert after == before
+                assert after_outbox == before_outbox
+                assert after.external_operation == {
+                    "refresh": "send",
+                    "review": "review",
+                    "send": "send",
+                    "cancel": "cancel",
+                }[operation]
+                serialized = json.dumps(
+                    {
+                        "record": after,
+                        "outbox": after_outbox,
+                    },
+                    default=str,
+                )
+                assert ATTACKER_TASK_ID not in serialized
+                assert ATTACKER_RESULT not in serialized
+                assert "attacker-review" not in serialized
+                assert PRIVATE_ERROR not in serialized
+            return after, outcome, after_outbox, requests[0]
+        finally:
+            release_response.set()
+            if not mutation.done():
+                mutation.cancel()
+                await asyncio.gather(mutation, return_exceptions=True)
+            await control.close()
+            mailbox_store.close()
+            task_store.close()
+
+    record, outcome, _outbox, request = asyncio.run(scenario())
+    assert isinstance(request, httpx.Request)
+    if matching_identity:
+        assert isinstance(outcome, async_subagent_runtime.TaskRecord)
+        assert record.external_operation is None
+        assert record.external_outcome_uncertain is False
+        assert record.upstream_task_id == PRIVATE_TASK_ID
+        assert record.state == {
+            "refresh": "completed",
+            "review": "running",
+            "send": "completed",
+            "cancel": "cancelled",
+        }[operation]
 
 
 def test_remote_refresh_sanitizes_record_and_sqlite_outbox_before_persistence(

@@ -157,6 +157,23 @@ def _validate_remote_task_state(
     return status, run_count
 
 
+class RemoteTaskIdentityMismatchError(ValueError):
+    """A bound upstream returned a Task other than the one requested."""
+
+
+def _validate_remote_task_identity(
+    task_id: str,
+    expected_upstream_task_id: str,
+    payload: dict[str, Any],
+) -> None:
+    """Reject a cross-Task response without echoing either private identity."""
+
+    if payload.get("task_id") != expected_upstream_task_id:
+        raise RemoteTaskIdentityMismatchError(
+            f"Remote task '{task_id}' returned a mismatched task_id"
+        )
+
+
 def _flatten_exception_messages(exc: BaseException) -> list[str]:
     """
     展开异常或异常组中的可读错误信息

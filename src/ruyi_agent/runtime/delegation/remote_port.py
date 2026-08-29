@@ -20,7 +20,9 @@ from ruyi_agent.runtime.delegation.context import (
     inject_context_metadata,
 )
 from ruyi_agent.runtime.delegation.contracts import (
+    RemoteTaskIdentityMismatchError,
     UnknownWorkerTaskError,
+    _validate_remote_task_identity,
     _validate_remote_task_state,
 )
 from ruyi_agent.runtime.delegation.registry import RemoteRefEntry
@@ -182,6 +184,7 @@ class RemoteTaskPort:
     ) -> TaskRecord:
         """Forward a review decision and synchronize the local proxy record."""
         entry = self._get_remote_entry_for_task(record.task_id)
+        upstream_task_id = record.upstream_task_id or record.task_id
         self._control._task_manager.begin_external_operation(
             record.task_id,
             operation="review",
@@ -190,11 +193,20 @@ class RemoteTaskPort:
         try:
             payload = await self._control._a2a_client.submit_review_decision(
                 entry.ref,
-                task_id=record.upstream_task_id or record.task_id,
+                task_id=upstream_task_id,
                 review_id=review_id,
                 decisions=decisions,
             )
+            _validate_remote_task_identity(
+                record.task_id,
+                upstream_task_id,
+                payload,
+            )
             _validate_remote_task_state(record.task_id, payload)
+        except RemoteTaskIdentityMismatchError:
+            # The durable request remains unresolved, but no field from a
+            # different upstream Task may enter the local proxy record.
+            raise
         except asyncio.CancelledError:
             self._mark_external_outcome_uncertain(
                 record.task_id,
@@ -222,9 +234,10 @@ class RemoteTaskPort:
     ) -> TaskRecord:
         """Forward input to one remote task and synchronize its proxy."""
         entry = self._get_remote_entry_for_task(record.task_id)
+        upstream_task_id = record.upstream_task_id or record.task_id
         operation_identity = idempotency_key or f"ruyi-send:{uuid.uuid4().hex}"
         send_kwargs: dict[str, Any] = {
-            "task_id": record.upstream_task_id or record.task_id,
+            "task_id": upstream_task_id,
             "input_content": message,
             "attachments": attachments,
             "idempotency_key": operation_identity,
@@ -241,7 +254,14 @@ class RemoteTaskPort:
             payload = await self._control._a2a_client.send_input(
                 entry.ref, **send_kwargs
             )
+            _validate_remote_task_identity(
+                record.task_id,
+                upstream_task_id,
+                payload,
+            )
             _validate_remote_task_state(record.task_id, payload)
+        except RemoteTaskIdentityMismatchError:
+            raise
         except asyncio.CancelledError:
             self._mark_external_outcome_uncertain(
                 record.task_id,
@@ -262,7 +282,8 @@ class RemoteTaskPort:
     async def cancel(self, record: TaskRecord) -> TaskRecord:
         """Cancel the active run represented by one remote proxy record."""
         entry = self._get_remote_entry_for_task(record.task_id)
-        operation_identity = record.upstream_task_id or record.task_id
+        upstream_task_id = record.upstream_task_id or record.task_id
+        operation_identity = upstream_task_id
         self._control._task_manager.begin_external_operation(
             record.task_id,
             operation="cancel",
@@ -271,9 +292,16 @@ class RemoteTaskPort:
         try:
             payload = await self._control._a2a_client.cancel_task(
                 entry.ref,
-                task_id=operation_identity,
+                task_id=upstream_task_id,
+            )
+            _validate_remote_task_identity(
+                record.task_id,
+                upstream_task_id,
+                payload,
             )
             _validate_remote_task_state(record.task_id, payload)
+        except RemoteTaskIdentityMismatchError:
+            raise
         except asyncio.CancelledError:
             self._mark_external_outcome_uncertain(
                 record.task_id,
@@ -373,6 +401,7 @@ class RemoteTaskPort:
         record = self._control._task_manager.get_task(task_id)
         upstream_task_id = record.upstream_task_id or task_id
         payload = await self._control._a2a_client.get_task(entry.ref, task_id=upstream_task_id)
+        _validate_remote_task_identity(task_id, upstream_task_id, payload)
         return self._control._task_manager.sync_remote_task(task_id, payload)
 
     async def _refresh_remote_task_with_retries(self, task_id: str) -> TaskRecord:
