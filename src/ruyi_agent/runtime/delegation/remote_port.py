@@ -28,6 +28,28 @@ from ruyi_agent.task_models import TaskRecord
 
 logger = logging.getLogger(__name__)
 
+_AUTHORITATIVE_REJECTION_CODES = frozenset(
+    {
+        "agent_not_found",
+        "agent_not_public",
+        "idempotency_key_reused",
+        "invalid_request",
+        "review_not_found",
+        "review_task_mismatch",
+        "task_already_running",
+        "task_not_found",
+        "unauthorized",
+    }
+)
+
+
+def _is_authoritative_rejection(exc: Exception) -> bool:
+    return (
+        isinstance(exc, A2AClientError)
+        and 400 <= exc.status_code < 500
+        and exc.code in _AUTHORITATIVE_REJECTION_CODES
+    )
+
 
 class RemoteTaskHost(Protocol):
     _a2a_client: Any
@@ -71,9 +93,9 @@ class RemoteTaskPort:
     ) -> TaskRecord:
         """Allocate one remote task and bind its upstream identity locally.
 
-        Failure semantics intentionally match the legacy control path: once a
-        local proxy record exists, allocation failure settles that record as
-        failed before the transport exception is re-raised.
+        An explicit pre-effect rejection settles the local proxy as failed.
+        Transport loss, server failures, cancellation, and malformed responses
+        retain a durable uncertain create intent for later reconciliation.
         """
         create_kwargs: dict[str, Any] = {
             "input_content": input_content,
@@ -91,6 +113,7 @@ class RemoteTaskPort:
             record.task_id,
             operation="create",
             identity=idempotency_key,
+            allow_replay=entry.ref.create_idempotency == "ruyi_gateway_v1",
         )
         try:
             payload = await self._control._a2a_client.create_task(
@@ -109,13 +132,18 @@ class RemoteTaskPort:
                 identity=idempotency_key,
             )
             raise
-        except Exception:
-            self._control._task_manager.clear_external_operation(record.task_id)
-            self._control._task_manager.mark_failed(
+        except Exception as exc:
+            if self._handle_remote_operation_failure(
                 record.task_id,
-                "Remote Gateway Task creation failed",
-            )
-            self._control._maybe_publish_settled_message(record.task_id)
+                operation="create",
+                identity=idempotency_key,
+                exc=exc,
+            ):
+                self._control._task_manager.mark_failed(
+                    record.task_id,
+                    "Remote Gateway Task creation failed",
+                )
+                self._control._maybe_publish_settled_message(record.task_id)
             raise
         synced = self._control._task_manager.bind_and_sync_remote_task(
             record.task_id,
@@ -147,6 +175,7 @@ class RemoteTaskPort:
                 review_id=review_id,
                 decisions=decisions,
             )
+            _validate_remote_task_state(record.task_id, payload)
         except asyncio.CancelledError:
             self._mark_external_outcome_uncertain(
                 record.task_id,
@@ -154,8 +183,13 @@ class RemoteTaskPort:
                 identity=review_id,
             )
             raise
-        except Exception:
-            self._control._task_manager.clear_external_operation(record.task_id)
+        except Exception as exc:
+            self._handle_remote_operation_failure(
+                record.task_id,
+                operation="review",
+                identity=review_id,
+                exc=exc,
+            )
             raise
         return self._control._task_manager.sync_remote_task(record.task_id, payload)
 
@@ -169,23 +203,26 @@ class RemoteTaskPort:
     ) -> TaskRecord:
         """Forward input to one remote task and synchronize its proxy."""
         entry = self._get_remote_entry_for_task(record.task_id)
-        operation_identity = idempotency_key or f"{record.task_id}:send:{uuid.uuid4()}"
+        operation_identity = idempotency_key or f"ruyi-send:{uuid.uuid4().hex}"
         send_kwargs: dict[str, Any] = {
             "task_id": record.upstream_task_id or record.task_id,
             "input_content": message,
             "attachments": attachments,
+            "idempotency_key": operation_identity,
         }
-        if idempotency_key is not None:
-            send_kwargs["idempotency_key"] = idempotency_key
         self._control._task_manager.begin_external_operation(
             record.task_id,
             operation="send",
             identity=operation_identity,
+            # Gateway input commands are idempotent under the forwarded key;
+            # retrying that exact durable identity reconciles a lost response.
+            allow_replay=True,
         )
         try:
             payload = await self._control._a2a_client.send_input(
                 entry.ref, **send_kwargs
             )
+            _validate_remote_task_state(record.task_id, payload)
         except asyncio.CancelledError:
             self._mark_external_outcome_uncertain(
                 record.task_id,
@@ -193,8 +230,13 @@ class RemoteTaskPort:
                 identity=operation_identity,
             )
             raise
-        except Exception:
-            self._control._task_manager.clear_external_operation(record.task_id)
+        except Exception as exc:
+            self._handle_remote_operation_failure(
+                record.task_id,
+                operation="send",
+                identity=operation_identity,
+                exc=exc,
+            )
             raise
         return self._control._task_manager.sync_remote_task(record.task_id, payload)
 
@@ -212,6 +254,7 @@ class RemoteTaskPort:
                 entry.ref,
                 task_id=operation_identity,
             )
+            _validate_remote_task_state(record.task_id, payload)
         except asyncio.CancelledError:
             self._mark_external_outcome_uncertain(
                 record.task_id,
@@ -219,8 +262,13 @@ class RemoteTaskPort:
                 identity=operation_identity,
             )
             raise
-        except Exception:
-            self._control._task_manager.clear_external_operation(record.task_id)
+        except Exception as exc:
+            self._handle_remote_operation_failure(
+                record.task_id,
+                operation="cancel",
+                identity=operation_identity,
+                exc=exc,
+            )
             raise
         return self._control._task_manager.sync_remote_task(record.task_id, payload)
 
@@ -243,6 +291,30 @@ class RemoteTaskPort:
                 operation,
                 task_id,
             )
+
+    def _handle_remote_operation_failure(
+        self,
+        task_id: str,
+        *,
+        operation: str,
+        identity: str,
+        exc: Exception,
+    ) -> bool:
+        """Return true only when the remote authoritatively rejected the effect."""
+
+        if _is_authoritative_rejection(exc):
+            self._control._task_manager.reject_external_operation(
+                task_id,
+                operation=operation,
+                identity=identity,
+            )
+            return True
+        self._mark_external_outcome_uncertain(
+            task_id,
+            operation=operation,
+            identity=identity,
+        )
+        return False
 
     def _get_remote_entry_for_task(self, task_id: str) -> RemoteRefEntry:
         """

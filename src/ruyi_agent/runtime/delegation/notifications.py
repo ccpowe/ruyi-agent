@@ -43,7 +43,11 @@ class SettledRunNotifier:
         return self._last_error
 
     def _is_settled_record(self, record: TaskRecord) -> bool:
-        return record.state in SETTLED_TASK_STATES
+        return (
+            record.state in SETTLED_TASK_STATES
+            and record.external_operation is None
+            and not record.external_outcome_uncertain
+        )
 
     def _maybe_publish_settled_message(self, task_id: str) -> None:
         """Attempt immediate delivery without making Task execution depend on it."""

@@ -109,10 +109,7 @@ class TaskManager:
             current = self._tasks.get(stored.task_id)
             if current is not None and self._has_live_active_run(current):
                 continue
-            record = task_record_for_restart(stored)
-            self._tasks[record.task_id] = record
-            if record.state != stored.state or record.error != stored.error:
-                self._save_lifecycle(record)
+            self._restore_stored_record(stored)
 
     def load_task_for_parent_thread(
         self,
@@ -137,11 +134,7 @@ class TaskManager:
         current = self._tasks.get(stored.task_id)
         if current is not None and self._has_live_active_run(current):
             return current
-        record = task_record_for_restart(stored)
-        self._tasks[record.task_id] = record
-        if record.state != stored.state or record.error != stored.error:
-            self._save_lifecycle(record)
-        return record
+        return self._restore_stored_record(stored)
 
     def load_task_by_id(self, task_id: str) -> TaskRecord | None:
         """
@@ -158,9 +151,14 @@ class TaskManager:
         current = self._tasks.get(stored.task_id)
         if current is not None and self._has_live_active_run(current):
             return current
+        return self._restore_stored_record(stored)
+
+    def _restore_stored_record(self, stored: TaskRecord) -> TaskRecord:
         record = task_record_for_restart(stored)
         self._tasks[record.task_id] = record
-        if record.state != stored.state or record.error != stored.error:
+        if record.external_operation is not None:
+            self._save_uncertain_external_operation(record)
+        elif record.state != stored.state or record.error != stored.error:
             self._save_lifecycle(record)
         return record
 
@@ -190,6 +188,17 @@ class TaskManager:
         """把当前任务记录写入持久化存储"""
         if self._store is not None:
             self._store.update_task(record)
+
+    def _save_uncertain_external_operation(self, record: TaskRecord) -> None:
+        if self._store is not None:
+            self._store.update_uncertain_external_operation(record)
+
+    def _save_rejected_external_operation(self, record: TaskRecord) -> None:
+        if self._store is not None:
+            self._store.update_rejected_external_operation(
+                record,
+                settled_outbox_intent=self._settled_outbox_intent(record),
+            )
 
     def _save_lifecycle(self, record: TaskRecord) -> None:
         """Atomically persist one public lifecycle transition and its event."""
@@ -594,10 +603,7 @@ class TaskManager:
             current = self._tasks.get(stored.task_id)
             if current is not None and self._has_live_active_run(current):
                 continue
-            record = task_record_for_restart(stored)
-            self._tasks[record.task_id] = record
-            if record.state != stored.state or record.error != stored.error:
-                self._save_lifecycle(record)
+            self._restore_stored_record(stored)
         return self.list_tasks()
 
     def find_by_review_id(self, review_id: str) -> TaskRecord | None:
@@ -833,16 +839,29 @@ class TaskManager:
         *,
         operation: str,
         identity: str,
+        allow_replay: bool = False,
     ) -> None:
         remote_reconciliation.begin_external_operation(
             self,
             task_id,
             operation=operation,
             identity=identity,
+            allow_replay=allow_replay,
         )
 
-    def clear_external_operation(self, task_id: str) -> None:
-        remote_reconciliation.clear_external_operation(self, task_id)
+    def reject_external_operation(
+        self,
+        task_id: str,
+        *,
+        operation: str,
+        identity: str,
+    ) -> None:
+        remote_reconciliation.reject_external_operation(
+            self,
+            task_id,
+            operation=operation,
+            identity=identity,
+        )
 
     def mark_external_outcome_uncertain(
         self,

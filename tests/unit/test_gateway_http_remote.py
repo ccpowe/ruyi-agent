@@ -29,8 +29,11 @@ from ruyi_agent.gateway.models import TaskRouteRecord
 from ruyi_agent.gateway.commands import command_request_hash
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.channels.http.routes import create_gateway_app
+from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
 from ruyi_agent.storage.gateway_command_store import GatewayCommandStore
+from ruyi_agent.storage.mailbox_store import MailboxStore
+from ruyi_agent.storage.task_store import TaskStore
 from tests.unit.gateway_http_support import (
     DelayedAgentFactory,
     FailOnceGatewayCommandStore,
@@ -214,11 +217,15 @@ def test_cancelled_remote_http_create_is_terminal_across_restart(
 
 def test_remote_ref_forwards_via_a2a(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("REMOTE_CODE_WIKI_TOKEN", "remote-secret")
     remote_factory = DelayedAgentFactory(delay=0.03)
     monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", remote_factory)
 
+    remote_db = str(tmp_path / "remote-tasks.sqlite")
+    remote_task_store = TaskStore(remote_db)
+    remote_mailbox_store = MailboxStore(remote_db)
     remote_control = async_subagent_runtime.AgentControl(
         {
             "code_wiki": LocalWorkerSpec(
@@ -234,6 +241,8 @@ def test_remote_ref_forwards_via_a2a(
         {},
         checkpointer=object(),
         backend=object(),
+        task_store=remote_task_store,
+        mailbox=AgentMailbox(remote_mailbox_store),
     )
     remote_service = GatewayTaskModule(
         main_agent_name="code_wiki",
@@ -313,6 +322,8 @@ def test_remote_ref_forwards_via_a2a(
         assert len(items) == 1
         assert items[0]["task_id"] == proxy_task_id
         assert items[0]["agent_name"] == "remote_code_wiki"
+    remote_task_store.close()
+    remote_mailbox_store.close()
 
 
 def test_public_remote_ref_create_injects_delegation_context_metadata(
@@ -406,9 +417,9 @@ def test_public_remote_ref_maps_unhashable_status_to_upstream_error(
     assert factory.control is not None
     records = factory.control.list_task_records()
     assert len(records) == 1
-    assert records[0].state == "failed"
+    assert records[0].state == "interrupted"
     assert records[0].upstream_task_id is None
-    assert records[0].error == "Remote Gateway Task creation failed"
+    assert records[0].external_outcome_uncertain is True
 
 
 def test_remote_response_lost_is_terminal_across_restart_and_queryable(

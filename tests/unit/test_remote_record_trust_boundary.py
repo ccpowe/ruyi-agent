@@ -223,7 +223,9 @@ def test_remote_webhook_sanitizes_record_outbox_mailbox_and_caller_webhook(
     )
 
 
-def test_remote_allocation_failure_persists_only_static_error(tmp_path) -> None:
+def test_ambiguous_remote_allocation_failure_persists_only_static_error(
+    tmp_path,
+) -> None:
     control, task_store, mailbox_store, _mailbox = _control(
         str(tmp_path / "allocation.sqlite"),
         a2a_client=MaliciousCreateFailureClient(),
@@ -247,11 +249,12 @@ def test_remote_allocation_failure_persists_only_static_error(tmp_path) -> None:
         mailbox_store.close()
         task_store.close()
 
-    assert (
-        durable is not None and durable.error == "Remote Gateway Task creation failed"
-    )
-    assert len(outbox) == 1
-    assert outbox[0]["content"] == "Remote Gateway Task creation failed"
+    assert durable is not None
+    assert durable.state == "interrupted"
+    assert durable.error == "Remote create outcome is uncertain; refresh is required"
+    assert durable.external_operation == "create"
+    assert durable.external_outcome_uncertain is True
+    assert outbox == []
     _assert_no_private_value(
         {
             "record": {"error": durable.error, "thread_id": durable.thread_id},

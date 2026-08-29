@@ -101,7 +101,13 @@ class MailboxStore:
                           FROM agent_tasks AS task
                           WHERE task.task_id = outbox.task_id
                             AND task.run_count = outbox.run_count
-                            AND task.mailbox_suppressed = 1
+                            AND (
+                                task.mailbox_suppressed = 1
+                                OR (
+                                    task.external_operation IS NOT NULL
+                                    AND task.external_outcome_uncertain = 1
+                                )
+                            )
                       )
                     """,
                     (intent.outbox_key, intent.claim_token),

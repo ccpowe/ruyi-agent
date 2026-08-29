@@ -363,55 +363,52 @@ def test_remote_create_error_and_persisted_route_never_leak_downstream_identity(
 def test_all_remote_proxy_http_errors_rewrite_to_public_route_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    remote = LeakingRemoteA2AClient()
-    app, _ = build_app(monkeypatch, a2a_client=remote)  # type: ignore[arg-type]
-
-    with TestClient(app) as client:
-        created = client.post(
-            "/agents/remote_code_wiki/tasks",
-            headers=auth_headers(),
-            json={"input": {"content": "pending review"}, "metadata": {}},
-        )
-        public_task_id = created.json()["task_id"]
-        assert public_task_id != remote.private_task_id
-
-        requests = []
-        remote.fail_operation = "get"
-        requests.append(client.get(f"/tasks/{public_task_id}", headers=auth_headers()))
-        remote.fail_operation = "send"
-        requests.append(
-            client.post(
-                f"/tasks/{public_task_id}/input",
+    results = []
+    for operation in ("get", "send", "cancel", "messages", "review", "events"):
+        remote = LeakingRemoteA2AClient()
+        app, _ = build_app(monkeypatch, a2a_client=remote)  # type: ignore[arg-type]
+        with TestClient(app) as client:
+            created = client.post(
+                "/agents/remote_code_wiki/tasks",
                 headers=auth_headers(),
-                json={"input": {"content": "continue"}},
+                json={"input": {"content": "pending review"}, "metadata": {}},
             )
-        )
-        remote.fail_operation = "cancel"
-        requests.append(
-            client.post(f"/tasks/{public_task_id}/cancel", headers=auth_headers())
-        )
-        remote.fail_operation = "messages"
-        requests.append(
-            client.get(f"/tasks/{public_task_id}/messages", headers=auth_headers())
-        )
-        remote.fail_operation = "review"
-        requests.append(
-            client.post(
-                f"/tasks/{public_task_id}/reviews/remote-review-1/decision",
-                headers=auth_headers(),
-                json={"decisions": [{"type": "approve"}]},
-            )
-        )
-        remote.fail_operation = "events"
-        requests.append(
-            client.get(
-                f"/tasks/{public_task_id}/events?run_count=1",
-                headers=auth_headers(),
-            )
-        )
+            public_task_id = created.json()["task_id"]
+            assert public_task_id != remote.private_task_id
+            remote.fail_operation = operation
+            if operation == "get":
+                response = client.get(
+                    f"/tasks/{public_task_id}", headers=auth_headers()
+                )
+            elif operation == "send":
+                response = client.post(
+                    f"/tasks/{public_task_id}/input",
+                    headers=auth_headers(),
+                    json={"input": {"content": "continue"}},
+                )
+            elif operation == "cancel":
+                response = client.post(
+                    f"/tasks/{public_task_id}/cancel", headers=auth_headers()
+                )
+            elif operation == "messages":
+                response = client.get(
+                    f"/tasks/{public_task_id}/messages", headers=auth_headers()
+                )
+            elif operation == "review":
+                response = client.post(
+                    f"/tasks/{public_task_id}/reviews/remote-review-1/decision",
+                    headers=auth_headers(),
+                    json={"decisions": [{"type": "approve"}]},
+                )
+            else:
+                response = client.get(
+                    f"/tasks/{public_task_id}/events?run_count=1",
+                    headers=auth_headers(),
+                )
+        results.append((response, public_task_id, remote))
 
-    assert {response.status_code for response in requests} == {502}
-    for response in requests:
+    assert {response.status_code for response, _, _ in results} == {502}
+    for response, public_task_id, remote in results:
         assert remote.private_task_id not in response.text
         assert "remote.invalid" not in response.text
         assert response.json()["error"]["details"]["task_id"] == public_task_id

@@ -101,6 +101,7 @@ class TaskRecord:
     artifacts: list[PublishedArtifact] = field(default_factory=list)
     external_operation: str | None = None
     external_operation_identity: str | None = None
+    external_operation_run_count: int | None = None
     external_outcome_uncertain: bool = False
 
 

@@ -208,6 +208,7 @@ class StaticRemoteA2AClient:
         self.created_idempotency_keys: list[str | None] = []
         self.sent_inputs: list[str] = []
         self.sent_attachments: list[list[dict[str, object]] | None] = []
+        self.sent_idempotency_keys: list[str | None] = []
         self.cancelled: list[str] = []
 
     async def create_task(
@@ -254,9 +255,11 @@ class StaticRemoteA2AClient:
         task_id: str,
         input_content: str,
         attachments: list[dict[str, object]] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, object]:
         self.sent_inputs.append(input_content)
         self.sent_attachments.append(attachments)
+        self.sent_idempotency_keys.append(idempotency_key)
         return {
             "task_id": task_id,
             "agent_name": remote_ref.name,

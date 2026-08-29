@@ -22,7 +22,9 @@ from ruyi_agent.gateway.routing import _encode_task_message_cursor
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.integrations.a2a.client import A2AClient
 from ruyi_agent.runtime.delegation.async_runtime import AgentControl
+from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
+from ruyi_agent.storage.mailbox_store import MailboxStore
 from ruyi_agent.storage.task_store import TaskStore
 
 
@@ -343,7 +345,9 @@ def test_remote_message_history_preserves_downstream_snapshot_cursor(
     monkeypatch.setenv("REMOTE_HISTORY_TOKEN", "downstream-secret")
 
     async def scenario() -> None:
-        downstream_task_store = TaskStore(str(tmp_path / "downstream-tasks.sqlite"))
+        downstream_db = str(tmp_path / "downstream-tasks.sqlite")
+        downstream_task_store = TaskStore(downstream_db)
+        downstream_mailbox_store = MailboxStore(downstream_db)
         downstream_route_store = GatewayRouteStore(
             str(tmp_path / "downstream-routes.sqlite")
         )
@@ -359,6 +363,7 @@ def test_remote_message_history_preserves_downstream_snapshot_cursor(
                 checkpointer=downstream_saver,
                 backend=StateBackend(),
                 task_store=downstream_task_store,
+                mailbox=AgentMailbox(downstream_mailbox_store),
                 node_id="node-downstream",
             )
             downstream_service = GatewayTaskModule(
@@ -486,6 +491,7 @@ def test_remote_message_history_preserves_downstream_snapshot_cursor(
                 upstream_route_store.close()
                 upstream_task_store.close()
                 downstream_route_store.close()
+                downstream_mailbox_store.close()
                 downstream_task_store.close()
 
     asyncio.run(scenario())

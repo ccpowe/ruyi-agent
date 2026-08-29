@@ -43,6 +43,7 @@ TASK_WRITE_COLUMNS = (
     "artifacts_json",
     "external_operation",
     "external_operation_identity",
+    "external_operation_run_count",
     "external_outcome_uncertain",
 )
 TASK_SELECT_COLUMNS = ", ".join(TASK_WRITE_COLUMNS)
@@ -133,6 +134,7 @@ def task_record_values(record: TaskRecord) -> tuple[Any, ...]:
         ),
         record.external_operation,
         record.external_operation_identity,
+        record.external_operation_run_count,
         int(record.external_outcome_uncertain),
     )
 
@@ -179,7 +181,8 @@ def row_to_task_record(row: tuple[Any, ...]) -> TaskRecord:
         artifacts=_parse_artifacts(row[27]),
         external_operation=row[28],
         external_operation_identity=row[29],
-        external_outcome_uncertain=bool(row[30]),
+        external_operation_run_count=row[30],
+        external_outcome_uncertain=bool(row[31]),
     )
 
 

@@ -159,11 +159,12 @@ class HangingRemoteOperationClient:
 
     async def get_task(self, remote_ref: Any, *, task_id: str) -> dict[str, Any]:
         self.get_calls += 1
+        status = "cancelled" if self.operation == "cancel" else "completed"
         return {
             "task_id": task_id,
             "agent_name": remote_ref.name,
-            "status": "completed",
-            "last_result": "reconciled",
+            "status": status,
+            "last_result": "reconciled" if status == "completed" else None,
             "error": None,
             "run_count": 2,
             "created_at": "2026-08-30T00:00:00Z",
@@ -1044,7 +1045,9 @@ async def test_cancelled_remote_mutation_is_durable_and_refresh_reconciles(
     assert uncertain.external_outcome_uncertain is True
 
     reconciled = await control.refresh_task(record.task_id)
-    assert reconciled.state == "completed"
+    assert reconciled.state == (
+        "cancelled" if operation == "cancel" else "completed"
+    )
     assert reconciled.external_operation is None
     assert reconciled.external_operation_identity is None
     assert reconciled.external_outcome_uncertain is False

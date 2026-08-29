@@ -653,9 +653,9 @@ class FailOnceRemoteCreateA2AClient:
         self.idempotency_keys.append(idempotency_key)
         if len(self.idempotency_keys) == 1:
             raise A2AClientError(
-                status_code=503,
-                code="upstream_unavailable",
-                message="remote create outcome is unknown",
+                status_code=400,
+                code="invalid_request",
+                message="remote create was authoritatively rejected",
             )
         return {
             "task_id": "remote-task-replayed",

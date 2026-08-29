@@ -105,6 +105,36 @@ class TaskStore:
 
         self._tasks.update(record)
 
+    def update_uncertain_external_operation(self, record: TaskRecord) -> None:
+        """Persist remote uncertainty and fence legacy invalid settlements."""
+
+        with self._database.transaction(immediate=True) as connection:
+            self._tasks.update_locked(connection, record)
+            outcomes = self._settled_outbox.discard_invalid_uncertain_locked(
+                connection,
+                task_id=record.task_id,
+            )
+            delivered = outcomes.get((record.task_id, record.run_count))
+            if delivered is not None and record.mailbox_delivered != delivered:
+                record.mailbox_delivered = delivered
+                self._tasks.update_locked(connection, record)
+
+    def update_rejected_external_operation(
+        self,
+        record: TaskRecord,
+        *,
+        settled_outbox_intent: SettledOutboxIntent | None,
+    ) -> None:
+        """Clear a rejected intent and restore its pre-effect settlement."""
+
+        with self._database.transaction(immediate=True) as connection:
+            self._tasks.update_locked(connection, record)
+            if settled_outbox_intent is not None:
+                self._settled_outbox.insert_locked(
+                    connection,
+                    settled_outbox_intent,
+                )
+
     def update_task_with_event(
         self,
         record: TaskRecord,
@@ -319,6 +349,24 @@ class TaskStore:
 
 
 def task_record_for_restart(record: TaskRecord) -> TaskRecord:
+    if record.route_kind == "remote_ref" and record.external_operation is not None:
+        operation = record.external_operation
+        error = f"Remote {operation} outcome is uncertain; refresh is required"
+        if (
+            record.state == "interrupted"
+            and record.result is None
+            and record.error == error
+            and record.external_outcome_uncertain
+        ):
+            return record
+        return replace(
+            record,
+            state="interrupted",
+            updated_at=datetime.now(UTC),
+            result=None,
+            error=error,
+            external_outcome_uncertain=True,
+        )
     if record.route_kind == "local" and record.state in EXECUTING_TASK_STATES:
         return replace(
             record,

@@ -23,25 +23,61 @@ def begin_external_operation(
     *,
     operation: str,
     identity: str,
+    allow_replay: bool = False,
 ) -> None:
     record = manager.get_task(task_id)
+    normalized_operation = normalize_task_event_text(operation)
+    normalized_identity = normalize_task_event_text(identity)
+    if record.external_operation is not None:
+        if (
+            allow_replay
+            and record.external_outcome_uncertain
+            and record.external_operation == normalized_operation
+            and record.external_operation_identity == normalized_identity
+        ):
+            return
+        raise RuntimeError(
+            f"Task '{task_id}' has an unresolved remote "
+            f"{record.external_operation} operation"
+        )
     root = manager._root_record(record)
     with manager._review_memory_transaction(record, root):
-        record.external_operation = normalize_task_event_text(operation)
-        record.external_operation_identity = normalize_task_event_text(identity)
-        record.external_outcome_uncertain = False
+        record.external_operation = normalized_operation
+        record.external_operation_identity = normalized_identity
+        record.external_operation_run_count = record.run_count
+        # A durable in-flight request is unknown after process loss. Successful
+        # effect evidence or an authoritative rejection is required to clear it.
+        record.external_outcome_uncertain = True
         record.updated_at = _now()
-        manager._save(record)
+        manager._save_uncertain_external_operation(record)
 
 
-def clear_external_operation(manager: Any, task_id: str) -> None:
+def reject_external_operation(
+    manager: Any,
+    task_id: str,
+    *,
+    operation: str,
+    identity: str,
+) -> None:
+    """Clear an intent only after its matching request was rejected pre-effect."""
+
     record = manager.get_task(task_id)
+    normalized_operation = normalize_task_event_text(operation)
+    normalized_identity = normalize_task_event_text(identity)
+    if (
+        record.external_operation != normalized_operation
+        or record.external_operation_identity != normalized_identity
+    ):
+        raise RuntimeError(
+            f"Task '{task_id}' external operation identity changed before rejection"
+        )
     root = manager._root_record(record)
     with manager._review_memory_transaction(record, root):
         record.external_operation = None
         record.external_operation_identity = None
+        record.external_operation_run_count = None
         record.external_outcome_uncertain = False
-        manager._save(record)
+        manager._save_rejected_external_operation(record)
 
 
 def mark_external_outcome_uncertain(
@@ -54,15 +90,14 @@ def mark_external_outcome_uncertain(
     record = manager.get_task(task_id)
     root = manager._root_record(record)
     with manager._review_memory_transaction(record, root):
-        record.state = "interrupted"
-        record.error = normalize_task_event_text(
-            f"Remote {operation} outcome is uncertain; refresh is required"
-        )
+        _mark_record_uncertain(record, operation=operation)
         record.external_operation = normalize_task_event_text(operation)
         record.external_operation_identity = normalize_task_event_text(identity)
+        if record.external_operation_run_count is None:
+            record.external_operation_run_count = record.run_count
         record.external_outcome_uncertain = True
         record.updated_at = _now()
-        manager._clear_pending_review_and_save(record)
+        manager._save_uncertain_external_operation(record)
 
 
 def bind_uncertain_remote_task(
@@ -130,6 +165,17 @@ def sync_remote_task(
     previous_run_count = record.run_count
     status, run_count = _validate_remote_task_state(task_id, payload)
 
+    if record.external_operation is not None and not _effect_is_proven(
+        record,
+        payload=payload,
+        status=status,
+        run_count=run_count,
+    ):
+        _mark_record_uncertain(record, operation=record.external_operation)
+        record.updated_at = _now()
+        manager._save_uncertain_external_operation(record)
+        return record
+
     last_result = payload.get("last_result")
     error = payload.get("error")
     pending_review = payload.get("pending_review")
@@ -143,6 +189,7 @@ def sync_remote_task(
         public_pending_review["source_task_id"] = record.task_id
     record.external_operation = None
     record.external_operation_identity = None
+    record.external_operation_run_count = None
     record.external_outcome_uncertain = False
     record.state = status
     record.thread_id = record.task_id
@@ -239,3 +286,49 @@ def sync_remote_task(
     else:
         manager._save(record)
     return record
+
+
+def _mark_record_uncertain(record: TaskRecord, *, operation: str) -> None:
+    record.state = "interrupted"
+    record.result = None
+    record.error = normalize_task_event_text(
+        f"Remote {operation} outcome is uncertain; refresh is required"
+    )
+
+
+def _effect_is_proven(
+    record: TaskRecord,
+    *,
+    payload: dict[str, Any],
+    status: str,
+    run_count: int,
+) -> bool:
+    operation = record.external_operation
+    identity = record.external_operation_identity
+    base_run_count = record.external_operation_run_count
+    if operation == "create":
+        upstream_task_id = record.upstream_task_id
+        return (
+            isinstance(upstream_task_id, str)
+            and bool(upstream_task_id)
+            and payload.get("task_id") == upstream_task_id
+        )
+    if base_run_count is None:
+        return False
+    if operation == "send":
+        return run_count > base_run_count
+    if operation == "review":
+        pending_review = payload.get("pending_review")
+        pending_review_id = (
+            pending_review.get("review_id")
+            if isinstance(pending_review, dict)
+            else None
+        )
+        return (
+            status != "waiting_for_human"
+            and run_count > base_run_count
+            and pending_review_id != identity
+        )
+    if operation == "cancel":
+        return status == "cancelled"
+    return False

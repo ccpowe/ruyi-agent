@@ -52,6 +52,8 @@ def build_settled_outbox_intent(record: TaskRecord) -> SettledOutboxIntent | Non
         or record.parent_thread_id is None
         or record.mailbox_suppressed
         or record.mailbox_delivered
+        or record.external_operation is not None
+        or record.external_outcome_uncertain
     ):
         return None
     key = settled_outbox_key(
@@ -144,6 +146,98 @@ class SettledOutboxRepository:
             )
         return cursor.rowcount == 1
 
+    @staticmethod
+    def discard_invalid_uncertain_locked(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str | None = None,
+    ) -> dict[tuple[str, int], bool]:
+        """Fence legacy settlements that projected an uncertain remote effect.
+
+        Pending and claimed mailbox rows have not crossed the durable delivery
+        boundary and can be removed. A delivered mailbox row is irreversible;
+        its Task run remains consumed so a later authoritative sync cannot emit
+        a conflicting second settlement for the same identity.
+        """
+
+        mailbox_exists = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'agent_mailbox_messages'
+            """
+        ).fetchone()
+        task_filter = "AND task.task_id = ?" if task_id is not None else ""
+        params: tuple[str, ...] = (task_id,) if task_id is not None else ()
+        rows = connection.execute(
+            f"""
+            SELECT outbox.outbox_key, outbox.message_id,
+                   outbox.task_id, outbox.run_count
+            FROM agent_task_settled_outbox AS outbox
+            JOIN agent_tasks AS task ON task.task_id = outbox.task_id
+            WHERE task.external_operation IS NOT NULL
+              AND task.external_outcome_uncertain = 1
+              AND outbox.run_count = task.run_count
+              {task_filter}
+            """,
+            params,
+        ).fetchall()
+        results: dict[tuple[str, int], bool] = {}
+        for outbox_key, message_id, row_task_id, run_count in rows:
+            mailbox_delivered = False
+            if mailbox_exists is not None:
+                delivered = connection.execute(
+                    """
+                    SELECT 1 FROM agent_mailbox_messages
+                    WHERE (idempotency_key = ? OR message_id = ?)
+                      AND status = 'delivered'
+                    LIMIT 1
+                    """,
+                    (str(outbox_key), str(message_id)),
+                ).fetchone()
+                mailbox_delivered = delivered is not None
+            key = (str(row_task_id), int(run_count))
+            results[key] = mailbox_delivered
+            if mailbox_delivered:
+                connection.execute(
+                    """
+                    UPDATE agent_task_settled_outbox
+                    SET status = 'delivered', claimed_by = NULL,
+                        claim_token = NULL, claimed_at = NULL,
+                        claim_expires_at = NULL
+                    WHERE outbox_key = ?
+                    """,
+                    (str(outbox_key),),
+                )
+                connection.execute(
+                    """
+                    UPDATE agent_tasks SET mailbox_delivered = 1
+                    WHERE task_id = ? AND run_count = ?
+                    """,
+                    key,
+                )
+                continue
+            if mailbox_exists is not None:
+                connection.execute(
+                    """
+                    DELETE FROM agent_mailbox_messages
+                    WHERE (idempotency_key = ? OR message_id = ?)
+                      AND status IN ('pending', 'claimed', 'retracted')
+                    """,
+                    (str(outbox_key), str(message_id)),
+                )
+            connection.execute(
+                "DELETE FROM agent_task_settled_outbox WHERE outbox_key = ?",
+                (str(outbox_key),),
+            )
+            connection.execute(
+                """
+                UPDATE agent_tasks SET mailbox_delivered = 0
+                WHERE task_id = ? AND run_count = ?
+                """,
+                key,
+            )
+        return results
+
     def reconcile_legacy_settlements(
         self,
         *,
@@ -231,6 +325,7 @@ class SettledOutboxRepository:
         expires_at = now + timedelta(seconds=lease_seconds)
         claim_token = uuid.uuid4().hex
         with self._database.transaction(immediate=True) as connection:
+            self.discard_invalid_uncertain_locked(connection)
             connection.execute(
                 """
                 UPDATE agent_task_settled_outbox

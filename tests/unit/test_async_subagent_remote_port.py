@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from fastapi import FastAPI
 import httpx
 import pytest
@@ -11,6 +12,8 @@ from ruyi_agent.integrations.a2a.client import A2AClient
 from ruyi_agent.config.loader import LocalWorkerSpec
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.channels.http.routes import create_gateway_app
+from ruyi_agent.storage.mailbox_store import MailboxStore
+from ruyi_agent.storage.task_store import TaskStore
 
 from tests.support.async_subagent_runtime import (
     FakeAgentFactory,
@@ -78,11 +81,15 @@ def test_run_agent_turn_records_expanded_exception_summary(
 
 def test_spawn_remote_ref_runs_via_a2a_gateway(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     factory = FakeAgentFactory()
     monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
     monkeypatch.setenv("REMOTE_CODE_WIKI_TOKEN", "remote-secret")
 
+    remote_db = str(tmp_path / "remote-tasks.sqlite")
+    remote_task_store = TaskStore(remote_db)
+    remote_mailbox_store = MailboxStore(remote_db)
     remote_control = async_subagent_runtime.AgentControl(
         {
             "code_wiki": LocalWorkerSpec(
@@ -98,6 +105,8 @@ def test_spawn_remote_ref_runs_via_a2a_gateway(
         {},
         checkpointer=object(),
         backend=object(),
+        task_store=remote_task_store,
+        mailbox=AgentMailbox(remote_mailbox_store),
         remote_poll_interval=0.01,
     )
     remote_service = GatewayTaskModule(
@@ -127,14 +136,23 @@ def test_spawn_remote_ref_runs_via_a2a_gateway(
     )
 
     async def scenario() -> tuple[str, str, str, str]:
-        started = await control.spawn_agent("remote_code_wiki", "research this")
-        task_id = started.split("task_id=")[1].split()[0]
-        status_before = await control.check_agent(task_id)
-        status_after = await control.wait_agent(task_id)
-        sent = await control.send_input(task_id, "follow up")
-        return task_id, status_before, status_after, sent
+        try:
+            started = await control.spawn_agent("remote_code_wiki", "research this")
+            task_id = started.split("task_id=")[1].split()[0]
+            status_before = await control.check_agent(task_id)
+            status_after = await control.wait_agent(task_id)
+            sent = await control.send_input(task_id, "follow up")
+            await control.wait_agent(task_id)
+            return task_id, status_before, status_after, sent
+        finally:
+            await control.close()
+            await remote_control.close()
 
-    task_id, status_before, status_after, sent = asyncio.run(scenario())
+    try:
+        task_id, status_before, status_after, sent = asyncio.run(scenario())
+    finally:
+        remote_mailbox_store.close()
+        remote_task_store.close()
 
     assert f"task_id={task_id}" in sent
     assert "route=remote_ref" in status_before
