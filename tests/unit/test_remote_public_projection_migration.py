@@ -327,6 +327,123 @@ def _database_row(db_path: str, query: str) -> sqlite3.Row:
         connection.close()
 
 
+def _database_rows(db_path: str, query: str) -> list[sqlite3.Row]:
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        return connection.execute(query).fetchall()
+    finally:
+        connection.close()
+
+
+def _create_current_collision_database(db_path: str) -> None:
+    task_store = TaskStore(db_path)
+    task_store.close()
+    mailbox_store = MailboxStore(db_path)
+    mailbox_store.close()
+
+
+def _insert_collision_task(
+    connection: sqlite3.Connection,
+    *,
+    task_id: str,
+    upstream_task_id: str,
+    agent_name: str,
+    run_count: int = 2,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO agent_tasks (
+            task_id, agent_name, state, thread_id, parent_task_id, root_task_id,
+            depth, created_at, updated_at, result, error, run_count, route_kind,
+            upstream_task_id, parent_thread_id
+        ) VALUES (?, ?, 'failed', ?, 'parent-task', 'parent-task', 2, ?, ?,
+                  NULL, ?, ?, 'remote_ref', ?, 'parent-thread')
+        """,
+        (
+            task_id,
+            agent_name,
+            upstream_task_id,
+            NOW,
+            NOW,
+            PRIVATE_ERROR,
+            run_count,
+            upstream_task_id,
+        ),
+    )
+
+
+def _insert_collision_message(
+    connection: sqlite3.Connection,
+    *,
+    message_id: str,
+    stored_task_id: str,
+    agent_name: str,
+    run_count: int,
+    idempotency_key: str | None = None,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO agent_mailbox_messages (
+            message_id, idempotency_key, recipient_task_id,
+            recipient_thread_id, sender_task_id, sender_agent_name,
+            child_task_id, child_agent_name, child_run_count, settled_status,
+            content, trigger_run, status, created_at, claimed_at,
+            claim_expires_at, claimed_by, claim_token
+        ) VALUES (?, ?, 'parent-task', 'parent-thread', ?, ?, ?, ?, ?, 'failed',
+                  ?, 1, 'claimed', ?, ?, '2099-01-01T00:00:00+00:00',
+                  'legacy-owner', ?)
+        """,
+        (
+            message_id,
+            idempotency_key,
+            stored_task_id,
+            agent_name,
+            stored_task_id,
+            agent_name,
+            run_count,
+            PRIVATE_ERROR,
+            NOW,
+            NOW,
+            f"legacy-token-{message_id}",
+        ),
+    )
+
+
+def _insert_collision_outbox(
+    connection: sqlite3.Connection,
+    *,
+    message_id: str,
+    task_id: str,
+    agent_name: str,
+    run_count: int,
+) -> str:
+    outbox_key = f"settled:parent-thread:{task_id}:{run_count}"
+    connection.execute(
+        """
+        INSERT INTO agent_task_settled_outbox (
+            outbox_key, message_id, task_id, run_count, recipient_task_id,
+            recipient_thread_id, child_agent_name, settled_status, content,
+            status, created_at, claimed_at, claim_expires_at, claimed_by,
+            claim_token, attempt_count
+        ) VALUES (?, ?, ?, ?, 'parent-task', 'parent-thread', ?, 'failed', ?,
+                  'claimed', ?, ?, '2099-01-01T00:00:00+00:00',
+                  'legacy-outbox-owner', 'legacy-outbox-token', 1)
+        """,
+        (
+            outbox_key,
+            message_id,
+            task_id,
+            run_count,
+            agent_name,
+            PRIVATE_ERROR,
+            NOW,
+            NOW,
+        ),
+    )
+    return outbox_key
+
+
 def _assert_no_raw_remote(value: object) -> None:
     serialized = json.dumps(value, default=str)
     assert PRIVATE_ERROR not in serialized
@@ -502,3 +619,223 @@ def test_remote_projection_upgrade_is_idempotent_and_preserves_frozen_v2_order(
     assert second_review.cursor_order_updated_at == first_review.cursor_order_updated_at
     assert migrations["count"] == 1
     assert migrations["completed"] == 1
+
+
+def test_shared_upstream_uses_outbox_binding_and_isolates_unanchored_ambiguity(
+    tmp_path,
+) -> None:
+    db_path = str(tmp_path / "shared-upstream.sqlite")
+    _create_current_collision_database(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        for task_id in ("proxy-shared-a", "proxy-shared-b"):
+            _insert_collision_task(
+                connection,
+                task_id=task_id,
+                upstream_task_id="shared-upstream",
+                agent_name="remote_shared",
+            )
+        linked_key = _insert_collision_outbox(
+            connection,
+            message_id="linked-message",
+            task_id="proxy-shared-a",
+            agent_name="remote_shared",
+            run_count=2,
+        )
+        _insert_collision_message(
+            connection,
+            message_id="linked-message",
+            stored_task_id="shared-upstream",
+            agent_name="remote_shared",
+            run_count=2,
+            idempotency_key=linked_key,
+        )
+        _insert_collision_message(
+            connection,
+            message_id="ambiguous-message",
+            stored_task_id="shared-upstream",
+            agent_name="remote_shared",
+            run_count=1,
+        )
+        isolated_key = _insert_collision_outbox(
+            connection,
+            message_id="mismatched-linked-message",
+            task_id="proxy-shared-b",
+            agent_name="remote_shared",
+            run_count=3,
+        )
+        _insert_collision_message(
+            connection,
+            message_id="mismatched-linked-message",
+            stored_task_id="shared-upstream",
+            agent_name="wrong-agent",
+            run_count=3,
+            idempotency_key=isolated_key,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    first_task_store = TaskStore(db_path)
+    first_task_store.close()
+    task_store = TaskStore(db_path)
+    mailbox_store = MailboxStore(db_path)
+    mailbox = AgentMailbox(mailbox_store)
+    try:
+        rows = {
+            row["message_id"]: row
+            for row in _database_rows(
+                db_path,
+                "SELECT * FROM agent_mailbox_messages ORDER BY message_id",
+            )
+        }
+        linked = rows["linked-message"]
+        ambiguous = rows["ambiguous-message"]
+        mismatched = rows["mismatched-linked-message"]
+        stale = SettledOutboxIntent(
+            outbox_key=isolated_key,
+            message_id="mismatched-linked-message",
+            task_id="proxy-shared-b",
+            run_count=3,
+            recipient_task_id="parent-task",
+            recipient_thread_id="parent-thread",
+            child_agent_name="remote_shared",
+            settled_status="failed",
+            content=PRIVATE_ERROR,
+            created_at=datetime.now(UTC),
+            claim_token="legacy-outbox-token",
+        )
+        stale_delivered = mailbox.publish_claimed_settled_outbox(stale)
+        claimed = mailbox.claim(
+            recipient_task_id="parent-task",
+            recipient_thread_id="parent-thread",
+        )
+        outboxes = {
+            str(row["outbox_key"]): row
+            for row in task_store.list_settled_outbox()
+        }
+    finally:
+        mailbox_store.close()
+        task_store.close()
+
+    assert linked["status"] == "pending"
+    assert linked["idempotency_key"] == linked_key
+    assert linked["sender_task_id"] == "proxy-shared-a"
+    assert linked["child_task_id"] == "proxy-shared-a"
+    assert linked["sender_agent_name"] == "remote_shared"
+    assert linked["child_agent_name"] == "remote_shared"
+    assert linked["content"] == PUBLIC_ERROR
+    assert linked["claim_token"] is None
+    assert ambiguous["status"] == "retracted"
+    assert ambiguous["idempotency_key"] is None
+    assert ambiguous["sender_task_id"] is None
+    assert ambiguous["sender_agent_name"] is None
+    assert ambiguous["child_task_id"] is None
+    assert ambiguous["child_agent_name"] is None
+    assert ambiguous["content"] == PUBLIC_ERROR
+    assert ambiguous["claim_token"] is None
+    assert mismatched["status"] == "retracted"
+    assert mismatched["idempotency_key"] is None
+    assert mismatched["sender_task_id"] is None
+    assert mismatched["sender_agent_name"] is None
+    assert mismatched["child_task_id"] is None
+    assert mismatched["child_agent_name"] is None
+    assert mismatched["claim_token"] is None
+    assert stale_delivered is False
+    assert [message.message_id for message in claimed] == ["linked-message"]
+    assert outboxes[linked_key]["status"] == "pending"
+    assert outboxes[linked_key]["content"] == PUBLIC_ERROR
+    assert outboxes[isolated_key]["status"] == "suppressed"
+    assert outboxes[isolated_key]["claim_token"] is None
+    assert outboxes[isolated_key]["retracted_at"] is not None
+
+
+def test_public_id_upstream_collision_uses_agent_and_isolates_same_agent_pair(
+    tmp_path,
+) -> None:
+    db_path = str(tmp_path / "public-upstream-collision.sqlite")
+    _create_current_collision_database(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        _insert_collision_task(
+            connection,
+            task_id="collision-id",
+            upstream_task_id="private-a",
+            agent_name="remote_a",
+        )
+        _insert_collision_task(
+            connection,
+            task_id="proxy-b",
+            upstream_task_id="collision-id",
+            agent_name="remote_b",
+        )
+        _insert_collision_message(
+            connection,
+            message_id="agent-resolved-message",
+            stored_task_id="collision-id",
+            agent_name="remote_b",
+            run_count=1,
+        )
+        _insert_collision_task(
+            connection,
+            task_id="ambiguous-public",
+            upstream_task_id="private-c",
+            agent_name="remote_same",
+        )
+        _insert_collision_task(
+            connection,
+            task_id="proxy-d",
+            upstream_task_id="ambiguous-public",
+            agent_name="remote_same",
+        )
+        _insert_collision_message(
+            connection,
+            message_id="public-ambiguous-message",
+            stored_task_id="ambiguous-public",
+            agent_name="remote_same",
+            run_count=1,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    first = TaskStore(db_path)
+    first.close()
+    second = TaskStore(db_path)
+    mailbox_store = MailboxStore(db_path)
+    mailbox = AgentMailbox(mailbox_store)
+    try:
+        rows = {
+            row["message_id"]: row
+            for row in _database_rows(
+                db_path,
+                "SELECT * FROM agent_mailbox_messages ORDER BY message_id",
+            )
+        }
+        claimed = mailbox.claim(
+            recipient_task_id="parent-task",
+            recipient_thread_id="parent-thread",
+        )
+    finally:
+        mailbox_store.close()
+        second.close()
+
+    resolved = rows["agent-resolved-message"]
+    ambiguous = rows["public-ambiguous-message"]
+    assert resolved["status"] == "pending"
+    assert resolved["sender_task_id"] == "proxy-b"
+    assert resolved["child_task_id"] == "proxy-b"
+    assert resolved["sender_agent_name"] == "remote_b"
+    assert resolved["child_agent_name"] == "remote_b"
+    assert resolved["content"] == PUBLIC_ERROR
+    assert resolved["idempotency_key"] == "settled:parent-thread:proxy-b:1"
+    assert ambiguous["status"] == "retracted"
+    assert ambiguous["sender_task_id"] is None
+    assert ambiguous["sender_agent_name"] is None
+    assert ambiguous["child_task_id"] is None
+    assert ambiguous["child_agent_name"] is None
+    assert ambiguous["idempotency_key"] is None
+    assert ambiguous["claim_token"] is None
+    assert [message.message_id for message in claimed] == [
+        "agent-resolved-message"
+    ]

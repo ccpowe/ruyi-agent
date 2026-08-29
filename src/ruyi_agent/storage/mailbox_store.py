@@ -467,6 +467,7 @@ class MailboxStore:
             WHERE idempotency_key IS NULL
               AND recipient_thread_id = ?
               AND child_task_id = ? AND child_run_count = ?
+              AND status IN ('pending', 'claimed', 'delivered')
             ORDER BY created_at, message_id
             """,
             (intent.recipient_thread_id, intent.task_id, intent.run_count),

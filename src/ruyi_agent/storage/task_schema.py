@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime
 
 from ruyi_agent.storage.task_database import TaskDatabase
 
@@ -532,11 +533,10 @@ def _resolve_legacy_remote_mailbox_binding(
         SELECT outbox.outbox_key, outbox.task_id, outbox.run_count,
                outbox.recipient_task_id, outbox.recipient_thread_id,
                outbox.child_agent_name, outbox.settled_status, outbox.content,
-               outbox.status
+               outbox.status, task.route_kind
         FROM agent_task_settled_outbox AS outbox
         JOIN agent_tasks AS task ON task.task_id = outbox.task_id
-        WHERE task.route_kind = 'remote_ref'
-          AND (outbox.message_id = ?
+        WHERE (outbox.message_id = ?
                OR (? IS NOT NULL AND outbox.outbox_key = ?))
         ORDER BY outbox.outbox_key
         """,
@@ -560,7 +560,8 @@ def _resolve_legacy_remote_mailbox_binding(
         matching = [
             candidate
             for candidate in matching
-            if candidate["task_id"] == str(outbox[1])
+            if str(outbox[9]) == "remote_ref"
+            and candidate["task_id"] == str(outbox[1])
             and _legacy_mailbox_matches_outbox(message=message, outbox=outbox)
         ]
     if len(matching) != 1:
@@ -641,7 +642,10 @@ def _isolate_legacy_remote_mailbox(
     connection.execute(
         """
         UPDATE agent_mailbox_messages
-        SET idempotency_key = NULL, content = ?, status = 'retracted',
+        SET idempotency_key = NULL,
+            sender_task_id = NULL, sender_agent_name = NULL,
+            child_task_id = NULL, child_agent_name = NULL,
+            content = ?, status = 'retracted',
             claimed_at = NULL, claim_expires_at = NULL,
             claimed_by = NULL, claim_token = NULL
         WHERE message_id = ? AND status != 'delivered'
