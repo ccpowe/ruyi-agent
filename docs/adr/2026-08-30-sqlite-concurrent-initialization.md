@@ -37,6 +37,16 @@ SQLite's effective URI parameter lookup. Thus an overridden value cannot split
 the startup lock from an alias that supplies only the final value. This parsing
 does not use HTML form rules: a literal `+` stays distinct from `%20`.
 
+SQLite applies ordinary last-value selection to repeated `cache` and `vfs`
+control parameters. `mode` has an additional connection-open validation step:
+the sequence may only move toward equal or more restrictive access. For
+example, `rwc` followed by `rw`, and `rw` followed by `ro`, open successfully
+and expose the final value; the reverse sequences fail with `access mode not
+allowed`. Both stores call `sqlite3.connect` before requesting the startup lock,
+so an invalid `mode` sequence never participates in the identity critical
+section. A successful sequence is folded to its final effective value like the
+other parameters.
+
 Named `mode=memory` databases retain their decoded URI path instead of being
 resolved as filesystem paths. A non-empty named memory URI with
 `cache=shared` uses the shared initialization lock; private or temporary memory
@@ -83,3 +93,8 @@ and percent-decoded application parameters with aliases containing only their
 final values. Repeated query keys, literal plus signs, and percent-encoded paths
 have explicit identity assertions; shared/private final memory-cache values
 remain separate database boundaries.
+
+Small real-SQLite control tests demonstrate shared/private `cache` behavior,
+successful/failing `vfs` order, successful restrictive `mode` transitions, and
+rejected access escalation. Full Task and Gateway Command constructors assert
+that rejected `mode` aliases make zero initialization-lock calls.

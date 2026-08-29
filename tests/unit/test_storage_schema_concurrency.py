@@ -401,6 +401,116 @@ def test_database_identity_canonicalizes_query_without_losing_semantics(
     ) != task_database_module._database_identity(f"{uri}mode=rwc")
 
 
+def test_sqlite_cache_and_vfs_control_parameters_use_final_decoded_value(
+    tmp_path: Path,
+) -> None:
+    memory_name = quote(f"control-{tmp_path.name}", safe="")
+    shared_override = f"file:{memory_name}?mode=memory&cache=private&ca%63he=shared"
+    shared_final = f"file:{memory_name}?cache=shared&mode=memory"
+    first_shared = sqlite3.connect(shared_override, uri=True)
+    second_shared = sqlite3.connect(shared_final, uri=True)
+    try:
+        first_shared.execute("CREATE TABLE shared_cache_evidence (value INTEGER)")
+        first_shared.commit()
+        assert second_shared.execute(
+            "SELECT COUNT(*) FROM shared_cache_evidence"
+        ).fetchone() == (0,)
+    finally:
+        first_shared.close()
+        second_shared.close()
+
+    private_uri = f"file:{memory_name}-private?mode=memory&cache=shared&ca%63he=private"
+    first_private = sqlite3.connect(private_uri, uri=True)
+    second_private = sqlite3.connect(private_uri, uri=True)
+    try:
+        first_private.execute("CREATE TABLE private_cache_evidence (value INTEGER)")
+        first_private.commit()
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            second_private.execute("SELECT * FROM private_cache_evidence")
+    finally:
+        first_private.close()
+        second_private.close()
+
+    db_path = tmp_path / "vfs.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.execute("CREATE TABLE vfs_evidence (value INTEGER)")
+    connection.commit()
+    connection.close()
+    uri = f"file:{quote(str(db_path), safe='/')}?"
+    vfs_override = f"{uri}v%66s=no_such_round10&vfs=unix"
+    vfs_final = f"{uri}vfs=unix"
+    assert task_database_module._database_identity(
+        vfs_override
+    ) == task_database_module._database_identity(vfs_final)
+    connection = sqlite3.connect(vfs_override, uri=True)
+    try:
+        assert connection.execute("SELECT * FROM vfs_evidence").fetchall() == []
+    finally:
+        connection.close()
+    with pytest.raises(sqlite3.OperationalError, match="no such vfs"):
+        sqlite3.connect(f"{uri}vfs=unix&vfs=no_such_round10", uri=True)
+
+
+def test_sqlite_mode_validates_escalation_before_initialization_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "mode.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.execute("CREATE TABLE mode_evidence (value INTEGER)")
+    connection.commit()
+    connection.close()
+    uri = f"file:{quote(str(db_path), safe='/')}?"
+
+    for override, final in (
+        ("mode=rwc&mode=rw", "mode=rw"),
+        ("mode=rw&mode=ro", "mode=ro"),
+    ):
+        assert task_database_module._database_identity(
+            f"{uri}{override}"
+        ) == task_database_module._database_identity(f"{uri}{final}")
+        connection = sqlite3.connect(f"{uri}{override}", uri=True)
+        try:
+            assert connection.execute("SELECT * FROM mode_evidence").fetchall() == []
+        finally:
+            connection.close()
+
+    lock_calls = {"task": 0, "command": 0}
+
+    @contextmanager
+    def track_task_lock(_db_path: str) -> Iterator[None]:
+        lock_calls["task"] += 1
+        yield
+
+    @contextmanager
+    def track_command_lock(_db_path: str) -> Iterator[None]:
+        lock_calls["command"] += 1
+        yield
+
+    monkeypatch.setattr(
+        task_database_module,
+        "database_initialization_lock",
+        track_task_lock,
+    )
+    monkeypatch.setattr(
+        gateway_command_store_module,
+        "database_initialization_lock",
+        track_command_lock,
+    )
+    with pytest.raises(
+        sqlite3.OperationalError,
+        match="access mode not allowed: rwc",
+    ):
+        TaskStore(f"{uri}mode=rw&mode=rwc")
+    with pytest.raises(
+        sqlite3.OperationalError,
+        match="access mode not allowed: rw",
+    ):
+        GatewayCommandStore(f"{uri}mode=ro&mode=rw")
+
+    assert lock_calls == {"task": 0, "command": 0}
+
+
 def test_database_identity_preserves_sqlite_named_memory_names() -> None:
     shared_aliases = (
         "file:round8-memory?mode=memory&cache=shared",
