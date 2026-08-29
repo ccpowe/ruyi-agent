@@ -68,7 +68,10 @@ class RecordingControl:
         return record
 
     def get_task_record(self, task_id: str) -> TaskRecord:
-        return self.records[task_id]
+        try:
+            return self.records[task_id]
+        except KeyError as exc:
+            raise UnknownWorkerTaskError(task_id) from exc
 
     def list_persisted_task_records(self) -> list[TaskRecord]:
         return list(self.records.values())
@@ -149,6 +152,38 @@ class RecordThenFailControl(RecordingControl):
         )
         self.records[task_id] = record
         raise RuntimeError("crashed before durable initial run")
+
+
+class TransientReadControl(RecordingControl):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_reads = True
+        self.spawn_calls = 0
+        self.send_calls = 0
+        self.cancel_calls = 0
+
+    def get_task_record(self, task_id: str) -> TaskRecord:
+        if self.fail_reads:
+            raise RuntimeError("task database temporarily unavailable")
+        return super().get_task_record(task_id)
+
+    async def spawn_task(self, *args: Any, **kwargs: Any) -> TaskRecord:
+        self.spawn_calls += 1
+        return await super().spawn_task(*args, **kwargs)
+
+    async def send_task_input(
+        self,
+        task_id: str,
+        input_content: str,
+        **kwargs: Any,
+    ) -> TaskRecord:
+        del input_content, kwargs
+        self.send_calls += 1
+        return self.get_task_record(task_id)
+
+    async def cancel_task(self, task_id: str) -> TaskRecord:
+        self.cancel_calls += 1
+        return self.get_task_record(task_id)
 
 
 class FailingReservationStore:
@@ -463,6 +498,93 @@ def test_local_record_without_durable_run_never_promotes_uncertain_route() -> No
             assert queried.state == "interrupted"
             assert listed[0].route_state == "uncertain"
             assert store.get_route("created-not-started").route_state == "uncertain"  # type: ignore[union-attr]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_active_local_transient_record_read_failure_does_not_degrade_route() -> None:
+    async def scenario() -> None:
+        control = TransientReadControl()
+        control.records["active-local"] = _record("active-local")
+        store = GatewayRouteStore(":memory:")
+        store.save_route(
+            TaskRouteRecord(
+                task_id="active-local",
+                agent_name="main",
+                metadata={},
+                route_kind="local",
+                upstream_task_id="active-local",
+                route_state="active",
+            )
+        )
+        router = TaskRouter(control=control, route_store=store)  # type: ignore[arg-type]
+        before = store.get_route("active-local")
+        try:
+            with pytest.raises(RuntimeError, match="temporarily unavailable"):
+                await router.get_route("active-local")
+            assert store.get_route("active-local") == before
+
+            control.fail_reads = False
+            route = await router.get_route("active-local")
+            assert route.route_state == "active"
+            assert (await router.get_record(route)).run_count == 1
+            assert (await router.send_input(route, "continue")).task_id == route.task_id
+            assert (await router.cancel(route)).task_id == route.task_id
+            assert store.get_route("active-local").route_state == "active"  # type: ignore[union-attr]
+            assert control.spawn_calls == 0
+            assert control.send_calls == control.cancel_calls == 1
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_pending_local_transient_record_read_failure_does_not_terminalize() -> None:
+    async def scenario() -> None:
+        control = TransientReadControl()
+        store = GatewayRouteStore(":memory:")
+        store.reserve_route(
+            TaskRouteRecord(
+                task_id="pending-local",
+                agent_name="main",
+                metadata={},
+                route_kind="local",
+                upstream_task_id="pending-local",
+                route_state="pending",
+            ),
+            create_key_scope="external",
+            create_replay_policy="local_task_identity",
+        )
+        store.mark_create_effect_started("pending-local")
+        router = TaskRouter(control=control, route_store=store)  # type: ignore[arg-type]
+        before = store.get_route("pending-local")
+        try:
+            with pytest.raises(RuntimeError, match="temporarily unavailable"):
+                await router.get_route("pending-local")
+            assert store.get_route("pending-local") == before
+            assert before is not None and before.route_state == "pending"
+
+            with pytest.raises(RuntimeError, match="temporarily unavailable"):
+                await router.create_task(
+                    agent_name="main",
+                    route_kind="local",
+                    input_content="must not respawn",
+                    metadata={},
+                    webhook=None,
+                    delegation_context=None,
+                    task_id="pending-local",
+                    idempotency_key="same-command",
+                )
+            assert store.get_route("pending-local") == before
+            assert control.spawn_calls == 0
+
+            control.records["pending-local"] = _record("pending-local")
+            control.fail_reads = False
+            recovered = await router.get_route("pending-local")
+            assert recovered.route_state == "active"
+            assert control.spawn_calls == 0
         finally:
             store.close()
 

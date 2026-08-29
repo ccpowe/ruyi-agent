@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 from ruyi_agent.gateway.errors import GatewayTaskError
+from ruyi_agent.runtime.delegation.contracts import UnknownWorkerTaskError
 from ruyi_agent.task_models import TaskRecord, TaskRouteRecord, TaskRouteKind
 
 if TYPE_CHECKING:
@@ -162,9 +163,7 @@ async def reconcile_pending_create(
     record: TaskRecord | None
     try:
         record = get_local_record(route.task_id)
-    except (KeyError, ValueError):
-        record = None
-    except Exception:
+    except UnknownWorkerTaskError:
         record = None
     effect_exists = record is not None and has_durable_create_effect(
         record,
