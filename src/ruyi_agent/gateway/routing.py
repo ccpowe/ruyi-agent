@@ -43,7 +43,12 @@ from ruyi_agent.runtime.task_events import (
     TaskStreamEvent,
 )
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
-from ruyi_agent.task_models import MetadataScalar, TaskRecord, TaskRouteRecord
+from ruyi_agent.task_models import (
+    MetadataScalar,
+    PendingReviewRecord,
+    TaskRecord,
+    TaskRouteRecord,
+)
 
 TASK_MESSAGE_CURSOR_VERSION = 1
 MAX_TASK_MESSAGE_CURSOR_LENGTH = 4096
@@ -189,6 +194,23 @@ class TaskRouter:
 
     async def save_route(self, route: TaskRouteRecord) -> None:
         await self._route_store.asave_route(route)
+
+    def list_pending_reviews(
+        self,
+        *,
+        root_task_id: str | None = None,
+        task_id: str | None = None,
+    ) -> list[PendingReviewRecord]:
+        return self._control.list_pending_reviews(
+            root_task_id=root_task_id,
+            task_id=task_id,
+        )
+
+    def get_pending_review(self, review_id: str) -> PendingReviewRecord | None:
+        try:
+            return self._control.get_pending_review(review_id)
+        except UnknownWorkerTaskError:
+            return None
 
     def ensure_record(self, route: TaskRouteRecord) -> TaskRecord:
         if route.route_kind != "remote_ref":

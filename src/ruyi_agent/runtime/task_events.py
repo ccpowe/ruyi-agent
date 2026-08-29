@@ -13,7 +13,7 @@ from typing import Any, Literal
 from langchain_core.messages import AIMessageChunk
 
 from ruyi_agent.storage.task_store import StoredTaskEvent, TaskStore
-from ruyi_agent.task_models import PublishedArtifact, TaskRecord
+from ruyi_agent.task_models import PendingReviewRecord, PublishedArtifact, TaskRecord
 
 
 TASK_EVENT_CURSOR_VERSION = 1
@@ -166,6 +166,41 @@ class TaskEventLedger:
             subscribers = self._commit_durable_locked(event)
         self._wake_subscribers(subscribers)
         return event
+
+    def update_review_transition(
+        self,
+        record: TaskRecord,
+        *,
+        pending_review: PendingReviewRecord | None,
+        root_record: TaskRecord | None,
+        events: list[tuple[TaskRecord, TaskLifecycleEventType, dict[str, Any]]],
+    ) -> list[StoredTaskEvent]:
+        """Commit a review transition and publish its durable Task events."""
+
+        for _event_record, _event_type, event_data in events:
+            _ensure_durable_event_data_fits(event_data)
+        with self._lock:
+            stored_events = self._store.update_review_transition(
+                record,
+                pending_review=pending_review,
+                root_record=root_record,
+                events=[
+                    (
+                        event_record,
+                        event_type,
+                        event_data,
+                        event_record.updated_at,
+                    )
+                    for event_record, event_type, event_data in events
+                ],
+            )
+            subscribers = [
+                subscriber
+                for event in stored_events
+                for subscriber in self._commit_durable_locked(event)
+            ]
+        self._wake_subscribers(subscribers)
+        return stored_events
 
     def publish_assistant_delta(
         self,

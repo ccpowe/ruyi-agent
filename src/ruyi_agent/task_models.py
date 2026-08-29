@@ -80,6 +80,18 @@ class TaskRecord:
     artifacts: list[PublishedArtifact] = field(default_factory=list)
 
 
+@dataclass(frozen=True, slots=True)
+class PendingReviewRecord:
+    """One durable human review owned by a Task within a delegation root."""
+
+    review_id: str
+    task_id: str
+    root_task_id: str
+    payload: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
 @dataclass(slots=True)
 class TaskRouteRecord:
     """Durable binding between a local Task identity and its execution route."""

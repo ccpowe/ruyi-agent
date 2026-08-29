@@ -13,7 +13,7 @@ from ruyi_agent.storage.task_store import (
     TaskRootBudgetExceededError,
     TaskStore,
 )
-from ruyi_agent.task_models import PublishedArtifact, TaskRecord
+from ruyi_agent.task_models import PendingReviewRecord, PublishedArtifact, TaskRecord
 
 
 def _budgeted_record(
@@ -245,6 +245,135 @@ def test_task_store_budget_counts_root_and_reports_persisted_count(tmp_path) -> 
         store.close()
 
 
+def test_task_store_review_transition_is_atomic_with_task_and_root_projection(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = TaskStore(str(tmp_path / "tasks.sqlite"))
+    created_at = datetime(2026, 8, 29, tzinfo=UTC)
+    root = TaskRecord(
+        task_id="root",
+        agent_name="main",
+        state="completed",
+        thread_id="root",
+        parent_task_id=None,
+        root_task_id="root",
+        depth=1,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    child = TaskRecord(
+        task_id="child",
+        agent_name="worker",
+        state="pending",
+        thread_id="child",
+        parent_task_id="root",
+        root_task_id="root",
+        depth=2,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    payload = {"review_id": "review-1", "action_requests": []}
+    review = PendingReviewRecord(
+        review_id="review-1",
+        task_id="child",
+        root_task_id="root",
+        payload=payload,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    try:
+        store.insert_task(root)
+        store.insert_task(child)
+        child.state = "waiting_for_human"
+        child.pending_review = payload
+        root.pending_review = {**payload, "source_task_id": "child"}
+
+        original_append = store._append_task_event_locked
+
+        def fail_append(**kwargs):
+            del kwargs
+            raise RuntimeError("event append failed")
+
+        monkeypatch.setattr(store, "_append_task_event_locked", fail_append)
+        with pytest.raises(RuntimeError, match="event append failed"):
+            store.update_review_transition(
+                child,
+                pending_review=review,
+                root_record=root,
+                events=[
+                    (
+                        child,
+                        "task.review_requested",
+                        {"status": "waiting_for_human"},
+                        created_at,
+                    ),
+                    (
+                        root,
+                        "task.review_requested",
+                        {"status": "completed"},
+                        created_at,
+                    ),
+                ],
+            )
+
+        persisted_child = store.get_task("child")
+        persisted_root = store.get_task("root")
+        assert persisted_child is not None
+        assert persisted_child.state == "pending"
+        assert persisted_child.pending_review is None
+        assert persisted_root is not None
+        assert persisted_root.pending_review is None
+        assert store.get_pending_review("review-1") is None
+
+        monkeypatch.setattr(store, "_append_task_event_locked", original_append)
+        store.update_review_transition(
+            child,
+            pending_review=review,
+            root_record=root,
+            events=[
+                (
+                    child,
+                    "task.review_requested",
+                    {"status": "waiting_for_human"},
+                    created_at,
+                ),
+            ],
+        )
+        child.state = "running"
+        child.pending_review = None
+        root.pending_review = None
+        monkeypatch.setattr(store, "_append_task_event_locked", fail_append)
+        with pytest.raises(RuntimeError, match="event append failed"):
+            store.update_review_transition(
+                child,
+                pending_review=None,
+                root_record=root,
+                events=[
+                    (
+                        child,
+                        "task.running",
+                        {"status": "running"},
+                        created_at,
+                    )
+                ],
+            )
+
+        persisted_child = store.get_task("child")
+        persisted_root = store.get_task("root")
+        assert persisted_child is not None
+        assert persisted_child.state == "waiting_for_human"
+        assert persisted_child.pending_review == payload
+        assert persisted_root is not None
+        assert persisted_root.pending_review == {
+            **payload,
+            "source_task_id": "child",
+        }
+        assert store.get_pending_review("review-1") == review
+    finally:
+        store.close()
+
+
 def test_task_store_duplicate_identity_is_checked_before_full_budget(tmp_path) -> None:
     store = TaskStore(str(tmp_path / "tasks.sqlite"))
     root = _budgeted_record(
@@ -330,3 +459,60 @@ def test_task_store_creates_root_task_id_query_index(tmp_path) -> None:
         connection.close()
 
     assert "idx_agent_tasks_root_task_id" in indexes
+
+
+def test_task_store_backfills_all_legacy_reviews_and_rebuilds_root_projection(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "tasks.sqlite"
+    created_at = datetime(2026, 8, 29, tzinfo=UTC)
+    legacy = TaskStore(str(db_path))
+    payload_a = {"review_id": "review-a", "action_requests": []}
+    payload_b = {"review_id": "review-b", "action_requests": []}
+    root = TaskRecord(
+        task_id="root",
+        agent_name="main",
+        state="completed",
+        thread_id="root",
+        parent_task_id=None,
+        root_task_id="root",
+        depth=1,
+        created_at=created_at,
+        updated_at=created_at,
+        pending_review={**payload_b, "source_task_id": "child-b"},
+    )
+    child_a = TaskRecord(
+        task_id="child-a",
+        agent_name="worker",
+        state="waiting_for_human",
+        thread_id="child-a",
+        parent_task_id="root",
+        root_task_id="root",
+        depth=2,
+        created_at=created_at,
+        updated_at=created_at,
+        pending_review=payload_a,
+    )
+    child_b = replace(
+        child_a,
+        task_id="child-b",
+        thread_id="child-b",
+        pending_review=payload_b,
+    )
+    legacy.insert_task(root)
+    legacy.insert_task(child_a)
+    legacy.insert_task(child_b)
+    legacy.close()
+
+    reopened = TaskStore(str(db_path))
+    try:
+        reviews = reopened.list_pending_reviews(root_task_id="root")
+        assert [review.review_id for review in reviews] == ["review-a", "review-b"]
+        restored_root = reopened.get_task("root")
+        assert restored_root is not None
+        assert restored_root.pending_review == {
+            **payload_a,
+            "source_task_id": "child-a",
+        }
+    finally:
+        reopened.close()

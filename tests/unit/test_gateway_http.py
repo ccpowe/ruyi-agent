@@ -3156,6 +3156,101 @@ def test_review_submit_accepts_root_task_mirrored_review(
     assert payload["pending_review"] is None
 
 
+def test_root_task_review_api_enumerates_and_decides_sibling_reviews(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interrupt_factory = ReviewInterruptingAgentFactory()
+    monkeypatch.setattr(
+        async_subagent_runtime, "create_runtime_agent", interrupt_factory
+    )
+    control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        checkpointer=object(),
+        backend=object(),
+    )
+    route_store = GatewayRouteStore(":memory:")
+    service = GatewayTaskModule(
+        main_agent_name="main",
+        agent_configs=build_agent_configs(),
+        control=control,
+        route_store=route_store,
+    )
+    app = create_gateway_app(service=service, bearer_token="secret-token")
+
+    async def seed_reviews() -> tuple[str, list[str]]:
+        root = await control.spawn_task("background_research", "root task")
+        if control.get_live_run(root.task_id) is not None:
+            await control.get_live_run(root.task_id)
+        review_ids = []
+        for _index in range(2):
+            child = await control.spawn_task(
+                "background_research",
+                "needs review",
+                parent_task_id=root.task_id,
+                parent_thread_id=root.thread_id,
+            )
+            if control.get_live_run(child.task_id) is not None:
+                await control.get_live_run(child.task_id)
+            review_ids.append(child.pending_review["review_id"])
+        await route_store.asave_route(
+            TaskRouteRecord(
+                task_id=root.task_id,
+                agent_name="background_research",
+                metadata={"channel": "test"},
+                route_kind="local",
+                upstream_task_id=root.task_id,
+            )
+        )
+        return root.task_id, review_ids
+
+    root_task_id, review_ids = asyncio.run(seed_reviews())
+
+    with TestClient(app) as client:
+        listed = client.get("/reviews", headers=auth_headers())
+        assert listed.status_code == 200, listed.json()
+        assert {item["review_id"] for item in listed.json()["items"]} == set(review_ids)
+
+        root_reviews = client.get(
+            f"/tasks/{root_task_id}/reviews",
+            headers=auth_headers(),
+        )
+        assert root_reviews.status_code == 200, root_reviews.json()
+        assert {item["review_id"] for item in root_reviews.json()["items"]} == set(
+            review_ids
+        )
+
+        fetched = client.get(
+            f"/reviews/{review_ids[1]}",
+            headers=auth_headers(),
+        )
+        assert fetched.status_code == 200, fetched.json()
+        assert fetched.json()["review_id"] == review_ids[1]
+
+        decided_second = client.post(
+            f"/tasks/{root_task_id}/reviews/{review_ids[1]}/decision",
+            headers=auth_headers(),
+            json={"decisions": [{"type": "approve"}]},
+        )
+        assert decided_second.status_code == 202, decided_second.json()
+        assert decided_second.json()["pending_review"]["review_id"] == review_ids[0]
+
+        remaining = client.get(
+            f"/tasks/{root_task_id}/reviews",
+            headers=auth_headers(),
+        )
+        assert [item["review_id"] for item in remaining.json()["items"]] == [
+            review_ids[0]
+        ]
+
+        decided_first = client.post(
+            f"/tasks/{root_task_id}/reviews/{review_ids[0]}/decision",
+            headers=auth_headers(),
+            json={"decisions": [{"type": "approve"}]},
+        )
+        assert decided_first.status_code == 202, decided_first.json()
+        assert decided_first.json()["pending_review"] is None
+
+
 def test_remote_a_to_b_to_a_loop_is_rejected_by_visited_nodes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

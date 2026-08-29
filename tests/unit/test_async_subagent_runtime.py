@@ -1353,6 +1353,163 @@ def test_submit_review_prefers_waiting_child_over_root_mirror(
     assert root.pending_review is None
 
 
+@pytest.mark.parametrize("decision_order", [(0, 1), (1, 0)])
+def test_sibling_reviews_remain_independent_for_any_decision_order(
+    monkeypatch: pytest.MonkeyPatch,
+    decision_order: tuple[int, int],
+) -> None:
+    factory = ContentAwareInterruptingAgentFactory()
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        checkpointer=object(),
+        backend=object(),
+    )
+
+    async def scenario() -> tuple[list[str], list[str], dict | None]:
+        root = await control.spawn_task("background_research", "root task")
+        if control.get_live_run(root.task_id) is not None:
+            await control.get_live_run(root.task_id)
+        children = []
+        for _index in range(2):
+            child = await control.spawn_task(
+                "background_research",
+                "needs review",
+                parent_task_id=root.task_id,
+                parent_thread_id=root.thread_id,
+            )
+            if control.get_live_run(child.task_id) is not None:
+                await control.get_live_run(child.task_id)
+            children.append(control.get_task_record(child.task_id))
+
+        pending = control.list_pending_reviews(root_task_id=root.task_id)
+        assert {review.task_id for review in pending} == {
+            child.task_id for child in children
+        }
+        ids = [child.pending_review["review_id"] for child in children]
+
+        await control.submit_review_decision(
+            ids[decision_order[0]],
+            [{"type": "approve"}],
+            wait=True,
+        )
+        remaining = control.list_pending_reviews(root_task_id=root.task_id)
+        root_after_first = control.get_task_record(root.task_id)
+        assert [review.review_id for review in remaining] == [ids[decision_order[1]]]
+        assert root_after_first.pending_review is not None
+        assert root_after_first.pending_review["review_id"] == ids[decision_order[1]]
+
+        await control.submit_review_decision(
+            ids[decision_order[1]],
+            [{"type": "approve"}],
+            wait=True,
+        )
+        return (
+            ids,
+            [
+                review.review_id
+                for review in control.list_pending_reviews(root_task_id=root.task_id)
+            ],
+            control.get_task_record(root.task_id).pending_review,
+        )
+
+    ids, remaining_ids, root_projection = asyncio.run(scenario())
+
+    assert len(set(ids)) == 2
+    assert remaining_ids == []
+    assert root_projection is None
+
+
+def test_pending_review_set_is_rebuilt_after_restart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    factory = ContentAwareInterruptingAgentFactory()
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    db_path = tmp_path / "tasks.sqlite"
+
+    async def seed() -> tuple[str, list[str]]:
+        store = TaskStore(str(db_path))
+        control = async_subagent_runtime.AgentControl(
+            build_specs(),
+            checkpointer=object(),
+            backend=object(),
+            task_store=store,
+        )
+        root = await control.spawn_task("background_research", "root task")
+        if control.get_live_run(root.task_id) is not None:
+            await control.get_live_run(root.task_id)
+        ids = []
+        for _index in range(2):
+            child = await control.spawn_task(
+                "background_research",
+                "needs review",
+                parent_task_id=root.task_id,
+                parent_thread_id=root.thread_id,
+            )
+            if control.get_live_run(child.task_id) is not None:
+                await control.get_live_run(child.task_id)
+            ids.append(child.pending_review["review_id"])
+        await control.close()
+        store.close()
+        return root.task_id, ids
+
+    root_task_id, review_ids = asyncio.run(seed())
+
+    reopened_store = TaskStore(str(db_path))
+    reopened = async_subagent_runtime.AgentControl(
+        build_specs(),
+        checkpointer=object(),
+        backend=object(),
+        task_store=reopened_store,
+    )
+    try:
+        restored = reopened.list_pending_reviews(root_task_id=root_task_id)
+        assert {review.review_id for review in restored} == set(review_ids)
+        assert {
+            reopened.get_pending_review(review_id).task_id for review_id in review_ids
+        } == {review.task_id for review in restored}
+    finally:
+        asyncio.run(reopened.close())
+        reopened_store.close()
+
+
+def test_root_lifecycle_keeps_child_review_compatibility_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = ContentAwareInterruptingAgentFactory()
+    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    control = async_subagent_runtime.AgentControl(
+        build_specs(),
+        checkpointer=object(),
+        backend=object(),
+    )
+
+    async def scenario() -> tuple[str, dict | None]:
+        root = await control.spawn_task("background_research", "root task")
+        if control.get_live_run(root.task_id) is not None:
+            await control.get_live_run(root.task_id)
+        child = await control.spawn_task(
+            "background_research",
+            "needs review",
+            parent_task_id=root.task_id,
+            parent_thread_id=root.thread_id,
+        )
+        if control.get_live_run(child.task_id) is not None:
+            await control.get_live_run(child.task_id)
+        review_id = child.pending_review["review_id"]
+
+        await control.send_task_input(root.task_id, "root follow-up")
+        if control.get_live_run(root.task_id) is not None:
+            await control.get_live_run(root.task_id)
+        return review_id, control.get_task_record(root.task_id).pending_review
+
+    review_id, projection = asyncio.run(scenario())
+
+    assert projection is not None
+    assert projection["review_id"] == review_id
+
+
 def test_cleared_root_review_is_replayable_from_durable_cursor(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

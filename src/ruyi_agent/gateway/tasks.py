@@ -57,6 +57,7 @@ from ruyi_agent.runtime.task_events import TaskStreamEvent
 from ruyi_agent.runtime.delegation.context import DelegationContext
 from ruyi_agent.task_models import (
     MetadataScalar,
+    PendingReviewRecord,
     PublishedArtifact,
     TaskRecord,
     TaskRouteRecord,
@@ -665,18 +666,19 @@ class GatewayTaskModule:
         decisions: list[dict[str, Any]],
     ) -> TaskResponse:
         route = await self._router.get_route(task_id)
-        record_before = self._router.ensure_record(route)
-        if not self._record_has_review(record_before, review_id):
-            if route.route_kind == "remote_ref":
-                record_before = await self._router.get_record(route)
-        if not self._record_has_review(record_before, review_id):
+        review = self._router.get_pending_review(review_id)
+        review_route = route
+        if review is not None and review.task_id != task_id:
+            review_route = await self._router.get_route(review.task_id)
+        if review_route.route_kind == "remote_ref":
+            await self._router.get_record(review_route)
+            review = self._router.get_pending_review(review_id)
+        if review is None or task_id not in {review.task_id, review.root_task_id}:
             raise GatewayTaskError(
                 code="review_not_found",
                 message=f"Review '{review_id}' does not belong to task '{task_id}'",
             )
-        mirrored_source_task_id = (record_before.pending_review or {}).get(
-            "source_task_id"
-        )
+        source_task_id = review.task_id
         review_record = await self._router.submit_review(
             task_id=task_id,
             review_id=review_id,
@@ -684,7 +686,7 @@ class GatewayTaskModule:
         )
         if review_record.task_id == task_id:
             return self._build_task_response(review_record, route.metadata)
-        if mirrored_source_task_id == review_record.task_id:
+        if source_task_id == review_record.task_id:
             refreshed_root = self._router.ensure_record(route)
             return self._build_task_response(refreshed_root, route.metadata)
         if review_record.task_id != task_id:
@@ -693,10 +695,6 @@ class GatewayTaskModule:
                 message=f"Review '{review_id}' does not belong to task '{task_id}'",
             )
         return self._build_task_response(review_record, route.metadata)
-
-    def _record_has_review(self, record: TaskRecord, review_id: str) -> bool:
-        pending_review = record.pending_review or {}
-        return pending_review.get("review_id") == review_id
 
     async def download_artifact(self, path: str) -> GatewayArtifact:
         self._ensure_workspace_path(path, kind="Artifact")
@@ -820,16 +818,21 @@ class GatewayTaskModule:
         offset = self._decode_cursor(cursor)
         items: list[ReviewResponse] = []
         routes = await self._router.list_routes()
+        routes_by_task_id: dict[str, TaskRouteRecord] = {}
         for route, task in await self._collect_tasks_for_listing(routes):
-            if task is None or task.pending_review is None:
+            if task is not None:
+                routes_by_task_id[route.task_id] = route
+        for pending_review in self._router.list_pending_reviews():
+            route = routes_by_task_id.get(pending_review.task_id)
+            if route is None:
                 continue
             record = self._router.ensure_record(route)
             review = self._build_review_response(
+                pending_review,
                 record,
                 route.metadata,
             )
-            if review is not None:
-                items.append(review)
+            items.append(review)
 
         items.sort(key=lambda item: (item.updated_at, item.review_id), reverse=True)
         page = items[offset : offset + limit]
@@ -840,15 +843,20 @@ class GatewayTaskModule:
 
     async def get_review(self, review_id: str) -> ReviewResponse:
         routes = await self._router.list_routes()
+        routes_by_task_id: dict[str, TaskRouteRecord] = {}
         for route, task in await self._collect_tasks_for_listing(routes):
-            if task is None or task.pending_review is None:
-                continue
-            if task.pending_review.get("review_id") != review_id:
-                continue
-            record = self._router.ensure_record(route)
-            review = self._build_review_response(record, route.metadata)
-            if review is not None:
-                return review
+            if task is not None:
+                routes_by_task_id[route.task_id] = route
+        pending_review = self._router.get_pending_review(review_id)
+        if pending_review is not None:
+            route = routes_by_task_id.get(pending_review.task_id)
+            if route is not None:
+                record = self._router.ensure_record(route)
+                return self._build_review_response(
+                    pending_review,
+                    record,
+                    route.metadata,
+                )
         raise GatewayTaskError(
             code="review_not_found",
             message=f"Review '{review_id}' does not exist",
@@ -863,9 +871,32 @@ class GatewayTaskModule:
                 message=f"Task '{task_id}' does not exist",
             )
         record = self._router.ensure_record(route)
-        review = self._build_review_response(record, route.metadata)
+        routes_by_task_id: dict[str, TaskRouteRecord] = {}
+        routes = await self._router.list_routes()
+        for candidate_route, candidate in await self._collect_tasks_for_listing(
+            routes
+        ):
+            if candidate is not None:
+                routes_by_task_id[candidate_route.task_id] = candidate_route
+        pending_reviews = self._router.list_pending_reviews(
+            root_task_id=task_id if record.root_task_id == task_id else None,
+            task_id=None if record.root_task_id == task_id else task_id,
+        )
+        items: list[ReviewResponse] = []
+        for pending_review in pending_reviews:
+            owner_route = routes_by_task_id.get(pending_review.task_id)
+            if owner_route is None:
+                continue
+            owner = self._router.ensure_record(owner_route)
+            items.append(
+                self._build_review_response(
+                    pending_review,
+                    owner,
+                    owner_route.metadata,
+                )
+            )
         return ReviewListResponse(
-            items=[review] if review is not None else [],
+            items=items,
             next_cursor=None,
         )
 
@@ -1101,28 +1132,24 @@ class GatewayTaskModule:
 
     def _build_review_response(
         self,
+        pending_review_record: PendingReviewRecord,
         record: TaskRecord,
         metadata: dict[str, MetadataScalar],
-    ) -> ReviewResponse | None:
-        pending_review = record.pending_review
-        if record.state != "waiting_for_human" or pending_review is None:
-            return None
-        review_id = pending_review.get("review_id")
-        if not isinstance(review_id, str) or not review_id:
-            return None
+    ) -> ReviewResponse:
+        pending_review = pending_review_record.payload
         raw_actions = pending_review.get("action_requests")
         raw_configs = pending_review.get("review_configs")
         return ReviewResponse(
-            review_id=review_id,
-            task_id=record.task_id,
+            review_id=pending_review_record.review_id,
+            task_id=pending_review_record.task_id,
             thread_id=record.thread_id,
             agent_name=record.agent_name,
             route_kind=record.route_kind,
             status="pending",
             action_requests=raw_actions if isinstance(raw_actions, list) else [],
             review_configs=raw_configs if isinstance(raw_configs, list) else [],
-            created_at=record.updated_at,
-            updated_at=record.updated_at,
+            created_at=pending_review_record.created_at,
+            updated_at=pending_review_record.updated_at,
             metadata=dict(metadata),
         )
 

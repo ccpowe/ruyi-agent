@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ruyi_agent.task_models import PublishedArtifact, TaskRecord
+from ruyi_agent.task_models import PendingReviewRecord, PublishedArtifact, TaskRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +90,20 @@ def _row_to_task_event(row: tuple[Any, ...]) -> StoredTaskEvent:
         event_type=str(row[3]),
         created_at=_parse_datetime(str(row[4])),
         data=data,
+    )
+
+
+def _row_to_pending_review(row: tuple[Any, ...]) -> PendingReviewRecord:
+    payload = json.loads(row[3])
+    if not isinstance(payload, dict):
+        raise ValueError("Stored pending review payload is not a JSON object")
+    return PendingReviewRecord(
+        review_id=str(row[0]),
+        task_id=str(row[1]),
+        root_task_id=str(row[2]),
+        payload=payload,
+        created_at=_parse_datetime(str(row[4])),
+        updated_at=_parse_datetime(str(row[5])),
     )
 
 
@@ -281,6 +295,80 @@ class TaskStore:
                 raise
         return event
 
+    def update_review_transition(
+        self,
+        record: TaskRecord,
+        *,
+        pending_review: PendingReviewRecord | None,
+        root_record: TaskRecord | None,
+        events: list[tuple[TaskRecord, str, dict[str, Any], datetime]],
+    ) -> list[StoredTaskEvent]:
+        """Persist a Task/review transition and compatibility projection atomically.
+
+        ``pending_review`` is the authoritative pending resource for ``record``;
+        passing ``None`` removes any pending review owned by that Task.  A
+        distinct ``root_record`` carries the legacy single-review projection.
+        All Task rows, the review row, and lifecycle events share one SQLite
+        transaction so a restart cannot observe a half-applied review state.
+        """
+
+        if pending_review is not None and pending_review.task_id != record.task_id:
+            raise ValueError("Pending review owner does not match Task record")
+        encoded_events = [
+            (event_record, event_type, _serialize_event_data(data), created_at)
+            for event_record, event_type, data, created_at in events
+        ]
+        with self._lock:
+            try:
+                self._update_task_locked(record)
+                self._conn.execute(
+                    "DELETE FROM agent_task_pending_reviews WHERE task_id = ?",
+                    (record.task_id,),
+                )
+                if pending_review is not None:
+                    self._conn.execute(
+                        """
+                        INSERT INTO agent_task_pending_reviews (
+                            review_id,
+                            task_id,
+                            root_task_id,
+                            payload_json,
+                            created_at,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            pending_review.review_id,
+                            pending_review.task_id,
+                            pending_review.root_task_id,
+                            json.dumps(
+                                pending_review.payload,
+                                ensure_ascii=True,
+                                sort_keys=True,
+                            ),
+                            _serialize_datetime(pending_review.created_at),
+                            _serialize_datetime(pending_review.updated_at),
+                        ),
+                    )
+                if root_record is not None and root_record.task_id != record.task_id:
+                    self._update_task_locked(root_record)
+
+                stored_events = [
+                    self._append_task_event_locked(
+                        task_id=event_record.task_id,
+                        run_count=event_record.run_count,
+                        event_type=event_type,
+                        encoded_data=encoded_data,
+                        event_created_at=created_at,
+                    )
+                    for event_record, event_type, encoded_data, created_at in encoded_events
+                ]
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return stored_events
+
     def append_task_event(
         self,
         *,
@@ -417,6 +505,47 @@ class TaskStore:
             return None
         return self._row_to_task_record(row)
 
+    def get_pending_review(self, review_id: str) -> PendingReviewRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT review_id, task_id, root_task_id, payload_json,
+                       created_at, updated_at
+                FROM agent_task_pending_reviews
+                WHERE review_id = ?
+                """,
+                (review_id,),
+            ).fetchone()
+        return _row_to_pending_review(row) if row is not None else None
+
+    def list_pending_reviews(
+        self,
+        *,
+        root_task_id: str | None = None,
+        task_id: str | None = None,
+    ) -> list[PendingReviewRecord]:
+        clauses: list[str] = []
+        params: list[str] = []
+        if root_task_id is not None:
+            clauses.append("root_task_id = ?")
+            params.append(root_task_id)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT review_id, task_id, root_task_id, payload_json,
+                       created_at, updated_at
+                FROM agent_task_pending_reviews
+                {where}
+                ORDER BY created_at ASC, review_id ASC
+                """,
+                params,
+            ).fetchall()
+        return [_row_to_pending_review(row) for row in rows]
+
     def get_task_by_parent_thread_id(
         self,
         *,
@@ -486,6 +615,7 @@ class TaskStore:
     def _init_db(self) -> None:
         with self._lock:
             self._conn.execute("PRAGMA busy_timeout = 30000")
+            self._conn.execute("PRAGMA foreign_keys = ON")
             if self._db_path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.execute(
@@ -536,6 +666,25 @@ class TaskStore:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS agent_task_pending_reviews (
+                    review_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL UNIQUE,
+                    root_task_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(task_id) REFERENCES agent_tasks(task_id)
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agent_task_pending_reviews_root
+                ON agent_task_pending_reviews(root_task_id, created_at, review_id)
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_agent_task_events_task_run_event
                 ON agent_task_events(task_id, run_count, event_id)
                 """
@@ -576,7 +725,111 @@ class TaskStore:
                 column="artifacts_json",
                 definition="TEXT NOT NULL DEFAULT '[]'",
             )
+            self._backfill_pending_reviews_locked()
             self._conn.commit()
+
+    def _backfill_pending_reviews_locked(self) -> None:
+        """Upgrade legacy waiting Tasks and rebuild root compatibility views."""
+
+        rows = self._conn.execute(
+            """
+            SELECT task_id, root_task_id, pending_review_json, updated_at
+            FROM agent_tasks
+            WHERE state = 'waiting_for_human' AND pending_review_json IS NOT NULL
+            """
+        ).fetchall()
+        for task_id, root_task_id, payload_json, updated_at in rows:
+            try:
+                payload = json.loads(payload_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            review_id = payload.get("review_id")
+            if not isinstance(review_id, str) or not review_id:
+                continue
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO agent_task_pending_reviews (
+                    review_id,
+                    task_id,
+                    root_task_id,
+                    payload_json,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    review_id,
+                    task_id,
+                    root_task_id,
+                    json.dumps(payload, ensure_ascii=True, sort_keys=True),
+                    updated_at,
+                    updated_at,
+                ),
+            )
+
+        review_roots = {
+            str(row[0])
+            for row in self._conn.execute(
+                "SELECT DISTINCT root_task_id FROM agent_task_pending_reviews"
+            ).fetchall()
+        }
+        for root_task_id in review_roots:
+            selected = self._conn.execute(
+                """
+                SELECT task_id, payload_json
+                FROM agent_task_pending_reviews
+                WHERE root_task_id = ?
+                ORDER BY created_at ASC, review_id ASC
+                LIMIT 1
+                """,
+                (root_task_id,),
+            ).fetchone()
+            if selected is None:
+                continue
+            task_id, payload_json = selected
+            payload = json.loads(payload_json)
+            if task_id != root_task_id:
+                payload["source_task_id"] = task_id
+            self._conn.execute(
+                "UPDATE agent_tasks SET pending_review_json = ? WHERE task_id = ?",
+                (
+                    json.dumps(payload, ensure_ascii=True, sort_keys=True),
+                    root_task_id,
+                ),
+            )
+
+        root_rows = self._conn.execute(
+            """
+            SELECT task_id, state, pending_review_json
+            FROM agent_tasks
+            WHERE task_id = root_task_id AND pending_review_json IS NOT NULL
+            """
+        ).fetchall()
+        for task_id, state, payload_json in root_rows:
+            if task_id in review_roots or state == "waiting_for_human":
+                continue
+            try:
+                payload = json.loads(payload_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and "source_task_id" in payload:
+                self._conn.execute(
+                    "UPDATE agent_tasks SET pending_review_json = NULL WHERE task_id = ?",
+                    (task_id,),
+                )
+
+    def _update_task_locked(self, record: TaskRecord) -> None:
+        columns = self._write_columns()
+        assignments = ", ".join(f"{column} = ?" for column in columns[1:])
+        values = self._record_values(record)
+        cursor = self._conn.execute(
+            f"UPDATE agent_tasks SET {assignments} WHERE task_id = ?",
+            (*values[1:], record.task_id),
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(f"Task does not exist: {record.task_id}")
 
     def _task_exists_locked(self, task_id: str) -> bool:
         row = self._conn.execute(

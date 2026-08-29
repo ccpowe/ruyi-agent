@@ -70,6 +70,7 @@ from ruyi_agent.runtime.task_events import (
     TaskEventLedger,
     TaskEventSubscription,
     TaskEventsUnavailableError,
+    TaskLifecycleEventType,
     assistant_delta_from_stream_part,
     artifact_event_data,
     lifecycle_event_data,
@@ -94,6 +95,7 @@ from ruyi_agent.task_models import (
     RESUMABLE_TASK_STATES,
     SETTLED_TASK_STATES,
     MetadataScalar,
+    PendingReviewRecord,
     PublishedArtifact,
     TaskRecord,
 )
@@ -674,6 +676,10 @@ class TaskManager:
         self._live_runs = LiveRunRegistry()
         self._store = store
         self._event_ledger = TaskEventLedger(store) if store is not None else None
+        self._pending_reviews: dict[str, PendingReviewRecord] = {
+            review.review_id: review
+            for review in (store.list_pending_reviews() if store is not None else [])
+        }
 
     @property
     def event_ledger(self) -> TaskEventLedger | None:
@@ -781,60 +787,150 @@ class TaskManager:
             return
         self._save(record)
 
-    def _mirror_pending_review_to_root(self, record: TaskRecord) -> None:
-        """Mirror a child review onto the root task for channel adapters."""
-        if record.root_task_id == record.task_id:
-            return
-        root = self._tasks.get(record.root_task_id)
-        if root is None:
-            root = self.load_task_by_id(record.root_task_id)
-        if root is None:
-            return
-        previous_fingerprint = public_task_event_fingerprint(root)
-        payload = dict(record.pending_review or {})
-        if not payload:
-            return
-        payload["source_task_id"] = record.task_id
-        root.pending_review = payload
-        root.updated_at = _now()
-        if (
-            self._event_ledger is not None
-            and public_task_event_fingerprint(root) != previous_fingerprint
-        ):
-            self._event_ledger.update_task(
-                root,
-                event_type="task.review_requested",
-                event_data=lifecycle_event_data(root),
-            )
-        else:
-            self._save(root)
+    def list_pending_reviews(
+        self,
+        *,
+        root_task_id: str | None = None,
+        task_id: str | None = None,
+    ) -> list[PendingReviewRecord]:
+        """List authoritative pending reviews in stable creation order."""
 
-    def _clear_mirrored_pending_review_from_root(self, record: TaskRecord) -> None:
-        """Clear the mirrored root review once the child review is resolved."""
+        if self._store is not None:
+            reviews = self._store.list_pending_reviews(
+                root_task_id=root_task_id,
+                task_id=task_id,
+            )
+            for review in reviews:
+                self._pending_reviews[review.review_id] = review
+            return reviews
+        reviews = [
+            review
+            for review in self._pending_reviews.values()
+            if (root_task_id is None or review.root_task_id == root_task_id)
+            and (task_id is None or review.task_id == task_id)
+        ]
+        return sorted(reviews, key=lambda item: (item.created_at, item.review_id))
+
+    def get_pending_review(self, review_id: str) -> PendingReviewRecord | None:
+        """Return one authoritative pending review by identity."""
+
+        if self._store is not None:
+            review = self._store.get_pending_review(review_id)
+            if review is not None:
+                self._pending_reviews[review.review_id] = review
+            return review
+        return self._pending_reviews.get(review_id)
+
+    def _review_for_task(self, task_id: str) -> PendingReviewRecord | None:
+        reviews = self.list_pending_reviews(task_id=task_id)
+        return reviews[0] if reviews else None
+
+    def _root_record(self, record: TaskRecord) -> TaskRecord | None:
         if record.root_task_id == record.task_id:
-            return
+            return record
         root = self._tasks.get(record.root_task_id)
         if root is None:
             root = self.load_task_by_id(record.root_task_id)
+        return root
+
+    def _project_root_review(
+        self,
+        record: TaskRecord,
+        reviews: list[PendingReviewRecord],
+    ) -> tuple[TaskRecord | None, bool]:
+        """Update the legacy root ``pending_review`` projection in memory."""
+
+        root = self._root_record(record)
         if root is None:
-            return
-        pending_review = root.pending_review or {}
-        if pending_review.get("source_task_id") != record.task_id:
-            return
-        previous_fingerprint = public_task_event_fingerprint(root)
-        root.pending_review = None
+            return None, False
+        previous = root.pending_review
+        candidates = sorted(
+            (
+                review
+                for review in reviews
+                if review.root_task_id == record.root_task_id
+            ),
+            key=lambda item: (item.created_at, item.review_id),
+        )
+        projected: dict[str, Any] | None = None
+        if candidates:
+            selected = candidates[0]
+            projected = dict(selected.payload)
+            if selected.task_id != root.task_id:
+                projected["source_task_id"] = selected.task_id
+        if previous == projected:
+            return root, False
+        root.pending_review = projected
         root.updated_at = _now()
-        if (
-            self._event_ledger is not None
-            and public_task_event_fingerprint(root) != previous_fingerprint
-        ):
-            self._event_ledger.update_task(
-                root,
-                event_type=lifecycle_event_type(root),
-                event_data=lifecycle_event_data(root),
+        return root, True
+
+    def _persist_review_transition(
+        self,
+        record: TaskRecord,
+        *,
+        pending_review: PendingReviewRecord | None,
+        root: TaskRecord | None,
+        root_changed: bool,
+        record_changed: bool = True,
+    ) -> None:
+        events: list[
+            tuple[TaskRecord, TaskLifecycleEventType, dict[str, Any]]
+        ] = []
+        if record_changed:
+            events.append(
+                (record, lifecycle_event_type(record), lifecycle_event_data(record))
+            )
+        if root_changed and root is not None and root.task_id != record.task_id:
+            root_event_type = (
+                "task.review_requested"
+                if root.pending_review is not None
+                else lifecycle_event_type(root)
+            )
+            events.append((root, root_event_type, lifecycle_event_data(root)))
+        if self._event_ledger is not None:
+            self._event_ledger.update_review_transition(
+                record,
+                pending_review=pending_review,
+                root_record=(
+                    root
+                    if root_changed
+                    and root is not None
+                    and root.task_id != record.task_id
+                    else None
+                ),
+                events=events,
             )
         else:
-            self._save(root)
+            self._save(record)
+            if root_changed and root is not None and root.task_id != record.task_id:
+                self._save(root)
+
+    def _clear_pending_review_and_save(self, record: TaskRecord) -> None:
+        current = self._review_for_task(record.task_id)
+        if current is None:
+            if record.task_id == record.root_task_id:
+                self._project_root_review(
+                    record,
+                    self.list_pending_reviews(root_task_id=record.root_task_id),
+                )
+            else:
+                record.pending_review = None
+            self._save_lifecycle(record)
+            return
+        record.pending_review = None
+        remaining = [
+            review
+            for review in self.list_pending_reviews(root_task_id=record.root_task_id)
+            if review.review_id != current.review_id
+        ]
+        root, root_changed = self._project_root_review(record, remaining)
+        self._persist_review_transition(
+            record,
+            pending_review=None,
+            root=root,
+            root_changed=root_changed,
+        )
+        self._pending_reviews.pop(current.review_id, None)
 
     def create_task_record(
         self,
@@ -976,26 +1072,13 @@ class TaskManager:
         return self.list_tasks()
 
     def find_by_review_id(self, review_id: str) -> TaskRecord | None:
-        mirrored_match: TaskRecord | None = None
-        for record in self._tasks.values():
-            pending_review = record.pending_review or {}
-            if pending_review.get("review_id") == review_id:
-                if record.state == "waiting_for_human":
-                    return record
-                if mirrored_match is None:
-                    mirrored_match = record
-        if self._store is None:
-            return mirrored_match
-        for stored in self._store.list_tasks():
-            pending_review = stored.pending_review or {}
-            if pending_review.get("review_id") == review_id:
-                record = task_record_for_restart(stored)
-                self._tasks[record.task_id] = record
-                if record.state == "waiting_for_human":
-                    return record
-                if mirrored_match is None:
-                    mirrored_match = record
-        return mirrored_match
+        review = self.get_pending_review(review_id)
+        if review is None:
+            return None
+        try:
+            return self.get_task(review.task_id)
+        except UnknownWorkerTaskError:
+            return None
 
     def find_by_thread_id(self, thread_id: str) -> TaskRecord | None:
         """
@@ -1046,10 +1129,8 @@ class TaskManager:
         record.run_count += 1
         record.mailbox_suppressed = False
         record.mailbox_delivered = False
-        self._clear_mirrored_pending_review_from_root(record)
-        record.pending_review = None
         record.error = None
-        self._save_lifecycle(record)
+        self._clear_pending_review_and_save(record)
 
     def add_artifact(self, task_id: str, artifact: PublishedArtifact) -> None:
         """Append a published artifact manifest to a task."""
@@ -1087,14 +1168,47 @@ class TaskManager:
         pending_review = dict(pending_review)
         review_id = pending_review.get("review_id")
         if not isinstance(review_id, str) or not review_id:
-            pending_review["review_id"] = str(uuid.uuid4())
+            review_id = str(uuid.uuid4())
+        else:
+            review_id = normalize_task_event_text(review_id)
+        pending_review["review_id"] = review_id
+        existing = self.get_pending_review(review_id)
+        current_review = self._review_for_task(record.task_id)
+        if existing is not None and existing.task_id != record.task_id:
+            raise ValueError(f"Pending review already exists: {review_id}")
         record.state = "waiting_for_human"
         record.updated_at = _now()
         self._live_runs.discard(task_id)
         record.pending_review = pending_review
         record.error = None
-        self._save_lifecycle(record)
-        self._mirror_pending_review_to_root(record)
+        review = PendingReviewRecord(
+            review_id=review_id,
+            task_id=record.task_id,
+            root_task_id=record.root_task_id,
+            payload=dict(pending_review),
+            created_at=(
+                current_review.created_at
+                if current_review is not None and current_review.review_id == review_id
+                else record.updated_at
+            ),
+            updated_at=record.updated_at,
+        )
+        reviews = [
+            item
+            for item in self.list_pending_reviews(root_task_id=record.root_task_id)
+            if item.task_id != record.task_id
+        ]
+        reviews.append(review)
+        root, root_changed = self._project_root_review(record, reviews)
+        self._persist_review_transition(
+            record,
+            pending_review=review,
+            root=root,
+            root_changed=root_changed,
+        )
+        if current_review is not None:
+            self._pending_reviews.pop(current_review.review_id, None)
+        self._pending_reviews[review.review_id] = review
 
     def mark_completed(self, task_id: str, result: str) -> None:
         """
@@ -1111,9 +1225,7 @@ class TaskManager:
         record.error = None
         record.updated_at = _now()
         self._live_runs.discard(task_id)
-        self._clear_mirrored_pending_review_from_root(record)
-        record.pending_review = None
-        self._save_lifecycle(record)
+        self._clear_pending_review_and_save(record)
 
     def mark_failed(self, task_id: str, error: str) -> None:
         """
@@ -1129,9 +1241,7 @@ class TaskManager:
         record.error = normalize_task_event_text(error)
         record.updated_at = _now()
         self._live_runs.discard(task_id)
-        self._clear_mirrored_pending_review_from_root(record)
-        record.pending_review = None
-        self._save_lifecycle(record)
+        self._clear_pending_review_and_save(record)
 
     def mark_cancelled(self, task_id: str) -> None:
         """
@@ -1145,10 +1255,8 @@ class TaskManager:
         record.state = "cancelled"
         record.updated_at = _now()
         self._live_runs.discard(task_id)
-        self._clear_mirrored_pending_review_from_root(record)
-        record.pending_review = None
         record.error = None
-        self._save_lifecycle(record)
+        self._clear_pending_review_and_save(record)
 
     def mark_interrupted(self, task_id: str, error: str) -> None:
         """
@@ -1162,9 +1270,7 @@ class TaskManager:
         record.error = normalize_task_event_text(error)
         record.updated_at = _now()
         self._live_runs.discard(task_id)
-        self._clear_mirrored_pending_review_from_root(record)
-        record.pending_review = None
-        self._save_lifecycle(record)
+        self._clear_pending_review_and_save(record)
 
     def sync_remote_task(self, task_id: str, payload: dict[str, Any]) -> TaskRecord:
         """
@@ -1182,6 +1288,7 @@ class TaskManager:
         """
         # 为什么集中同步远端状态：CLI 和 wait/check/send_input/cancel 都需要一致地映射远端任务视图。
         record = self.get_task(task_id)
+        current_review = self._review_for_task(task_id)
         previous_fingerprint = public_task_event_fingerprint(record)
         status, run_count = _validate_remote_task_state(task_id, payload)
 
@@ -1200,7 +1307,7 @@ class TaskManager:
             else None
         )
         record.pending_review = (
-            pending_review if isinstance(pending_review, dict) else None
+            dict(pending_review) if isinstance(pending_review, dict) else None
         )
         record.run_count = run_count
         record.created_at = _parse_task_timestamp(
@@ -1212,11 +1319,68 @@ class TaskManager:
             fallback=record.updated_at,
         )
         self._live_runs.discard(task_id)
+        record_changed = public_task_event_fingerprint(record) != previous_fingerprint
         if record.state == "waiting_for_human" and record.pending_review is not None:
-            self._mirror_pending_review_to_root(record)
-        else:
-            self._clear_mirrored_pending_review_from_root(record)
-        if public_task_event_fingerprint(record) != previous_fingerprint:
+            review_id = record.pending_review.get("review_id")
+            if not isinstance(review_id, str) or not review_id:
+                review_id = str(uuid.uuid4())
+            else:
+                review_id = normalize_task_event_text(review_id)
+            record.pending_review["review_id"] = review_id
+            matching_review = self.get_pending_review(review_id)
+            if (
+                matching_review is not None
+                and matching_review.task_id != record.task_id
+            ):
+                raise ValueError(f"Pending review already exists: {review_id}")
+            review = PendingReviewRecord(
+                review_id=review_id,
+                task_id=record.task_id,
+                root_task_id=record.root_task_id,
+                payload=dict(record.pending_review),
+                created_at=(
+                    current_review.created_at
+                    if current_review is not None
+                    and current_review.review_id == review_id
+                    else record.updated_at
+                ),
+                updated_at=record.updated_at,
+            )
+            reviews = [
+                item
+                for item in self.list_pending_reviews(root_task_id=record.root_task_id)
+                if item.task_id != record.task_id
+            ]
+            reviews.append(review)
+            root, root_changed = self._project_root_review(record, reviews)
+            self._persist_review_transition(
+                record,
+                pending_review=review,
+                root=root,
+                root_changed=root_changed,
+                record_changed=record_changed,
+            )
+            if current_review is not None:
+                self._pending_reviews.pop(current_review.review_id, None)
+            self._pending_reviews[review.review_id] = review
+        elif current_review is not None:
+            remaining = [
+                review
+                for review in self.list_pending_reviews(
+                    root_task_id=record.root_task_id
+                )
+                if review.review_id != current_review.review_id
+            ]
+            root, root_changed = self._project_root_review(record, remaining)
+            self._persist_review_transition(
+                record,
+                pending_review=None,
+                root=root,
+                root_changed=root_changed,
+                record_changed=record_changed,
+            )
+            self._pending_reviews.pop(current_review.review_id, None)
+        elif record_changed:
             self._save_lifecycle(record)
         else:
             self._save(record)
@@ -1733,21 +1897,26 @@ class AgentControl:
         record = self._task_manager.get_task(task_id)
         if self._task_manager.has_active_run(task_id):
             raise TaskAlreadyRunningError(f"Worker task is already running: {task_id}")
+        review_id = (record.pending_review or {}).get("review_id")
         run_task = asyncio.create_task(
             self._run_agent_payload(
                 task_id,
                 Command(resume={"decisions": decisions}),
             )
         )
+        try:
+            self._task_manager.mark_running(task_id, run_task)
+        except BaseException:
+            run_task.cancel()
+            raise
         self._audit_task_review(
             "task_review_resumed",
             record,
             payload={
-                "review_id": (record.pending_review or {}).get("review_id"),
+                "review_id": review_id,
                 "decisions": decisions,
             },
         )
-        self._task_manager.mark_running(task_id, run_task)
         self._attach_mailbox_wakeup(task_id, run_task)
 
     def _format_task_record(self, record: TaskRecord) -> str:
@@ -2725,10 +2894,30 @@ class AgentControl:
 
     def list_pending_review_records(self) -> list[TaskRecord]:
         return [
-            record
-            for record in self._task_manager.list_tasks()
-            if record.state == "waiting_for_human" and record.pending_review is not None
+            self._task_manager.get_task(review.task_id)
+            for review in self._task_manager.list_pending_reviews()
         ]
+
+    def list_pending_reviews(
+        self,
+        *,
+        root_task_id: str | None = None,
+        task_id: str | None = None,
+    ) -> list[PendingReviewRecord]:
+        """Enumerate authoritative pending Review resources."""
+
+        return self._task_manager.list_pending_reviews(
+            root_task_id=root_task_id,
+            task_id=task_id,
+        )
+
+    def get_pending_review(self, review_id: str) -> PendingReviewRecord:
+        """Resolve one authoritative pending Review resource."""
+
+        review = self._task_manager.get_pending_review(review_id)
+        if review is None:
+            raise UnknownWorkerTaskError(f"Unknown pending review: {review_id}")
+        return review
 
     def get_task_by_review_id(self, review_id: str) -> TaskRecord:
         record = self._task_manager.find_by_review_id(review_id)
