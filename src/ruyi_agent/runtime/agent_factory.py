@@ -18,7 +18,7 @@ from langgraph.graph.message import add_messages
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.runtime.middleware.stack import build_runtime_middleware
 from ruyi_agent.runtime.prompts import PROJECT_BASE_AGENT_PROMPT
-from ruyi_agent.config.loader import LocalWorkerSpec, RemoteRef
+from ruyi_agent.config.agent_runtime import LocalWorkerSpec, RemoteRef
 from ruyi_agent.control_plane.permissions import PermissionPolicy
 from ruyi_agent.integrations.mcp.registry import MCPRegistry
 from ruyi_agent.storage.review_audit import ReviewAuditStore

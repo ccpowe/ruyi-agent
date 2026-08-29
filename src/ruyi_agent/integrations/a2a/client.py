@@ -429,32 +429,14 @@ class A2AClient:
                 "token_env": "REMOTE_GATEWAY_TOKEN"
             }
         """
-        auth = remote_ref.auth or {}
+        auth = remote_ref.auth
 
         # 如果没有配置认证，直接返回基础 headers
-        if not auth:
+        if auth is None:
             return {}
 
-        # 检查认证类型
-        auth_type = auth.get("type")
-        if auth_type != "bearer":
-            raise A2AClientError(
-                status_code=503,
-                code="runtime_unavailable",
-                message=(
-                    f"Remote ref '{remote_ref.name}' has unsupported auth type "
-                    f"{auth_type!r}"
-                ),
-            )
-
-        # 获取 token 环境变量名
-        token_env = auth.get("token_env")
-        if not isinstance(token_env, str) or not token_env:
-            raise A2AClientError(
-                status_code=503,
-                code="runtime_unavailable",
-                message=f"Remote ref '{remote_ref.name}' is missing auth.token_env",
-            )
+        # auth 已在 TOML/RemoteRef 边界验证为 bearer 配置。
+        token_env = auth.token_env
 
         # 从环境变量读取 token
         token = os.getenv(token_env)

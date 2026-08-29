@@ -2,19 +2,44 @@ from __future__ import annotations
 
 import pytest
 
+from ruyi_agent.config.agent_models import LocalAgentConfig
 from ruyi_agent.config.system_tools import resolve_system_tools
 from ruyi_agent.config.system_tools import validate_system_tool_names
 
 
+def _local_config(
+    name: str,
+    *,
+    workers: tuple[str, ...] = (),
+    system_tools: frozenset[str] = frozenset(),
+    disabled_system_tools: frozenset[str] = frozenset(),
+) -> LocalAgentConfig:
+    return LocalAgentConfig(
+        name=name,
+        public=False,
+        description="",
+        system_prompt="",
+        provider="provider",
+        model="model",
+        memory=(),
+        skills=(),
+        server_names=(),
+        tool_names=(),
+        workers=workers,
+        system_tools=system_tools,
+        disabled_system_tools=disabled_system_tools,
+    )
+
+
 def test_system_tools_merge_automatic_explicit_and_disabled() -> None:
     configs = {
-        "main": {
-            "kind": "local",
-            "workers": ["child"],
-            "system_tools": ["tool_search"],
-            "disabled_system_tools": ["cancel_agent"],
-        },
-        "child": {"kind": "local", "workers": []},
+        "main": _local_config(
+            "main",
+            workers=("child",),
+            system_tools=frozenset({"tool_search"}),
+            disabled_system_tools=frozenset({"cancel_agent"}),
+        ),
+        "child": _local_config("child"),
     }
 
     resolved = resolve_system_tools("main", configs)
@@ -27,8 +52,8 @@ def test_system_tools_merge_automatic_explicit_and_disabled() -> None:
 
 def test_leaf_worker_automatically_gets_parent_communication_only() -> None:
     configs = {
-        "main": {"kind": "local", "workers": ["child"]},
-        "child": {"kind": "local", "workers": []},
+        "main": _local_config("main", workers=("child",)),
+        "child": _local_config("child"),
     }
 
     resolved = resolve_system_tools("child", configs)

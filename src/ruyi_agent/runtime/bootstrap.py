@@ -5,12 +5,12 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any
 
 from fastapi import FastAPI
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from ruyi_agent.config.runtime_settings import configure_runtime_environment
+from ruyi_agent.config.agent_models import AgentConfigs
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.runtime.delegation.async_runtime import AgentControl
 from ruyi_agent.integrations.backend.runtime import create_backend_runtime
@@ -94,7 +94,7 @@ class AppRuntime:
     """保存 Gateway 和 Channel Adapter 共同依赖的长生命周期运行对象。"""
 
     main_agent_name: str
-    agent_configs: dict[str, dict[str, Any]]
+    agent_configs: AgentConfigs
     local_agent_specs: dict[str, LocalWorkerSpec]
     gateway_service: GatewayTaskModule
     worker_control: AgentControl
@@ -189,7 +189,6 @@ async def bootstrap_application():
                 providers=llm_providers,
                 getenv=os.getenv,
                 home_dir=home_dir,
-                skills_root=skills_root,
                 unavailable_errors=unavailable_agents,
             )
             all_remote_refs = await build_all_remote_refs(agent_configs)
@@ -238,7 +237,7 @@ async def bootstrap_application():
             print(
                 "configured public gateway agents:",
                 sorted(
-                    name for name, config in agent_configs.items() if config["public"]
+                    name for name, config in agent_configs.items() if config.public
                 ),
             )
             print(

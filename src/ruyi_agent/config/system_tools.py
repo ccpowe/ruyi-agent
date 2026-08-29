@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+
+from ruyi_agent.config.agent_models import AgentConfig, LocalAgentConfig
 
 
 DELEGATION_SYSTEM_TOOLS = frozenset(
@@ -36,26 +39,27 @@ class ResolvedSystemTools:
 
 def local_agent_parent_names(
     agent_name: str,
-    agent_configs: dict[str, dict[str, object]],
+    agent_configs: Mapping[str, AgentConfig],
 ) -> frozenset[str]:
     return frozenset(
         parent_name
         for parent_name, config in agent_configs.items()
-        if config.get("kind") == "local" and agent_name in config.get("workers", [])
+        if isinstance(config, LocalAgentConfig) and agent_name in config.workers
     )
 
 
 def resolve_system_tools(
     agent_name: str,
-    agent_configs: dict[str, dict[str, object]],
+    agent_configs: Mapping[str, AgentConfig],
     *,
     backend_available: bool = True,
     artifact_available: bool = True,
 ) -> ResolvedSystemTools:
     config = agent_configs[agent_name]
+    if not isinstance(config, LocalAgentConfig):
+        raise ValueError(f"Agent '{agent_name}' is not a local agent.")
     automatic: set[str] = set()
-    workers = config.get("workers", [])
-    if workers:
+    if config.workers:
         automatic.update(DELEGATION_SYSTEM_TOOLS)
     elif local_agent_parent_names(agent_name, agent_configs):
         automatic.update({"send_input", "list_agents"})
@@ -63,11 +67,11 @@ def resolve_system_tools(
         automatic.update(FILESYSTEM_SYSTEM_TOOLS)
     if artifact_available:
         automatic.update(ARTIFACT_SYSTEM_TOOLS)
-    if config.get("tool_search") is True:
+    if config.tool_search:
         automatic.update(TOOL_SEARCH_SYSTEM_TOOLS)
 
-    explicit = set(config.get("system_tools", []))
-    disabled = set(config.get("disabled_system_tools", []))
+    explicit = set(config.system_tools)
+    disabled = set(config.disabled_system_tools)
     enabled = (automatic | explicit) - disabled
     return ResolvedSystemTools(
         enabled=frozenset(enabled),

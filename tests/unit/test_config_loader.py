@@ -7,6 +7,8 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 import ruyi_agent.config.loader as config_loader
+import ruyi_agent.config.agent_runtime as agent_runtime
+import ruyi_agent.integrations.model_providers as model_providers
 
 
 class FakeRegistry:
@@ -128,7 +130,8 @@ def test_load_agent_configs_returns_main_agent_and_agents_section(tmp_path: Path
     main_agent, agents = config_loader.load_agent_configs(config_path)
 
     assert main_agent == "main"
-    assert agents["main"]["kind"] == "local"
+    assert isinstance(agents["main"], config_loader.LocalAgentConfig)
+    assert agents["main"].kind == "local"
 
 
 def test_load_agent_configs_rejects_name_that_differs_from_agent_key(
@@ -162,6 +165,119 @@ def test_load_agent_configs_rejects_name_that_differs_from_agent_key(
         ValueError,
         match="Agent key 'main' must match its configured name 'different_name'",
     ):
+        config_loader.load_agent_configs(config_path)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "toml_value"),
+    [
+        ("memory", '"AGENTS.md"'),
+        ("server_names", '"deepwiki"'),
+        ("tool_names", '"search"'),
+        ("workers", '"worker"'),
+    ],
+)
+def test_load_agent_configs_rejects_string_where_list_is_required(
+    tmp_path: Path,
+    field_name: str,
+    toml_value: str,
+) -> None:
+    list_fields = {
+        "memory": "[]",
+        "server_names": "[]",
+        "tool_names": "[]",
+        "workers": "[]",
+    }
+    list_fields[field_name] = toml_value
+    config_path = tmp_path / "agents.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                'main_agent = "main"',
+                "",
+                "[agents.main]",
+                'kind = "local"',
+                "public = true",
+                'name = "main"',
+                'description = "desc"',
+                'system_prompt = "prompt"',
+                'provider = "openrouter"',
+                'model = "model"',
+                f"memory = {list_fields['memory']}",
+                "skills = []",
+                f"server_names = {list_fields['server_names']}",
+                f"tool_names = {list_fields['tool_names']}",
+                f"workers = {list_fields['workers']}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=f"field '{field_name}'.*list of strings"):
+        config_loader.load_agent_configs(config_path)
+
+
+@pytest.mark.parametrize(
+    ("remote_lines", "expected_error"),
+    [
+        (['url = "relative/path"'], "absolute HTTP\\(S\\) URL"),
+        (
+            [
+                'url = "https://example.com"',
+                "[agents.remote.auth]",
+                'type = "basic"',
+                'token_env = "REMOTE_TOKEN"',
+            ],
+            "type must be 'bearer'",
+        ),
+        (
+            [
+                'url = "https://example.com"',
+                "[agents.remote.auth]",
+                'type = "bearer"',
+            ],
+            "missing required fields: token_env",
+        ),
+    ],
+)
+def test_load_agent_configs_validates_remote_url_and_auth(
+    tmp_path: Path,
+    remote_lines: list[str],
+    expected_error: str,
+) -> None:
+    config_path = tmp_path / "agents.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                'main_agent = "main"',
+                "",
+                "[agents.main]",
+                'kind = "local"',
+                "public = true",
+                'name = "main"',
+                'description = "desc"',
+                'system_prompt = "prompt"',
+                'provider = "openrouter"',
+                'model = "model"',
+                "memory = []",
+                "skills = []",
+                "server_names = []",
+                "tool_names = []",
+                'workers = ["remote"]',
+                "",
+                "[agents.remote]",
+                'kind = "remote_ref"',
+                "public = false",
+                'name = "remote"',
+                'description = "remote"',
+                'remote_agent_name = "worker"',
+                *remote_lines,
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=expected_error):
         config_loader.load_agent_configs(config_path)
 
 
@@ -227,7 +343,7 @@ def test_build_chat_model_from_config_builds_openai_compatible_model(monkeypatch
         )
         return built_model
 
-    monkeypatch.setattr(config_loader, "init_chat_model", fake_init_chat_model)
+    monkeypatch.setattr(model_providers, "init_chat_model", fake_init_chat_model)
 
     providers = {
         "deepseek": config_loader.LLMProviderSpec(
@@ -270,7 +386,7 @@ def test_build_chat_model_from_config_builds_moonshot_model(monkeypatch) -> None
             return built_model
 
     monkeypatch.setattr(
-        config_loader,
+        model_providers,
         "_get_chat_moonshot_class",
         lambda: FakeChatMoonshot,
     )
@@ -337,7 +453,7 @@ def test_build_chat_model_from_config_builds_deepseek_model_with_reasoning_echo(
             }
 
     monkeypatch.setattr(
-        config_loader,
+        model_providers,
         "_get_chat_deepseek_class",
         lambda: FakeChatDeepSeek,
     )
@@ -390,7 +506,7 @@ def test_build_chat_model_from_config_builds_litellm_model(monkeypatch) -> None:
             return built_model
 
     monkeypatch.setattr(
-        config_loader,
+        model_providers,
         "_get_chat_litellm_class",
         lambda: FakeChatLiteLLM,
     )
@@ -434,7 +550,7 @@ def test_build_chat_model_from_config_builds_openai_codex_model(monkeypatch) -> 
         return built_model
 
     monkeypatch.setattr(
-        config_loader,
+        model_providers,
         "_build_openai_codex_model",
         fake_build_openai_codex_model,
     )
@@ -697,7 +813,9 @@ def test_build_local_worker_spec_resolves_tools_and_keeps_skill_names(
 ) -> None:
     # 为什么测本地 worker 构造：这是当前把配置转成可执行 worker 定义的关键路径。
     built_model = object()
-    monkeypatch.setattr(config_loader, "init_chat_model", lambda *_a, **_k: built_model)
+    monkeypatch.setattr(
+        model_providers, "init_chat_model", lambda *_a, **_k: built_model
+    )
     fake_tools = [object(), object()]
     registry = FakeRegistry(fake_tools)
     agent_configs = {
@@ -758,7 +876,9 @@ def test_build_local_worker_spec_resolves_tools_and_keeps_skill_names(
 
 def test_build_local_worker_spec_keeps_special_skill_modes(monkeypatch) -> None:
     built_model = object()
-    monkeypatch.setattr(config_loader, "init_chat_model", lambda *_a, **_k: built_model)
+    monkeypatch.setattr(
+        model_providers, "init_chat_model", lambda *_a, **_k: built_model
+    )
     registry = FakeRegistry([])
     base_config = {
         "kind": "local",
@@ -833,11 +953,23 @@ def test_build_all_local_specs_isolates_unavailable_agent(monkeypatch) -> None:
             raise ValueError("Environment variable 'BROKEN_API_KEY' is not set")
         return healthy_spec
 
-    monkeypatch.setattr(config_loader, "build_local_worker_spec", fake_build)
+    monkeypatch.setattr(agent_runtime, "build_local_worker_spec", fake_build)
     errors: dict[str, str] = {}
     configs = {
-        "main": {"kind": "local"},
-        "broken": {"kind": "local"},
+        name: config_loader.LocalAgentConfig(
+            name=name,
+            public=False,
+            description="",
+            system_prompt="",
+            provider="provider",
+            model="model",
+            memory=(),
+            skills=(),
+            server_names=(),
+            tool_names=(),
+            workers=(),
+        )
+        for name in ("main", "broken")
     }
 
     specs = asyncio.run(
@@ -878,16 +1010,18 @@ def test_build_remote_ref_returns_remote_spec() -> None:
     assert remote_ref.description == "remote helper"
     assert remote_ref.url == "https://example.com/a2a"
     assert remote_ref.remote_agent_name == "code_wiki"
-    assert remote_ref.auth == {
-        "type": "bearer",
-        "token_env": "REMOTE_CODE_WIKI_TOKEN",
-    }
+    assert remote_ref.auth == config_loader.BearerAuthConfig(
+        type="bearer",
+        token_env="REMOTE_CODE_WIKI_TOKEN",
+    )
 
 
 def test_build_local_worker_spec_resolves_tools_and_backend_paths(monkeypatch) -> None:
     # 为什么测本地 worker 规格：当前本地 worker 的实现依赖这一步把配置变成可执行定义。
     built_model = object()
-    monkeypatch.setattr(config_loader, "init_chat_model", lambda *_a, **_k: built_model)
+    monkeypatch.setattr(
+        model_providers, "init_chat_model", lambda *_a, **_k: built_model
+    )
     fake_tools = [object()]
     registry = FakeRegistry(fake_tools)
     agent_configs = {
@@ -903,6 +1037,7 @@ def test_build_local_worker_spec_resolves_tools_and_backend_paths(monkeypatch) -
             "skills": ["frontend-skill"],
             "server_names": ["exa"],
             "tool_names": ["deepwiki.ask_question"],
+            "workers": [],
         }
     }
 
@@ -940,7 +1075,9 @@ def test_build_local_worker_spec_resolves_tools_and_backend_paths(monkeypatch) -
 
 
 def test_build_all_local_worker_specs_builds_every_local_agent(monkeypatch) -> None:
-    monkeypatch.setattr(config_loader, "init_chat_model", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        model_providers, "init_chat_model", lambda *_a, **_k: object()
+    )
     registry = FakeRegistry([object()])
     agent_configs = {
         "main": {
@@ -1236,7 +1373,8 @@ def test_load_agent_configs_allows_local_to_remote_ref_worker(
     main_agent_name, agent_configs = config_loader.load_agent_configs(config_path)
 
     assert main_agent_name == "main"
-    assert agent_configs["remote_wiki"]["kind"] == "remote_ref"
+    assert isinstance(agent_configs["remote_wiki"], config_loader.RemoteAgentConfig)
+    assert agent_configs["remote_wiki"].kind == "remote_ref"
 
 
 def test_load_agent_configs_rejects_longer_local_worker_cycle(
