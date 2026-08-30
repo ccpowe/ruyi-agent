@@ -30,7 +30,10 @@ from ruyi_agent.gateway.route_reservations import (
     has_active_route_binding as _has_active_route_binding,
     has_durable_create_effect as _has_durable_create_effect,
 )
-from ruyi_agent.gateway_protocol.sse import SSEProtocolError, task_stream_event_from_gateway
+from ruyi_agent.gateway_protocol.sse import (
+    SSEProtocolError,
+    task_stream_event_from_gateway,
+)
 from ruyi_agent.integrations.a2a.client import A2AClientError
 from ruyi_agent.runtime.delegation.async_runtime import AgentControl
 from ruyi_agent.runtime.delegation.contracts import (
