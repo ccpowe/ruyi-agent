@@ -96,6 +96,7 @@ def test_create_workflow_has_typed_boundary_and_acyclic_import_dag() -> None:
         "route_store",
     ]
     assert not workflow_init.args.kwonlyargs
+    assert branches(workflow_tree) <= 55
     assert span(run) <= 60 and branches(run) <= 4
     assert all(span(node) <= 65 and branches(node) <= 10 for node in callables)
     assert len(callables) <= 26
@@ -138,6 +139,10 @@ def test_create_workflow_has_typed_boundary_and_acyclic_import_dag() -> None:
         "ruyi_agent.gateway.task_service",
         "ruyi_agent.gateway.commands",
         "ruyi_agent.gateway.channels",
+        "ruyi_agent.gateway.sse",
+        "ruyi_agent.gateway._http_transport",
+        "ruyi_agent.gateway_protocol",
+        "ruyi_agent.channels",
     )
     assert not any(
         imported == forbidden or imported.startswith(f"{forbidden}.")
@@ -147,9 +152,10 @@ def test_create_workflow_has_typed_boundary_and_acyclic_import_dag() -> None:
     source = _WORKFLOW.read_text()
     assert not any(
         token in source
-        for token in "getattr(|hasattr(|setattr(|vars(|locals(|globals(|__dict__|except AttributeError|# fmt:|# noqa|coverage: ".split(
-            "|"
-        )
+        for token in (
+            "getattr(|hasattr(|setattr(|vars(|locals(|globals(|__dict__|"
+            "except AttributeError|# fmt:|# noqa|coverage: "
+        ).split("|")
     )
     assert all(
         "ruyi_agent.gateway.create_route_workflow"
@@ -161,14 +167,7 @@ def test_create_workflow_has_typed_boundary_and_acyclic_import_dag() -> None:
         for path in tree_path.rglob("*.py")
     )
 
-    request = CreateRouteRequest(
-        agent_name="main",
-        route_kind="local",
-        input_content="hello",
-        metadata={},
-        webhook=None,
-        delegation_context=None,
-    )
+    request = CreateRouteRequest("main", "local", "hello", {}, None, None)
     with pytest.raises(FrozenInstanceError):
         request.agent_name = "other"
 
@@ -177,6 +176,7 @@ class _Control:
     def __init__(self, record: TaskRecord) -> None:
         self.record = record
         self.spawn_calls = 0
+        self.ensure_error: Exception | None = None
 
     def remote_create_idempotency_guaranteed(self, agent_name: str) -> bool:
         return True
@@ -184,24 +184,20 @@ class _Control:
     async def spawn_task(
         self, agent_name: str, task: str, **kwargs: object
     ) -> TaskRecord:
-        del agent_name, task, kwargs
         self.spawn_calls += 1
         return self.record
 
     def get_task_record(self, task_id: str) -> TaskRecord:
         if task_id.startswith("effect-"):
             raise UnknownWorkerTaskError(task_id)
-        del task_id
         return self.record
 
     def ensure_remote_task_record(self, **kwargs: object) -> TaskRecord:
-        del kwargs
-        raise UnknownAgentTargetError("missing")
+        raise self.ensure_error or UnknownAgentTargetError("missing")
 
 
 class _MarkerFailureStore(GatewayRouteStore):
     async def amark_create_effect_started(self, task_id: str) -> GatewayCreateEvidence:
-        del task_id
         raise sqlite3.OperationalError("marker unavailable")
 
 
@@ -231,18 +227,24 @@ def _record(
         route_kind=route_kind,
         upstream_task_id=upstream_task_id,
         webhook={"url": "private-url"} if private_remote else None,
-        pending_review=(
-            {
-                "review_id": "private-review",
-                "source_task_id": "private-upstream-id",
-                "details": "private-review-detail",
-            }
-            if private_remote
-            else None
-        ),
-        external_operation="private-operation" if private_remote else None,
+        pending_review=dict(source_task_id="private-id") if private_remote else None,
         external_operation_identity=("private-upstream-id" if private_remote else None),
     )
+
+
+def _assert_public_payload(
+    error: GatewayTaskError, task_id: str, route_state: str
+) -> None:
+    assert error.kind == "upstream_failure"
+    assert error.code == "upstream_gateway_error"
+    assert error.effect_disposition is None
+    assert error.message == "Remote Gateway returned an invalid Task payload"
+    expected = {"task_id": task_id, "route_state": route_state}
+    expected["task_url"] = f"/tasks/{task_id}"
+    if route_state == "uncertain":
+        expected.update(task_queryable=True, create_retryable=False)
+        expected["effect_outcome"] = "uncertain"
+    assert error.details == expected
 
 
 @pytest.mark.parametrize("failure", ["before_effect", "route_marker"])
@@ -298,7 +300,12 @@ def test_public_router_boundary_failure_never_spawns(failure: str) -> None:
                 else "Gateway create effect boundary could not be persisted"
             )
             evidence = store.get_create_evidence("boundary-task")
-            assert evidence is not None and evidence.effect_boundary == "reserved"
+            assert evidence == GatewayCreateEvidence(
+                task_id="boundary-task",
+                key_scope="none",
+                replay_policy="local_task_identity",
+                effect_boundary="reserved",
+            )
             queried = await router.get_record(route)
             assert queried.state == "failed"
             assert queried.error == "Gateway Task route is failed"
@@ -392,19 +399,7 @@ def test_public_router_rejects_remote_payload_or_nondurable_effect(
             assert route.route_state == "uncertain"
             assert control.spawn_calls == 1
             if route_kind == "remote_ref":
-                assert caught.value.kind == "upstream_failure"
-                assert caught.value.effect_disposition is None
-                assert caught.value.message == (
-                    "Remote Gateway returned an invalid Task payload"
-                )
-                assert caught.value.details == {
-                    "task_id": task_id,
-                    "task_url": f"/tasks/{task_id}",
-                    "route_state": "uncertain",
-                    "task_queryable": True,
-                    "create_retryable": False,
-                    "effect_outcome": "uncertain",
-                }
+                _assert_public_payload(caught.value, task_id, "uncertain")
                 assert route.route_error == "Remote Gateway Task creation failed"
                 evidence = store.get_create_evidence(task_id)
                 assert evidence is not None and evidence.effect_boundary == "started"
@@ -417,6 +412,13 @@ def test_public_router_rejects_remote_payload_or_nondurable_effect(
                 route.route_state, route.upstream_task_id = "active", "upstream"
                 with pytest.raises(GatewayTaskError, match="Runtime"):
                     router.ensure_record(route)
+                control.ensure_error = ValueError(
+                    "private-downstream-id https://private.invalid/tasks/private-id"
+                )
+                with pytest.raises(GatewayTaskError) as payload:
+                    router.ensure_record(route)
+                _assert_public_payload(payload.value, task_id, "active")
+                assert "private" not in repr(payload.value)
                 route.route_kind = "local"
                 route.route_state, route.upstream_task_id = "active", "missing"
                 with pytest.raises(GatewayTaskError, match="does not exist"):
