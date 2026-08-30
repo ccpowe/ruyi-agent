@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -11,11 +12,14 @@ from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTas
 from ruyi_agent.channels.presentation import (
     ChannelDeliveryCoordinator,
     ChannelDeliveryHooks,
+    ChannelDeliveryRedrivePolicy,
 )
 from ruyi_agent.channels.task_watch import TaskWatchManager, WatchRetryPolicy
 from ruyi_agent.storage.channel_delivery_store import (
     ChannelDeliveryStore,
     delivery_intent_id,
+    parse_channel_delivery_kind,
+    parse_channel_delivery_state,
 )
 from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 from tests.unit._feishu_adapter_support import (
@@ -149,6 +153,240 @@ def test_restart_recovers_exhausted_watch_for_each_platform(
         second_store.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("platform", ["telegram", "feishu"])
+def test_exhausted_query_redrives_in_same_process(
+    tmp_path: Path,
+    platform: str,
+) -> None:
+    async def scenario() -> None:
+        store = ChannelDeliveryStore(str(tmp_path / f"{platform}-redrive.sqlite3"))
+        gateway = SequenceGateway(
+            [
+                GatewayClientError(status_code=503, code="down", message="temporary"),
+                gateway_task("completed"),
+            ]
+        )
+        manager = TaskWatchManager(
+            gateway_client=gateway,
+            poll_interval=0,
+            terminal_review_grace_checks=0,
+            retry_policy=WatchRetryPolicy(max_attempts=0),
+        )
+        coordinator = ChannelDeliveryCoordinator(
+            task_watch=manager,
+            store=store,
+            platform=platform,
+            redrive_policy=ChannelDeliveryRedrivePolicy(
+                base_delay=0.02,
+                max_delay=0.02,
+                jitter_ratio=0,
+                scan_interval=0.01,
+            ),
+        )
+        events: list[str] = []
+        assert coordinator.ensure_delivery(
+            session_key=f"{platform}:session-1",
+            chat_id="chat-1",
+            task_id="task-1",
+            run_count=1,
+            hooks=hooks(events),
+        )
+        await coordinator.wait()
+        intent_id = delivery_intent_id(
+            platform=platform,
+            session_key=f"{platform}:session-1",
+            task_id="task-1",
+            run_count=1,
+        )
+        for _ in range(100):
+            current = store.get(intent_id)
+            if current is not None and current.state == "delivered":
+                break
+            await asyncio.sleep(0.005)
+        delivered = store.get(intent_id)
+        assert delivered is not None and delivered.state == "delivered"
+        assert delivered.redrive_count == 0
+        assert gateway.calls == 2
+        assert events == ["terminal"]
+        await coordinator.close()
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_channel_delivery_contract_and_legacy_migration(tmp_path: Path) -> None:
+    for value in (" watch", "WATCH", ""):
+        with pytest.raises(ValueError):
+            parse_channel_delivery_kind(value)
+    for value in (" delivered ", "DELIVERED", None):
+        with pytest.raises(ValueError):
+            parse_channel_delivery_state(value)
+
+    legacy_columns = (
+        "intent_id",
+        "platform",
+        "session_key",
+        "chat_id",
+        "task_id",
+        "run_count",
+        "delivery_kind",
+        "review_id",
+        "state",
+        "cursor",
+        "attempt_count",
+        "next_attempt_at",
+        "last_error",
+        "lease_owner",
+        "lease_token",
+        "lease_until",
+        "fence",
+        "created_at",
+        "updated_at",
+    )
+    legacy_schema = """
+        CREATE TABLE channel_delivery_intents (
+            intent_id TEXT PRIMARY KEY,
+            platform TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            run_count INTEGER NOT NULL CHECK (run_count >= 0),
+            delivery_kind TEXT NOT NULL,
+            review_id TEXT,
+            state TEXT NOT NULL,
+            cursor INTEGER NOT NULL DEFAULT 0,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at REAL,
+            last_error TEXT,
+            lease_owner TEXT,
+            lease_token TEXT,
+            lease_until REAL,
+            fence INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(platform, session_key, task_id, run_count)
+        );
+        CREATE INDEX idx_channel_delivery_recovery
+            ON channel_delivery_intents(platform, state, next_attempt_at);
+        CREATE TABLE channel_delivery_steps (
+            intent_id TEXT NOT NULL,
+            step_key TEXT NOT NULL,
+            delivered_at REAL NOT NULL,
+            PRIMARY KEY(intent_id, step_key),
+            FOREIGN KEY(intent_id) REFERENCES channel_delivery_intents(intent_id)
+                ON DELETE CASCADE
+        );
+    """
+
+    def create_legacy(
+        path: Path,
+        *,
+        state: str,
+        kind: str = "watch",
+    ) -> tuple[tuple[object, ...], ...]:
+        connection = sqlite3.connect(path)
+        connection.executescript(legacy_schema)
+        values: tuple[object, ...] = (
+            "legacy-1",
+            "telegram",
+            "telegram:session-1",
+            "chat-1",
+            "task-1",
+            1,
+            kind,
+            None,
+            state,
+            7,
+            3,
+            None,
+            "gateway unavailable",
+            None,
+            None,
+            None,
+            4,
+            10.0,
+            20.0,
+        )
+        connection.execute(
+            f"INSERT INTO channel_delivery_intents ({', '.join(legacy_columns)}) "
+            f"VALUES ({', '.join('?' for _ in legacy_columns)})",
+            values,
+        )
+        connection.execute(
+            "INSERT INTO channel_delivery_steps VALUES (?, ?, ?)",
+            ("legacy-1", "review:r1:message", 19.0),
+        )
+        connection.commit()
+        before = tuple(
+            connection.execute(
+                f"SELECT {', '.join(legacy_columns)} FROM channel_delivery_intents"
+            ).fetchall()
+        )
+        connection.close()
+        return before
+
+    valid_path = tmp_path / "legacy-valid.sqlite3"
+    before = create_legacy(valid_path, state="error")
+    store = ChannelDeliveryStore(str(valid_path))
+    intent = store.get("legacy-1")
+    assert intent is not None
+    assert intent.delivery_kind == "watch"
+    assert intent.state == "error"
+    assert intent.next_attempt_at == 20.0
+    assert intent.redrive_count == 0
+    assert store.step_delivered("legacy-1", step_key="review:r1:message")
+    store.close()
+
+    connection = sqlite3.connect(valid_path)
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "UPDATE channel_delivery_intents SET delivery_kind = 'invalid'"
+        )
+    connection.rollback()
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute("UPDATE channel_delivery_intents SET state = 'invalid'")
+    connection.rollback()
+    migrated = tuple(
+        connection.execute(
+            f"SELECT {', '.join(legacy_columns)} FROM channel_delivery_intents"
+        ).fetchall()
+    )
+    assert migrated[0][:11] + migrated[0][12:] == before[0][:11] + before[0][12:]
+    assert migrated[0][11] == 20.0
+    assert {
+        row[2]
+        for row in connection.execute("PRAGMA foreign_key_list(channel_delivery_steps)")
+    } == {"channel_delivery_intents"}
+    connection.close()
+
+    for suffix, kind, state in (
+        ("state", "watch", "not-a-state"),
+        ("kind", "not-a-kind", "error"),
+    ):
+        invalid_path = tmp_path / f"legacy-invalid-{suffix}.sqlite3"
+        invalid_before = create_legacy(
+            invalid_path,
+            kind=kind,
+            state=state,
+        )
+        with pytest.raises(ValueError):
+            ChannelDeliveryStore(str(invalid_path))
+        connection = sqlite3.connect(invalid_path)
+        assert (
+            tuple(
+                connection.execute(
+                    f"SELECT {', '.join(legacy_columns)} "
+                    "FROM channel_delivery_intents"
+                ).fetchall()
+            )
+            == invalid_before
+        )
+        assert connection.execute(
+            "SELECT intent_id, step_key FROM channel_delivery_steps"
+        ).fetchall() == [("legacy-1", "review:r1:message")]
+        connection.close()
 
 
 def test_partial_artifact_failure_retries_without_duplicate_message(
@@ -713,6 +951,7 @@ def test_coordinator_close_cancels_and_consumes_blocked_delivery(
             platform="telegram",
             lease_seconds=1,
             lease_heartbeat_interval=0.01,
+            redrive_policy=ChannelDeliveryRedrivePolicy(scan_interval=60),
         )
         coordinator.ensure_delivery(
             session_key="telegram:session-1",
@@ -737,6 +976,11 @@ def test_coordinator_close_cancels_and_consumes_blocked_delivery(
         )
         assert cancelled.is_set()
         assert store.get(intent_id).lease_token is None  # type: ignore[union-attr]
+        assert not any(
+            task.get_name().startswith("channel-delivery-reconciler:")
+            for task in asyncio.all_tasks()
+            if not task.done()
+        )
         store.close()
 
     asyncio.run(scenario())

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import random
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -11,6 +13,12 @@ from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTas
 from ruyi_agent.channels.task_watch import TaskWatchHooks, TaskWatchManager
 from ruyi_agent.storage.channel_delivery_store import (
     ChannelDeliveryIntent,
+    DELIVERY_KIND_REVIEW,
+    DELIVERY_KIND_TERMINAL,
+    DELIVERY_STATE_DELIVERED,
+    DELIVERY_STATE_ERROR,
+    DELIVERY_STATE_SUPERSEDED,
+    DELIVERY_STATE_TERMINAL_GRACE,
     ChannelDeliveryStore,
 )
 
@@ -18,10 +26,48 @@ from ruyi_agent.storage.channel_delivery_store import (
 TaskCallback = Callable[[GatewayTask], Awaitable[None]]
 ArtifactCallback = Callable[[GatewayTask, GatewayPublishedArtifact], Awaitable[None]]
 Effect = Callable[[], Awaitable[None]]
+Random = Callable[[], float]
+Sleep = Callable[[float], Awaitable[None]]
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ChannelDeliveryLeaseLost(RuntimeError):
     """The fenced delivery lease expired or was claimed by another owner."""
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelDeliveryRedrivePolicy:
+    """Persistent-query-error backoff and bounded reconciliation settings."""
+
+    base_delay: float = 60.0
+    max_delay: float = 3600.0
+    jitter_ratio: float = 0.2
+    scan_interval: float = 30.0
+    batch_limit: int = 100
+
+    def __post_init__(self) -> None:
+        if self.base_delay <= 0:
+            raise ValueError("delivery redrive base delay must be positive")
+        if self.max_delay < self.base_delay:
+            raise ValueError("delivery redrive max delay must not be below base delay")
+        if self.jitter_ratio < 0:
+            raise ValueError("delivery redrive jitter ratio must not be negative")
+        if self.scan_interval <= 0:
+            raise ValueError("delivery reconciliation scan interval must be positive")
+        if self.batch_limit <= 0:
+            raise ValueError("delivery reconciliation batch limit must be positive")
+
+    def delay(self, redrive_count: int, *, random_value: float) -> float:
+        exponent = min(31, max(0, redrive_count - 1))
+        base = min(self.max_delay, self.base_delay * (2**exponent))
+        jitter = base * self.jitter_ratio * max(0.0, min(1.0, random_value))
+        return min(self.max_delay, max(1e-06, base + jitter))
+
+
+# A short name is useful for embedders while retaining one implementation.
+RedrivePolicy = ChannelDeliveryRedrivePolicy
 
 
 @dataclass(slots=True)
@@ -119,6 +165,16 @@ class ChannelDeliveryCoordinator:
         owner_id: str | None = None,
         lease_seconds: float = 30.0,
         lease_heartbeat_interval: float | None = None,
+        redrive_policy: ChannelDeliveryRedrivePolicy | None = None,
+        redrive_base_delay: float | None = None,
+        redrive_max_delay: float | None = None,
+        redrive_jitter_ratio: float | None = None,
+        reconcile_scan_interval: float | None = None,
+        reconcile_batch_limit: int | None = None,
+        reconciler_scan_interval: float | None = None,
+        reconciler_batch_limit: int | None = None,
+        reconcile_sleep: Sleep = asyncio.sleep,
+        random_value: Random = random.random,
     ) -> None:
         self.task_watch = task_watch
         self.review_presenter = ReviewPresenter()
@@ -134,11 +190,73 @@ class ChannelDeliveryCoordinator:
         )
         if self._lease_heartbeat_interval <= 0:
             raise ValueError("Channel delivery heartbeat interval must be positive")
+        if reconcile_scan_interval is not None and reconciler_scan_interval is not None:
+            if reconcile_scan_interval != reconciler_scan_interval:
+                raise ValueError("Conflicting reconciliation scan intervals")
+        if reconcile_batch_limit is not None and reconciler_batch_limit is not None:
+            if reconcile_batch_limit != reconciler_batch_limit:
+                raise ValueError("Conflicting reconciliation batch limits")
+        scan_interval = (
+            reconcile_scan_interval
+            if reconcile_scan_interval is not None
+            else reconciler_scan_interval
+        )
+        batch_limit = (
+            reconcile_batch_limit
+            if reconcile_batch_limit is not None
+            else reconciler_batch_limit
+        )
+        base_policy = redrive_policy or ChannelDeliveryRedrivePolicy()
+        base_delay = base_policy.base_delay
+        max_delay = base_policy.max_delay
+        jitter_ratio = base_policy.jitter_ratio
+        policy_scan_interval = base_policy.scan_interval
+        policy_batch_limit = base_policy.batch_limit
+        if redrive_base_delay is not None:
+            base_delay = redrive_base_delay
+        if redrive_max_delay is not None:
+            max_delay = redrive_max_delay
+        if redrive_jitter_ratio is not None:
+            jitter_ratio = redrive_jitter_ratio
+        if scan_interval is not None:
+            policy_scan_interval = scan_interval
+        if batch_limit is not None:
+            policy_batch_limit = batch_limit
+        self._redrive_policy = ChannelDeliveryRedrivePolicy(
+            base_delay=base_delay,
+            max_delay=max_delay,
+            jitter_ratio=jitter_ratio,
+            scan_interval=policy_scan_interval,
+            batch_limit=policy_batch_limit,
+        )
+        # Adapters enable the supervisor from ``recover()``.  A caller that
+        # explicitly supplies redrive settings may also use the coordinator
+        # directly, so give that form the same in-process behavior without
+        # changing the historical default-only direct composition path.
+        self._auto_start_reconciler = any(
+            value is not None
+            for value in (
+                redrive_policy,
+                redrive_base_delay,
+                redrive_max_delay,
+                redrive_jitter_ratio,
+                reconcile_scan_interval,
+                reconcile_batch_limit,
+                reconciler_scan_interval,
+                reconciler_batch_limit,
+            )
+        )
+        self._reconcile_sleep = reconcile_sleep
+        self._random_value = random_value
         self._tokens: dict[tuple[str, int], tuple[str, str]] = {}
         self._restart_requests: dict[
             tuple[str, int], tuple[ChannelDeliveryIntent, ChannelDeliveryHooks]
         ] = {}
+        self._hooks_by_intent: dict[str, ChannelDeliveryHooks] = {}
         self._delivery_events: dict[str, asyncio.Event] = {}
+        self._reconcile_wakeup = asyncio.Event()
+        self._reconciler: asyncio.Task[None] | None = None
+        self._reconciler_enabled = False
         self._closed = False
 
     def ensure_watch(
@@ -192,11 +310,19 @@ class ChannelDeliveryCoordinator:
             task_id=task_id,
             run_count=run_count,
         )
+        self._hooks_by_intent[intent.intent_id] = hooks
         key = (intent.task_id, intent.run_count)
-        if self.task_watch.is_active(task_id=intent.task_id, run_count=intent.run_count):
+        if self.task_watch.is_active(
+            task_id=intent.task_id, run_count=intent.run_count
+        ):
             self._restart_requests[key] = (intent, hooks)
+            if self._auto_start_reconciler:
+                self._start_reconciler()
             return False
-        return self._start_intent(intent, hooks=hooks)
+        started = self._start_intent(intent, hooks=hooks)
+        if self._auto_start_reconciler:
+            self._start_reconciler()
+        return started
 
     async def ensure_terminal_delivery(
         self,
@@ -220,20 +346,23 @@ class ChannelDeliveryCoordinator:
             task_id=task_id,
             run_count=run_count,
         )
+        self._hooks_by_intent[intent.intent_id] = hooks
         event = self._delivery_events.setdefault(intent.intent_id, asyncio.Event())
         event.clear()
         self._start_intent(intent, hooks=hooks)
+        if self._auto_start_reconciler:
+            self._start_reconciler()
         while True:
             if self._closed:
                 raise RuntimeError("ChannelDeliveryCoordinator is closed")
             current = self._store.get(intent.intent_id)
             if current is not None and current.state in {
-                "terminal_grace",
-                "delivered",
+                DELIVERY_STATE_TERMINAL_GRACE,
+                DELIVERY_STATE_DELIVERED,
             }:
                 return
             if current is None or (
-                current.state in {"error", "superseded"}
+                current.state in {DELIVERY_STATE_ERROR, DELIVERY_STATE_SUPERSEDED}
                 and not self.is_active(task_id=task_id, run_count=run_count)
                 and current.lease_token is None
             ):
@@ -259,9 +388,21 @@ class ChannelDeliveryCoordinator:
         started: list[tuple[str, int, str]] = []
         try:
             for intent in await self._store.alist_recoverable(platform=self._platform):
-                if self._start_intent(intent, hooks=hooks_for(intent)):
+                hooks = hooks_for(intent)
+                self._hooks_by_intent[intent.intent_id] = hooks
+                if (
+                    intent.state == DELIVERY_STATE_ERROR
+                    and intent.next_attempt_at is not None
+                    and intent.next_attempt_at > self._store.now()
+                ):
+                    # A persistent query-error backoff survives a restart.  The
+                    # reconciler owns the eventual due claim; explicit delivery
+                    # calls still use _start_intent for an immediate attempt.
+                    continue
+                if self._start_intent(intent, hooks=hooks):
                     recovered += 1
                     started.append((intent.task_id, intent.run_count, intent.intent_id))
+            self._start_reconciler()
             return recovered
         except BaseException:
             for task_id, run_count, intent_id in started:
@@ -271,27 +412,148 @@ class ChannelDeliveryCoordinator:
                     self._store.release(intent_id, token=owned[1])
             raise
 
+    def _start_reconciler(self) -> None:
+        if self._store is None or self._platform is None or self._closed:
+            return
+        self._reconciler_enabled = True
+        if self._reconciler is not None and not self._reconciler.done():
+            return
+        self._reconciler = asyncio.create_task(
+            self._reconcile_loop(),
+            name=f"channel-delivery-reconciler:{self._platform}",
+        )
+        self._reconciler.add_done_callback(self._consume_reconciler_result)
+
+    async def _reconcile_loop(self) -> None:
+        failure_attempt = 0
+        try:
+            while not self._closed:
+                try:
+                    await self._reconcile_once()
+                    failure_attempt = 0
+                    await self._wait_for_reconcile_signal()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    failure_attempt += 1
+                    _LOGGER.warning(
+                        "Channel delivery reconciliation failed; retrying with backoff",
+                        extra={
+                            "platform": self._platform,
+                            "owner_id": self._owner_id,
+                            "failure_attempt": failure_attempt,
+                            "error_type": type(exc).__name__,
+                        },
+                        exc_info=True,
+                    )
+                    delay = self._redrive_policy.delay(
+                        failure_attempt,
+                        random_value=self._random_value(),
+                    )
+                    await self._reconcile_sleep(delay)
+                    # Keep even injected/test sleepers from turning a
+                    # repeatedly failing supervisor into an event-loop hog.
+                    await asyncio.sleep(0)
+        finally:
+            if self._reconciler is asyncio.current_task():
+                self._reconciler = None
+
+    async def _reconcile_once(self) -> None:
+        if self._store is None or self._platform is None:
+            return
+        now = self._store.now()
+        intents = await self._store.alist_due_errors(
+            platform=self._platform,
+            limit=self._redrive_policy.batch_limit,
+            now=now,
+        )
+        for intent in intents:
+            hooks = self._hooks_by_intent.get(intent.intent_id)
+            if hooks is None:
+                # Startup recovery normally populates this map.  A row without
+                # transport hooks cannot be safely sent and is left durable for
+                # the next startup/recovery attempt.
+                continue
+            token = self._store.claim_due_error(
+                intent.intent_id,
+                owner=self._owner_id,
+                lease_seconds=self._lease_seconds,
+                now=self._store.now(),
+            )
+            if token is None:
+                continue
+            if not self._start_intent(intent, hooks=hooks, token=token):
+                self._store.release(intent.intent_id, token=token)
+            await asyncio.sleep(0)
+
+    async def _wait_for_reconcile_signal(self) -> None:
+        if self._store is None or self._platform is None or self._closed:
+            return
+        self._reconcile_wakeup.clear()
+        now = self._store.now()
+        earliest = await self._store.anext_due_error_at(
+            platform=self._platform,
+            now=now,
+        )
+        timeout = self._redrive_policy.scan_interval
+        if earliest is not None and earliest > now:
+            timeout = min(timeout, earliest - now)
+        # A due row that lost a race with another owner must not cause an
+        # immediate full-table loop; the bounded scan interval handles it.
+        if timeout <= 0:
+            timeout = self._redrive_policy.scan_interval
+        wake = asyncio.create_task(self._reconcile_wakeup.wait())
+        timer = asyncio.create_task(self._reconcile_sleep(timeout))
+        try:
+            await asyncio.wait(
+                {wake, timer},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (wake, timer):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(wake, timer, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    @staticmethod
+    def _consume_reconciler_result(task: asyncio.Task[Any]) -> None:
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            return
+
     def _start_intent(
         self,
         intent: ChannelDeliveryIntent,
         *,
         hooks: ChannelDeliveryHooks,
+        token: str | None = None,
     ) -> bool:
         if self._store is None:
+            return False
+        if self._closed:
+            if token is not None:
+                self._store.release(intent.intent_id, token=token)
             return False
         key = (intent.task_id, intent.run_count)
         if self.task_watch.is_active(
             task_id=intent.task_id, run_count=intent.run_count
         ):
+            if token is not None:
+                self._store.release(intent.intent_id, token=token)
             return False
-        token = self._store.claim(
-            intent.intent_id,
-            owner=self._owner_id,
-            lease_seconds=self._lease_seconds,
-        )
+        if token is None:
+            token = self._store.claim(
+                intent.intent_id,
+                owner=self._owner_id,
+                lease_seconds=self._lease_seconds,
+            )
         if token is None:
             return False
         self._tokens[key] = (intent.intent_id, token)
+        self._hooks_by_intent[intent.intent_id] = hooks
+        redrive_delay: float | None = None
 
         async def observed(_: GatewayTask) -> None:
             if not self._store.renew(
@@ -322,13 +584,33 @@ class ChannelDeliveryCoordinator:
                 )
             )
 
+        async def exhausted(exc: Exception, auto_redrive: bool) -> None:
+            del exc
+            nonlocal redrive_delay
+            redrive_delay = None
+            if not auto_redrive or not self._reconciler_enabled:
+                return
+            current = self._store.get(intent.intent_id)
+            count = (
+                current.redrive_count if current is not None else intent.redrive_count
+            )
+            redrive_delay = self._redrive_policy.delay(
+                count + 1,
+                random_value=self._random_value(),
+            )
+
         async def failed(exc: Exception) -> None:
             owned = self._store.mark_error(
-                intent.intent_id, token=token, error=str(exc)
+                intent.intent_id,
+                token=token,
+                error=str(exc),
+                redrive_delay=redrive_delay,
             )
             self._tokens.pop(key, None)
             self._restart_requests.pop(key, None)
             self._signal_delivery(intent.intent_id)
+            if owned and redrive_delay is not None:
+                self._reconcile_wakeup.set()
             if owned and hooks.on_error is not None:
                 await hooks.on_error(exc)
 
@@ -374,6 +656,7 @@ class ChannelDeliveryCoordinator:
                     on_superseded=superseded,
                     on_observed=observed,
                     on_retry=retry,
+                    on_exhausted=exhausted,
                     on_error=failed,
                     on_stopped=stopped,
                 ),
@@ -400,7 +683,7 @@ class ChannelDeliveryCoordinator:
             self._store.mark_delivering(
                 intent.intent_id,
                 token=token,
-                delivery_kind="review",
+                delivery_kind=DELIVERY_KIND_REVIEW,
                 review_id=review_id,
             )
         )
@@ -437,7 +720,7 @@ class ChannelDeliveryCoordinator:
             self._store.mark_delivering(
                 intent.intent_id,
                 token=token,
-                delivery_kind="terminal",
+                delivery_kind=DELIVERY_KIND_TERMINAL,
                 review_id=None,
             )
         )
@@ -474,11 +757,8 @@ class ChannelDeliveryCoordinator:
                 )
             )
         delivered_hook_step = f"terminal:{task.run_count}:delivered-hook"
-        if (
-            hooks.on_terminal_delivered is not None
-            and not self._store.step_delivered(
-                intent.intent_id, step_key=delivered_hook_step
-            )
+        if hooks.on_terminal_delivered is not None and not self._store.step_delivered(
+            intent.intent_id, step_key=delivered_hook_step
         ):
             delivered_callback = hooks.on_terminal_delivered
             await self._run_effect(
@@ -591,11 +871,19 @@ class ChannelDeliveryCoordinator:
         if self._closed:
             return
         self._closed = True
+        self._reconciler_enabled = False
+        self._reconcile_wakeup.set()
+        reconciler = self._reconciler
+        if reconciler is not None and not reconciler.done():
+            reconciler.cancel()
+        if reconciler is not None:
+            await asyncio.gather(reconciler, return_exceptions=True)
         await self.task_watch.close()
         if self._store is not None:
             self._store.release_owner(self._owner_id)
         self._tokens.clear()
         self._restart_requests.clear()
+        self._hooks_by_intent.clear()
         for event in self._delivery_events.values():
             event.set()
         self._delivery_events.clear()

@@ -22,6 +22,7 @@ TERMINAL_TASK_STATES = SETTLED_TASK_STATES
 TaskHook = Callable[[GatewayTask], Awaitable[None]]
 ErrorHook = Callable[[Exception], Awaitable[None]]
 RetryHook = Callable[[Exception, int, float], Awaitable[None]]
+ExhaustedHook = Callable[[Exception, bool], Awaitable[None]]
 ObservedHook = Callable[[GatewayTask], Awaitable[None]]
 StoppedHook = Callable[[], Awaitable[None]]
 Sleep = Callable[[float], Awaitable[None]]
@@ -51,6 +52,7 @@ class TaskWatchHooks:
     on_error: ErrorHook | None = None
     on_stopped: StoppedHook | None = None
     on_terminal_grace_complete: TaskHook | None = None
+    on_exhausted: ExhaustedHook | None = None
 
 
 def is_retryable_gateway_error(exc: Exception) -> bool:
@@ -115,9 +117,7 @@ class TaskWatchManager:
         return watch is not None and not watch.done()
 
     async def wait(self) -> None:
-        while active := [
-            watch for watch in self._watches.values() if not watch.done()
-        ]:
+        while active := [watch for watch in self._watches.values() if not watch.done()]:
             await asyncio.gather(*active)
 
     async def cancel(self, *, task_id: str, run_count: int) -> None:
@@ -158,14 +158,42 @@ class TaskWatchManager:
             while True:
                 try:
                     payload = await self._gateway_client.get_task(task_id=task_id)
-                    task = gateway_task_from_payload(payload)
-                    if hooks.on_observed is not None:
-                        await hooks.on_observed(task)
                 except Exception as exc:
                     query_attempt += 1
-                    if not is_retryable_gateway_error(exc) or (
+                    retryable = is_retryable_gateway_error(exc)
+                    if not retryable or (
                         query_attempt > self._retry_policy.max_attempts
                     ):
+                        await self._report_exhausted(
+                            hooks,
+                            exc,
+                            auto_redrive=retryable,
+                        )
+                        await self._report_error(hooks, exc)
+                        return
+                    delay = self._retry_policy.delay(
+                        query_attempt,
+                        random_value=self._random_value(),
+                    )
+                    if hooks.on_retry is not None:
+                        await hooks.on_retry(exc, query_attempt, delay)
+                    await self._sleep(delay)
+                    continue
+                try:
+                    task = gateway_task_from_payload(payload)
+                except Exception as exc:
+                    # A malformed Gateway response is a contract failure, not
+                    # evidence that retrying the Gateway will eventually help.
+                    query_attempt += 1
+                    retryable = is_retryable_gateway_error(exc)
+                    if not retryable or (
+                        query_attempt > self._retry_policy.max_attempts
+                    ):
+                        await self._report_exhausted(
+                            hooks,
+                            exc,
+                            auto_redrive=False,
+                        )
                         await self._report_error(hooks, exc)
                         return
                     delay = self._retry_policy.delay(
@@ -178,6 +206,8 @@ class TaskWatchManager:
                     continue
                 query_attempt = 0
                 try:
+                    if hooks.on_observed is not None:
+                        await hooks.on_observed(task)
                     if task.run_count > expected_run_count:
                         if hooks.on_superseded is not None:
                             await hooks.on_superseded(task)
@@ -207,6 +237,11 @@ class TaskWatchManager:
                 except Exception as exc:
                     delivery_attempt += 1
                     if delivery_attempt > self._retry_policy.max_attempts:
+                        await self._report_exhausted(
+                            hooks,
+                            exc,
+                            auto_redrive=False,
+                        )
                         await self._report_error(hooks, exc)
                         return
                     delay = self._retry_policy.delay(
@@ -235,6 +270,20 @@ class TaskWatchManager:
             return
         try:
             await hooks.on_error(exc)
+        except Exception:
+            return
+
+    @staticmethod
+    async def _report_exhausted(
+        hooks: TaskWatchHooks,
+        exc: Exception,
+        *,
+        auto_redrive: bool,
+    ) -> None:
+        if hooks.on_exhausted is None:
+            return
+        try:
+            await hooks.on_exhausted(exc, auto_redrive)
         except Exception:
             return
 
