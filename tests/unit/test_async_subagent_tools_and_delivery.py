@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import pytest
+from langchain_core.tools import StructuredTool
 
 import ruyi_agent.runtime.delegation.async_runtime as async_subagent_runtime
 import ruyi_agent.runtime.agent_factory as agent_factory_module
@@ -12,7 +13,7 @@ from ruyi_agent.storage.mailbox_store import MailboxStore
 from ruyi_agent.runtime.delegation.notifications import SettledRunNotifier
 from ruyi_agent.runtime.delegation.policy import DelegationPolicy
 from ruyi_agent.runtime.delegation.registry import AgentRegistry
-from ruyi_agent.runtime.delegation.local_executor import LocalTaskExecutor
+from ruyi_agent.runtime.delegation.run_supervisor import RuntimeClosingError
 from ruyi_agent.runtime.delegation.task_manager import TaskManager
 from ruyi_agent.runtime.delegation.tools import DelegationTools
 from ruyi_agent.runtime.delegation.contracts import (
@@ -238,23 +239,34 @@ def test_send_input_to_settled_task_wakes_mailbox_run(
 ) -> None:
     mailbox = AgentMailbox()
 
-    class ConsumingAgent(FakeAgent):
+    class TwoStageAgent(FakeAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.second_started = asyncio.Event()
+            self.allow_second_finish = asyncio.Event()
+            self.consumed: list = []
+
         async def ainvoke(self, payload, *, config, version):
             self.calls.append(
                 {"payload": payload, "config": config, "version": version}
             )
-            if payload == {"messages": []}:
+            if len(self.calls) == 2:
+                assert payload == {"messages": []}
                 task_id = config["configurable"]["task_id"]
                 thread_id = config["configurable"]["thread_id"]
-                messages = mailbox.claim(
-                    recipient_task_id=task_id,
-                    recipient_thread_id=thread_id,
+                self.consumed.extend(
+                    mailbox.claim(
+                        recipient_task_id=task_id,
+                        recipient_thread_id=thread_id,
+                    )
                 )
-                mailbox.acknowledge([message.message_id for message in messages])
-            await asyncio.sleep(0)
+                assert [message.content for message in self.consumed] == ["follow up"]
+                mailbox.acknowledge([message.message_id for message in self.consumed])
+                self.second_started.set()
+                await self.allow_second_finish.wait()
             return {"messages": [{"role": "assistant", "content": "done"}]}
 
-    agent = ConsumingAgent()
+    agent = TwoStageAgent()
     monkeypatch.setattr(
         agent_factory_module,
         "create_runtime_agent",
@@ -268,23 +280,31 @@ def test_send_input_to_settled_task_wakes_mailbox_run(
         mailbox=mailbox,
     )
 
-    async def scenario() -> tuple[int, list[dict]]:
+    async def scenario() -> tuple[int, list[dict], list, list]:
         record = await control.spawn_task("background_research", "first")
         await wait_for_task_state(control, record.task_id, states={"completed"})
         continued = await control.send_task_input(record.task_id, "follow up")
+        await asyncio.wait_for(agent.second_started.wait(), timeout=1)
+        assert len(agent.calls) == 2
+        assert agent.consumed
+        empty = mailbox.claim(
+            recipient_task_id=record.task_id,
+            recipient_thread_id=record.thread_id,
+        )
+        agent.allow_second_finish.set()
         continued = await wait_for_task_state(
             control, continued.task_id, states={"completed"}
         )
-        return continued.run_count, agent.calls
+        await control.close()
+        return continued.run_count, agent.calls, agent.consumed, empty
 
-    run_count, calls = asyncio.run(scenario())
+    run_count, calls, consumed, empty = asyncio.run(scenario())
 
     assert run_count == 2
     assert calls[1]["payload"] == {"messages": []}
-    assert (
-        mailbox.has_triggering_messages(calls[1]["config"]["configurable"]["task_id"])
-        is False
-    )
+    assert len(calls) == 2
+    assert len(consumed) == 1
+    assert empty == []
 
 
 def test_restart_loads_persisted_task_and_wakes_pending_mailbox_input(
@@ -639,7 +659,9 @@ def test_build_tools_for_agent_limits_spawn_scope() -> None:
     assert allowed_record.task_id in wait_denied
 
 
-def test_compiling_agent_resolves_declared_scope_in_target_order() -> None:
+def test_compiling_agent_resolves_declared_scope_in_target_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured: dict = {}
 
     def capture_factory(**kwargs):
@@ -688,7 +710,7 @@ def test_compiling_agent_resolves_declared_scope_in_target_order() -> None:
             "local_first",
             "remote_first",
         ),
-        system_tools=frozenset({"spawn_agent", "list_agents"}),
+        system_tools=frozenset({"spawn_agent", "check_agent", "list_agents"}),
     )
     specs = {
         "main": main,
@@ -700,47 +722,73 @@ def test_compiling_agent_resolves_declared_scope_in_target_order() -> None:
         "remote_second": remote_second,
         "remote_first": remote_first,
     }
-    manager = TaskManager()
-    registry = AgentRegistry(specs, refs)
-    policy = DelegationPolicy(
-        manager,
-        node_id="node-test",
-        max_delegation_depth=3,
-        max_tasks_per_root=20,
-        permission_default_profile="",
+
+    class CountingRemoteClient:
+        def __init__(self) -> None:
+            self.get_calls = 0
+
+        async def get_task(self, remote_ref: RemoteRef, *, task_id: str) -> dict:
+            del remote_ref, task_id
+            self.get_calls += 1
+            raise AssertionError("closed runtime must not call remote get")
+
+    remote_client = CountingRemoteClient()
+    monkeypatch.setattr(
+        agent_factory_module,
+        "create_runtime_agent",
+        capture_factory,
     )
-    delegation_tools = DelegationTools(
-        registry,
-        manager,
-        policy,
-        SettledRunNotifier(manager, None),
-    )
-    command_port = _CommandPort(manager)
-    worker_tools = delegation_tools.build_tools_for("main", command_port=command_port)
-    executor = LocalTaskExecutor(
-        manager,
-        registry=registry,
-        agent_factory=capture_factory,
-        backend=object(),
+    control = async_subagent_runtime.AgentControl(
+        specs,
+        refs,
         checkpointer=object(),
-        mailbox=None,
-        permission_policy=None,
-        permission_default_profile="",
-        skill_catalog={},
-        skill_syncer=None,
-        review_audit_store=None,
-        backend_kind="test",
-        workspace_root="",
+        backend=object(),
+        a2a_client=remote_client,
     )
 
-    executor.compile_agent("main", worker_tools=worker_tools)
+    async def scenario() -> tuple[TaskRecord, TaskRecord]:
+        record = await control.spawn_task(
+            "main",
+            "compile",
+            task_id="main-task",
+            parent_thread_id="main-thread",
+        )
+        record = await wait_for_task_state(
+            control,
+            record.task_id,
+            states={"completed"},
+        )
+        remote_record = control.ensure_remote_task_record(
+            agent_name="remote_first",
+            task_id="remote-task",
+            upstream_task_id="upstream-task",
+        )
+        await control.close()
+        with pytest.raises(RuntimeClosingError, match="closing"):
+            await control.refresh_task(remote_record.task_id)
+        return record, remote_record
+
+    record, remote_record = asyncio.run(scenario())
 
     assert list(captured["local_worker_specs"]) == ["local_first", "local_second"]
     assert list(captured["remote_refs"]) == ["remote_first", "remote_second"]
     assert {tool.name for tool in captured["worker_tools"]} == {
         "spawn_agent",
+        "check_agent",
         "list_agents",
     }
+    assert all(isinstance(tool, StructuredTool) for tool in captured["worker_tools"])
+    spawn_tool = next(
+        tool for tool in captured["worker_tools"] if tool.name == "spawn_agent"
+    )
+    check_tool = next(
+        tool for tool in captured["worker_tools"] if tool.name == "check_agent"
+    )
+    assert "remote_first" in spawn_tool.description
+    assert isinstance(check_tool, StructuredTool)
+    assert record.state == "completed"
+    assert remote_record.route_kind == "remote_ref"
+    assert remote_client.get_calls == 0
 
 
 def test_declared_but_unavailable_target_returns_clear_error() -> None:

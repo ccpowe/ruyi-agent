@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 import ruyi_agent.runtime.agent_factory as agent_factory_module
+import ruyi_agent.runtime.delegation.task_runtime as task_runtime_module
 from ruyi_agent.runtime.delegation.async_runtime import AgentControl
 from ruyi_agent.runtime.delegation.notifications import SettledRunNotifier
 from ruyi_agent.runtime.delegation.task_manager import TaskManager
@@ -18,6 +19,7 @@ from ruyi_agent.storage.mailbox_store import MailboxStore
 from ruyi_agent.storage.task_store import TaskStore
 from ruyi_agent.task_models import TaskRecord
 from tests.support.async_subagent_runtime import (
+    FakeAgent,
     FakeAgentFactory,
     build_specs,
     build_test_remote_refs,
@@ -31,11 +33,12 @@ def _control(
     *,
     task_store: TaskStore | None = None,
     mailbox_store: MailboxStore | None = None,
+    agent_factory: object | None = None,
 ) -> tuple[AgentControl, TaskStore, MailboxStore, AgentMailbox]:
     monkeypatch.setattr(
         agent_factory_module,
         "create_runtime_agent",
-        FakeAgentFactory(),
+        agent_factory if agent_factory is not None else FakeAgentFactory(),
     )
     task_store = task_store or TaskStore(db_path)
     mailbox_store = mailbox_store or MailboxStore(db_path)
@@ -269,19 +272,60 @@ def test_direct_mailbox_retry_does_not_poison_seen_key(
 def test_first_outbox_write_failure_retries_and_does_not_block_webhook(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     db_path = str(tmp_path / "retry.sqlite")
-    control, task_store, mailbox_store, mailbox = _control(monkeypatch, db_path)
-    original_publish = mailbox_store.publish_claimed_settled_outbox
-    publish_calls = 0
+    setup_store = TaskStore(db_path)
+    parent = _record("parent-task", parent_thread_id=None)
+    setup_store.insert_task(parent)
+    setup_store.close()
+    active_mailbox: list[AgentMailbox] = []
+
+    class ParentWakeAgent(FakeAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.parent_messages: list = []
+
+        async def ainvoke(self, payload, *, config, version):
+            self.calls.append(
+                {"payload": payload, "config": config, "version": version}
+            )
+            if payload == {"messages": []}:
+                task_id = config["configurable"]["task_id"]
+                thread_id = config["configurable"]["thread_id"]
+                self.parent_messages.extend(
+                    active_mailbox[0].claim(
+                        recipient_task_id=task_id,
+                        recipient_thread_id=thread_id,
+                    )
+                )
+                active_mailbox[0].acknowledge(
+                    [message.message_id for message in self.parent_messages]
+                )
+            return {"messages": [{"role": "assistant", "content": "done"}]}
+
+    agent = ParentWakeAgent()
+
+    def factory(**kwargs):
+        del kwargs
+        return agent
+
+    control, task_store, mailbox_store, mailbox = _control(
+        monkeypatch,
+        db_path,
+        agent_factory=factory,
+    )
+    active_mailbox.append(mailbox)
+    original_publish = MailboxStore.publish_claimed_settled_outbox
+    publish_attempts = 0
     webhook_calls: list[str] = []
 
-    def flaky_publish(intent) -> bool:
-        nonlocal publish_calls
-        publish_calls += 1
-        if publish_calls == 1:
+    def flaky_publish(store: MailboxStore, intent) -> bool:
+        nonlocal publish_attempts
+        publish_attempts += 1
+        if publish_attempts == 1:
             raise RuntimeError("mailbox unavailable")
-        return original_publish(intent)
+        return original_publish(store, intent)
 
     class CapturingClient:
         def __init__(self, *, timeout: float) -> None:
@@ -297,35 +341,70 @@ def test_first_outbox_write_failure_retries_and_does_not_block_webhook(
             del headers, json
             webhook_calls.append(url)
 
-    monkeypatch.setattr(mailbox_store, "publish_claimed_settled_outbox", flaky_publish)
+    monkeypatch.setattr(
+        MailboxStore,
+        "publish_claimed_settled_outbox",
+        flaky_publish,
+    )
     monkeypatch.setattr(httpx, "AsyncClient", CapturingClient)
 
-    async def scenario() -> list:
+    async def scenario() -> tuple[TaskRecord, list, list, list]:
         record = await control.spawn_task(
             "background_research",
             "run",
+            task_id="child-task",
+            parent_task_id=parent.task_id,
             parent_thread_id="parent-thread",
             webhook={"url": "https://client.example/settled"},
         )
         await wait_for_task_state(control, record.task_id, states={"completed"})
         assert task_store.list_settled_outbox()[0]["status"] == "pending"
-        await _notifier(task_store, mailbox).reconcile()
-        return mailbox.claim(
-            recipient_task_id=None,
-            recipient_thread_id="parent-thread",
-        )
-
-    try:
-        messages = asyncio.run(scenario())
-    finally:
+        await control.close()
         mailbox_store.close()
         task_store.close()
 
+        reopened_tasks = TaskStore(db_path)
+        reopened_mailbox_store = MailboxStore(db_path)
+        reopened_mailbox = AgentMailbox(reopened_mailbox_store)
+        active_mailbox[0] = reopened_mailbox
+        reopened, _, _, _ = _control(
+            monkeypatch,
+            db_path,
+            task_store=reopened_tasks,
+            mailbox_store=reopened_mailbox_store,
+            agent_factory=factory,
+        )
+        try:
+            await reopened.wake_pending_mailbox_tasks()
+            parent_after = await wait_for_task_state(
+                reopened,
+                parent.task_id,
+                states={"completed"},
+            )
+            messages = list(agent.parent_messages)
+            empty = reopened_mailbox.claim(
+                recipient_task_id=parent.task_id,
+                recipient_thread_id=parent.thread_id,
+            )
+            rows = reopened_tasks.list_settled_outbox()
+            return parent_after, messages, empty, rows
+        finally:
+            await reopened.close()
+            reopened_mailbox_store.close()
+            reopened_tasks.close()
+
+    parent_after, messages, empty, rows = asyncio.run(scenario())
+
     assert webhook_calls == ["https://client.example/settled"]
-    assert publish_calls == 2
-    assert [(message.child_task_id, message.run_count) for message in messages] == [
-        (messages[0].child_task_id, 1)
-    ]
+    assert publish_attempts == 2
+    assert "mailbox unavailable" in caplog.text
+    assert "dispatch settled:parent-thread:child-task:1" in caplog.text
+    assert len(messages) == 1
+    assert messages[0].child_task_id == "child-task"
+    assert messages[0].run_count == 1
+    assert parent_after.run_count == 2
+    assert empty == []
+    assert len(rows) == 1 and rows[0]["status"] == "delivered"
 
 
 def test_webhook_failure_does_not_lose_mailbox_delivery(
@@ -556,9 +635,44 @@ def test_background_reconciler_starts_and_closes_cleanly(
     db_path = str(tmp_path / "background.sqlite")
     control, task_store, mailbox_store, _ = _control(monkeypatch, db_path)
 
+    class ControlledSleep:
+        def __init__(self) -> None:
+            self.entered = {
+                1: [asyncio.Event(), asyncio.Event()],
+                5: [asyncio.Event(), asyncio.Event()],
+            }
+            self.released = {
+                1: [asyncio.Event(), asyncio.Event()],
+                5: [asyncio.Event(), asyncio.Event()],
+            }
+            self.counts = {1: 0, 5: 0}
+
+        async def __call__(self, delay: int) -> None:
+            assert delay in self.entered
+            index = self.counts[delay]
+            self.counts[delay] += 1
+            if index < 2:
+                self.entered[delay][index].set()
+                await self.released[delay][index].wait()
+            else:
+                await asyncio.Event().wait()
+
+    controlled_sleep = ControlledSleep()
+    monkeypatch.setattr(task_runtime_module.asyncio, "sleep", controlled_sleep)
+
     async def scenario() -> None:
         control.start_mailbox_recovery()
-        await asyncio.sleep(0)
+        await controlled_sleep.entered[1][0].wait()
+        await controlled_sleep.entered[5][0].wait()
+        assert controlled_sleep.counts == {1: 1, 5: 1}
+        controlled_sleep.released[1][0].set()
+        await controlled_sleep.entered[1][1].wait()
+        assert controlled_sleep.counts[5] == 1
+        controlled_sleep.released[5][0].set()
+        await controlled_sleep.entered[5][1].wait()
+        assert controlled_sleep.counts[1] == 2
+        controlled_sleep.released[1][1].set()
+        controlled_sleep.released[5][1].set()
         await control.close()
 
     try:

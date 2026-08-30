@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 import ruyi_agent.runtime.bootstrap as bootstrap_module
+import ruyi_agent.runtime.delegation.run_supervisor as supervisor_module
 from ruyi_agent.config.paths import RuyiPaths
 from ruyi_agent.config.runtime_settings import load_runtime_settings
 from ruyi_agent.runtime.delegation.async_runtime import AgentControl
@@ -710,7 +711,7 @@ async def test_cancel_task_is_tracked_through_concurrent_close(
     record = await control.spawn_task("background_research", "cancel")
     await agent.all_started.wait()
     cancelling = asyncio.create_task(control.cancel_task(record.task_id))
-    await asyncio.sleep(0)
+    await webhook_started.wait()
 
     await asyncio.wait_for(control.close(), timeout=0.5)
     with pytest.raises(asyncio.CancelledError):
@@ -883,20 +884,57 @@ async def test_runtime_permits_reject_forgery_cross_task_and_reuse() -> None:
 @pytest.mark.parametrize("kind", ["mutation", "operation"])
 @async_test
 async def test_permit_cleanup_survives_double_cancel_while_condition_is_locked(
+    monkeypatch: pytest.MonkeyPatch,
     kind: str,
 ) -> None:
+    first_acquire_started = asyncio.Event()
+    first_acquire_release = asyncio.Event()
+    cleanup_acquire_started = asyncio.Event()
+    second_cleanup_acquire_started = asyncio.Event()
+    cleanup_acquire_release = asyncio.Event()
+
+    class GatedCondition(asyncio.Condition):
+        def __init__(self) -> None:
+            super().__init__()
+            self.base_acquire = self.acquire
+            self.acquire = self.gated_acquire
+            self.first_acquire = True
+            self.gate_cleanup = False
+            self.cleanup_acquires = 0
+
+        async def gated_acquire(self) -> bool:
+            if self.first_acquire:
+                self.first_acquire = False
+                first_acquire_started.set()
+                await first_acquire_release.wait()
+            if self.gate_cleanup:
+                self.cleanup_acquires += 1
+                if self.cleanup_acquires == 1:
+                    cleanup_acquire_started.set()
+                elif self.cleanup_acquires == 2:
+                    second_cleanup_acquire_started.set()
+                await cleanup_acquire_release.wait()
+            return await self.base_acquire()
+
+    conditions: list[GatedCondition] = []
+
+    def condition_factory() -> GatedCondition:
+        condition = GatedCondition()
+        conditions.append(condition)
+        return condition
+
+    monkeypatch.setattr(supervisor_module.asyncio, "Condition", condition_factory)
     _manager, supervisor = _direct_supervisor()
     ready = asyncio.Event()
-    release = asyncio.Event()
 
     async def owner() -> None:
         mutation = await supervisor.acquire_mutation()
-        permit: Any = mutation
+        permit = mutation
         if kind == "operation":
             permit = await supervisor.promote_to_operation(mutation)
         ready.set()
         try:
-            await release.wait()
+            await asyncio.Event().wait()
         finally:
             if kind == "operation":
                 await supervisor.cleanup_operation(permit)
@@ -904,12 +942,21 @@ async def test_permit_cleanup_survives_double_cancel_while_condition_is_locked(
                 await supervisor.cleanup_mutation(permit)
 
     task = asyncio.create_task(owner())
+    await first_acquire_started.wait()
+    assert len(conditions) == 1
+    first_acquire_release.set()
     await ready.wait()
+    conditions[0].gate_cleanup = True
     task.cancel()
-    await asyncio.sleep(0)
+    await cleanup_acquire_started.wait()
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
+    await second_cleanup_acquire_started.wait()
+    cleanup_acquire_release.set()
+    with pytest.raises(AssertionError, match="cancellation-safe cleanup"):
         await task
+
+    new_permit = await supervisor.acquire_mutation()
+    await supervisor.release_mutation(new_permit)
     await supervisor.close()
 
 
