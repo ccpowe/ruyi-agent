@@ -22,10 +22,12 @@ from ruyi_agent.gateway.routing import _encode_task_message_cursor
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.integrations.a2a.client import A2AClient
 from ruyi_agent.runtime.delegation.async_runtime import AgentControl
+from ruyi_agent.runtime.delegation.task_manager import TaskManager
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
 from ruyi_agent.storage.mailbox_store import MailboxStore
 from ruyi_agent.storage.task_store import TaskStore
+from tests.support.async_subagent_runtime import wait_for_task_state
 
 
 @tool
@@ -119,10 +121,7 @@ def _agent_config(name: str, *, kind: str = "local") -> dict[str, object]:
 
 
 async def _wait_for_run(control: AgentControl, task_id: str) -> None:
-    record = control.get_task_record(task_id)
-    active_run = control.get_live_run(record.task_id)
-    if active_run is not None:
-        await active_run
+    await wait_for_task_state(control, task_id, states={"completed"})
 
 
 def test_local_message_history_is_snapshot_consistent_and_survives_restart(
@@ -157,7 +156,7 @@ def test_local_message_history_is_snapshot_consistent_and_survives_restart(
             )
             try:
                 pending_task_id = "pending-without-checkpoint"
-                pending_record = control._task_manager.create_task_record(
+                pending_record = TaskManager(task_store).create_task_record(
                     pending_task_id,
                     "main",
                     parent_task_id=None,

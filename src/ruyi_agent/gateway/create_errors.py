@@ -15,11 +15,13 @@ from ruyi_agent.gateway.route_reservations import (
     with_route_identity,
 )
 from ruyi_agent.integrations.a2a.client import A2AClientError
-from ruyi_agent.runtime.delegation.async_runtime import (
+from ruyi_agent.runtime.delegation.contracts import (
     MaxDelegationDepthError,
-    MaxTasksPerRootError,
     RemoteExecutorNotImplementedError,
     UnknownAgentTargetError,
+)
+from ruyi_agent.storage.task_store import (
+    TaskRootBudgetExceededError as MaxTasksPerRootError,
 )
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
 from ruyi_agent.task_models import TaskRouteRecord

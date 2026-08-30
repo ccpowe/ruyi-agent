@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import httpx
 
-import ruyi_agent.runtime.delegation.async_runtime as async_runtime
+import ruyi_agent.runtime.agent_factory as agent_factory_module
+from ruyi_agent.runtime.delegation.async_runtime import AgentControl
 from ruyi_agent.channels.gateway_client import GatewayHTTPClient
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.channels.http.routes import create_gateway_app
@@ -59,13 +60,13 @@ def test_telegram_channel_turn_reuses_gateway_task_through_real_http_and_sqlite(
     mailbox = AgentMailbox(mailbox_store)
     agent = RecordingAgent(mailbox)
     monkeypatch.setattr(
-        async_runtime,
+        agent_factory_module,
         "create_runtime_agent",
         lambda **kwargs: agent,
     )
     route_store = GatewayRouteStore(str(tmp_path / "routes.sqlite"))
     session_store = ChannelSessionStore(str(tmp_path / "sessions.sqlite"))
-    control = async_runtime.AgentControl(
+    control = AgentControl(
         {
             "main": LocalWorkerSpec(
                 name="main",

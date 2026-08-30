@@ -6,6 +6,7 @@ import httpx
 from fastapi import FastAPI
 
 import ruyi_agent.runtime.delegation.async_runtime as async_runtime
+import ruyi_agent.runtime.agent_factory as agent_factory_module
 from ruyi_agent.channels.http.routes import create_gateway_app
 from ruyi_agent.config.loader import LocalWorkerSpec, RemoteRef
 from ruyi_agent.gateway.tasks import GatewayTaskModule
@@ -15,6 +16,7 @@ from ruyi_agent.storage.gateway_command_store import GatewayCommandStore
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
 from ruyi_agent.storage.mailbox_store import MailboxStore
 from ruyi_agent.storage.task_store import TaskStore
+from tests.support.async_subagent_runtime import wait_for_task_state
 
 
 class RecordingAgent:
@@ -98,7 +100,7 @@ def test_declared_ruyi_gateway_replays_lost_create_response_safely(
         name = str(kwargs["name"])
         return agents.setdefault(name, RecordingAgent(mailboxes.get(name)))
 
-    monkeypatch.setattr(async_runtime, "create_runtime_agent", create_agent)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", create_agent)
     monkeypatch.setenv("REMOTE_E2E_TOKEN", "remote-secret")
 
     downstream_db = str(tmp_path / "downstream-tasks.sqlite")
@@ -231,8 +233,11 @@ def test_declared_ruyi_gateway_replays_lost_create_response_safely(
             downstream_records = downstream_control.list_persisted_task_records()
             assert len(downstream_records) == 1
             downstream_record = downstream_records[0]
-            if downstream_control.get_live_run(downstream_record.task_id) is not None:
-                await downstream_control.get_live_run(downstream_record.task_id)
+            await wait_for_task_state(
+                downstream_control,
+                downstream_record.task_id,
+                states={"completed"},
+            )
 
             input_headers = {
                 "Authorization": "Bearer upstream-secret",
@@ -252,8 +257,11 @@ def test_declared_ruyi_gateway_replays_lost_create_response_safely(
             assert lost_input.status_code == 502
             assert recovered_input.status_code == 202
             downstream_record = downstream_control.list_persisted_task_records()[0]
-            if downstream_control.get_live_run(downstream_record.task_id) is not None:
-                await downstream_control.get_live_run(downstream_record.task_id)
+            await wait_for_task_state(
+                downstream_control,
+                downstream_record.task_id,
+                states={"completed"},
+            )
             return proxy_task_id, downstream_record.task_id
 
     try:

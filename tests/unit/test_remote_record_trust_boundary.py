@@ -7,12 +7,14 @@ import httpx
 from fastapi.testclient import TestClient
 import pytest
 
-import ruyi_agent.runtime.delegation.async_runtime as async_subagent_runtime
+from ruyi_agent.task_models import TaskRecord
+from ruyi_agent.runtime.delegation.async_runtime import AgentControl
 from ruyi_agent.channels.http.routes import create_gateway_app
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.integrations.a2a.client import A2AClient
 from ruyi_agent.integrations.a2a.client import A2AClientError
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
+from ruyi_agent.runtime.delegation.task_manager import TaskManager
 from ruyi_agent.storage.mailbox_store import MailboxStore
 from ruyi_agent.storage.task_store import TaskStore
 from tests.support.async_subagent_runtime import build_test_remote_refs
@@ -83,7 +85,7 @@ def _control(
     *,
     a2a_client: object,
 ) -> tuple[
-    async_subagent_runtime.AgentControl,
+    AgentControl,
     TaskStore,
     MailboxStore,
     AgentMailbox,
@@ -91,7 +93,7 @@ def _control(
     task_store = TaskStore(db_path)
     mailbox_store = MailboxStore(db_path)
     mailbox = AgentMailbox(mailbox_store)
-    control = async_subagent_runtime.AgentControl(
+    control = AgentControl(
         {},
         build_test_remote_refs(),
         checkpointer=object(),
@@ -104,12 +106,12 @@ def _control(
 
 
 def _seed_remote_record(
-    control: async_subagent_runtime.AgentControl,
+    task_store: TaskStore,
     *,
     task_id: str,
     webhook: dict[str, str] | None = None,
 ) -> None:
-    control._task_manager.create_task_record(  # noqa: SLF001
+    TaskManager(task_store, settled_outbox_enabled=True).create_task_record(
         task_id,
         "remote_code_wiki",
         parent_task_id=None,
@@ -159,13 +161,13 @@ def _bound_payload(
 
 
 def _seed_bound_operation(
-    control: async_subagent_runtime.AgentControl,
+    task_store: TaskStore,
     *,
     operation: str,
     task_id: str,
 ) -> None:
-    _seed_remote_record(control, task_id=task_id)
-    manager = control._task_manager  # noqa: SLF001
+    manager = TaskManager(task_store, settled_outbox_enabled=True)
+    _seed_remote_record(task_store, task_id=task_id)
     if operation == "review":
         manager.sync_remote_task(
             task_id,
@@ -220,9 +222,7 @@ def test_bound_remote_operation_validates_response_identity_before_sync(
         dispatched = asyncio.Event()
         release_response = asyncio.Event()
         requests: list[httpx.Request] = []
-        returned_task_id = (
-            PRIVATE_TASK_ID if matching_identity else ATTACKER_TASK_ID
-        )
+        returned_task_id = PRIVATE_TASK_ID if matching_identity else ATTACKER_TASK_ID
         if matching_identity:
             status = {
                 "refresh": "completed",
@@ -267,7 +267,7 @@ def test_bound_remote_operation_validates_response_identity_before_sync(
             ),
         )
         task_id = f"proxy-{operation}"
-        _seed_bound_operation(control, operation=operation, task_id=task_id)
+        _seed_bound_operation(task_store, operation=operation, task_id=task_id)
         if operation == "refresh":
             call = control.refresh_task(task_id)
         elif operation == "review":
@@ -304,12 +304,15 @@ def test_bound_remote_operation_validates_response_identity_before_sync(
             if not matching_identity:
                 assert after == before
                 assert after_outbox == before_outbox
-                assert after.external_operation == {
-                    "refresh": "send",
-                    "review": "review",
-                    "send": "send",
-                    "cancel": "cancel",
-                }[operation]
+                assert (
+                    after.external_operation
+                    == {
+                        "refresh": "send",
+                        "review": "review",
+                        "send": "send",
+                        "cancel": "cancel",
+                    }[operation]
+                )
                 serialized = json.dumps(
                     {
                         "record": after,
@@ -334,16 +337,19 @@ def test_bound_remote_operation_validates_response_identity_before_sync(
     record, outcome, _outbox, request = asyncio.run(scenario())
     assert isinstance(request, httpx.Request)
     if matching_identity:
-        assert isinstance(outcome, async_subagent_runtime.TaskRecord)
+        assert isinstance(outcome, TaskRecord)
         assert record.external_operation is None
         assert record.external_outcome_uncertain is False
         assert record.upstream_task_id == PRIVATE_TASK_ID
-        assert record.state == {
-            "refresh": "completed",
-            "review": "running",
-            "send": "completed",
-            "cancel": "cancelled",
-        }[operation]
+        assert (
+            record.state
+            == {
+                "refresh": "completed",
+                "review": "running",
+                "send": "completed",
+                "cancel": "cancelled",
+            }[operation]
+        )
 
 
 def test_remote_refresh_sanitizes_record_and_sqlite_outbox_before_persistence(
@@ -353,7 +359,7 @@ def test_remote_refresh_sanitizes_record_and_sqlite_outbox_before_persistence(
         str(tmp_path / "refresh.sqlite"),
         a2a_client=MaliciousRefreshClient(),
     )
-    _seed_remote_record(control, task_id="proxy-refresh")
+    _seed_remote_record(task_store, task_id="proxy-refresh")
 
     async def scenario():
         return await control.refresh_task("proxy-refresh")
@@ -391,7 +397,7 @@ def test_remote_webhook_sanitizes_record_outbox_mailbox_and_caller_webhook(
 ) -> None:
     CapturingAsyncClient.calls.clear()
     monkeypatch.setattr(
-        async_subagent_runtime.httpx,
+        httpx,
         "AsyncClient",
         CapturingAsyncClient,
     )
@@ -400,10 +406,11 @@ def test_remote_webhook_sanitizes_record_outbox_mailbox_and_caller_webhook(
         a2a_client=object(),
     )
     _seed_remote_record(
-        control,
+        task_store,
         task_id="proxy-webhook",
         webhook={"url": "https://caller.example/hooks", "token": "caller-token"},
     )
+    control.get_task_record("proxy-webhook")
 
     async def scenario() -> bool:
         return await control.handle_remote_task_event(_failed_payload())
@@ -552,7 +559,7 @@ def test_remote_http_task_and_sse_rewrite_private_review_identity(
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     store = TaskStore(str(tmp_path / "http-sse.sqlite"))
-    control = async_subagent_runtime.AgentControl(
+    control = AgentControl(
         {},
         build_test_remote_refs(),
         checkpointer=object(),

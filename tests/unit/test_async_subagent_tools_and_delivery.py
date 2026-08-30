@@ -4,41 +4,111 @@ import asyncio
 import pytest
 
 import ruyi_agent.runtime.delegation.async_runtime as async_subagent_runtime
+import ruyi_agent.runtime.agent_factory as agent_factory_module
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.config.loader import LocalWorkerSpec, RemoteRef
 from ruyi_agent.storage.task_store import TaskStore
 from ruyi_agent.storage.mailbox_store import MailboxStore
+from ruyi_agent.runtime.delegation.notifications import SettledRunNotifier
+from ruyi_agent.runtime.delegation.policy import DelegationPolicy
+from ruyi_agent.runtime.delegation.registry import AgentRegistry
+from ruyi_agent.runtime.delegation.local_executor import LocalTaskExecutor
+from ruyi_agent.runtime.delegation.task_manager import TaskManager
+from ruyi_agent.runtime.delegation.tools import DelegationTools
+from ruyi_agent.runtime.delegation.contracts import (
+    UnknownAgentTargetError,
+    UnavailableAgentTargetError,
+)
+from ruyi_agent.task_models import TaskRecord
 
 from tests.support.async_subagent_runtime import (
     FakeAgent,
     FakeAgentFactory,
     build_specs,
     build_test_remote_refs,
+    wait_for_task_state,
 )
 
 
-def test_list_agents_returns_current_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
-    # 为什么测列表能力：主 agent 需要知道当前 runtime 里有哪些异步子任务正在被管理。
-    factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+class _CommandPort:
+    """Ephemeral four-method command port used by direct tool tests."""
 
-    control = async_subagent_runtime.AgentControl(
-        build_specs(),
-        build_test_remote_refs(),
-        checkpointer=object(),
-        backend=object(),
+    def __init__(self, manager: TaskManager) -> None:
+        self.manager = manager
+        self.calls: list[tuple[str, str]] = []
+        self.spawn_error: BaseException | None = None
+
+    async def spawn_task(
+        self,
+        agent_name: str,
+        task: str,
+        *,
+        parent_task_id: str | None = None,
+        parent_thread_id: str | None = None,
+    ) -> TaskRecord:
+        del agent_name, task, parent_task_id, parent_thread_id
+        if self.spawn_error is not None:
+            raise self.spawn_error
+        raise AssertionError("scope test must reject spawn before invoking its port")
+
+    async def refresh_task(self, task_id: str) -> TaskRecord:
+        self.calls.append(("refresh", task_id))
+        return self.manager.get_task(task_id)
+
+    async def send_task_input(self, task_id: str, message: str) -> TaskRecord:
+        self.calls.append(("send", message))
+        return self.manager.get_task(task_id)
+
+    async def cancel_task(self, task_id: str) -> TaskRecord:
+        self.calls.append(("cancel", task_id))
+        return self.manager.get_task(task_id)
+
+
+def _direct_tools(
+    specs: dict[str, LocalWorkerSpec] | None = None,
+    remote_refs: dict[str, RemoteRef] | None = None,
+    *,
+    unavailable_agents: dict[str, str] | None = None,
+) -> tuple[TaskManager, DelegationTools, _CommandPort]:
+    manager = TaskManager()
+    registry = AgentRegistry(
+        specs if specs is not None else build_specs(),
+        remote_refs if remote_refs is not None else build_test_remote_refs(),
+        unavailable_agents,
+    )
+    policy = DelegationPolicy(
+        manager,
+        node_id="node-test",
+        max_delegation_depth=3,
+        max_tasks_per_root=20,
+        permission_default_profile="",
+    )
+    notifier = SettledRunNotifier(manager, None)
+    command_port = _CommandPort(manager)
+    return manager, DelegationTools(registry, manager, policy, notifier), command_port
+
+
+def test_list_agents_returns_current_tasks() -> None:
+    # 为什么测列表能力：主 agent 需要知道当前 runtime 里有哪些异步子任务正在被管理。
+    manager, tools, command_port = _direct_tools()
+    record = manager.create_task_record(
+        "task-1",
+        "background_research",
+        parent_task_id=None,
+        root_task_id="task-1",
+        depth=1,
+        parent_thread_id="main-thread",
+    )
+    list_tool = next(
+        tool
+        for tool in tools.build_tools(command_port=command_port)
+        if tool.name == "list_agents"
+    )
+    listing = asyncio.run(
+        list_tool.ainvoke({}, config={"configurable": {"thread_id": "main-thread"}})
     )
 
-    async def scenario() -> tuple[str, str]:
-        started = await control.spawn_agent("background_research", "research this")
-        task_id = started.split("task_id=")[1].split()[0]
-        await control.wait_agent(task_id)
-        listing = await control.list_agents()
-        return task_id, listing
-
-    task_id, listing = asyncio.run(scenario())
-
-    assert f"task_id={task_id}" in listing
+    assert f"task_id={record.task_id}" in listing
     assert "agent=background_research" in listing
     assert "name=remote_code_wiki" in listing
     assert "kind=remote_ref" in listing
@@ -48,7 +118,7 @@ def test_background_local_task_publishes_terminal_message_to_mailbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     mailbox = AgentMailbox()
     control = async_subagent_runtime.AgentControl(
         build_specs(),
@@ -64,8 +134,7 @@ def test_background_local_task_publishes_terminal_message_to_mailbox(
             "research this",
             parent_thread_id="main-thread",
         )
-        assert control.get_live_run(record.task_id) is not None
-        await control.get_live_run(record.task_id)
+        await wait_for_task_state(control, record.task_id, states={"completed"})
         return mailbox.drain("main-thread")
 
     messages = asyncio.run(scenario())
@@ -82,7 +151,7 @@ def test_background_local_task_publishes_each_settled_run_to_mailbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     mailbox = AgentMailbox()
     control = async_subagent_runtime.AgentControl(
         build_specs(),
@@ -98,13 +167,12 @@ def test_background_local_task_publishes_each_settled_run_to_mailbox(
             "first run",
             parent_thread_id="main-thread",
         )
-        assert control.get_live_run(record.task_id) is not None
-        await control.get_live_run(record.task_id)
+        await wait_for_task_state(control, record.task_id, states={"completed"})
         first_messages = mailbox.drain("main-thread")
 
         followup = await control.send_task_input(record.task_id, "second run")
-        assert control.get_live_run(followup.task_id) is not None
-        await control.get_live_run(followup.task_id)
+        mailbox.drain(record.thread_id)
+        await wait_for_task_state(control, followup.task_id, states={"completed"})
         second_messages = mailbox.drain("main-thread")
         return first_messages, second_messages
 
@@ -135,7 +203,7 @@ def test_send_input_to_active_run_queues_mailbox_message(
 
     agent = BlockingAgent()
     monkeypatch.setattr(
-        async_subagent_runtime,
+        agent_factory_module,
         "create_runtime_agent",
         lambda **kwargs: agent,
     )
@@ -155,8 +223,7 @@ def test_send_input_to_active_run_queues_mailbox_message(
         continued_state = continued.state
         messages = mailbox.drain(record.thread_id)
         agent.release.set()
-        assert control.get_live_run(record.task_id) is not None
-        await control.get_live_run(record.task_id)
+        await wait_for_task_state(control, record.task_id, states={"completed"})
         return continued_state, messages
 
     state, messages = asyncio.run(scenario())
@@ -189,7 +256,7 @@ def test_send_input_to_settled_task_wakes_mailbox_run(
 
     agent = ConsumingAgent()
     monkeypatch.setattr(
-        async_subagent_runtime,
+        agent_factory_module,
         "create_runtime_agent",
         lambda **kwargs: agent,
     )
@@ -203,13 +270,12 @@ def test_send_input_to_settled_task_wakes_mailbox_run(
 
     async def scenario() -> tuple[int, list[dict]]:
         record = await control.spawn_task("background_research", "first")
-        assert control.get_live_run(record.task_id) is not None
-        await control.get_live_run(record.task_id)
+        await wait_for_task_state(control, record.task_id, states={"completed"})
         continued = await control.send_task_input(record.task_id, "follow up")
-        assert control.get_live_run(continued.task_id) is not None
-        await control.get_live_run(continued.task_id)
-        await asyncio.sleep(0)
-        return control._task_manager.get_task(record.task_id).run_count, agent.calls
+        continued = await wait_for_task_state(
+            control, continued.task_id, states={"completed"}
+        )
+        return continued.run_count, agent.calls
 
     run_count, calls = asyncio.run(scenario())
 
@@ -231,7 +297,7 @@ def test_restart_loads_persisted_task_and_wakes_pending_mailbox_input(
     first_mailbox = AgentMailbox(first_mailbox_store)
     first_agent = FakeAgent()
     monkeypatch.setattr(
-        async_subagent_runtime,
+        agent_factory_module,
         "create_runtime_agent",
         lambda **kwargs: first_agent,
     )
@@ -246,9 +312,8 @@ def test_restart_loads_persisted_task_and_wakes_pending_mailbox_input(
 
     async def create_persisted_task() -> tuple[str, str]:
         record = await first_control.spawn_task("background_research", "first")
-        assert first_control.get_live_run(record.task_id) is not None
-        await first_control.get_live_run(record.task_id)
-        await asyncio.sleep(0)
+        await wait_for_task_state(first_control, record.task_id, states={"completed"})
+        await first_control.close()
         first_mailbox.publish_input(
             recipient_task_id=record.task_id,
             recipient_thread_id=record.thread_id,
@@ -274,12 +339,13 @@ def test_restart_loads_persisted_task_and_wakes_pending_mailbox_input(
                 recipient_thread_id=config["configurable"]["thread_id"],
             )
             assert [message.content for message in messages] == ["resume after restart"]
+            second_mailbox.acknowledge([message.message_id for message in messages])
             await asyncio.sleep(0)
             return {"messages": [{"role": "assistant", "content": "resumed"}]}
 
     restarted_agent = RestartConsumingAgent()
     monkeypatch.setattr(
-        async_subagent_runtime,
+        agent_factory_module,
         "create_runtime_agent",
         lambda **kwargs: restarted_agent,
     )
@@ -293,10 +359,12 @@ def test_restart_loads_persisted_task_and_wakes_pending_mailbox_input(
     )
 
     async def recover() -> int:
+        assert second_task_store.get_task(task_id).run_count == 1
         await second_control.wake_pending_mailbox_tasks()
-        record = second_control._task_manager.get_task(task_id)
-        assert second_control.get_live_run(record.task_id) is not None
-        await second_control.get_live_run(record.task_id)
+        record = await wait_for_task_state(
+            second_control, task_id, states={"completed"}
+        )
+        assert len(restarted_agent.calls) == 1
         return record.run_count
 
     try:
@@ -306,32 +374,54 @@ def test_restart_loads_persisted_task_and_wakes_pending_mailbox_input(
         second_task_store.close()
 
 
-def test_wait_agent_suppresses_mailbox_delivery(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+def test_wait_agent_suppresses_mailbox_delivery() -> None:
     mailbox = AgentMailbox()
-    control = async_subagent_runtime.AgentControl(
-        build_specs(),
-        build_test_remote_refs(),
-        checkpointer=object(),
-        backend=object(),
-        mailbox=mailbox,
+    manager = TaskManager()
+    registry = AgentRegistry(build_specs(), build_test_remote_refs())
+    policy = DelegationPolicy(
+        manager,
+        node_id="node-test",
+        max_delegation_depth=3,
+        max_tasks_per_root=20,
+        permission_default_profile="",
     )
-
-    async def scenario() -> list:
-        record = await control.spawn_task(
-            "background_research",
-            "research this",
-            parent_thread_id="main-thread",
+    notifier = SettledRunNotifier(manager, mailbox)
+    delegation_tools = DelegationTools(registry, manager, policy, notifier)
+    command_port = _CommandPort(manager)
+    record = manager.create_task_record(
+        "child-task",
+        "background_research",
+        parent_task_id="parent-task",
+        root_task_id="parent-task",
+        depth=2,
+        parent_thread_id="main-thread",
+    )
+    manager.mark_completed(record.task_id, "done")
+    mailbox.publish_settled(
+        recipient_thread_id=record.parent_thread_id,
+        recipient_task_id=record.parent_task_id,
+        child_task_id=record.task_id,
+        child_agent_name=record.agent_name,
+        run_count=record.run_count,
+        status=record.state,
+        content=record.result or "",
+    )
+    wait_tool = next(
+        tool
+        for tool in delegation_tools.build_tools(command_port=command_port)
+        if tool.name == "wait_agent"
+    )
+    result = asyncio.run(
+        wait_tool.ainvoke(
+            {"task_id": record.task_id},
+            config={"configurable": {"thread_id": "main-thread"}},
         )
-        await control.wait_agent(record.task_id)
-        return mailbox.drain("main-thread")
+    )
+    messages = mailbox.drain("main-thread")
 
-    messages = asyncio.run(scenario())
-
+    assert "state=completed" in result
     assert messages == []
+    assert manager.get_task(record.task_id).mailbox_suppressed is True
 
 
 def test_mailbox_delivery_flags_are_persisted(
@@ -339,7 +429,7 @@ def test_mailbox_delivery_flags_are_persisted(
     tmp_path,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     db_path = tmp_path / "tasks.sqlite"
     task_store = TaskStore(str(db_path))
     mailbox_store = MailboxStore(str(db_path))
@@ -359,18 +449,20 @@ def test_mailbox_delivery_flags_are_persisted(
             "background result",
             parent_thread_id="main-thread",
         )
-        assert control.get_live_run(delivered.task_id) is not None
-        await control.get_live_run(delivered.task_id)
+        await wait_for_task_state(control, delivered.task_id, states={"completed"})
 
         suppressed = await control.spawn_task(
             "background_research",
             "wait for result",
             parent_thread_id="main-thread",
         )
-        await control.wait_agent(suppressed.task_id)
+        await wait_for_task_state(control, suppressed.task_id, states={"completed"})
         return delivered.task_id, suppressed.task_id
 
     delivered_task_id, suppressed_task_id = asyncio.run(scenario())
+    manager = TaskManager(task_store, settled_outbox_enabled=True)
+    notifier = SettledRunNotifier(manager, mailbox)
+    notifier.suppress_mailbox_delivery(manager.get_task(suppressed_task_id))
     mailbox_store.close()
     task_store.close()
 
@@ -391,17 +483,19 @@ def test_spawn_unknown_agent_raises_clear_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # 为什么测未知 agent：tool 参数错误不应直接打断整个主流程。
-    factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
-
-    control = async_subagent_runtime.AgentControl(
-        build_specs(),
-        build_test_remote_refs(),
-        checkpointer=object(),
-        backend=object(),
+    del monkeypatch
+    _manager, tools, command_port = _direct_tools()
+    command_port.spawn_error = UnknownAgentTargetError(
+        "Unknown agent target: missing_agent"
     )
-
-    message = asyncio.run(control.spawn_agent("missing_agent", "research this"))
+    spawn_tool = next(
+        tool
+        for tool in tools.build_tools(command_port=command_port)
+        if tool.name == "spawn_agent"
+    )
+    message = asyncio.run(
+        spawn_tool.ainvoke({"agent_name": "missing_agent", "task": "research this"})
+    )
     assert "Unknown agent target" in message
     assert "background_research" in message
     assert "remote_code_wiki" in message
@@ -411,28 +505,19 @@ def test_build_tools_exposes_available_agent_names(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # 为什么测工具描述：主 agent 是否知道可用 worker，很大程度取决于工具描述是否带出可选类型。
-    factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
-
-    control = async_subagent_runtime.AgentControl(
-        build_specs(),
-        build_test_remote_refs(),
-        checkpointer=object(),
-        backend=object(),
+    del monkeypatch
+    _manager, delegation_tools, command_port = _direct_tools()
+    spawn_tool = next(
+        tool
+        for tool in delegation_tools.build_tools(command_port=command_port)
+        if tool.name == "spawn_agent"
     )
-
-    tools = control.build_tools()
-    spawn_tool = next(tool for tool in tools if tool.name == "spawn_agent")
     assert "background_research" in spawn_tool.description
     assert "remote_code_wiki" in spawn_tool.description
     assert "spawnable via remote gateway" in spawn_tool.description
 
 
-def test_build_tools_for_agent_limits_spawn_scope(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+def test_build_tools_for_agent_limits_spawn_scope() -> None:
     main_spec = LocalWorkerSpec(
         name="main",
         description="main agent",
@@ -460,21 +545,16 @@ def test_build_tools_for_agent_limits_spawn_scope(
         url="https://example.com/other",
         remote_agent_name="other",
     )
-    control = async_subagent_runtime.AgentControl(
+    manager, delegation_tools, command_port = _direct_tools(
         {
             "main": main_spec,
             "background_research": background_spec,
             "extra_worker": extra_spec,
         },
-        {
-            **remote_refs,
-            "other_remote": other_remote,
-        },
-        checkpointer=object(),
-        backend=object(),
+        {**remote_refs, "other_remote": other_remote},
     )
 
-    tools = control.build_tools_for("main")
+    tools = delegation_tools.build_tools_for("main", command_port=command_port)
     spawn_tool = next(tool for tool in tools if tool.name == "spawn_agent")
     wait_tool = next(tool for tool in tools if tool.name == "wait_agent")
     check_tool = next(tool for tool in tools if tool.name == "check_agent")
@@ -490,20 +570,29 @@ def test_build_tools_for_agent_limits_spawn_scope(
     denied = asyncio.run(
         spawn_tool.ainvoke({"agent_name": "extra_worker", "task": "do this"})
     )
-    out_of_scope_record = asyncio.run(control.spawn_task("extra_worker", "hidden task"))
-    other_thread_record = asyncio.run(
-        control.spawn_task(
-            "background_research",
-            "other visible type hidden owner",
-            parent_thread_id="other-thread",
-        )
+    out_of_scope_record = manager.create_task_record(
+        "extra-task",
+        "extra_worker",
+        parent_task_id=None,
+        root_task_id="extra-task",
+        depth=1,
+        parent_thread_id="main-thread",
     )
-    allowed_record = asyncio.run(
-        control.spawn_task(
-            "background_research",
-            "visible task",
-            parent_thread_id="main-thread",
-        )
+    other_thread_record = manager.create_task_record(
+        "other-task",
+        "background_research",
+        parent_task_id=None,
+        root_task_id="other-task",
+        depth=1,
+        parent_thread_id="other-thread",
+    )
+    allowed_record = manager.create_task_record(
+        "allowed-task",
+        "background_research",
+        parent_task_id=None,
+        root_task_id="allowed-task",
+        depth=1,
+        parent_thread_id="main-thread",
     )
     main_config = {"configurable": {"thread_id": "main-thread"}}
     listing = asyncio.run(list_tool.ainvoke({}, config=main_config))
@@ -550,20 +639,13 @@ def test_build_tools_for_agent_limits_spawn_scope(
     assert allowed_record.task_id in wait_denied
 
 
-def test_compiling_agent_resolves_declared_scope_in_target_order(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_compiling_agent_resolves_declared_scope_in_target_order() -> None:
     captured: dict = {}
 
     def capture_factory(**kwargs):
         captured.update(kwargs)
         return FakeAgent()
 
-    monkeypatch.setattr(
-        async_subagent_runtime,
-        "create_runtime_agent",
-        capture_factory,
-    )
     def local_spec(name: str) -> LocalWorkerSpec:
         return LocalWorkerSpec(
             name=name,
@@ -608,22 +690,50 @@ def test_compiling_agent_resolves_declared_scope_in_target_order(
         ),
         system_tools=frozenset({"spawn_agent", "list_agents"}),
     )
-    control = async_subagent_runtime.AgentControl(
-        {
-            "main": main,
-            "local_second": local_second,
-            "local_first": local_first,
-            "extra": extra,
-        },
-        {
-            "remote_second": remote_second,
-            "remote_first": remote_first,
-        },
-        checkpointer=object(),
+    specs = {
+        "main": main,
+        "local_second": local_second,
+        "local_first": local_first,
+        "extra": extra,
+    }
+    refs = {
+        "remote_second": remote_second,
+        "remote_first": remote_first,
+    }
+    manager = TaskManager()
+    registry = AgentRegistry(specs, refs)
+    policy = DelegationPolicy(
+        manager,
+        node_id="node-test",
+        max_delegation_depth=3,
+        max_tasks_per_root=20,
+        permission_default_profile="",
+    )
+    delegation_tools = DelegationTools(
+        registry,
+        manager,
+        policy,
+        SettledRunNotifier(manager, None),
+    )
+    command_port = _CommandPort(manager)
+    worker_tools = delegation_tools.build_tools_for("main", command_port=command_port)
+    executor = LocalTaskExecutor(
+        manager,
+        registry=registry,
+        agent_factory=capture_factory,
         backend=object(),
+        checkpointer=object(),
+        mailbox=None,
+        permission_policy=None,
+        permission_default_profile="",
+        skill_catalog={},
+        skill_syncer=None,
+        review_audit_store=None,
+        backend_kind="test",
+        workspace_root="",
     )
 
-    control._get_or_create_agent("main")
+    executor.compile_agent("main", worker_tools=worker_tools)
 
     assert list(captured["local_worker_specs"]) == ["local_first", "local_second"]
     assert list(captured["remote_refs"]) == ["remote_first", "remote_second"]
@@ -644,17 +754,18 @@ def test_declared_but_unavailable_target_returns_clear_error() -> None:
         skills=[],
         delegation_targets=("unavailable_worker",),
     )
-    control = async_subagent_runtime.AgentControl(
+    _manager, delegation_tools, command_port = _direct_tools(
         {"main": main},
         {},
-        checkpointer=object(),
-        backend=object(),
-        unavailable_agents={
-            "unavailable_worker": "missing provider credential",
-        },
+        unavailable_agents={"unavailable_worker": "missing provider credential"},
+    )
+    command_port.spawn_error = UnavailableAgentTargetError(
+        "Agent target 'unavailable_worker' is unavailable: missing provider credential"
     )
     spawn_tool = next(
-        tool for tool in control.build_tools_for("main") if tool.name == "spawn_agent"
+        tool
+        for tool in delegation_tools.build_tools_for("main", command_port=command_port)
+        if tool.name == "spawn_agent"
     )
 
     message = asyncio.run(
@@ -668,11 +779,7 @@ def test_declared_but_unavailable_target_returns_clear_error() -> None:
     assert "Available:" in message
 
 
-def test_child_task_can_send_input_to_direct_parent_but_cannot_cancel_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+def test_child_task_can_send_input_to_direct_parent_but_cannot_cancel_it() -> None:
     parent_spec = LocalWorkerSpec(
         name="parent",
         description="parent",
@@ -691,56 +798,49 @@ def test_child_task_can_send_input_to_direct_parent_but_cannot_cancel_it(
         tools=[],
         memory=[],
         skills=[],
-        system_tools=frozenset({"send_input", "list_agents"}),
+        system_tools=frozenset({"send_input", "list_agents", "cancel_agent"}),
     )
-    control = async_subagent_runtime.AgentControl(
-        {"parent": parent_spec, "child": child_spec},
-        {},
-        checkpointer=object(),
-        backend=object(),
+    manager, delegation_tools, command_port = _direct_tools(
+        {"parent": parent_spec, "child": child_spec}, {}
     )
 
-    async def scenario() -> tuple[str, str, str, str]:
-        parent = await control.spawn_task("parent", "parent run")
-        assert control.get_live_run(parent.task_id) is not None
-        await control.get_live_run(parent.task_id)
-        child = await control.spawn_task(
-            "child",
-            "child run",
-            parent_task_id=parent.task_id,
-            parent_thread_id=parent.thread_id,
-        )
-        assert control.get_live_run(child.task_id) is not None
-        await control.get_live_run(child.task_id)
-        tools = control.build_tools_for("child")
-        send_tool = next(tool for tool in tools if tool.name == "send_input")
-        list_tool = next(tool for tool in tools if tool.name == "list_agents")
-        config = {
-            "configurable": {
-                "task_id": child.task_id,
-                "thread_id": child.thread_id,
-                "parent_task_id": parent.task_id,
-            }
+    parent = manager.create_task_record(
+        "parent-task",
+        "parent",
+        parent_task_id=None,
+        root_task_id="parent-task",
+        depth=1,
+    )
+    child = manager.create_task_record(
+        "child-task",
+        "child",
+        parent_task_id=parent.task_id,
+        parent_thread_id=parent.thread_id,
+        root_task_id=parent.root_task_id,
+        depth=2,
+    )
+    tools = delegation_tools.build_tools_for("child", command_port=command_port)
+    send_tool = next(tool for tool in tools if tool.name == "send_input")
+    list_tool = next(tool for tool in tools if tool.name == "list_agents")
+    scoped_cancel = next(tool for tool in tools if tool.name == "cancel_agent")
+    config = {
+        "configurable": {
+            "task_id": child.task_id,
+            "thread_id": child.thread_id,
+            "parent_task_id": parent.task_id,
         }
-        listing = await list_tool.ainvoke({}, config=config)
-        sent = await send_tool.ainvoke(
+    }
+    listing = asyncio.run(list_tool.ainvoke({}, config=config))
+    sent = asyncio.run(
+        send_tool.ainvoke(
             {"task_id": parent.task_id, "message": "need clarification"},
             config=config,
         )
-        # Use the same scoped tool set with cancel enabled to exercise direction
-        # authorization independently from system-tool filtering.
-        scoped_cancel = next(
-            tool
-            for tool in control._build_tools(
-                allowed_targets=set(),
-                caller_agent_name="child",
-            )
-            if tool.name == "cancel_agent"
-        )
-        denied = await scoped_cancel.ainvoke({"task_id": parent.task_id}, config=config)
-        return parent.task_id, listing, sent, denied
-
-    parent_id, listing, sent, denied = asyncio.run(scenario())
+    )
+    denied = asyncio.run(
+        scoped_cancel.ainvoke({"task_id": parent.task_id}, config=config)
+    )
+    parent_id = parent.task_id
 
     assert parent_id in listing
     assert f"task_id={parent_id}" in sent

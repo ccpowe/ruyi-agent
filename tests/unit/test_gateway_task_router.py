@@ -12,7 +12,7 @@ from ruyi_agent.gateway.errors import GatewayTaskError
 from ruyi_agent.gateway.models import TaskRouteRecord
 from ruyi_agent.gateway.routing import TaskRouter
 from ruyi_agent.integrations.a2a.client import A2AClientError
-from ruyi_agent.runtime.delegation.async_runtime import UnknownWorkerTaskError
+from ruyi_agent.runtime.delegation.contracts import UnknownWorkerTaskError
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
 from ruyi_agent.task_models import TaskRecord
 

@@ -8,6 +8,7 @@ from typing import Literal
 import pytest
 
 import ruyi_agent.runtime.delegation.async_runtime as async_subagent_runtime
+import ruyi_agent.runtime.agent_factory as agent_factory_module
 from ruyi_agent.integrations.a2a.client import A2AClient
 from ruyi_agent.config.loader import LocalWorkerSpec, RemoteRef
 from ruyi_agent.gateway.tasks import GatewayTaskModule
@@ -30,7 +31,7 @@ class DelayedFakeAgent:
                 "version": version,
             }
         )
-        await async_subagent_runtime.asyncio.sleep(self.delay)
+        await asyncio.sleep(self.delay)
         content = payload["messages"][0]["content"]
         return {"messages": [{"role": "assistant", "content": f"done: {content}"}]}
 
@@ -39,9 +40,10 @@ class DelayedAgentFactory:
     def __init__(self, delay: float = 0.05) -> None:
         self.delay = delay
         self.created: list[DelayedFakeAgent] = []
-        self.control: async_subagent_runtime.AgentControl | None = None
+        self.compile_kwargs: list[dict[str, object]] = []
 
     def __call__(self, **kwargs):
+        self.compile_kwargs.append(dict(kwargs))
         agent = DelayedFakeAgent(delay=self.delay)
         self.created.append(agent)
         return agent
@@ -550,7 +552,7 @@ def build_app(
     remote_ref_url: str | None = None,
 ) -> tuple[object, DelayedAgentFactory]:
     factory = DelayedAgentFactory(delay=delay)
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         build_test_remote_refs(
@@ -563,7 +565,6 @@ def build_app(
         node_id=node_id,
         workspace_root=workspace_root,
     )
-    factory.control = control
     service = GatewayTaskModule(
         main_agent_name="main",
         agent_configs=build_agent_configs(

@@ -10,7 +10,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk
 import pytest
 import uvicorn
 
-import ruyi_agent.runtime.delegation.async_runtime as async_runtime
+import ruyi_agent.runtime.agent_factory as agent_factory_module
 from ruyi_agent.channels.http.routes import create_gateway_app
 from ruyi_agent.config.loader import LocalWorkerSpec, RemoteRef
 from ruyi_agent.gateway.sse import GatewayTaskEvent, iter_gateway_task_events
@@ -167,7 +167,7 @@ def test_real_http_sse_disconnect_does_not_cancel_run_and_cursor_replays(
 ) -> None:
     async def scenario() -> None:
         factory = ControlledStreamingFactory()
-        monkeypatch.setattr(async_runtime, "create_runtime_agent", factory)
+        monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
         store = TaskStore(str(tmp_path / "local-tasks.sqlite"))
         control = AgentControl(
             {"main": _spec("main")},
@@ -229,9 +229,7 @@ def test_real_http_sse_disconnect_does_not_cancel_run_and_cursor_replays(
                         params={"run_count": str(run_count)},
                         headers={"Last-Event-ID": cursor},
                     ) as replay_response:
-                        replay = iter_gateway_task_events(
-                            replay_response.aiter_lines()
-                        )
+                        replay = iter_gateway_task_events(replay_response.aiter_lines())
                         terminal = await _next_event(replay)
                         ended = await _next_event(replay)
                         assert terminal.event_type == "task.completed"
@@ -256,7 +254,7 @@ def test_real_two_gateway_sse_proxy_streams_and_replays(
     async def scenario() -> None:
         monkeypatch.setenv("DOWNSTREAM_GATEWAY_TOKEN", "downstream-secret")
         factory = ControlledStreamingFactory()
-        monkeypatch.setattr(async_runtime, "create_runtime_agent", factory)
+        monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
         downstream_store = TaskStore(str(tmp_path / "downstream-tasks.sqlite"))
         downstream_control = AgentControl(
             {"worker": _spec("worker")},

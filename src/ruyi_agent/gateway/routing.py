@@ -36,8 +36,8 @@ from ruyi_agent.gateway.route_reservations import (
 )
 from ruyi_agent.gateway.sse import SSEProtocolError, task_stream_event_from_gateway
 from ruyi_agent.integrations.a2a.client import A2AClientError
-from ruyi_agent.runtime.delegation.async_runtime import (
-    AgentControl,
+from ruyi_agent.runtime.delegation.async_runtime import AgentControl
+from ruyi_agent.runtime.delegation.contracts import (
     DurableTaskMailboxRequiredError,
     TaskAlreadyRunningError,
     UnknownAgentTargetError,
@@ -286,8 +286,8 @@ class TaskRouter:
                 remote_replay_safe=remote_replay_safe,
                 reservation=reservation,
                 route_store=self._route_store,
-                fail_reservation=lambda route, error, uncertain: (
-                    self._fail_reservation(route, error, uncertain=uncertain)
+                fail_reservation=lambda route, error, uncertain: self._fail_reservation(
+                    route, error, uncertain=uncertain
                 ),
             ) from exc
         except BaseException:

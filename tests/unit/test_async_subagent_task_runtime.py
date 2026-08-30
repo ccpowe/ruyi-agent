@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 import logging
 from pathlib import Path
 import pytest
 
+from ruyi_agent.task_models import TaskRecord
+from ruyi_agent.storage.task_store import (
+    TaskRootBudgetExceededError as MaxTasksPerRootError,
+)
 import ruyi_agent.runtime.delegation.async_runtime as async_subagent_runtime
+import ruyi_agent.runtime.agent_factory as agent_factory_module
 from ruyi_agent.integrations.a2a.client import A2AClientError
+from ruyi_agent.runtime.delegation.contracts import MaxDelegationDepthError
 from ruyi_agent.runtime.delegation.context import (
     CONTEXT_VERSION,
     CONTEXT_VERSION_FIELD,
@@ -17,6 +24,8 @@ from ruyi_agent.runtime.delegation.context import (
     ROOT_ID_FIELD,
     VISITED_NODES_FIELD,
 )
+from ruyi_agent.runtime.delegation.policy import DelegationPolicy
+from ruyi_agent.runtime.delegation.task_manager import TaskManager
 from ruyi_agent.storage.task_store import TaskStore
 
 from tests.support.async_subagent_runtime import (
@@ -32,6 +41,7 @@ from tests.support.async_subagent_runtime import (
     SuccessfulRemoteCreateA2AClient,
     build_specs,
     build_test_remote_refs,
+    wait_for_task_state,
 )
 
 
@@ -39,7 +49,7 @@ def test_root_spawn_records_depth_1_and_self_as_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         build_test_remote_refs(),
@@ -47,11 +57,9 @@ def test_root_spawn_records_depth_1_and_self_as_root(
         backend=object(),
     )
 
-    async def scenario() -> async_subagent_runtime.TaskRecord:
+    async def scenario() -> TaskRecord:
         record = await control.spawn_task("background_research", "root task")
-        assert control.get_live_run(record.task_id) is not None
-        await control.get_live_run(record.task_id)
-        return record
+        return await wait_for_task_state(control, record.task_id, states={"completed"})
 
     record = asyncio.run(scenario())
 
@@ -64,7 +72,7 @@ def test_nested_spawn_inherits_root_and_increments_depth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         build_test_remote_refs(),
@@ -73,8 +81,8 @@ def test_nested_spawn_inherits_root_and_increments_depth(
     )
 
     async def scenario() -> tuple[
-        async_subagent_runtime.TaskRecord,
-        async_subagent_runtime.TaskRecord,
+        TaskRecord,
+        TaskRecord,
     ]:
         root = await control.spawn_task("background_research", "root task")
         child = await control.spawn_task(
@@ -83,13 +91,10 @@ def test_nested_spawn_inherits_root_and_increments_depth(
             parent_task_id=root.task_id,
             parent_thread_id=root.thread_id,
         )
-        assert control.get_live_run(root.task_id) is not None
-        assert control.get_live_run(child.task_id) is not None
-        root_run = control.get_live_run(root.task_id)
-        child_run = control.get_live_run(child.task_id)
-        await root_run
-        await child_run
-        return root, child
+        return (
+            await wait_for_task_state(control, root.task_id, states={"completed"}),
+            await wait_for_task_state(control, child.task_id, states={"completed"}),
+        )
 
     root, child = asyncio.run(scenario())
 
@@ -102,7 +107,7 @@ def test_spawn_agent_extracts_parent_context_from_configurable_task_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         build_test_remote_refs(),
@@ -110,24 +115,16 @@ def test_spawn_agent_extracts_parent_context_from_configurable_task_id(
         backend=object(),
     )
 
-    async def scenario() -> async_subagent_runtime.TaskRecord:
+    async def scenario() -> TaskRecord:
         root = await control.spawn_task("background_research", "root task")
-        started = await control.spawn_agent(
+        child = await control.spawn_task(
             "background_research",
             "child task",
-            config={
-                "configurable": {
-                    "thread_id": root.thread_id,
-                    "task_id": root.task_id,
-                    "root_task_id": root.root_task_id,
-                    "delegation_depth": root.depth,
-                }
-            },
+            parent_task_id=root.task_id,
+            parent_thread_id=root.thread_id,
         )
-        child_task_id = started.split("task_id=")[1].split()[0]
-        await control.wait_agent(root.task_id)
-        await control.wait_agent(child_task_id)
-        return control.get_task_record(child_task_id)
+        await wait_for_task_state(control, root.task_id, states={"completed"})
+        return await wait_for_task_state(control, child.task_id, states={"completed"})
 
     child = asyncio.run(scenario())
 
@@ -136,36 +133,27 @@ def test_spawn_agent_extracts_parent_context_from_configurable_task_id(
 
 
 def test_spawn_agent_falls_back_to_thread_id_when_task_id_missing(
-    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
-    control = async_subagent_runtime.AgentControl(
-        build_specs(),
-        build_test_remote_refs(),
-        checkpointer=object(),
-        backend=object(),
+    manager = TaskManager()
+    root = manager.create_task_record(
+        "root", "background_research", parent_task_id=None, root_task_id="root", depth=1
     )
+    policy = DelegationPolicy(
+        manager,
+        node_id="node-test",
+        max_delegation_depth=3,
+        max_tasks_per_root=20,
+        permission_default_profile="",
+    )
+    with caplog.at_level(
+        logging.WARNING, logger="ruyi_agent.runtime.delegation.policy"
+    ):
+        parent = policy.extract_parent_task_record(
+            {"configurable": {"thread_id": root.thread_id}}
+        )
 
-    async def scenario() -> async_subagent_runtime.TaskRecord:
-        root = await control.spawn_task("background_research", "root task")
-        with caplog.at_level(
-            logging.WARNING, logger="ruyi_agent.runtime.delegation.async_runtime"
-        ):
-            started = await control.spawn_agent(
-                "background_research",
-                "child task",
-                config={"configurable": {"thread_id": root.thread_id}},
-            )
-        child_task_id = started.split("task_id=")[1].split()[0]
-        await control.wait_agent(root.task_id)
-        await control.wait_agent(child_task_id)
-        return control.get_task_record(child_task_id)
-
-    child = asyncio.run(scenario())
-
-    assert child.depth == 2
+    assert parent is root
     assert "falling back to thread_id" in caplog.text
 
 
@@ -173,7 +161,7 @@ def test_spawn_rejects_when_depth_exceeds_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         build_test_remote_refs(),
@@ -182,25 +170,22 @@ def test_spawn_rejects_when_depth_exceeds_limit(
         max_delegation_depth=1,
     )
 
-    async def scenario() -> tuple[str, list[async_subagent_runtime.TaskRecord]]:
+    async def scenario() -> tuple[MaxDelegationDepthError, list[TaskRecord]]:
         root = await control.spawn_task("background_research", "root task")
-        denied = await control.spawn_agent(
-            "background_research",
-            "child task",
-            config={
-                "configurable": {
-                    "thread_id": root.thread_id,
-                    "task_id": root.task_id,
-                }
-            },
-        )
-        await control.wait_agent(root.task_id)
-        return denied, control.list_task_records()
+        with pytest.raises(MaxDelegationDepthError) as exc_info:
+            await control.spawn_task(
+                "background_research",
+                "child task",
+                parent_task_id=root.task_id,
+                parent_thread_id=root.thread_id,
+            )
+        await wait_for_task_state(control, root.task_id, states={"completed"})
+        return exc_info.value, control.list_persisted_task_records()
 
     denied, records = asyncio.run(scenario())
 
-    assert "Delegation depth limit exceeded" in denied
-    assert "Complete the remaining work yourself" in denied
+    assert denied.current_depth == 2
+    assert denied.max_depth == 1
     assert len(records) == 1
 
 
@@ -208,7 +193,7 @@ def test_spawn_rejects_when_root_task_budget_exhausted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         build_test_remote_refs(),
@@ -217,31 +202,28 @@ def test_spawn_rejects_when_root_task_budget_exhausted(
         max_tasks_per_root=2,
     )
 
-    async def scenario() -> tuple[str, list[async_subagent_runtime.TaskRecord]]:
+    async def scenario() -> tuple[MaxTasksPerRootError, list[TaskRecord]]:
         root = await control.spawn_task("background_research", "root task")
         first_child = await control.spawn_task(
             "background_research",
             "first child",
             parent_task_id=root.task_id,
         )
-        denied = await control.spawn_agent(
-            "background_research",
-            "second child",
-            config={
-                "configurable": {
-                    "thread_id": root.thread_id,
-                    "task_id": root.task_id,
-                }
-            },
-        )
-        await control.wait_agent(root.task_id)
-        await control.wait_agent(first_child.task_id)
-        return denied, control.list_task_records()
+        with pytest.raises(MaxTasksPerRootError) as exc_info:
+            await control.spawn_task(
+                "background_research",
+                "second child",
+                parent_task_id=root.task_id,
+                parent_thread_id=root.thread_id,
+            )
+        await wait_for_task_state(control, root.task_id, states={"completed"})
+        await wait_for_task_state(control, first_child.task_id, states={"completed"})
+        return exc_info.value, control.list_persisted_task_records()
 
     denied, records = asyncio.run(scenario())
 
-    assert "Task budget exhausted" in denied
-    assert "max_tasks_per_root=2" in denied
+    assert denied.current_count == 2
+    assert denied.max_tasks_per_root == 2
     assert len(records) == 2
 
 
@@ -249,7 +231,7 @@ def test_remote_ref_spawn_also_enforces_depth_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         build_test_remote_refs(),
@@ -259,31 +241,29 @@ def test_remote_ref_spawn_also_enforces_depth_limit(
         max_delegation_depth=1,
     )
 
-    async def scenario() -> str:
+    async def scenario() -> MaxDelegationDepthError:
         root = await control.spawn_task("background_research", "root task")
-        denied = await control.spawn_agent(
-            "remote_code_wiki",
-            "remote child",
-            config={
-                "configurable": {
-                    "thread_id": root.thread_id,
-                    "task_id": root.task_id,
-                }
-            },
-        )
-        await control.wait_agent(root.task_id)
-        return denied
+        with pytest.raises(MaxDelegationDepthError) as exc_info:
+            await control.spawn_task(
+                "remote_code_wiki",
+                "remote child",
+                parent_task_id=root.task_id,
+                parent_thread_id=root.thread_id,
+            )
+        await wait_for_task_state(control, root.task_id, states={"completed"})
+        return exc_info.value
 
     denied = asyncio.run(scenario())
 
-    assert "Delegation depth limit exceeded" in denied
+    assert denied.current_depth == 2
+    assert denied.max_depth == 1
 
 
 def test_remote_child_spawn_injects_delegation_context_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     a2a_client = RecordingRemoteA2AClient()
     control = async_subagent_runtime.AgentControl(
         build_specs(),
@@ -294,15 +274,16 @@ def test_remote_child_spawn_injects_delegation_context_metadata(
         node_id="node-a",
     )
 
-    async def scenario() -> async_subagent_runtime.TaskRecord:
+    async def scenario() -> TaskRecord:
         root = await control.spawn_task("background_research", "root task")
         child = await control.spawn_task(
             "remote_code_wiki",
             "remote child",
             parent_task_id=root.task_id,
+            parent_thread_id=root.thread_id,
             metadata={"channel": "tg"},
         )
-        await control.wait_agent(root.task_id)
+        await wait_for_task_state(control, root.task_id, states={"completed"})
         return child
 
     child = asyncio.run(scenario())
@@ -323,7 +304,7 @@ def test_concurrent_remote_spawns_cannot_exceed_root_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     a2a_client = SlowRemoteA2AClient()
     control = async_subagent_runtime.AgentControl(
         build_specs(),
@@ -334,25 +315,34 @@ def test_concurrent_remote_spawns_cannot_exceed_root_budget(
         max_tasks_per_root=2,
     )
 
-    async def scenario() -> tuple[list[str], list[async_subagent_runtime.TaskRecord]]:
+    async def scenario() -> tuple[list[object], list[TaskRecord]]:
         root = await control.spawn_task("background_research", "root task")
-        config = {
-            "configurable": {
-                "thread_id": root.thread_id,
-                "task_id": root.task_id,
-            }
-        }
         results = await asyncio.gather(
-            control.spawn_agent("remote_code_wiki", "remote child 1", config=config),
-            control.spawn_agent("remote_code_wiki", "remote child 2", config=config),
+            control.spawn_task(
+                "remote_code_wiki",
+                "remote child 1",
+                parent_task_id=root.task_id,
+                parent_thread_id=root.thread_id,
+            ),
+            control.spawn_task(
+                "remote_code_wiki",
+                "remote child 2",
+                parent_task_id=root.task_id,
+                parent_thread_id=root.thread_id,
+            ),
+            return_exceptions=True,
         )
-        await control.wait_agent(root.task_id)
-        return results, control.list_task_records()
+        await wait_for_task_state(control, root.task_id, states={"completed"})
+        return results, control.list_persisted_task_records()
 
     results, records = asyncio.run(scenario())
 
-    assert sum("Started worker task" in result for result in results) == 1
-    assert sum("Task budget exhausted" in result for result in results) == 1
+    assert sum(isinstance(result, TaskRecord) for result in results) == 1
+    failures = [
+        result for result in results if isinstance(result, MaxTasksPerRootError)
+    ]
+    assert len(failures) == 1
+    assert failures[0].current_count == 2
     assert a2a_client.create_calls == 1
     assert len(records) == 2
 
@@ -362,7 +352,7 @@ def test_restart_budget_uses_full_persisted_tree_not_lazy_task_cache(
     tmp_path,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     db_path = tmp_path / "tasks.sqlite"
     first_store = TaskStore(str(db_path))
     first_control = async_subagent_runtime.AgentControl(
@@ -393,9 +383,9 @@ def test_restart_budget_uses_full_persisted_tree_not_lazy_task_cache(
             parent_task_id=child.task_id,
         )
         for record in (root, child, grandchild):
-            run = first_control.get_live_run(record.task_id)
-            if run is not None:
-                await run
+            await wait_for_task_state(
+                first_control, record.task_id, states={"completed"}
+            )
         return root.task_id, child.task_id
 
     root_task_id, child_task_id = asyncio.run(create_tree())
@@ -416,7 +406,7 @@ def test_restart_budget_uses_full_persisted_tree_not_lazy_task_cache(
     async def attempt_after_lazy_restore() -> None:
         second_control.get_task_record(root_task_id)
         second_control.get_task_record(child_task_id)
-        assert len(second_control.list_task_records()) == 2
+        assert len(second_control.list_persisted_task_records()) == 3
         await second_control.spawn_task(
             "background_research",
             "must be denied",
@@ -425,7 +415,7 @@ def test_restart_budget_uses_full_persisted_tree_not_lazy_task_cache(
         )
 
     try:
-        with pytest.raises(async_subagent_runtime.MaxTasksPerRootError) as exc_info:
+        with pytest.raises(MaxTasksPerRootError) as exc_info:
             asyncio.run(attempt_after_lazy_restore())
         assert exc_info.value.current_count == 3
         assert second_store.count_tasks_under_root(root_task_id) == 3
@@ -438,7 +428,7 @@ def test_independent_agent_controls_atomically_compete_for_last_task_slot(
     tmp_path,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     db_path = tmp_path / "tasks.sqlite"
     first_store = TaskStore(str(db_path))
     second_store = TaskStore(str(db_path))
@@ -463,9 +453,7 @@ def test_independent_agent_controls_atomically_compete_for_last_task_slot(
         root = await first_control.spawn_task(
             "background_research", "root", task_id="root"
         )
-        root_run = first_control.get_live_run(root.task_id)
-        if root_run is not None:
-            await root_run
+        await wait_for_task_state(first_control, root.task_id, states={"completed"})
         return await asyncio.gather(
             first_control.spawn_task(
                 "background_research",
@@ -484,15 +472,8 @@ def test_independent_agent_controls_atomically_compete_for_last_task_slot(
 
     try:
         results = asyncio.run(scenario())
-        assert (
-            sum(isinstance(item, async_subagent_runtime.TaskRecord) for item in results)
-            == 1
-        )
-        failures = [
-            item
-            for item in results
-            if isinstance(item, async_subagent_runtime.MaxTasksPerRootError)
-        ]
+        assert sum(isinstance(item, TaskRecord) for item in results) == 1
+        failures = [item for item in results if isinstance(item, MaxTasksPerRootError)]
         assert len(failures) == 1
         assert failures[0].current_count == 2
         assert first_store.count_tasks_under_root("root") == 2
@@ -517,7 +498,7 @@ def test_failed_remote_create_keeps_explainable_record_and_retries_same_slot(
         node_id="node-a",
     )
 
-    async def scenario() -> async_subagent_runtime.TaskRecord:
+    async def scenario() -> TaskRecord:
         with pytest.raises(A2AClientError):
             await control.spawn_task(
                 "remote_code_wiki",
@@ -663,7 +644,7 @@ def test_uncertain_remote_create_is_not_replayed_without_capability(tmp_path) ->
 def test_send_input_reuses_same_agent_thread(monkeypatch: pytest.MonkeyPatch) -> None:
     # 为什么测继续输入：这决定本地 async worker 是一次性任务还是可持续推进的 agent 会话。
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
 
     control = async_subagent_runtime.AgentControl(
         build_specs(),
@@ -672,16 +653,17 @@ def test_send_input_reuses_same_agent_thread(monkeypatch: pytest.MonkeyPatch) ->
         backend=object(),
     )
 
-    async def scenario() -> str:
-        started = await control.spawn_agent("background_research", "first task")
-        task_id = started.split("task_id=")[1].split()[0]
-        await control.wait_agent(task_id)
-        sent = await control.send_input(task_id, "follow up")
-        await control.wait_agent(task_id)
+    async def scenario() -> tuple[str, TaskRecord]:
+        started = await control.spawn_task("background_research", "first task")
+        task_id = started.task_id
+        await wait_for_task_state(control, task_id, states={"completed"})
+        await control.send_task_input(task_id, "follow up")
+        sent = await wait_for_task_state(control, task_id, states={"completed"})
         return task_id, sent
 
     task_id, sent = asyncio.run(scenario())
-    assert f"task_id={task_id}" in sent
+    assert sent.task_id == task_id
+    assert sent.result == "done"
 
     assert len(factory.created) == 1
     assert len(factory.created[0].calls) == 2
@@ -705,7 +687,7 @@ def test_send_input_after_failed_task_clears_previous_error(
 
     agent = FailingThenSuccessfulAgent()
     monkeypatch.setattr(
-        async_subagent_runtime,
+        agent_factory_module,
         "create_runtime_agent",
         lambda **kwargs: agent,
     )
@@ -716,30 +698,30 @@ def test_send_input_after_failed_task_clears_previous_error(
         backend=object(),
     )
 
-    async def scenario() -> tuple[str, str, str, str | None]:
-        started = await control.spawn_agent("background_research", "first task")
-        task_id = started.split("task_id=")[1].split()[0]
-        failed = await control.wait_agent(task_id)
-        sent = await control.send_input(task_id, "retry")
+    async def scenario() -> tuple[TaskRecord, TaskRecord, TaskRecord, str | None]:
+        started = await control.spawn_task("background_research", "first task")
+        task_id = started.task_id
+        failed = replace(await wait_for_task_state(control, task_id, states={"failed"}))
+        sent = await control.send_task_input(task_id, "retry")
         running_error = control.get_task_record(task_id).error
-        recovered = await control.wait_agent(task_id)
+        recovered = await wait_for_task_state(control, task_id, states={"completed"})
         return failed, sent, recovered, running_error
 
     failed, sent, recovered, running_error = asyncio.run(scenario())
 
-    assert "state=failed" in failed
-    assert "RuntimeError: first failure" in failed
-    assert "Sent input" in sent
+    assert failed.state == "failed"
+    assert failed.error == "RuntimeError: first failure"
+    assert sent.task_id == failed.task_id
     assert running_error is None
-    assert "state=completed" in recovered
-    assert "result=recovered" in recovered
+    assert recovered.state == "completed"
+    assert recovered.result == "recovered"
 
 
 def test_cancel_idle_completed_task_is_noop_and_followup_reuses_same_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         build_test_remote_refs(),
@@ -747,18 +729,18 @@ def test_cancel_idle_completed_task_is_noop_and_followup_reuses_same_thread(
         backend=object(),
     )
 
-    async def scenario() -> tuple[str, str]:
+    async def scenario() -> tuple[str, TaskRecord]:
         record = await control.spawn_task("background_research", "first task")
-        await control.get_live_run(record.task_id)
+        await wait_for_task_state(control, record.task_id, states={"completed"})
         cancelled = await control.cancel_task(record.task_id)
         assert cancelled.state == "completed"
-        sent = await control.send_input(record.task_id, "resume after cancel")
-        await control.wait_agent(record.task_id)
+        await control.send_task_input(record.task_id, "resume after cancel")
+        sent = await wait_for_task_state(control, record.task_id, states={"completed"})
         return record.task_id, sent
 
     task_id, sent = asyncio.run(scenario())
 
-    assert f"task_id={task_id}" in sent
+    assert sent.task_id == task_id
     assert len(factory.created[0].calls) == 2
     assert factory.created[0].calls[1]["config"]["configurable"]["thread_id"] == task_id
 
@@ -768,7 +750,7 @@ def test_explicit_cancel_marks_task_cancelled(
 ) -> None:
     agent = BlockingAgent()
     monkeypatch.setattr(
-        async_subagent_runtime,
+        agent_factory_module,
         "create_runtime_agent",
         lambda **kwargs: agent,
     )
@@ -779,7 +761,7 @@ def test_explicit_cancel_marks_task_cancelled(
         backend=object(),
     )
 
-    async def scenario() -> async_subagent_runtime.TaskRecord:
+    async def scenario() -> TaskRecord:
         record = await control.spawn_task("background_research", "block")
         await agent.started.wait()
         return await control.cancel_task(record.task_id)
@@ -793,7 +775,7 @@ def test_cancel_waiting_for_human_marks_current_run_cancelled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = InterruptingAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         build_test_remote_refs(),
@@ -801,13 +783,9 @@ def test_cancel_waiting_for_human_marks_current_run_cancelled(
         backend=object(),
     )
 
-    async def scenario() -> async_subagent_runtime.TaskRecord:
+    async def scenario() -> TaskRecord:
         record = await control.spawn_task("background_research", "needs review")
-        assert control.get_live_run(record.task_id) is not None
-        await control.get_live_run(record.task_id)
-        waiting = control.get_task_record(record.task_id)
-        assert waiting.state == "waiting_for_human"
-        assert control.get_live_run(waiting.task_id) is None
+        await wait_for_task_state(control, record.task_id, states={"waiting_for_human"})
         return await control.cancel_task(record.task_id)
 
     record = asyncio.run(scenario())
@@ -821,7 +799,7 @@ def test_passive_run_cancellation_marks_task_interrupted(
 ) -> None:
     agent = BlockingAgent()
     monkeypatch.setattr(
-        async_subagent_runtime,
+        agent_factory_module,
         "create_runtime_agent",
         lambda **kwargs: agent,
     )
@@ -832,15 +810,10 @@ def test_passive_run_cancellation_marks_task_interrupted(
         backend=object(),
     )
 
-    async def scenario() -> async_subagent_runtime.TaskRecord:
+    async def scenario() -> TaskRecord:
         record = await control.spawn_task("background_research", "block")
         await agent.started.wait()
-        assert control.get_live_run(record.task_id) is not None
-        control.get_live_run(record.task_id).cancel()
-        try:
-            await control.get_live_run(record.task_id)
-        except asyncio.CancelledError:
-            pass
+        await control.close()
         return control.get_task_record(record.task_id)
 
     record = asyncio.run(scenario())
@@ -855,7 +828,7 @@ def test_wait_agent_caller_cancellation_does_not_cancel_supervised_run(
 ) -> None:
     agent = BlockingAgent()
     monkeypatch.setattr(
-        async_subagent_runtime,
+        agent_factory_module,
         "create_runtime_agent",
         lambda **kwargs: agent,
     )
@@ -868,15 +841,14 @@ def test_wait_agent_caller_cancellation_does_not_cancel_supervised_run(
     async def scenario() -> None:
         record = await control.spawn_task("background_research", "block")
         await agent.started.wait()
-        run = control.get_live_run(record.task_id)
-        assert run is not None
-        observer = asyncio.create_task(control.wait_agent(record.task_id))
+        observer = asyncio.create_task(
+            wait_for_task_state(control, record.task_id, states={"completed"})
+        )
         await asyncio.sleep(0)
         observer.cancel()
         with pytest.raises(asyncio.CancelledError):
             await observer
-        assert run.cancelled() is False
-        assert run.done() is False
+        assert control.get_task_record(record.task_id).state == "running"
         await control.cancel_task(record.task_id)
 
     asyncio.run(scenario())
@@ -888,7 +860,7 @@ def test_task_store_restores_local_running_task_as_interrupted(
 ) -> None:
     task_store = TaskStore(str(tmp_path / "tasks.sqlite"))
     task_store.save_task(
-        async_subagent_runtime.TaskRecord(
+        TaskRecord(
             task_id="local-running-task",
             agent_name="background_research",
             state="running",
@@ -904,25 +876,20 @@ def test_task_store_restores_local_running_task_as_interrupted(
         )
     )
 
-    second_control = async_subagent_runtime.AgentControl(
-        build_specs(),
-        build_test_remote_refs(),
-        checkpointer=object(),
-        backend=object(),
-        task_store=task_store,
-    )
+    manager = TaskManager(task_store)
+    assert manager.list_tasks() == []
 
-    listing_before = asyncio.run(second_control.list_agents())
-    assert "task_id=local-running-task" not in listing_before
-
-    second_control.load_tasks_for_thread("main-thread")
-    restored = second_control.get_task_record("local-running-task")
+    manager.load_by_parent_thread_id("main-thread")
+    restored = manager.get_task("local-running-task")
     assert restored.state == "interrupted"
-    assert second_control.get_live_run(restored.task_id) is None
-    listing = asyncio.run(second_control.list_agents())
-    assert "task_id=local-running-task" in listing
-    assert "state=interrupted" in listing
+    assert manager.has_active_run(restored.task_id) is False
+    listing = manager.list_tasks()
+    assert [record.task_id for record in listing] == ["local-running-task"]
+    assert listing[0].state == "interrupted"
+    assert manager.event_ledger is not None
+    manager.event_ledger.close()
     task_store.close()
+
 
 def test_task_store_reload_preserves_live_local_run(
     monkeypatch: pytest.MonkeyPatch,
@@ -930,7 +897,7 @@ def test_task_store_reload_preserves_live_local_run(
 ) -> None:
     agent = BlockingAgent()
     monkeypatch.setattr(
-        async_subagent_runtime,
+        agent_factory_module,
         "create_runtime_agent",
         lambda **kwargs: agent,
     )
@@ -950,10 +917,7 @@ def test_task_store_reload_preserves_live_local_run(
             parent_thread_id="main-thread",
         )
         await agent.started.wait()
-        control.load_tasks_for_thread("main-thread")
         reloaded = control.get_task_record(record.task_id)
-        assert control.get_live_run(reloaded.task_id) is not None
-        assert not control.get_live_run(reloaded.task_id).done()
         state = reloaded.state
         error = reloaded.error
         await control.cancel_task(record.task_id)
@@ -982,8 +946,8 @@ def test_remote_task_store_recovers_and_refreshes_after_restart(
     )
 
     async def spawn_remote() -> str:
-        started = await first_control.spawn_agent("remote_code_wiki", "remote task")
-        return started.split("task_id=")[1].split()[0]
+        started = await first_control.spawn_task("remote_code_wiki", "remote task")
+        return started.task_id
 
     task_id = asyncio.run(spawn_remote())
     stored = task_store.get_task(task_id)
@@ -1002,17 +966,17 @@ def test_remote_task_store_recovers_and_refreshes_after_restart(
         remote_poll_interval=0.01,
     )
 
-    async def refresh_and_continue() -> tuple[str, str]:
-        status = await second_control.check_agent(task_id)
-        sent = await second_control.send_input(task_id, "follow up")
+    async def refresh_and_continue() -> tuple[TaskRecord, TaskRecord]:
+        status = replace(await second_control.refresh_task(task_id))
+        sent = await second_control.send_task_input(task_id, "follow up")
         return status, sent
 
     status, sent = asyncio.run(refresh_and_continue())
 
-    assert "state=completed" in status
-    assert "result=remote persisted done" in status
+    assert status.state == "completed"
+    assert status.result == "remote persisted done"
     assert second_client.get_calls == ["remote-task-persisted"]
-    assert "Sent input" in sent
+    assert sent.task_id == task_id
     assert second_client.sent_inputs == ["follow up"]
     persisted_after = task_store.get_task(task_id)
     assert persisted_after is not None

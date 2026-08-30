@@ -10,7 +10,8 @@ from fastapi.testclient import TestClient
 import pytest
 from starlette.requests import ClientDisconnect
 
-import ruyi_agent.runtime.delegation.async_runtime as async_subagent_runtime
+from ruyi_agent.runtime.delegation.async_runtime import AgentControl
+import ruyi_agent.runtime.agent_factory as agent_factory_module
 from ruyi_agent.integrations.a2a.client import A2AClient
 from ruyi_agent.config.loader import LocalWorkerSpec
 from ruyi_agent.gateway.tasks import GatewayTaskModule
@@ -134,9 +135,9 @@ def test_task_event_endpoint_auth_validation_replay_and_headers(
     tmp_path,
 ) -> None:
     factory = DelayedAgentFactory(delay=0.2)
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     store = TaskStore(str(tmp_path / "tasks.sqlite"))
-    control = async_subagent_runtime.AgentControl(
+    control = AgentControl(
         build_specs(),
         {},
         checkpointer=object(),
@@ -246,10 +247,10 @@ def test_remote_task_event_stream_rewrites_task_id_and_replays_cursor(
 ) -> None:
     monkeypatch.setenv("REMOTE_CODE_WIKI_TOKEN", "remote-secret")
     factory = DelayedAgentFactory(delay=0.15)
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
 
     remote_store = TaskStore(str(tmp_path / "remote-tasks.sqlite"))
-    remote_control = async_subagent_runtime.AgentControl(
+    remote_control = AgentControl(
         {
             "code_wiki": LocalWorkerSpec(
                 name="code_wiki",
@@ -284,7 +285,7 @@ def test_remote_task_event_stream_rewrites_task_id_and_replays_cursor(
     remote_root.mount("/a2a", remote_app)
 
     proxy_store = TaskStore(str(tmp_path / "proxy-tasks.sqlite"))
-    proxy_control = async_subagent_runtime.AgentControl(
+    proxy_control = AgentControl(
         build_specs(),
         build_test_remote_refs(),
         checkpointer=object(),
@@ -401,7 +402,7 @@ def test_established_remote_stream_fault_emits_error_then_end(
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     store = TaskStore(str(tmp_path / "proxy-tasks.sqlite"))
-    control = async_subagent_runtime.AgentControl(
+    control = AgentControl(
         {},
         build_test_remote_refs(),
         checkpointer=object(),
@@ -504,7 +505,7 @@ def test_fresh_remote_stream_requires_snapshot_before_any_other_event(
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     store = TaskStore(str(tmp_path / "proxy-tasks.sqlite"))
-    control = async_subagent_runtime.AgentControl(
+    control = AgentControl(
         {},
         build_test_remote_refs(),
         checkpointer=object(),
@@ -651,7 +652,7 @@ def test_remote_stream_requires_one_atomic_error_end_pair(
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     store = TaskStore(str(tmp_path / "proxy-tasks.sqlite"))
-    control = async_subagent_runtime.AgentControl(
+    control = AgentControl(
         {},
         build_test_remote_refs(),
         checkpointer=object(),
@@ -743,7 +744,7 @@ def test_resumed_remote_stream_rejects_late_snapshot(
         )
 
     store = TaskStore(str(tmp_path / "proxy-tasks.sqlite"))
-    control = async_subagent_runtime.AgentControl(
+    control = AgentControl(
         {},
         build_test_remote_refs(),
         checkpointer=object(),
@@ -823,7 +824,7 @@ def test_resumed_remote_stream_allows_end_without_replayed_full_state(
         )
 
     store = TaskStore(str(tmp_path / "proxy-tasks.sqlite"))
-    control = async_subagent_runtime.AgentControl(
+    control = AgentControl(
         {},
         build_test_remote_refs(),
         checkpointer=object(),

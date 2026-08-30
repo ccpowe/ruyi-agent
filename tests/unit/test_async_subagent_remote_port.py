@@ -6,9 +6,17 @@ from fastapi import FastAPI
 import httpx
 import pytest
 
+from ruyi_agent.task_models import TaskRecord
+from ruyi_agent.runtime.delegation.contracts import _format_exception_summary
 import ruyi_agent.runtime.delegation.async_runtime as async_subagent_runtime
+import ruyi_agent.runtime.agent_factory as agent_factory_module
+from ruyi_agent.runtime.delegation.notifications import SettledRunNotifier
+from ruyi_agent.runtime.delegation.policy import DelegationPolicy
+from ruyi_agent.runtime.delegation.registry import AgentRegistry
+from ruyi_agent.runtime.delegation.task_manager import TaskManager
+from ruyi_agent.runtime.delegation.tools import DelegationTools
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
-from ruyi_agent.integrations.a2a.client import A2AClient
+from ruyi_agent.integrations.a2a.client import A2AClient, A2AClientError
 from ruyi_agent.config.loader import LocalWorkerSpec
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.channels.http.routes import create_gateway_app
@@ -21,6 +29,7 @@ from tests.support.async_subagent_runtime import (
     AlwaysFailingRemoteA2AClient,
     build_specs,
     build_test_remote_refs,
+    wait_for_task_state,
 )
 from tests.unit.gateway_http_support import build_local_agent_config
 
@@ -35,7 +44,7 @@ def test_format_exception_summary_expands_exception_group() -> None:
         ],
     )
 
-    summary = async_subagent_runtime._format_exception_summary(exc)
+    summary = _format_exception_summary(exc)
 
     assert "ValueError: bad input" in summary
     assert "RuntimeError: boom" in summary
@@ -46,8 +55,15 @@ def test_run_agent_turn_records_expanded_exception_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # 为什么测失败落库：展开后的异常信息要真正进入 task 状态，而不是只停留在 helper 层。
-    factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    class FailingFactory:
+        def __call__(self, **kwargs):
+            return FailingAgent()
+
+    monkeypatch.setattr(
+        agent_factory_module,
+        "create_runtime_agent",
+        FailingFactory(),
+    )
 
     class FailingAgent:
         async def ainvoke(self, payload, *, config, version):
@@ -65,18 +81,20 @@ def test_run_agent_turn_records_expanded_exception_summary(
         checkpointer=object(),
         backend=object(),
     )
-    control._compiled_agents["background_research"] = FailingAgent()
 
-    async def scenario() -> str:
-        started = await control.spawn_agent("background_research", "research this")
-        task_id = started.split("task_id=")[1].split()[0]
-        return await control.wait_agent(task_id)
+    async def scenario() -> TaskRecord:
+        started = await control.spawn_task("background_research", "research this")
+        return await wait_for_task_state(
+            control,
+            started.task_id,
+            states={"completed", "failed", "cancelled", "interrupted"},
+        )
 
     status = asyncio.run(scenario())
 
-    assert "state=failed" in status
-    assert "ValueError: bad input" in status
-    assert "RuntimeError: boom" in status
+    assert status.state == "failed"
+    assert "ValueError: bad input" in (status.error or "")
+    assert "RuntimeError: boom" in (status.error or "")
 
 
 def test_spawn_remote_ref_runs_via_a2a_gateway(
@@ -84,12 +102,13 @@ def test_spawn_remote_ref_runs_via_a2a_gateway(
     tmp_path: Path,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     monkeypatch.setenv("REMOTE_CODE_WIKI_TOKEN", "remote-secret")
 
     remote_db = str(tmp_path / "remote-tasks.sqlite")
     remote_task_store = TaskStore(remote_db)
     remote_mailbox_store = MailboxStore(remote_db)
+    remote_mailbox = AgentMailbox(remote_mailbox_store)
     remote_control = async_subagent_runtime.AgentControl(
         {
             "code_wiki": LocalWorkerSpec(
@@ -106,7 +125,7 @@ def test_spawn_remote_ref_runs_via_a2a_gateway(
         checkpointer=object(),
         backend=object(),
         task_store=remote_task_store,
-        mailbox=AgentMailbox(remote_mailbox_store),
+        mailbox=remote_mailbox,
         remote_poll_interval=0.01,
     )
     remote_service = GatewayTaskModule(
@@ -135,30 +154,39 @@ def test_spawn_remote_ref_runs_via_a2a_gateway(
         remote_poll_interval=0.01,
     )
 
-    async def scenario() -> tuple[str, str, str, str]:
+    async def scenario() -> tuple[str, TaskRecord, TaskRecord, TaskRecord, TaskRecord]:
         try:
-            started = await control.spawn_agent("remote_code_wiki", "research this")
-            task_id = started.split("task_id=")[1].split()[0]
-            status_before = await control.check_agent(task_id)
-            status_after = await control.wait_agent(task_id)
-            sent = await control.send_input(task_id, "follow up")
-            await control.wait_agent(task_id)
-            return task_id, status_before, status_after, sent
+            started = await control.spawn_task("remote_code_wiki", "research this")
+            task_id = started.task_id
+            status_before = control.get_task_record(task_id)
+            status_after = await control.refresh_task(task_id)
+            sent = await control.send_task_input(task_id, "follow up")
+            [downstream] = remote_control.list_persisted_task_records()
+            claimed = remote_mailbox.claim(
+                recipient_task_id=downstream.task_id,
+                recipient_thread_id=downstream.thread_id,
+            )
+            remote_mailbox.acknowledge([message.message_id for message in claimed])
+            final = await control.refresh_task(task_id)
+            return task_id, status_before, status_after, sent, final
         finally:
             await control.close()
             await remote_control.close()
 
     try:
-        task_id, status_before, status_after, sent = asyncio.run(scenario())
+        task_id, status_before, status_after, sent, final = asyncio.run(scenario())
     finally:
         remote_mailbox_store.close()
         remote_task_store.close()
 
-    assert f"task_id={task_id}" in sent
-    assert "route=remote_ref" in status_before
-    assert "state=" in status_before
-    assert "state=completed" in status_after
-    assert "result=done" in status_after
+    assert sent.task_id == task_id
+    assert status_before.route_kind == "remote_ref"
+    assert status_before.state in {"running", "completed"}
+    assert status_after.state == "completed"
+    assert status_after.result == "done"
+    assert sent.state in {"pending", "running", "completed"}
+    assert final.state == "completed"
+    assert final.run_count == 2
     assert len(factory.created) == 1
 
 
@@ -173,42 +201,81 @@ def test_wait_agent_retries_transient_remote_status_failures() -> None:
         remote_status_retry_attempts=2,
     )
 
-    async def scenario() -> tuple[str, str]:
-        started = await control.spawn_agent("remote_code_wiki", "research this")
-        task_id = started.split("task_id=")[1].split()[0]
-        status_after = await control.wait_agent(task_id)
+    async def scenario() -> tuple[str, TaskRecord]:
+        started = await control.spawn_task("remote_code_wiki", "research this")
+        task_id = started.task_id
+        status_after = await control.refresh_task(task_id)
         return task_id, status_after
 
     task_id, status_after = asyncio.run(scenario())
 
-    assert f"task_id={task_id}" in status_after
-    assert "state=completed" in status_after
-    assert "result=remote done" in status_after
+    assert status_after.task_id == task_id
+    assert status_after.state == "completed"
+    assert status_after.result == "remote done"
 
 
-def test_check_agent_keeps_last_known_state_when_remote_status_temporarily_unavailable() -> (
-    None
-):
-    control = async_subagent_runtime.AgentControl(
-        build_specs(),
-        build_test_remote_refs(),
-        checkpointer=object(),
-        backend=object(),
-        a2a_client=AlwaysFailingRemoteA2AClient(),
+def test_check_agent_keeps_last_known_state_when_remote_status_temporarily_unavailable():
+    manager = TaskManager()
+    task_id = "remote-task-2"
+    manager.create_task_record(
+        task_id,
+        "remote_code_wiki",
+        parent_task_id=None,
+        root_task_id=task_id,
+        depth=1,
+        route_kind="remote_ref",
+        parent_thread_id="main-thread",
+    )
+    policy = DelegationPolicy(
+        manager,
+        node_id="node-test",
+        max_delegation_depth=3,
+        max_tasks_per_root=20,
+        permission_default_profile="",
+    )
+    notifier = SettledRunNotifier(manager, None)
+
+    class RefreshUnavailablePort:
+        async def spawn_task(
+            self, agent_name, task, *, parent_task_id=None, parent_thread_id=None
+        ):
+            raise AssertionError("spawn_task should not be called")
+
+        async def refresh_task(self, requested_task_id):
+            assert requested_task_id == task_id
+            raise A2AClientError(
+                status_code=502,
+                code="upstream_gateway_error",
+                message="temporarily unavailable",
+            )
+
+        async def send_task_input(self, requested_task_id, message):
+            raise AssertionError("send_task_input should not be called")
+
+        async def cancel_task(self, requested_task_id):
+            raise AssertionError("cancel_task should not be called")
+
+    tools = DelegationTools(
+        AgentRegistry(build_specs(), build_test_remote_refs()),
+        manager,
+        policy,
+        notifier,
         remote_poll_interval=0.01,
-        remote_status_retry_attempts=2,
+    )
+    check_tool = next(
+        tool
+        for tool in tools.build_tools(command_port=RefreshUnavailablePort())
+        if tool.name == "check_agent"
+    )
+    status = asyncio.run(
+        check_tool.ainvoke(
+            {"task_id": task_id},
+            config={"configurable": {"thread_id": "main-thread"}},
+        )
     )
 
-    async def scenario() -> tuple[str, str]:
-        started = await control.spawn_agent("remote_code_wiki", "research this")
-        task_id = started.split("task_id=")[1].split()[0]
-        status = await control.check_agent(task_id)
-        return task_id, status
-
-    task_id, status = asyncio.run(scenario())
-
     assert f"task_id={task_id}" in status
-    assert "state=running" in status
+    assert "state=pending" in status
     assert "warning=remote_status_temporarily_unavailable" in status
 
 
@@ -277,7 +344,7 @@ def test_remote_task_webhook_event_relays_client_webhook(
             )
 
     monkeypatch.setattr(
-        async_subagent_runtime.httpx,
+        httpx,
         "AsyncClient",
         CapturingAsyncClient,
     )
@@ -289,7 +356,7 @@ def test_remote_task_webhook_event_relays_client_webhook(
         a2a_client=AlwaysFailingRemoteA2AClient(),
     )
 
-    async def scenario() -> tuple[bool, async_subagent_runtime.TaskRecord]:
+    async def scenario() -> tuple[bool, TaskRecord]:
         record = await control.spawn_task(
             "remote_code_wiki",
             "research this",

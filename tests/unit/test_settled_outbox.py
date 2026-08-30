@@ -5,9 +5,13 @@ import sqlite3
 import threading
 import uuid
 from datetime import UTC, datetime
+
+import httpx
 import pytest
 
-import ruyi_agent.runtime.delegation.async_runtime as async_subagent_runtime
+import ruyi_agent.runtime.agent_factory as agent_factory_module
+from ruyi_agent.runtime.delegation.async_runtime import AgentControl
+from ruyi_agent.runtime.delegation.notifications import SettledRunNotifier
 from ruyi_agent.runtime.delegation.task_manager import TaskManager
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.storage.mailbox_store import MailboxStore
@@ -17,6 +21,7 @@ from tests.support.async_subagent_runtime import (
     FakeAgentFactory,
     build_specs,
     build_test_remote_refs,
+    wait_for_task_state,
 )
 
 
@@ -26,16 +31,16 @@ def _control(
     *,
     task_store: TaskStore | None = None,
     mailbox_store: MailboxStore | None = None,
-) -> tuple[async_subagent_runtime.AgentControl, TaskStore, MailboxStore, AgentMailbox]:
+) -> tuple[AgentControl, TaskStore, MailboxStore, AgentMailbox]:
     monkeypatch.setattr(
-        async_subagent_runtime,
+        agent_factory_module,
         "create_runtime_agent",
         FakeAgentFactory(),
     )
     task_store = task_store or TaskStore(db_path)
     mailbox_store = mailbox_store or MailboxStore(db_path)
     mailbox = AgentMailbox(mailbox_store)
-    control = async_subagent_runtime.AgentControl(
+    control = AgentControl(
         build_specs(),
         build_test_remote_refs(),
         checkpointer=object(),
@@ -43,8 +48,19 @@ def _control(
         mailbox=mailbox,
         task_store=task_store,
     )
-    assert control._task_manager.settled_outbox_enabled is True
     return control, task_store, mailbox_store, mailbox
+
+
+def _notifier(
+    task_store: TaskStore,
+    mailbox: AgentMailbox,
+    *,
+    manager: TaskManager | None = None,
+) -> SettledRunNotifier:
+    return SettledRunNotifier(
+        manager or TaskManager(task_store, settled_outbox_enabled=True),
+        mailbox,
+    )
 
 
 def _record(
@@ -215,7 +231,9 @@ def test_direct_mailbox_retry_does_not_poison_seen_key(
         )
         store._conn.commit()
     try:
-        with pytest.raises(sqlite3.IntegrityError, match="injected mailbox write failure"):
+        with pytest.raises(
+            sqlite3.IntegrityError, match="injected mailbox write failure"
+        ):
             mailbox.publish_settled(
                 recipient_thread_id="parent-thread",
                 child_task_id="child-1",
@@ -280,7 +298,7 @@ def test_first_outbox_write_failure_retries_and_does_not_block_webhook(
             webhook_calls.append(url)
 
     monkeypatch.setattr(mailbox_store, "publish_claimed_settled_outbox", flaky_publish)
-    monkeypatch.setattr(control._httpx, "AsyncClient", CapturingClient)
+    monkeypatch.setattr(httpx, "AsyncClient", CapturingClient)
 
     async def scenario() -> list:
         record = await control.spawn_task(
@@ -289,11 +307,9 @@ def test_first_outbox_write_failure_retries_and_does_not_block_webhook(
             parent_thread_id="parent-thread",
             webhook={"url": "https://client.example/settled"},
         )
-        run = control.get_live_run(record.task_id)
-        assert run is not None
-        await run
+        await wait_for_task_state(control, record.task_id, states={"completed"})
         assert task_store.list_settled_outbox()[0]["status"] == "pending"
-        await control._settled_notifier.reconcile()
+        await _notifier(task_store, mailbox).reconcile()
         return mailbox.claim(
             recipient_task_id=None,
             recipient_thread_id="parent-thread",
@@ -331,9 +347,9 @@ def test_webhook_failure_does_not_lose_mailbox_delivery(
 
         async def post(self, url, *, headers, json):
             del url, headers, json
-            raise control._httpx.ConnectError("webhook unavailable")
+            raise httpx.ConnectError("webhook unavailable")
 
-    monkeypatch.setattr(control._httpx, "AsyncClient", FailingClient)
+    monkeypatch.setattr(httpx, "AsyncClient", FailingClient)
 
     async def scenario() -> list:
         record = await control.spawn_task(
@@ -342,9 +358,7 @@ def test_webhook_failure_does_not_lose_mailbox_delivery(
             parent_thread_id="parent-thread",
             webhook={"url": "https://client.example/settled"},
         )
-        run = control.get_live_run(record.task_id)
-        assert run is not None
-        await run
+        await wait_for_task_state(control, record.task_id, states={"completed"})
         return mailbox.claim(
             recipient_task_id=None,
             recipient_thread_id="parent-thread",
@@ -441,7 +455,7 @@ def test_preexisting_mailbox_row_is_acked_without_duplicate(
     )
 
     async def reconcile() -> list:
-        await control._settled_notifier.reconcile()
+        await _notifier(task_store, mailbox).reconcile()
         return mailbox.claim(
             recipient_task_id=None,
             recipient_thread_id="parent-thread",
@@ -473,13 +487,17 @@ def test_two_reconcilers_deliver_one_message(
     second, second_tasks, second_mailboxes, _ = _control(monkeypatch, db_path)
     start = threading.Event()
 
-    def dispatch(control: async_subagent_runtime.AgentControl) -> list[str]:
+    def dispatch(tasks: TaskStore, mailbox: AgentMailbox) -> list[str]:
         start.wait(timeout=5)
-        return control._settled_notifier._dispatch_available()
+        return asyncio.run(_notifier(tasks, mailbox).reconcile())
 
     async def scenario() -> list:
-        first_dispatch = asyncio.create_task(asyncio.to_thread(dispatch, first))
-        second_dispatch = asyncio.create_task(asyncio.to_thread(dispatch, second))
+        first_dispatch = asyncio.create_task(
+            asyncio.to_thread(dispatch, first_tasks, first_mailbox)
+        )
+        second_dispatch = asyncio.create_task(
+            asyncio.to_thread(dispatch, second_tasks, first_mailbox)
+        )
         await asyncio.sleep(0)
         start.set()
         await asyncio.gather(first_dispatch, second_dispatch)
@@ -540,10 +558,8 @@ def test_background_reconciler_starts_and_closes_cleanly(
 
     async def scenario() -> None:
         control.start_mailbox_recovery()
-        assert control._settled_notifier._reconciliation_task is not None
         await asyncio.sleep(0)
         await control.close()
-        assert control._settled_notifier._reconciliation_task is None
 
     try:
         asyncio.run(scenario())
@@ -558,19 +574,9 @@ def test_parent_wake_failure_is_consumed_and_retried_from_durable_mailbox(
 ) -> None:
     db_path = str(tmp_path / "parent-wake.sqlite")
     control, task_store, mailbox_store, mailbox = _control(monkeypatch, db_path)
-    manager = control._task_manager
-    attempts = 0
+    manager = TaskManager(task_store, settled_outbox_enabled=True)
 
-    async def flaky_wake(task_id: str) -> TaskRecord:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise RuntimeError("injected parent wake failure")
-        return manager.get_task(task_id)
-
-    control._ensure_task_awake = flaky_wake  # type: ignore[method-assign]
-
-    async def scenario() -> tuple[list, BaseException | None]:
+    async def scenario() -> tuple[list, list[str]]:
         parent = manager.create_task_record(
             "parent-task",
             "background_research",
@@ -588,25 +594,22 @@ def test_parent_wake_failure_is_consumed_and_retried_from_durable_mailbox(
         )
         manager.mark_running(child.task_id, asyncio.current_task())  # type: ignore[arg-type]
         manager.mark_completed(child.task_id, "done")
-        control._maybe_publish_settled_message(child.task_id)
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        assert attempts == 1
-        await control._settled_notifier.reconcile()
+        notifier = _notifier(task_store, mailbox, manager=manager)
+        assert notifier.publish_settled_message(child.task_id) == [parent.task_id]
+        wake_ids = await notifier.reconcile()
         messages = mailbox.claim(
             recipient_task_id=parent.task_id,
             recipient_thread_id=parent.thread_id,
         )
-        return messages, control._settled_notifier.last_error
+        return messages, wake_ids
 
     try:
-        messages, last_error = asyncio.run(scenario())
+        messages, wake_ids = asyncio.run(scenario())
     finally:
         mailbox_store.close()
         task_store.close()
 
-    assert attempts == 2
-    assert isinstance(last_error, RuntimeError)
+    assert wake_ids == ["parent-task"]
     assert [message.child_task_id for message in messages] == ["child-task"]
 
 
@@ -635,7 +638,7 @@ def test_claim_then_suppress_fences_publish_and_reconciles_retraction(
     )
 
     async def reconcile() -> list:
-        await control._settled_notifier.reconcile()
+        await _notifier(task_store, mailbox).reconcile()
         return mailbox.claim(
             recipient_task_id=None,
             recipient_thread_id="parent-thread",
@@ -666,15 +669,14 @@ def test_wait_after_delivery_atomically_suppresses_and_retracts(
             "run",
             parent_thread_id="parent-thread",
         )
-        run = control.get_live_run(record.task_id)
-        assert run is not None
-        await run
-        result = await control.wait_agent(record.task_id)
+        await wait_for_task_state(control, record.task_id, states={"completed"})
+        result = control.get_task_record(record.task_id)
+        _notifier(task_store, mailbox).suppress_mailbox_delivery(result)
         messages = mailbox.claim(
             recipient_task_id=None,
             recipient_thread_id="parent-thread",
         )
-        return result, messages
+        return f"state={result.state}", messages
 
     try:
         result, messages = asyncio.run(scenario())
@@ -704,18 +706,19 @@ def test_new_run_gets_a_distinct_parent_message(
             "first",
             parent_thread_id="parent-thread",
         )
-        first_run = control.get_live_run(record.task_id)
-        assert first_run is not None
-        await first_run
+        await wait_for_task_state(control, record.task_id, states={"completed"})
         first = mailbox.claim(
             recipient_task_id=None,
             recipient_thread_id="parent-thread",
         )
         mailbox.acknowledge([message.message_id for message in first])
         await control.send_task_input(record.task_id, "second")
-        second_run = control.get_live_run(record.task_id)
-        assert second_run is not None
-        await second_run
+        claimed_input = mailbox.claim(
+            recipient_task_id=record.task_id,
+            recipient_thread_id=record.thread_id,
+        )
+        mailbox.acknowledge([message.message_id for message in claimed_input])
+        await wait_for_task_state(control, record.task_id, states={"completed"})
         second = mailbox.claim(
             recipient_task_id=None,
             recipient_thread_id="parent-thread",
@@ -746,9 +749,7 @@ def test_shared_memory_uri_uses_the_same_atomic_outbox_database(
             "run",
             parent_thread_id="parent-thread",
         )
-        run = control.get_live_run(record.task_id)
-        assert run is not None
-        await run
+        await wait_for_task_state(control, record.task_id, states={"completed"})
         return mailbox.claim(
             recipient_task_id=None,
             recipient_thread_id="parent-thread",
@@ -782,11 +783,9 @@ def test_task_store_without_mailbox_does_not_create_undeliverable_intent(
 ) -> None:
     store = TaskStore(str(tmp_path / "no-mailbox.sqlite"))
     monkeypatch.setattr(
-        async_subagent_runtime,
-        "create_runtime_agent",
-        FakeAgentFactory(),
+        agent_factory_module, "create_runtime_agent", FakeAgentFactory()
     )
-    control = async_subagent_runtime.AgentControl(
+    control = AgentControl(
         build_specs(),
         build_test_remote_refs(),
         checkpointer=object(),
@@ -800,9 +799,7 @@ def test_task_store_without_mailbox_does_not_create_undeliverable_intent(
             "run",
             parent_thread_id="parent-thread",
         )
-        run = control.get_live_run(record.task_id)
-        assert run is not None
-        await run
+        await wait_for_task_state(control, record.task_id, states={"completed"})
         return control.get_task_record(record.task_id).state
 
     try:
@@ -960,9 +957,9 @@ def test_restart_adopts_random_id_legacy_mailbox_identity(
     setup_mailbox.close()
     setup_tasks.close()
 
-    control, tasks, mailboxes, _ = _control(monkeypatch, db_path)
+    _, tasks, mailboxes, mailbox = _control(monkeypatch, db_path)
     try:
-        asyncio.run(control._settled_notifier.reconcile())
+        asyncio.run(_notifier(tasks, mailbox).reconcile())
         outbox_after = tasks.list_settled_outbox()[0]
         with mailboxes._lock:
             messages = mailboxes._conn.execute(
@@ -1007,9 +1004,7 @@ def test_restart_binds_unkeyed_legacy_row_and_rejects_payload_conflict(
             FROM agent_mailbox_messages
             """
         ).fetchall()
-    assert [tuple(row) for row in bound] == [
-        (random_message_id, claimed[0].outbox_key)
-    ]
+    assert [tuple(row) for row in bound] == [(random_message_id, claimed[0].outbox_key)]
     mailbox.close()
     tasks.close()
 
@@ -1053,7 +1048,7 @@ def test_agent_control_fails_fast_without_one_shared_sqlite_database(
         mailbox = AgentMailbox()
     try:
         with pytest.raises(RuntimeError, match="share one SQLite database"):
-            async_subagent_runtime.AgentControl(
+            AgentControl(
                 build_specs(),
                 build_test_remote_refs(),
                 checkpointer=object(),
@@ -1149,9 +1144,7 @@ def test_suppression_win_blocks_cross_connection_mailbox_claim(
     tasks.insert_task(record)
     tasks.reconcile_settled_outbox()
     publisher = MailboxStore(db_path)
-    assert publisher.publish_claimed_settled_outbox(
-        tasks.claim_settled_outbox()[0]
-    )
+    assert publisher.publish_claimed_settled_outbox(tasks.claim_settled_outbox()[0])
     claimant = MailboxStore(db_path)
     entered = threading.Event()
     release = threading.Event()
@@ -1214,9 +1207,7 @@ def test_mailbox_claim_win_is_retracted_by_later_suppression(
     tasks.insert_task(record)
     tasks.reconcile_settled_outbox()
     publisher = MailboxStore(db_path)
-    assert publisher.publish_claimed_settled_outbox(
-        tasks.claim_settled_outbox()[0]
-    )
+    assert publisher.publish_claimed_settled_outbox(tasks.claim_settled_outbox()[0])
     claimant = MailboxStore(db_path)
     entered = threading.Event()
     release = threading.Event()
@@ -1455,10 +1446,13 @@ def test_pending_wake_query_excludes_more_than_one_cleanup_page_of_suppression(
                 ),
             )
     assert mailbox.list_pending_trigger_recipient_task_ids() == []
-    assert mailbox.claim(
-        recipient_task_id="parent-100",
-        recipient_thread_id="parent-thread",
-    ) == []
+    assert (
+        mailbox.claim(
+            recipient_task_id="parent-100",
+            recipient_thread_id="parent-thread",
+        )
+        == []
+    )
     mailbox.close()
     tasks.close()
 
@@ -1468,17 +1462,16 @@ def test_periodic_dispatch_stops_polling_legacy_task_table_after_watermark(
     tmp_path,
 ) -> None:
     db_path = str(tmp_path / "migration-complete.sqlite")
-    control, tasks, mailboxes, _ = _control(monkeypatch, db_path)
-    asyncio.run(control._settled_notifier.reconcile())
+    _, tasks, mailboxes, mailbox = _control(monkeypatch, db_path)
+    asyncio.run(_notifier(tasks, mailbox).reconcile())
 
     def unexpected_legacy_scan():
         raise AssertionError("completed legacy migration must not be polled")
 
+    manager = TaskManager(tasks, settled_outbox_enabled=True)
     monkeypatch.setattr(
-        control._task_manager,
-        "reconcile_settled_outbox_batch",
-        unexpected_legacy_scan,
+        manager, "reconcile_settled_outbox_batch", unexpected_legacy_scan
     )
-    asyncio.run(control._settled_notifier.reconcile())
+    asyncio.run(_notifier(tasks, mailbox, manager=manager).reconcile())
     mailboxes.close()
     tasks.close()

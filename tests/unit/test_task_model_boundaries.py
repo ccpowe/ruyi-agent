@@ -6,17 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from ruyi_agent.runtime.delegation.async_runtime import (
-    PublishedArtifact as RuntimePublishedArtifact,
-)
-from ruyi_agent.runtime.delegation.async_runtime import TaskRecord as RuntimeTaskRecord
 from ruyi_agent.runtime.delegation.live_runs import LiveRunRegistry
 from ruyi_agent.storage.task_store import TaskStore
 from ruyi_agent.task_models import (
     ACTIVE_TASK_STATES,
     SETTLED_TASK_STATES,
     TASK_STATES,
-    PublishedArtifact,
     TaskRecord,
     parse_task_state,
 )
@@ -29,9 +24,12 @@ def test_task_record_contains_only_persistence_safe_fields() -> None:
     assert "cancel_requested" not in field_names
 
 
-def test_async_runtime_keeps_legacy_model_imports_compatible() -> None:
-    assert RuntimeTaskRecord is TaskRecord
-    assert RuntimePublishedArtifact is PublishedArtifact
+def test_async_runtime_does_not_reexport_model_types() -> None:
+    from ruyi_agent.runtime.delegation import async_runtime
+
+    assert async_runtime.__all__ == ["AgentControl"]
+    assert "TaskRecord" not in vars(async_runtime)
+    assert "PublishedArtifact" not in vars(async_runtime)
 
 
 def test_task_state_parser_and_sets_share_one_canonical_vocabulary() -> None:

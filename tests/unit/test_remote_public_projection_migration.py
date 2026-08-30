@@ -7,7 +7,10 @@ import sqlite3
 
 import pytest
 
-import ruyi_agent.runtime.delegation.async_runtime as async_subagent_runtime
+import httpx
+from ruyi_agent.runtime.delegation.async_runtime import AgentControl
+from ruyi_agent.runtime.delegation.notifications import SettledRunNotifier
+from ruyi_agent.runtime.delegation.task_manager import TaskManager
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.storage.mailbox_store import MailboxStore
 from ruyi_agent.storage.settled_outbox import SettledOutboxIntent
@@ -478,7 +481,7 @@ def test_baseline_remote_upgrade_fences_raw_claims_before_notifier_and_replays_s
     _create_baseline_database(db_path)
     CapturingAsyncClient.calls.clear()
     monkeypatch.setattr(
-        async_subagent_runtime.httpx,
+        httpx,
         "AsyncClient",
         CapturingAsyncClient,
     )
@@ -486,7 +489,7 @@ def test_baseline_remote_upgrade_fences_raw_claims_before_notifier_and_replays_s
     task_store = TaskStore(db_path)
     mailbox_store = MailboxStore(db_path)
     mailbox = AgentMailbox(mailbox_store)
-    control = async_subagent_runtime.AgentControl(
+    control = AgentControl(
         {},
         build_test_remote_refs(),
         checkpointer=object(),
@@ -553,8 +556,24 @@ def test_baseline_remote_upgrade_fences_raw_claims_before_notifier_and_replays_s
 
     async def scenario():
         refreshed = await control.refresh_task(PUBLIC_TASK_ID)
-        await control._settled_notifier.reconcile()  # noqa: SLF001
-        await control._send_settled_webhook(PUBLIC_TASK_ID)  # noqa: SLF001
+        notifier = SettledRunNotifier(
+            TaskManager(task_store, settled_outbox_enabled=True),
+            mailbox,
+        )
+        await notifier.reconcile()
+        await control.handle_remote_task_event(
+            {
+                "task_id": PRIVATE_TASK_ID,
+                "agent_name": "remote_code_wiki",
+                "status": "failed",
+                "last_result": None,
+                "error": PRIVATE_ERROR,
+                "run_count": 1,
+                "created_at": NOW,
+                "updated_at": NOW,
+                "pending_review": None,
+            }
+        )
         return refreshed, mailbox.claim(
             recipient_task_id="parent-task",
             recipient_thread_id="parent-thread",
@@ -651,7 +670,7 @@ def test_delivered_outbox_only_anchors_pending_mailbox_identity_and_not_content(
     outbox_key = f"settled:parent-thread:{PUBLIC_TASK_ID}:1"
     CapturingAsyncClient.calls.clear()
     monkeypatch.setattr(
-        async_subagent_runtime.httpx,
+        httpx,
         "AsyncClient",
         CapturingAsyncClient,
     )
@@ -685,7 +704,7 @@ def test_delivered_outbox_only_anchors_pending_mailbox_identity_and_not_content(
     task_store = TaskStore(db_path)
     mailbox_store = MailboxStore(db_path)
     mailbox = AgentMailbox(mailbox_store)
-    control = async_subagent_runtime.AgentControl(
+    control = AgentControl(
         {},
         build_test_remote_refs(),
         checkpointer=object(),
@@ -703,15 +722,29 @@ def test_delivered_outbox_only_anchors_pending_mailbox_identity_and_not_content(
             """,
         )
         outbox = {
-            str(row["outbox_key"]): row
-            for row in task_store.list_settled_outbox()
+            str(row["outbox_key"]): row for row in task_store.list_settled_outbox()
         }[outbox_key]
         claimable_outbox = task_store.claim_settled_outbox()
         claimed_mailbox = mailbox.claim(
             recipient_task_id="parent-task",
             recipient_thread_id="parent-thread",
         )
-        asyncio.run(control._send_settled_webhook(PUBLIC_TASK_ID))  # noqa: SLF001
+        control.get_task_record(PUBLIC_TASK_ID)
+        asyncio.run(
+            control.handle_remote_task_event(
+                {
+                    "task_id": PRIVATE_TASK_ID,
+                    "agent_name": "remote_code_wiki",
+                    "status": "failed",
+                    "last_result": None,
+                    "error": PRIVATE_ERROR,
+                    "run_count": 1,
+                    "created_at": NOW,
+                    "updated_at": NOW,
+                    "pending_review": None,
+                }
+            )
+        )
     finally:
         asyncio.run(control.close())
         mailbox_store.close()
@@ -835,8 +868,7 @@ def test_retracted_mailbox_fences_every_linked_remote_outbox_on_each_reopen(
     mailbox = AgentMailbox(mailbox_store)
     try:
         second_outboxes = {
-            str(row["outbox_key"]): row
-            for row in task_store.list_settled_outbox()
+            str(row["outbox_key"]): row for row in task_store.list_settled_outbox()
         }
         mailbox_rows = {
             str(row["message_id"]): row
@@ -972,8 +1004,7 @@ def test_shared_upstream_uses_outbox_binding_and_isolates_unanchored_ambiguity(
             recipient_thread_id="parent-thread",
         )
         outboxes = {
-            str(row["outbox_key"]): row
-            for row in task_store.list_settled_outbox()
+            str(row["outbox_key"]): row for row in task_store.list_settled_outbox()
         }
     finally:
         mailbox_store.close()
@@ -1097,9 +1128,7 @@ def test_public_id_upstream_collision_uses_agent_and_isolates_same_agent_pair(
     assert ambiguous["child_agent_name"] is None
     assert ambiguous["idempotency_key"] is None
     assert ambiguous["claim_token"] is None
-    assert [message.message_id for message in claimed] == [
-        "agent-resolved-message"
-    ]
+    assert [message.message_id for message in claimed] == ["agent-resolved-message"]
 
 
 def test_authoritative_local_outbox_wins_over_colliding_remote_upstream(
@@ -1151,10 +1180,9 @@ def test_authoritative_local_outbox_wins_over_colliding_remote_upstream(
             WHERE message_id = 'local-linked-message'
             """,
         )
-        outbox = {
-            str(row["outbox_key"]): row
-            for row in second.list_settled_outbox()
-        }[local_key]
+        outbox = {str(row["outbox_key"]): row for row in second.list_settled_outbox()}[
+            local_key
+        ]
     finally:
         mailbox_store.close()
         second.close()

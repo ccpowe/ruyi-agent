@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 import pytest
 
-import ruyi_agent.runtime.delegation.async_runtime as runtime_module
+from ruyi_agent.runtime.delegation.async_runtime import AgentControl
 from ruyi_agent.integrations.a2a.client import A2AClient, A2AClientError
 from ruyi_agent.runtime.delegation.task_manager import TaskManager
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
@@ -158,15 +158,13 @@ async def test_real_a2a_pre_dispatch_failure_restores_and_can_retry(
             )
         return httpx.Response(200, json=payload)
 
-    db_path = str(
-        tmp_path / f"pre-dispatch-{failure_mode}-{operation}.sqlite"
-    )
+    db_path = str(tmp_path / f"pre-dispatch-{failure_mode}-{operation}.sqlite")
     task_store = TaskStore(db_path)
     mailbox_store = MailboxStore(db_path)
     remote_refs = build_test_remote_refs()
     if failure_mode == "invalid-url":
         remote_refs["remote_code_wiki"].url = "not-a-valid-http-url"
-    control = runtime_module.AgentControl(
+    control = AgentControl(
         {},
         remote_refs,
         checkpointer=object(),
@@ -189,7 +187,7 @@ async def test_real_a2a_pre_dispatch_failure_restores_and_can_retry(
                 parent_thread_id="parent-thread",
             )
         else:
-            manager = control._task_manager
+            manager = TaskManager(task_store, settled_outbox_enabled=True)
             manager.create_task_record(
                 task_id,
                 "remote_code_wiki",
@@ -235,12 +233,15 @@ async def test_real_a2a_pre_dispatch_failure_restores_and_can_retry(
         assert restored.external_operation is None
         assert restored.external_operation_identity is None
         assert restored.external_outcome_uncertain is False
-        assert restored.state == {
-            "create": "pending",
-            "send": "completed",
-            "review": "waiting_for_human",
-            "cancel": "running",
-        }[operation]
+        assert (
+            restored.state
+            == {
+                "create": "pending",
+                "send": "completed",
+                "review": "waiting_for_human",
+                "cancel": "running",
+            }[operation]
+        )
         assert all(
             row["settled_status"] != "interrupted"
             for row in task_store.list_settled_outbox()
@@ -357,9 +358,7 @@ class AmbiguousOperationClient:
         self.sent_idempotency_key = kwargs["idempotency_key"]
         return self._fail_or_payload(_payload(status="completed", run_count=2))
 
-    async def submit_review_decision(
-        self, *args: Any, **kwargs: Any
-    ) -> dict[str, Any]:
+    async def submit_review_decision(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         del args, kwargs
         return self._fail_or_payload(_payload(status="running", run_count=2))
 
@@ -389,9 +388,7 @@ class KillAfterDispatchClient(AmbiguousOperationClient):
             return await self._hang()
         return await super().send_input(*args, **kwargs)
 
-    async def submit_review_decision(
-        self, *args: Any, **kwargs: Any
-    ) -> dict[str, Any]:
+    async def submit_review_decision(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         if self.operation == "review":
             return await self._hang()
         return await super().submit_review_decision(*args, **kwargs)
@@ -414,7 +411,7 @@ async def test_ambiguous_remote_failure_remains_unknown_without_settlement(
     task_store = TaskStore(db_path)
     mailbox_store = MailboxStore(db_path)
     client = AmbiguousOperationClient(operation, failure)
-    control = runtime_module.AgentControl(
+    control = AgentControl(
         {},
         build_test_remote_refs(),
         checkpointer=object(),
@@ -478,7 +475,7 @@ async def test_process_loss_after_dispatch_is_unknown_after_restart(
     db_path = str(tmp_path / f"killed-{operation}.sqlite")
     task_store = TaskStore(db_path)
     client = KillAfterDispatchClient(operation)
-    control = runtime_module.AgentControl(
+    control = AgentControl(
         {},
         build_test_remote_refs(),
         checkpointer=object(),
@@ -544,7 +541,7 @@ async def test_only_authoritative_rejection_clears_matching_operation(
     task_store = TaskStore(db_path)
     mailbox_store = MailboxStore(db_path)
     client = AmbiguousOperationClient(operation, "rejected")
-    control = runtime_module.AgentControl(
+    control = AgentControl(
         {},
         build_test_remote_refs(),
         checkpointer=object(),

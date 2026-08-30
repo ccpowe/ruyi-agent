@@ -1,16 +1,11 @@
-"""LangChain delegation tools and their agent-facing presentation.
-
-DelegationTools adapts the structured runtime API to scoped model tools. It
-owns visibility rules and human-readable results, but never mutates TaskRecord
-state directly.
-"""
+"""LangChain delegation tools and their agent-facing presentation."""
 
 from __future__ import annotations
 
 import asyncio
 import inspect
 import logging
-from typing import Any, Protocol
+from typing import Protocol
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
@@ -29,63 +24,47 @@ from ruyi_agent.runtime.delegation.contracts import (
     UnknownWorkerTaskError,
 )
 from ruyi_agent.runtime.delegation.registry import (
+    AgentRegistry,
     RegisteredAgent,
     RemoteRefEntry,
 )
-from ruyi_agent.storage.task_store import TaskRootBudgetExceededError as MaxTasksPerRootError
+from ruyi_agent.runtime.delegation.notifications import SettledRunNotifier
+from ruyi_agent.runtime.delegation.policy import DelegationPolicy
+from ruyi_agent.runtime.delegation.task_manager import TaskManager
+from ruyi_agent.storage.task_store import (
+    TaskRootBudgetExceededError as MaxTasksPerRootError,
+)
 from ruyi_agent.task_models import SETTLED_TASK_STATES, TaskRecord
 
 logger = logging.getLogger(__name__)
 
 
-class DelegationToolsHost(Protocol):
-    _registry: Any
-    _remote_poll_interval: float
-    _remote_status_retry_attempts: int
-    _task_manager: Any
-
-    def _allowed_targets_for_agent(self, agent_name: str) -> set[str]: ...
-    def _extract_parent_task_record(
-        self, config: RunnableConfig | None
-    ) -> TaskRecord | None: ...
-    def _extract_parent_thread_id(self, config: RunnableConfig | None) -> str | None: ...
-    def _format_agents_and_tasks(
+class TaskCommandPort(Protocol):
+    async def spawn_task(
         self,
-        allowed_targets: set[str] | None = None,
-        visible_task_ids: set[str] | None = None,
-    ) -> str: ...
-    def _format_depth_limit_error(self, exc: MaxDelegationDepthError) -> str: ...
-    def _format_remote_status_unavailable(
-        self, record: TaskRecord, exc: BaseException
-    ) -> str: ...
-    def _format_task_budget_error(self, exc: MaxTasksPerRootError) -> str: ...
-    def _format_task_record(self, record: TaskRecord) -> str: ...
-    async def _refresh_remote_task_with_retries(self, task_id: str) -> TaskRecord: ...
-    async def _resolve_pending_reviews_from_config(
-        self, config: RunnableConfig | None
-    ) -> bool: ...
-    def _suppress_mailbox_delivery(self, record: TaskRecord) -> None: ...
+        agent_name: str,
+        task: str,
+        *,
+        parent_task_id: str | None = None,
+        parent_thread_id: str | None = None,
+    ) -> TaskRecord: ...
+
+    async def refresh_task(self, task_id: str) -> TaskRecord: ...
+
+    async def send_task_input(self, task_id: str, message: str) -> TaskRecord: ...
+
     async def cancel_task(self, task_id: str) -> TaskRecord: ...
-    async def send_task_input(self, task_id: str, message: str, **kwargs: Any) -> TaskRecord: ...
-    async def spawn_task(self, agent_name: str, task: str, **kwargs: Any) -> TaskRecord: ...
 
 
 class DelegationTools:
-    """Build scoped delegation tools over the structured runtime port."""
-
-    def __init__(self, control: DelegationToolsHost) -> None:
-        self._control = control
+    def __init__(self, registry: AgentRegistry, task_manager: TaskManager, policy: DelegationPolicy, notifier: SettledRunNotifier, *, remote_poll_interval: float = 0.5) -> None:  # fmt: skip
+        self._registry = registry
+        self._task_manager = task_manager
+        self._policy = policy
+        self._notifier = notifier
+        self._remote_poll_interval = remote_poll_interval
 
     def _format_task_record(self, record: TaskRecord) -> str:
-        """
-        格式化任务记录为工具返回文本
-
-        Args:
-            record: 任务记录
-
-        Returns:
-            单行可读任务状态
-        """
         # waiting_for_human is a control-plane pause, not useful model context.
         # Keep it internal and expose it as running so callers do not retry or
         # re-delegate while a user is reviewing the blocked tool call.
@@ -128,7 +107,6 @@ class DelegationTools:
             return False
         return bool(result)
 
-
     def _allowed_targets_for_agent(self, agent_name: str) -> set[str]:
         """
         计算某个本地 worker 可委托的目标集合
@@ -139,9 +117,9 @@ class DelegationTools:
         Returns:
             该 worker 配置中允许继续委托的本地 worker 和 remote_ref 名称集合
         """
-        return set(self._control._registry.get_spec(agent_name).delegation_targets)
+        return set(self._registry.get_spec(agent_name).delegation_targets)
 
-    def build_tools_for(self, agent_name: str) -> list[StructuredTool]:
+    def build_tools_for(self, agent_name: str, *, command_port: TaskCommandPort) -> list[StructuredTool]:  # fmt: skip
         """
         为指定 worker 构造带作用域的委托工具
 
@@ -151,21 +129,22 @@ class DelegationTools:
         Returns:
             该 worker 可使用的 StructuredTool 列表
         """
-        spec = self._control._registry.get_spec(agent_name)
-        return self._control._build_tools(
-            allowed_targets=self._control._allowed_targets_for_agent(agent_name),
+        spec = self._registry.get_spec(agent_name)
+        return self._build_tools(
+            command_port=command_port,
+            allowed_targets=self._allowed_targets_for_agent(agent_name),
             caller_agent_name=agent_name,
             enabled_tools=spec.system_tools,
         )
 
-    def build_tools(self) -> list[StructuredTool]:
+    def build_tools(self, *, command_port: TaskCommandPort) -> list[StructuredTool]:
         """
         构造主 agent 使用的全量委托工具
 
         Returns:
             不限制目标范围的 StructuredTool 列表
         """
-        return self._control._build_tools()
+        return self._build_tools(command_port=command_port)
 
     def _caller_and_visible_tasks(
         self,
@@ -175,31 +154,29 @@ class DelegationTools:
     ) -> tuple[TaskRecord | None, list[TaskRecord]]:
         """Resolve the caller and exactly the tasks visible to its tool scope."""
         try:
-            caller = self._control._extract_parent_task_record(config)
+            caller = self._policy.extract_parent_task_record(config)
         except UnknownWorkerTaskError:
             caller = None
         if caller is not None:
             records: list[TaskRecord] = [caller]
             if caller.parent_task_id is not None:
                 try:
-                    records.append(
-                        self._control._task_manager.get_task(caller.parent_task_id)
-                    )
+                    records.append(self._task_manager.get_task(caller.parent_task_id))
                 except UnknownWorkerTaskError:
                     pass
             records.extend(
                 record
-                for record in self._control._task_manager.list_persisted_tasks()
+                for record in self._task_manager.list_persisted_tasks()
                 if record.parent_task_id == caller.task_id
             )
             return caller, records
-        parent_thread_id = self._control._extract_parent_thread_id(config)
+        parent_thread_id = self._policy.extract_parent_thread_id(config)
         if parent_thread_id is None:
             return None, []
-        self._control._task_manager.load_by_parent_thread_id(parent_thread_id)
+        self._task_manager.load_by_parent_thread_id(parent_thread_id)
         return None, [
             record
-            for record in self._control._task_manager.list_tasks()
+            for record in self._task_manager.list_tasks()
             if record.parent_thread_id == parent_thread_id
             and (allowed_targets is None or record.agent_name in allowed_targets)
         ]
@@ -257,7 +234,7 @@ class DelegationTools:
     ) -> TaskRecord:
         """Return one task only when it is visible to the current tool caller."""
         try:
-            record = self._control._task_manager.get_task(task_id)
+            record = self._task_manager.get_task(task_id)
         except UnknownWorkerTaskError:
             raise UnknownWorkerTaskError(
                 f"Unknown task_id '{task_id}'. Call list_agents and use an exact "
@@ -284,13 +261,17 @@ class DelegationTools:
             )
         return record
 
-    def _build_tools(
+    def _format_remote_status_unavailable(
         self,
-        *,
-        allowed_targets: set[str] | None = None,
-        caller_agent_name: str | None = None,
-        enabled_tools: frozenset[str] | None = None,
-    ) -> list[StructuredTool]:
+        record: TaskRecord,
+        exc: BaseException,
+    ) -> str:
+        return (
+            f"{self._format_task_record(record)} | "
+            f"warning=remote_status_temporarily_unavailable: {exc}"
+        )
+
+    def _build_tools(self, *, command_port: TaskCommandPort, allowed_targets: set[str] | None = None, caller_agent_name: str | None = None, enabled_tools: frozenset[str] | None = None) -> list[StructuredTool]:  # fmt: skip
         """
         构造委托工具集合
 
@@ -303,10 +284,10 @@ class DelegationTools:
         """
         # 为什么显式构造工具：需要把可用 worker 列表直接写进工具描述，而不是只依赖函数签名。
         spawn_description = SPAWN_AGENT_TOOL_DESCRIPTION.format(
-            available_local_workers=self._control._registry.render_local_worker_descriptions(
+            available_local_workers=self._registry.render_local_worker_descriptions(
                 allowed_targets
             ),
-            available_remote_refs=self._control._registry.render_remote_ref_descriptions(
+            available_remote_refs=self._registry.render_remote_ref_descriptions(
                 allowed_targets
             ),
         )
@@ -318,13 +299,18 @@ class DelegationTools:
         ) -> str:
             """带目标白名单校验的 spawn_agent 包装器"""
             if allowed_targets is not None and agent_name not in allowed_targets:
-                available = ", ".join(self._control._registry.list_target_names(allowed_targets))
+                available = ", ".join(self._registry.list_target_names(allowed_targets))
                 caller = caller_agent_name or "current agent"
                 return (
                     f"Agent target '{agent_name}' is not allowed for '{caller}'. "
                     f"Available: {available}"
                 )
-            return await self._control.spawn_agent(agent_name, task, config)
+            return await self.spawn_agent(
+                agent_name,
+                task,
+                config,
+                command_port=command_port,
+            )
 
         async def scoped_wait_agent(
             task_id: str,
@@ -340,7 +326,11 @@ class DelegationTools:
                 )
             except UnknownWorkerTaskError as exc:
                 return str(exc)
-            return await self._control.wait_agent(task_id, config)
+            return await self.wait_agent(
+                task_id,
+                config,
+                command_port=command_port,
+            )
 
         async def scoped_check_agent(
             task_id: str,
@@ -356,7 +346,11 @@ class DelegationTools:
                 )
             except UnknownWorkerTaskError as exc:
                 return str(exc)
-            return await self._control.check_agent(task_id, config)
+            return await self.check_agent(
+                task_id,
+                config,
+                command_port=command_port,
+            )
 
         async def scoped_send_input(
             task_id: str,
@@ -373,7 +367,7 @@ class DelegationTools:
                 )
             except UnknownWorkerTaskError as exc:
                 return str(exc)
-            return await self._control.send_input(task_id, message)
+            return await self.send_input(task_id, message, command_port=command_port)
 
         async def scoped_cancel_agent(
             task_id: str,
@@ -389,21 +383,21 @@ class DelegationTools:
                 )
             except UnknownWorkerTaskError as exc:
                 return str(exc)
-            return await self._control.cancel_agent(task_id)
+            return await self.cancel_agent(task_id, command_port=command_port)
 
         async def scoped_list_agents(
             config: RunnableConfig = None,  # type: ignore[assignment]
         ) -> str:
             """列出当前调用方可见的 agent 目标和任务"""
-            parent_thread_id = self._control._extract_parent_thread_id(config)
+            parent_thread_id = self._policy.extract_parent_thread_id(config)
             if parent_thread_id is not None:
-                self._control._task_manager.load_by_parent_thread_id(parent_thread_id)
+                self._task_manager.load_by_parent_thread_id(parent_thread_id)
             _, visible = self._caller_and_visible_tasks(
                 config,
                 allowed_targets=allowed_targets,
             )
             visible_task_ids = {record.task_id for record in visible}
-            return self._control._format_agents_and_tasks(
+            return self._format_agents_and_tasks(
                 allowed_targets,
                 visible_task_ids=visible_task_ids,
             )
@@ -471,12 +465,13 @@ class DelegationTools:
             return tools
         return [tool for tool in tools if tool.name in enabled_tools]
 
-
     async def spawn_agent(
         self,
         agent_name: str,
         task: str,
         config: RunnableConfig = None,  # type: ignore[assignment]
+        *,
+        command_port: TaskCommandPort,
     ) -> str:
         # 为什么有这个工具：让主 agent 能启动本地 worker 或远端引用，而不用阻塞当前流程。
         """
@@ -491,11 +486,11 @@ class DelegationTools:
             面向模型的启动结果文本，包含 task_id 和 route
         """
         try:
-            parent_record = self._control._extract_parent_task_record(config)
-            parent_thread_id = self._control._extract_parent_thread_id(config)
+            parent_record = self._policy.extract_parent_task_record(config)
+            parent_thread_id = self._policy.extract_parent_thread_id(config)
             if parent_thread_id is None and parent_record is not None:
                 parent_thread_id = parent_record.thread_id
-            record = await self._control.spawn_task(
+            record = await command_port.spawn_task(
                 agent_name,
                 task,
                 parent_task_id=(
@@ -504,13 +499,13 @@ class DelegationTools:
                 parent_thread_id=parent_thread_id,
             )
         except UnknownAgentTargetError as exc:
-            available = ", ".join(self._control._registry.list_target_names())
+            available = ", ".join(self._registry.list_target_names())
             # 工具参数错误返回普通文本，而不是抛异常打断整轮 agent 执行。
             return f"{exc}. Available: {available}"
         except MaxDelegationDepthError as exc:
-            return self._control._format_depth_limit_error(exc)
+            return self._policy.format_depth_limit_error(exc)
         except MaxTasksPerRootError as exc:
-            return self._control._format_task_budget_error(exc)
+            return self._policy.format_task_budget_error(exc)
         except UnknownWorkerTaskError as exc:
             return str(exc)
         except (RemoteExecutorNotImplementedError, A2AClientError, ValueError) as exc:
@@ -524,6 +519,8 @@ class DelegationTools:
         self,
         task_id: str,
         config: RunnableConfig = None,  # type: ignore[assignment]
+        *,
+        command_port: TaskCommandPort,
     ) -> str:
         # 为什么有这个工具：让主 agent 在需要同步结果时，再显式等待本地或远端任务完成。
         """
@@ -540,32 +537,31 @@ class DelegationTools:
             面向模型的任务状态文本
         """
         try:
-            record = self._control._task_manager.get_task(task_id)
+            record = self._task_manager.get_task(task_id)
         except UnknownWorkerTaskError as exc:
             return str(exc)
-        self._control._suppress_mailbox_delivery(record)
+        self._notifier.suppress_mailbox_delivery(record)
         if record.route_kind == "remote_ref":
             try:
                 while True:
-                    record = await self._control._refresh_remote_task_with_retries(task_id)
+                    record = await command_port.refresh_task(task_id)
                     if record.state in SETTLED_TASK_STATES:
-                        return self._control._format_task_record(record)
+                        return self._format_task_record(record)
                     if record.state == "waiting_for_human":
-                        resolved = await self._control._resolve_pending_reviews_from_config(
-                            config,
+                        resolved = await self._resolve_pending_reviews_from_config(
+                            config
                         )
                         if not resolved:
-                            return self._control._format_task_record(record)
-                    await asyncio.sleep(self._control._remote_poll_interval)
+                            return self._format_task_record(record)
+                    await asyncio.sleep(self._remote_poll_interval)
             except A2AClientError as exc:
-                return self._control._format_remote_status_unavailable(
-                    self._control._task_manager.get_task(task_id),
-                    exc,
+                return self._format_remote_status_unavailable(
+                    self._task_manager.get_task(task_id), exc
                 )
             except ValueError as exc:
                 return str(exc)
         while True:
-            run_task = self._control._task_manager.get_live_run(task_id)
+            run_task = self._task_manager.get_live_run(task_id)
             if run_task is not None:
                 try:
                     await asyncio.shield(run_task)
@@ -573,22 +569,24 @@ class DelegationTools:
                     current = asyncio.current_task()
                     if current is not None and current.cancelling():
                         raise
-            record = self._control._task_manager.get_task(task_id)
+            record = self._task_manager.get_task(task_id)
             if record.state in SETTLED_TASK_STATES:
-                return self._control._format_task_record(record)
+                return self._format_task_record(record)
             if record.state == "waiting_for_human":
-                resolved = await self._control._resolve_pending_reviews_from_config(config)
-                record = self._control._task_manager.get_task(task_id)
+                resolved = await self._resolve_pending_reviews_from_config(config)
+                record = self._task_manager.get_task(task_id)
                 if record.state == "waiting_for_human" and not resolved:
-                    return self._control._format_task_record(record)
+                    return self._format_task_record(record)
                 await asyncio.sleep(0.1)
                 continue
-            return self._control._format_task_record(record)
+            return self._format_task_record(record)
 
     async def check_agent(
         self,
         task_id: str,
         config: RunnableConfig = None,  # type: ignore[assignment]
+        *,
+        command_port: TaskCommandPort,
     ) -> str:
         # 为什么有这个工具：让主 agent 可以非阻塞地轮询 worker 当前状态。
         """
@@ -602,23 +600,28 @@ class DelegationTools:
             面向模型的任务状态文本
         """
         try:
-            record = self._control._task_manager.get_task(task_id)
+            record = self._task_manager.get_task(task_id)
             if record.route_kind == "remote_ref":
-                record = await self._control._refresh_remote_task_with_retries(task_id)
+                record = await command_port.refresh_task(task_id)
             if record.state in SETTLED_TASK_STATES:
-                self._control._suppress_mailbox_delivery(record)
-            return self._control._format_task_record(record)
+                self._notifier.suppress_mailbox_delivery(record)
+            return self._format_task_record(record)
         except UnknownWorkerTaskError as exc:
             return str(exc)
         except A2AClientError as exc:
-            return self._control._format_remote_status_unavailable(
-                self._control._task_manager.get_task(task_id),
-                exc,
+            return self._format_remote_status_unavailable(
+                self._task_manager.get_task(task_id), exc
             )
         except ValueError as exc:
             return str(exc)
 
-    async def send_input(self, task_id: str, message: str) -> str:
+    async def send_input(
+        self,
+        task_id: str,
+        message: str,
+        *,
+        command_port: TaskCommandPort,
+    ) -> str:
         # 为什么有这个工具：让主 agent 可以继续推进同一个 worker 任务，而不用重新创建会话。
         """
         向已有委托任务发送后续输入
@@ -631,7 +634,7 @@ class DelegationTools:
             面向模型的发送结果文本
         """
         try:
-            record = await self._control.send_task_input(task_id, message)
+            record = await command_port.send_task_input(task_id, message)
         except UnknownWorkerTaskError as exc:
             return str(exc)
         except TaskAlreadyRunningError:
@@ -641,7 +644,12 @@ class DelegationTools:
             return str(exc)
         return f"Sent input to worker task: task_id={record.task_id}"
 
-    async def cancel_agent(self, task_id: str) -> str:
+    async def cancel_agent(
+        self,
+        task_id: str,
+        *,
+        command_port: TaskCommandPort,
+    ) -> str:
         # 为什么有这个工具：让主 agent 可以中断 worker 当前 run，同时保留会话。
         """
         取消委托 Task 当前 run，不关闭长期 agent 会话
@@ -653,7 +661,7 @@ class DelegationTools:
             面向模型的取消结果文本
         """
         try:
-            record = await self._control.cancel_task(task_id)
+            record = await command_port.cancel_task(task_id)
         except UnknownWorkerTaskError as exc:
             return str(exc)
         except (A2AClientError, ValueError) as exc:
@@ -673,7 +681,7 @@ class DelegationTools:
         Returns:
             面向模型的 agent 与 task 列表文本
         """
-        return self._control._format_agents_and_tasks()
+        return self._format_agents_and_tasks()
 
     def _format_agents_and_tasks(
         self,
@@ -693,19 +701,19 @@ class DelegationTools:
         registered_lines = [
             "Registered agent targets:",
             *[
-                self._control._format_registered_agent(entry)
+                self._format_registered_agent(entry)
                 for entry in sorted(
-                    self._control._registry.list_registered_agents(allowed_targets),
+                    self._registry.list_registered_agents(allowed_targets),
                     key=lambda item: item.name,
                 )
             ],
         ]
-        records = self._control._task_manager.list_tasks()
+        records = self._task_manager.list_tasks()
         if not records:
             return "\n".join([*registered_lines, "Tracked tasks:", "- none"])
         task_lines = ["Tracked tasks:"]
         task_lines.extend(
-            self._control._format_task_record(record)
+            self._format_task_record(record)
             for record in records
             if (
                 record.task_id in visible_task_ids

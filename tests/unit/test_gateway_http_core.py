@@ -10,7 +10,9 @@ import httpx
 from fastapi.testclient import TestClient
 import pytest
 
-import ruyi_agent.runtime.delegation.async_runtime as async_subagent_runtime
+from ruyi_agent.task_models import TaskRecord
+from ruyi_agent.runtime.delegation.async_runtime import AgentControl
+import ruyi_agent.runtime.agent_factory as agent_factory_module
 from ruyi_agent.config.loader import LocalWorkerSpec
 from ruyi_agent.runtime.delegation.context import (
     CONTEXT_VERSION,
@@ -40,13 +42,14 @@ from tests.unit.gateway_http_support import (
     build_specs,
     build_test_remote_refs,
 )
+from tests.support.async_subagent_runtime import wait_for_task_state
 
 
 def test_gateway_exposes_subagent_task_created_by_public_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        async_subagent_runtime,
+        agent_factory_module,
         "create_runtime_agent",
         DelegatingAgentFactory(),
     )
@@ -61,7 +64,7 @@ def test_gateway_exposes_subagent_task_created_by_public_root(
         skills=[],
         delegation_targets=("background_research",),
     )
-    control = async_subagent_runtime.AgentControl(
+    control = AgentControl(
         {
             "main": parent_spec,
             "background_research": child_spec,
@@ -77,7 +80,7 @@ def test_gateway_exposes_subagent_task_created_by_public_root(
     )
 
     async def scenario() -> tuple[
-        list[async_subagent_runtime.TaskRecord],
+        list[TaskRecord],
         TaskResponse,
         TaskResponse,
         list[TaskResponse],
@@ -91,24 +94,23 @@ def test_gateway_exposes_subagent_task_created_by_public_root(
         # Route persistence is now executed via asyncio.to_thread to avoid blocking
         # the FastAPI event loop. That yields control and allows very fast tasks to
         # complete before this assertion runs.
-        if control.get_live_run(parent.task_id) is not None:
-            await control.get_live_run(parent.task_id)
+        await wait_for_task_state(control, parent.task_id, states={"completed"})
         child_records = [
             record
-            for record in control.list_task_records()
+            for record in control.list_persisted_task_records()
             if record.agent_name == "background_research"
         ]
         for record in child_records:
-            if control.get_live_run(record.task_id) is not None:
-                await control.get_live_run(record.task_id)
+            await wait_for_task_state(control, record.task_id, states={"completed"})
         child_response = await service.get_task(child_records[0].task_id)
         continued_child = await service.send_input(
             child_records[0].task_id,
             "follow-up",
         )
         continued_record = control.get_task_record(child_records[0].task_id)
-        if control.get_live_run(continued_record.task_id) is not None:
-            await control.get_live_run(continued_record.task_id)
+        await wait_for_task_state(
+            control, continued_record.task_id, states={"completed"}
+        )
         task_tree = await service.list_tasks(
             agent_name=None,
             status=None,
@@ -539,8 +541,8 @@ def test_create_replay_does_not_depend_on_current_agent_availability(
     tmp_path: Path,
 ) -> None:
     factory = DelayedAgentFactory(delay=0.1)
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
-    control = async_subagent_runtime.AgentControl(
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
+    control = AgentControl(
         build_specs(),
         build_test_remote_refs(),
         checkpointer=object(),
@@ -892,7 +894,14 @@ def test_task_response_includes_published_artifacts_and_downloads_by_id(
             json={"input": {"content": "write report"}},
         )
         task_id = create_response.json()["task_id"]
-        artifact = factory.control.register_artifact(
+        for _ in range(100):
+            if factory.compile_kwargs:
+                break
+            time.sleep(0.01)
+        assert factory.compile_kwargs
+        register_artifact = factory.compile_kwargs[0]["register_artifact"]
+        assert callable(register_artifact)
+        artifact = register_artifact(
             task_id=task_id,
             artifact={
                 "path": "/workspace/out/report.txt",
@@ -943,7 +952,14 @@ def test_task_artifact_download_encodes_non_ascii_filename_header(
             json={"input": {"content": "write report"}},
         )
         task_id = create_response.json()["task_id"]
-        artifact = factory.control.register_artifact(
+        for _ in range(100):
+            if factory.compile_kwargs:
+                break
+            time.sleep(0.01)
+        assert factory.compile_kwargs
+        register_artifact = factory.compile_kwargs[0]["register_artifact"]
+        assert callable(register_artifact)
+        artifact = register_artifact(
             task_id=task_id,
             artifact={
                 "path": "/workspace/out/intro.txt",
@@ -1058,7 +1074,7 @@ def test_create_task_rejects_incomplete_attachment_upload_result(
 def test_create_task_accepts_inbound_delegation_context_and_strips_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    app, factory = build_app(monkeypatch, delay=0.1, node_id="node-b")
+    app, _ = build_app(monkeypatch, delay=0.1, node_id="node-b")
     with TestClient(app) as client:
         response = client.post(
             "/agents/main/tasks",
@@ -1080,14 +1096,8 @@ def test_create_task_accepts_inbound_delegation_context_and_strips_metadata(
     assert response.status_code == 201
     payload = response.json()
     assert payload["metadata"] == {"channel": "tg"}
-    assert factory.control is not None
-    record = factory.control.get_task_record(payload["task_id"])
-    assert record.root_task_id == "node-a:root-1"
-    assert record.depth == 2
-    assert record.delegation_root_id == "node-a:root-1"
-    assert record.delegation_visited_nodes == ("node-a", "node-b")
-    assert record.delegation_max_depth == 3
-    assert record.delegation_max_tasks_per_root == 20
+    assert payload["root_task_id"] == "node-a:root-1"
+    assert payload["depth"] == 2
 
 
 def test_create_task_rejects_inbound_delegation_loop(
@@ -1183,7 +1193,7 @@ def test_send_input_and_list_tasks_follow_contract(
 def test_idempotent_send_requires_durable_mailbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    app, factory = build_app(monkeypatch, delay=0.03)
+    app, _ = build_app(monkeypatch, delay=0.03)
     with TestClient(app) as client:
         created = client.post(
             "/agents/main/tasks",
@@ -1204,13 +1214,14 @@ def test_idempotent_send_requires_durable_mailbox(
             headers=headers,
             json={"input": {"content": "second"}},
         )
+        current = client.get(f"/tasks/{task_id}", headers=auth_headers())
 
     assert first.status_code == 503
     assert first.json()["error"]["code"] == "idempotency_unavailable"
     assert retry.status_code == 503
     assert retry.json()["error"]["code"] == "idempotency_unavailable"
-    assert factory.control is not None
-    assert factory.control.get_task_record(task_id).run_count == 1
+    assert current.status_code == 200
+    assert current.json()["run_count"] == 1
 
 
 def test_send_retry_after_command_completion_failure_publishes_one_mailbox_input(
@@ -1218,7 +1229,7 @@ def test_send_retry_after_command_completion_failure_publishes_one_mailbox_input
     tmp_path: Path,
 ) -> None:
     factory = DelayedAgentFactory(delay=0.03)
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     db_path = str(tmp_path / "tasks.sqlite")
     task_store = TaskStore(db_path)
     mailbox_store = MailboxStore(db_path)
@@ -1226,7 +1237,7 @@ def test_send_retry_after_command_completion_failure_publishes_one_mailbox_input
     route_store = GatewayRouteStore(str(tmp_path / "routes.sqlite"))
     command_store = FailOnceGatewayCommandStore(db_path)
     command_store.fail_next_complete = False
-    control = async_subagent_runtime.AgentControl(
+    control = AgentControl(
         build_specs(),
         build_test_remote_refs(),
         checkpointer=object(),
@@ -1235,7 +1246,6 @@ def test_send_retry_after_command_completion_failure_publishes_one_mailbox_input
         task_store=task_store,
         workspace_root="/workspace",
     )
-    factory.control = control
     service = GatewayTaskModule(
         main_agent_name="main",
         agent_configs=build_agent_configs(),

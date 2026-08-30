@@ -3,7 +3,11 @@ from __future__ import annotations
 import asyncio
 import pytest
 
+from ruyi_agent.task_models import TaskRecord
+from ruyi_agent.runtime.delegation.contracts import UnknownWorkerTaskError
+from ruyi_agent.runtime.delegation.task_manager import TaskManager
 import ruyi_agent.runtime.delegation.async_runtime as async_subagent_runtime
+import ruyi_agent.runtime.agent_factory as agent_factory_module
 from ruyi_agent.storage.task_store import TaskStore
 
 from tests.support.async_subagent_runtime import (
@@ -13,6 +17,7 @@ from tests.support.async_subagent_runtime import (
     ReviewRemoteA2AClient,
     build_specs,
     build_test_remote_refs,
+    wait_for_task_state,
 )
 
 
@@ -20,7 +25,7 @@ def test_child_review_is_mirrored_to_root_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = ContentAwareInterruptingAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         checkpointer=object(),
@@ -28,20 +33,18 @@ def test_child_review_is_mirrored_to_root_task(
     )
 
     async def scenario() -> tuple[
-        async_subagent_runtime.TaskRecord,
-        async_subagent_runtime.TaskRecord,
+        TaskRecord,
+        TaskRecord,
     ]:
         root = await control.spawn_task("background_research", "root task")
-        if control.get_live_run(root.task_id) is not None:
-            await control.get_live_run(root.task_id)
+        await wait_for_task_state(control, root.task_id, states={"completed"})
         child = await control.spawn_task(
             "background_research",
             "needs review",
             parent_task_id=root.task_id,
             parent_thread_id=root.thread_id,
         )
-        if control.get_live_run(child.task_id) is not None:
-            await control.get_live_run(child.task_id)
+        await wait_for_task_state(control, child.task_id, states={"waiting_for_human"})
         return control.get_task_record(root.task_id), control.get_task_record(
             child.task_id
         )
@@ -54,11 +57,12 @@ def test_child_review_is_mirrored_to_root_task(
     assert root.pending_review["review_id"] == child.pending_review["review_id"]
     assert root.pending_review["source_task_id"] == child.task_id
 
+
 def test_submit_review_prefers_waiting_child_over_root_mirror(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = ContentAwareInterruptingAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         checkpointer=object(),
@@ -66,20 +70,18 @@ def test_submit_review_prefers_waiting_child_over_root_mirror(
     )
 
     async def scenario() -> tuple[
-        async_subagent_runtime.TaskRecord,
-        async_subagent_runtime.TaskRecord,
+        TaskRecord,
+        TaskRecord,
     ]:
         root = await control.spawn_task("background_research", "root task")
-        if control.get_live_run(root.task_id) is not None:
-            await control.get_live_run(root.task_id)
+        await wait_for_task_state(control, root.task_id, states={"completed"})
         child = await control.spawn_task(
             "background_research",
             "needs review",
             parent_task_id=root.task_id,
             parent_thread_id=root.thread_id,
         )
-        if control.get_live_run(child.task_id) is not None:
-            await control.get_live_run(child.task_id)
+        await wait_for_task_state(control, child.task_id, states={"waiting_for_human"})
         waiting_child = control.get_task_record(child.task_id)
         updated_child = await control.submit_review_decision(
             waiting_child.pending_review["review_id"],
@@ -101,7 +103,7 @@ def test_sibling_reviews_remain_independent_for_any_decision_order(
     decision_order: tuple[int, int],
 ) -> None:
     factory = ContentAwareInterruptingAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         checkpointer=object(),
@@ -110,8 +112,7 @@ def test_sibling_reviews_remain_independent_for_any_decision_order(
 
     async def scenario() -> tuple[list[str], list[str], dict | None]:
         root = await control.spawn_task("background_research", "root task")
-        if control.get_live_run(root.task_id) is not None:
-            await control.get_live_run(root.task_id)
+        await wait_for_task_state(control, root.task_id, states={"completed"})
         children = []
         for _index in range(2):
             child = await control.spawn_task(
@@ -120,8 +121,9 @@ def test_sibling_reviews_remain_independent_for_any_decision_order(
                 parent_task_id=root.task_id,
                 parent_thread_id=root.thread_id,
             )
-            if control.get_live_run(child.task_id) is not None:
-                await control.get_live_run(child.task_id)
+            await wait_for_task_state(
+                control, child.task_id, states={"waiting_for_human"}
+            )
             children.append(control.get_task_record(child.task_id))
 
         pending = control.list_pending_reviews(root_task_id=root.task_id)
@@ -167,7 +169,7 @@ def test_pending_review_set_is_rebuilt_after_restart(
     tmp_path,
 ) -> None:
     factory = ContentAwareInterruptingAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     db_path = tmp_path / "tasks.sqlite"
 
     async def seed() -> tuple[str, list[str]]:
@@ -179,8 +181,7 @@ def test_pending_review_set_is_rebuilt_after_restart(
             task_store=store,
         )
         root = await control.spawn_task("background_research", "root task")
-        if control.get_live_run(root.task_id) is not None:
-            await control.get_live_run(root.task_id)
+        await wait_for_task_state(control, root.task_id, states={"completed"})
         ids = []
         for _index in range(2):
             child = await control.spawn_task(
@@ -189,8 +190,9 @@ def test_pending_review_set_is_rebuilt_after_restart(
                 parent_task_id=root.task_id,
                 parent_thread_id=root.thread_id,
             )
-            if control.get_live_run(child.task_id) is not None:
-                await control.get_live_run(child.task_id)
+            await wait_for_task_state(
+                control, child.task_id, states={"waiting_for_human"}
+            )
             ids.append(child.pending_review["review_id"])
         await control.close()
         store.close()
@@ -220,7 +222,7 @@ def test_root_lifecycle_keeps_child_review_compatibility_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = ContentAwareInterruptingAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         checkpointer=object(),
@@ -229,21 +231,18 @@ def test_root_lifecycle_keeps_child_review_compatibility_projection(
 
     async def scenario() -> tuple[str, dict | None]:
         root = await control.spawn_task("background_research", "root task")
-        if control.get_live_run(root.task_id) is not None:
-            await control.get_live_run(root.task_id)
+        await wait_for_task_state(control, root.task_id, states={"completed"})
         child = await control.spawn_task(
             "background_research",
             "needs review",
             parent_task_id=root.task_id,
             parent_thread_id=root.thread_id,
         )
-        if control.get_live_run(child.task_id) is not None:
-            await control.get_live_run(child.task_id)
+        await wait_for_task_state(control, child.task_id, states={"waiting_for_human"})
         review_id = child.pending_review["review_id"]
 
         await control.send_task_input(root.task_id, "root follow-up")
-        if control.get_live_run(root.task_id) is not None:
-            await control.get_live_run(root.task_id)
+        await wait_for_task_state(control, root.task_id, states={"completed"})
         return review_id, control.get_task_record(root.task_id).pending_review
 
     review_id, projection = asyncio.run(scenario())
@@ -257,7 +256,7 @@ def test_review_creation_failure_restores_memory_and_durable_state(
     tmp_path,
 ) -> None:
     store = TaskStore(str(tmp_path / "tasks.sqlite"))
-    manager = async_subagent_runtime.TaskManager(store)
+    manager = TaskManager(store)
     root = manager.create_task_record(
         "root",
         "background_research",
@@ -306,7 +305,7 @@ def test_review_decision_failure_restores_memory_and_is_retryable(
     tmp_path,
 ) -> None:
     factory = ContentAwareInterruptingAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     store = TaskStore(str(tmp_path / "tasks.sqlite"))
     control = async_subagent_runtime.AgentControl(
         build_specs(),
@@ -317,16 +316,14 @@ def test_review_decision_failure_restores_memory_and_is_retryable(
 
     async def scenario() -> tuple[str, str]:
         root = await control.spawn_task("background_research", "root task")
-        if control.get_live_run(root.task_id) is not None:
-            await control.get_live_run(root.task_id)
+        await wait_for_task_state(control, root.task_id, states={"completed"})
         child = await control.spawn_task(
             "background_research",
             "needs review",
             parent_task_id=root.task_id,
             parent_thread_id=root.thread_id,
         )
-        if control.get_live_run(child.task_id) is not None:
-            await control.get_live_run(child.task_id)
+        await wait_for_task_state(control, child.task_id, states={"waiting_for_human"})
         review_id = child.pending_review["review_id"]
         original_append = store._append_task_event_locked
 
@@ -354,7 +351,7 @@ def test_review_decision_failure_restores_memory_and_is_retryable(
         assert in_memory_root.pending_review == persisted_root.pending_review
         assert in_memory_root.pending_review["review_id"] == review_id
         assert control.get_pending_review(review_id).task_id == child.task_id
-        assert control.get_live_run(child.task_id) is None
+        assert control.get_task_record(child.task_id).state == "waiting_for_human"
 
         monkeypatch.setattr(store, "_append_task_event_locked", original_append)
         retried = await control.submit_review_decision(
@@ -363,7 +360,7 @@ def test_review_decision_failure_restores_memory_and_is_retryable(
             wait=True,
         )
         assert retried.state == "completed"
-        with pytest.raises(async_subagent_runtime.UnknownWorkerTaskError):
+        with pytest.raises(UnknownWorkerTaskError):
             control.get_pending_review(review_id)
         assert control.get_task_record(root.task_id).pending_review is None
         return review_id, retried.task_id
@@ -382,7 +379,7 @@ def test_cleared_root_review_is_replayable_from_durable_cursor(
     tmp_path,
 ) -> None:
     factory = ContentAwareInterruptingAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
 
     async def scenario():
         store = TaskStore(str(tmp_path / "tasks.sqlite"))
@@ -394,16 +391,16 @@ def test_cleared_root_review_is_replayable_from_durable_cursor(
         )
         try:
             root = await control.spawn_task("background_research", "root task")
-            if control.get_live_run(root.task_id) is not None:
-                await control.get_live_run(root.task_id)
+            await wait_for_task_state(control, root.task_id, states={"completed"})
             child = await control.spawn_task(
                 "background_research",
                 "needs review",
                 parent_task_id=root.task_id,
                 parent_thread_id=root.thread_id,
             )
-            if control.get_live_run(child.task_id) is not None:
-                await control.get_live_run(child.task_id)
+            await wait_for_task_state(
+                control, child.task_id, states={"waiting_for_human"}
+            )
 
             root = control.get_task_record(root.task_id)
             assert root.pending_review is not None
@@ -443,7 +440,7 @@ def test_submit_review_decision_default_does_not_wait_for_resumed_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = ResumeBlockingInterruptingAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         checkpointer=object(),
@@ -452,8 +449,7 @@ def test_submit_review_decision_default_does_not_wait_for_resumed_run(
 
     async def scenario() -> str:
         record = await control.spawn_task("background_research", "needs review")
-        assert control.get_live_run(record.task_id) is not None
-        await control.get_live_run(record.task_id)
+        await wait_for_task_state(control, record.task_id, states={"waiting_for_human"})
         waiting = control.get_task_record(record.task_id)
         assert waiting.state == "waiting_for_human"
         updated = await control.submit_review_decision(
@@ -461,14 +457,10 @@ def test_submit_review_decision_default_does_not_wait_for_resumed_run(
             [{"type": "approve"}],
         )
         assert updated.state == "running"
-        assert control.get_live_run(updated.task_id) is not None
+        state_before_cancel = updated.state
         await factory.created[0].resume_started.wait()
-        control.get_live_run(updated.task_id).cancel()
-        try:
-            await control.get_live_run(updated.task_id)
-        except asyncio.CancelledError:
-            pass
-        return "running"
+        await control.cancel_task(updated.task_id)
+        return state_before_cancel
 
     state_before_cancel = asyncio.run(scenario())
 
@@ -486,11 +478,11 @@ def test_remote_review_decision_is_forwarded_to_upstream_gateway() -> None:
         a2a_client=a2a_client,  # type: ignore[arg-type]
     )
 
-    async def scenario() -> async_subagent_runtime.TaskRecord:
+    async def scenario() -> TaskRecord:
         record = await control.spawn_task("remote_code_wiki", "needs review")
         assert record.state == "waiting_for_human"
         assert record.pending_review is not None
-        pending = control.list_pending_review_records()
+        pending = control.list_pending_reviews()
         assert [item.task_id for item in pending] == [record.task_id]
         return await control.submit_review_decision(
             "remote-review-1",
@@ -515,7 +507,7 @@ def test_sync_remote_waiting_review_is_mirrored_to_root_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = FakeAgentFactory()
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         build_test_remote_refs(),
@@ -525,12 +517,11 @@ def test_sync_remote_waiting_review_is_mirrored_to_root_task(
     )
 
     async def scenario() -> tuple[
-        async_subagent_runtime.TaskRecord,
-        async_subagent_runtime.TaskRecord,
+        TaskRecord,
+        TaskRecord,
     ]:
         root = await control.spawn_task("background_research", "root task")
-        if control.get_live_run(root.task_id) is not None:
-            await control.get_live_run(root.task_id)
+        await wait_for_task_state(control, root.task_id, states={"completed"})
         child = await control.spawn_task(
             "remote_code_wiki",
             "needs review",

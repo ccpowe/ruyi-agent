@@ -7,6 +7,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk
 
 from ruyi_agent.integrations.a2a.client import A2AClientError
 from ruyi_agent.config.loader import LocalWorkerSpec, RemoteRef
+from ruyi_agent.runtime.delegation.async_runtime import AgentControl
 from ruyi_agent.runtime.skills.types import SkillEntry
 
 
@@ -31,11 +32,30 @@ class FakeAgentFactory:
     def __init__(self) -> None:
         # 为什么保留工厂：需要验证 runtime 会缓存 agent，而不是每次重新构造。
         self.created: list[FakeAgent] = []
+        self.compile_kwargs: list[dict[str, object]] = []
 
     def __call__(self, **kwargs):
+        self.compile_kwargs.append(dict(kwargs))
         agent = FakeAgent()
         self.created.append(agent)
         return agent
+
+
+async def wait_for_task_state(
+    control: AgentControl,
+    task_id: str,
+    *,
+    states: set[str] | frozenset[str],
+    timeout: float = 5.0,
+):
+    """Wait through the application API without observing a live run handle."""
+
+    async with asyncio.timeout(timeout):
+        while True:
+            record = control.get_task_record(task_id)
+            if record.state in states:
+                return record
+            await asyncio.sleep(0.01)
 
 
 class StreamingAgent:
@@ -822,6 +842,8 @@ def build_specs() -> dict[str, LocalWorkerSpec]:
             skills=["frontend-skill"],
         )
     }
+
+
 def write_test_skill(tmp_path, name: str) -> SkillEntry:
     skill_dir = tmp_path / name
     skill_dir.mkdir(parents=True)

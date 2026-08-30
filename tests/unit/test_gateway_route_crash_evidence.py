@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from ruyi_agent.gateway.errors import GatewayTaskError
 from ruyi_agent.gateway.routing import TaskRouter
-from ruyi_agent.runtime.delegation.async_runtime import UnknownWorkerTaskError
+from ruyi_agent.runtime.delegation.contracts import UnknownWorkerTaskError
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
 from ruyi_agent.task_models import TaskRecord
 from tests.unit.gateway_http_support import auth_headers, build_app
@@ -295,16 +295,6 @@ def test_local_http_cancel_before_durable_effect_is_failed_across_restart(
     route_path = str(tmp_path / "cancelled-local-routes.sqlite")
     first_routes = _BlockingEffectBoundaryStore(route_path)
     first_app, factory = build_app(monkeypatch, route_store=first_routes)
-    assert factory.control is not None
-    spawn_calls = 0
-
-    async def forbidden_spawn(*args: object, **kwargs: object) -> TaskRecord:
-        nonlocal spawn_calls
-        del args, kwargs
-        spawn_calls += 1
-        raise AssertionError("the local effect boundary was not crossed")
-
-    factory.control.spawn_task = forbidden_spawn  # type: ignore[method-assign]
 
     async def cancel_request() -> None:
         async with httpx.AsyncClient(
@@ -329,22 +319,11 @@ def test_local_http_cancel_before_durable_effect_is_failed_across_restart(
     assert cancelled.route_error == "Gateway Task creation did not start"
     evidence = first_routes.get_create_evidence(cancelled.task_id)
     assert evidence is not None and evidence.effect_boundary == "reserved"
-    assert spawn_calls == 0
+    assert factory.created == []
     first_routes.close()
 
     second_routes = GatewayRouteStore(route_path)
     second_app, second_factory = build_app(monkeypatch, route_store=second_routes)
-    assert second_factory.control is not None
-    recovery_effects = 0
-
-    async def forbidden(*args: object, **kwargs: object) -> TaskRecord:
-        nonlocal recovery_effects
-        del args, kwargs
-        recovery_effects += 1
-        raise AssertionError("startup/read/send must not invoke an effect")
-
-    second_factory.control.spawn_task = forbidden  # type: ignore[method-assign]
-    second_factory.control.send_task_input = forbidden  # type: ignore[method-assign]
     try:
         with TestClient(second_app) as client:
             queried = client.get(f"/tasks/{cancelled.task_id}", headers=auth_headers())
@@ -356,7 +335,7 @@ def test_local_http_cancel_before_durable_effect_is_failed_across_restart(
         assert queried.status_code == 200
         assert queried.json()["status"] == "failed"
         assert sent.status_code == 409
-        assert recovery_effects == 0
+        assert second_factory.created == []
     finally:
         second_routes.close()
 

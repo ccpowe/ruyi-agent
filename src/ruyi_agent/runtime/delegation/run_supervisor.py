@@ -10,12 +10,21 @@ from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeVar
 
 from ruyi_agent.runtime.delegation.contracts import TaskAlreadyRunningError
+from ruyi_agent.runtime.delegation.task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
 
 RunFactory = Callable[[], Awaitable[None]]
 MaintenanceFactory = Callable[[], Awaitable[None]]
 _T = TypeVar("_T")
+
+
+class RunCompletionPort(Protocol):
+    def on_run_finished(
+        self,
+        task_id: str,
+        task: asyncio.Task[None],
+    ) -> None: ...
 
 
 class RuntimeClosingError(RuntimeError):
@@ -26,23 +35,12 @@ class InvalidRuntimePermitError(RuntimeError):
     """Raised when a lifecycle permit is forged, stolen, or reused."""
 
 
-class RunSupervisorHost(Protocol):
-    """Narrow runtime capabilities needed by the run supervisor."""
-
-    _mailbox: Any
-    _task_manager: Any
-
-    async def _ensure_task_awake(self, task_id: str) -> Any: ...
-
-
 class _Permit:
     """Unforgeable-in-practice token issued only through a supervisor registry."""
 
     __slots__ = ("_active", "_issued", "_nonce", "_owner", "_supervisor")
 
     def __init__(self) -> None:
-        # A directly constructed token is deliberately inert. Even copying these
-        # attributes from a real token cannot pass the registry identity check.
         self._supervisor: RunSupervisor | None = None
         self._nonce: str | None = None
         self._owner: asyncio.Task[Any] | None = None
@@ -66,22 +64,10 @@ class _PermitEntry:
 
 
 class RunSupervisor:
-    """Own local runs, public mutations, and their shutdown boundary.
-
-    A newly created ``asyncio.Task`` waits behind an event until ``mark_running``
-    commits. Admission tokens are registry-bound to the current asyncio Task and
-    cannot be inherited, copied, constructed, released, or reused by other Tasks.
-    """
-
-    def __init__(
-        self,
-        control: RunSupervisorHost,
-        *,
-        shutdown_grace_period: float = 5.0,
-    ) -> None:
+    def __init__(self, task_manager: TaskManager, *, shutdown_grace_period: float = 5.0) -> None:  # fmt: skip
         if shutdown_grace_period < 0:
             raise ValueError("shutdown_grace_period must not be negative")
-        self._control = control
+        self._task_manager = task_manager
         self._shutdown_grace_period = shutdown_grace_period
         self._lifecycle_condition = asyncio.Condition()
         self._schedule_lock = asyncio.Lock()
@@ -111,9 +97,7 @@ class RunSupervisor:
         """Expose unique operation owners for shutdown diagnostics and tests."""
 
         return {
-            entry.owner
-            for entry in self._permits.values()
-            if entry.kind == "operation"
+            entry.owner for entry in self._permits.values() if entry.kind == "operation"
         }
 
     def get_run(self, task_id: str) -> asyncio.Task[None] | None:
@@ -149,13 +133,13 @@ class RunSupervisor:
 
         owner = self._require_current_task()
         async with self._lifecycle_condition:
-            self._require_accepting()
             self._consume_permit_locked(
                 permit,
                 "mutation",
                 owner,
                 allow_inactive=False,
             )
+            self._require_accepting()
             return self._mint_permit(_OperationPermit, owner, "operation")
 
     async def wait_for_lock(
@@ -210,8 +194,8 @@ class RunSupervisor:
         task_id: str,
         run_factory: RunFactory,
         *,
+        completion_port: RunCompletionPort | None = None,
         permit: _MutationPermit | None = None,
-        wake_mailbox: bool = True,
     ) -> asyncio.Task[None]:
         """Persist and release one local run without an execution-before-save gap."""
 
@@ -236,13 +220,13 @@ class RunSupervisor:
                         name=f"ruyi-task-run:{task_id}",
                     )
                     try:
-                        self._control._task_manager.mark_running(task_id, run_task)
+                        self._task_manager.mark_running(task_id, run_task)
                     except BaseException:
                         run_task.cancel()
 
                         async def rollback_failed_run() -> None:
                             await asyncio.gather(run_task, return_exceptions=True)
-                            self._control._task_manager.discard_live_run(task_id)
+                            self._task_manager.discard_live_run(task_id)
 
                         await self._await_cleanup(
                             rollback_failed_run(),
@@ -255,7 +239,7 @@ class RunSupervisor:
                         lambda finished: self._run_finished(
                             task_id,
                             finished,
-                            wake_mailbox=wake_mailbox,
+                            completion_port,
                         )
                     )
                     release.set()
@@ -303,9 +287,6 @@ class RunSupervisor:
             current = asyncio.current_task()
             operations = tuple(task for task in self._operations if task is not current)
 
-        # Cancel external I/O before waiting for short mutations. A remote
-        # operation can own a delegation-budget lock that an admitted mutation
-        # is waiting to enter; reversing this order would deadlock shutdown.
         await self._cancel_and_gather(operations)
         async with self._lifecycle_condition:
             self._discard_operation_permits_locked(operations)
@@ -338,6 +319,7 @@ class RunSupervisor:
             self._finalize_interrupted(task_id)
         self._runs.clear()
         self._maintenance.clear()
+        self._permits.clear()
         self._closed = True
 
     async def _finish_permit_cleanup(
@@ -413,7 +395,9 @@ class RunSupervisor:
         if entry is None or entry.token is not permit:
             raise InvalidRuntimePermitError("Runtime permit is forged or inactive")
         if entry.owner is not owner or entry.kind != kind:
-            raise InvalidRuntimePermitError("Runtime permit has the wrong owner or kind")
+            raise InvalidRuntimePermitError(
+                "Runtime permit has the wrong owner or kind"
+            )
         return entry
 
     def _consume_permit_locked(
@@ -504,8 +488,7 @@ class RunSupervisor:
         self,
         task_id: str,
         task: asyncio.Task[None],
-        *,
-        wake_mailbox: bool,
+        completion_port: RunCompletionPort | None,
     ) -> None:
         if self._runs.get(task_id) is task:
             self._runs.pop(task_id, None)
@@ -515,11 +498,11 @@ class RunSupervisor:
                 task_id,
                 error="Task interrupted: unhandled run failure",
             )
-        if wake_mailbox and self._control._mailbox is not None and self.is_accepting:
-            self.start_maintenance(
-                lambda: self._control._ensure_task_awake(task_id),
-                name=f"mailbox-wakeup:{task_id}",
-            )
+        if completion_port is not None:
+            try:
+                completion_port.on_run_finished(task_id, task)
+            except Exception:
+                logger.exception("Run completion callback failed: %s", task_id)
 
     def _create_maintenance_task(
         self,
@@ -554,16 +537,16 @@ class RunSupervisor:
         error: str = "Task interrupted: runtime shutdown",
     ) -> None:
         try:
-            record = self._control._task_manager.get_task(task_id)
+            record = self._task_manager.get_task(task_id)
             if record.state == "running":
-                self._control._task_manager.mark_interrupted(task_id, error)
+                self._task_manager.mark_interrupted(task_id, error)
         except Exception:
             logger.exception(
                 "Failed to persist interrupted state during runtime shutdown: %s",
                 task_id,
             )
         finally:
-            self._control._task_manager.discard_live_run(task_id)
+            self._task_manager.discard_live_run(task_id)
 
     @staticmethod
     def _consume_task_result(
@@ -586,4 +569,4 @@ class RunSupervisor:
         return error
 
 
-__all__ = ["RunSupervisor", "RuntimeClosingError"]
+__all__ = ["RunCompletionPort", "RunSupervisor", "RuntimeClosingError"]

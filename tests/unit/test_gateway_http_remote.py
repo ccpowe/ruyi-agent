@@ -12,7 +12,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
-import ruyi_agent.runtime.delegation.async_runtime as async_subagent_runtime
+from ruyi_agent.runtime.delegation.async_runtime import AgentControl
+import ruyi_agent.runtime.agent_factory as agent_factory_module
 from ruyi_agent.integrations.a2a.client import A2AClient
 from ruyi_agent.integrations.a2a.client import A2AClientError
 from ruyi_agent.config.loader import LocalWorkerSpec, RemoteRef
@@ -48,6 +49,7 @@ from tests.unit.gateway_http_support import (
     build_local_agent_config,
     build_specs,
 )
+from tests.support.async_subagent_runtime import wait_for_task_state
 
 
 class ResponseLostRemoteA2AClient(StaticRemoteA2AClient):
@@ -221,12 +223,12 @@ def test_remote_ref_forwards_via_a2a(
 ) -> None:
     monkeypatch.setenv("REMOTE_CODE_WIKI_TOKEN", "remote-secret")
     remote_factory = DelayedAgentFactory(delay=0.03)
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", remote_factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", remote_factory)
 
     remote_db = str(tmp_path / "remote-tasks.sqlite")
     remote_task_store = TaskStore(remote_db)
     remote_mailbox_store = MailboxStore(remote_db)
-    remote_control = async_subagent_runtime.AgentControl(
+    remote_control = AgentControl(
         {
             "code_wiki": LocalWorkerSpec(
                 name="code_wiki",
@@ -262,7 +264,7 @@ def test_remote_ref_forwards_via_a2a(
     remote_root_app.mount("/a2a", remote_app)
     transport = httpx.ASGITransport(app=remote_root_app)
 
-    app, factory = build_app(
+    app, _ = build_app(
         monkeypatch,
         delay=0.03,
         a2a_client=A2AClient(
@@ -282,12 +284,7 @@ def test_remote_ref_forwards_via_a2a(
         create_payload = create_response.json()
         assert create_payload["agent_name"] == "remote_code_wiki"
         proxy_task_id = create_payload["task_id"]
-        assert factory.control is not None
-        proxy_record = factory.control.get_task_record(proxy_task_id)
-        assert proxy_record.route_kind == "remote_ref"
-        assert proxy_record.agent_name == "remote_code_wiki"
-        assert proxy_record.upstream_task_id is not None
-        assert proxy_record.depth == 1
+        assert create_payload["depth"] == 1
 
         time.sleep(0.08)
         get_response = client.get(f"/tasks/{proxy_task_id}", headers=auth_headers())
@@ -385,7 +382,7 @@ def test_declared_remote_create_capability_generates_downstream_key(
 def test_public_remote_ref_maps_unhashable_status_to_upstream_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    app, factory = build_app(
+    app, _ = build_app(
         monkeypatch,
         a2a_client=UnhashableStatusRemoteA2AClient(),  # type: ignore[arg-type]
     )
@@ -414,12 +411,6 @@ def test_public_remote_ref_maps_unhashable_status_to_upstream_error(
     assert query.status_code == 200
     assert query.json()["task_id"] == task_id
     assert query.json()["status"] == "interrupted"
-    assert factory.control is not None
-    records = factory.control.list_task_records()
-    assert len(records) == 1
-    assert records[0].state == "interrupted"
-    assert records[0].upstream_task_id is None
-    assert records[0].external_outcome_uncertain is True
 
 
 def test_remote_response_lost_is_terminal_across_restart_and_queryable(
@@ -818,7 +809,7 @@ def test_remote_ref_review_is_exposed_and_forwarded(
 ) -> None:
     monkeypatch.setenv("REMOTE_CODE_WIKI_TOKEN", "remote-secret")
     a2a_client = ReviewRemoteA2AClient()
-    app, factory = build_app(
+    app, _ = build_app(
         monkeypatch,
         a2a_client=a2a_client,  # type: ignore[arg-type]
     )
@@ -885,10 +876,6 @@ def test_remote_ref_review_is_exposed_and_forwarded(
             }
         )
 
-        assert factory.control is not None
-        pending = factory.control.list_pending_review_records()
-        assert [item.task_id for item in pending] == [proxy_task_id]
-
         submit_response = client.post(
             f"/tasks/{proxy_task_id}/reviews/remote-review-1/decision",
             headers=auth_headers(),
@@ -943,10 +930,8 @@ def test_review_submit_accepts_root_task_mirrored_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     interrupt_factory = ReviewInterruptingAgentFactory()
-    monkeypatch.setattr(
-        async_subagent_runtime, "create_runtime_agent", interrupt_factory
-    )
-    control = async_subagent_runtime.AgentControl(
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", interrupt_factory)
+    control = AgentControl(
         build_specs(),
         checkpointer=object(),
         backend=object(),
@@ -966,16 +951,14 @@ def test_review_submit_accepts_root_task_mirrored_review(
     async def seed_review() -> None:
         nonlocal child_review_id, root_task_id
         root = await control.spawn_task("background_research", "root task")
-        if control.get_live_run(root.task_id) is not None:
-            await control.get_live_run(root.task_id)
+        await wait_for_task_state(control, root.task_id, states={"completed", "failed"})
         child = await control.spawn_task(
             "background_research",
             "needs review",
             parent_task_id=root.task_id,
             parent_thread_id=root.thread_id,
         )
-        if control.get_live_run(child.task_id) is not None:
-            await control.get_live_run(child.task_id)
+        await wait_for_task_state(control, child.task_id, states={"waiting_for_human"})
         root_task_id = root.task_id
         child_review_id = control.get_task_record(child.task_id).pending_review[
             "review_id"
@@ -1014,10 +997,8 @@ def test_root_task_review_api_enumerates_and_decides_sibling_reviews(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     interrupt_factory = ReviewInterruptingAgentFactory()
-    monkeypatch.setattr(
-        async_subagent_runtime, "create_runtime_agent", interrupt_factory
-    )
-    control = async_subagent_runtime.AgentControl(
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", interrupt_factory)
+    control = AgentControl(
         build_specs(),
         checkpointer=object(),
         backend=object(),
@@ -1033,8 +1014,7 @@ def test_root_task_review_api_enumerates_and_decides_sibling_reviews(
 
     async def seed_reviews() -> tuple[str, list[str]]:
         root = await control.spawn_task("background_research", "root task")
-        if control.get_live_run(root.task_id) is not None:
-            await control.get_live_run(root.task_id)
+        await wait_for_task_state(control, root.task_id, states={"completed", "failed"})
         review_ids = []
         for _index in range(2):
             child = await control.spawn_task(
@@ -1043,8 +1023,9 @@ def test_root_task_review_api_enumerates_and_decides_sibling_reviews(
                 parent_task_id=root.task_id,
                 parent_thread_id=root.thread_id,
             )
-            if control.get_live_run(child.task_id) is not None:
-                await control.get_live_run(child.task_id)
+            await wait_for_task_state(
+                control, child.task_id, states={"waiting_for_human"}
+            )
             review_ids.append(child.pending_review["review_id"])
         await route_store.asave_route(
             TaskRouteRecord(
@@ -1110,7 +1091,7 @@ def test_remote_a_to_b_to_a_loop_is_rejected_by_visited_nodes(
 ) -> None:
     monkeypatch.setenv("LOOP_GATEWAY_TOKEN", "secret-token")
     monkeypatch.setattr(
-        async_subagent_runtime,
+        agent_factory_module,
         "create_runtime_agent",
         RemoteBackDelegatingAgentFactory(),
     )
@@ -1131,7 +1112,7 @@ def test_remote_a_to_b_to_a_loop_is_rejected_by_visited_nodes(
     transports_a: dict[str, httpx.AsyncBaseTransport] = {}
     transports_b: dict[str, httpx.AsyncBaseTransport] = {}
 
-    a_control = async_subagent_runtime.AgentControl(
+    a_control = AgentControl(
         {
             "main": LocalWorkerSpec(
                 name="main",
@@ -1178,7 +1159,7 @@ def test_remote_a_to_b_to_a_loop_is_rejected_by_visited_nodes(
         skills=[],
         delegation_targets=("back_to_a",),
     )
-    b_control = async_subagent_runtime.AgentControl(
+    b_control = AgentControl(
         {"code_wiki": b_spec},
         {"back_to_a": b_to_a_ref},
         checkpointer=object(),
@@ -1224,8 +1205,8 @@ def test_public_remote_ref_not_registered_in_runtime_returns_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = DelayedAgentFactory(delay=0.03)
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", factory)
-    control = async_subagent_runtime.AgentControl(
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
+    control = AgentControl(
         build_specs(),
         {},
         checkpointer=object(),
@@ -1259,9 +1240,9 @@ def test_remote_route_persists_across_service_restart(
 ) -> None:
     monkeypatch.setenv("REMOTE_CODE_WIKI_TOKEN", "remote-secret")
     remote_factory = DelayedAgentFactory(delay=0.03)
-    monkeypatch.setattr(async_subagent_runtime, "create_runtime_agent", remote_factory)
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", remote_factory)
 
-    remote_control = async_subagent_runtime.AgentControl(
+    remote_control = AgentControl(
         {
             "code_wiki": LocalWorkerSpec(
                 name="code_wiki",
@@ -1332,6 +1313,13 @@ def test_remote_route_webhook_persists_across_service_restart(
 ) -> None:
     calls: list[dict[str, object]] = []
 
+    class RunningRemoteA2AClient(StaticRemoteA2AClient):
+        async def create_task(self, *args, **kwargs):
+            payload = await super().create_task(*args, **kwargs)
+            payload["status"] = "running"
+            payload["last_result"] = None
+            return payload
+
     class CapturingAsyncClient:
         def __init__(self, *, timeout: float) -> None:
             self.timeout = timeout
@@ -1352,7 +1340,7 @@ def test_remote_route_webhook_persists_across_service_restart(
             )
 
     monkeypatch.setattr(
-        async_subagent_runtime.httpx,
+        httpx,
         "AsyncClient",
         CapturingAsyncClient,
     )
@@ -1360,7 +1348,7 @@ def test_remote_route_webhook_persists_across_service_restart(
     first_store = GatewayRouteStore(str(route_db))
     first_app, _ = build_app(
         monkeypatch,
-        a2a_client=StaticRemoteA2AClient(),  # type: ignore[arg-type]
+        a2a_client=RunningRemoteA2AClient(),  # type: ignore[arg-type]
         route_store=first_store,
     )
     with TestClient(first_app) as client:

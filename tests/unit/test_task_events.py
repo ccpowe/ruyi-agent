@@ -16,10 +16,8 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 from ruyi_agent.gateway.sse import (
     encode_task_stream_event,
 )
-from ruyi_agent.runtime.delegation.async_runtime import (
-    AgentControl,
-    TaskManager,
-)
+from ruyi_agent.runtime.delegation.async_runtime import AgentControl
+from ruyi_agent.runtime.delegation.task_manager import TaskManager
 from ruyi_agent.runtime.task_events import (
     InvalidTaskEventCursorError,
     MAX_ASSISTANT_DELTA_TEXT_LENGTH,
@@ -131,9 +129,7 @@ class SecretStreamingModel(BaseChatModel):
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
         del messages, stop, run_manager, kwargs
-        yield ChatGenerationChunk(
-            message=AIMessageChunk(content=self.secret)
-        )
+        yield ChatGenerationChunk(message=AIMessageChunk(content=self.secret))
 
 
 def _message_stream_parts_containing(
@@ -219,6 +215,7 @@ def test_task_event_ledger_streams_snapshot_delta_lifecycle_and_end(tmp_path) ->
 
     asyncio.run(scenario())
 
+
 def test_ledger_rejects_oversized_durable_data_before_persistence(tmp_path) -> None:
     store = TaskStore(str(tmp_path / "tasks.sqlite"))
     ledger = TaskEventLedger(store)
@@ -228,9 +225,7 @@ def test_ledger_rejects_oversized_durable_data_before_persistence(tmp_path) -> N
             ledger.insert_task(
                 record,
                 event_type="task.created",
-                event_data={
-                    "content": "x" * (MAX_DURABLE_TASK_EVENT_DATA_BYTES + 1)
-                },
+                event_data={"content": "x" * (MAX_DURABLE_TASK_EVENT_DATA_BYTES + 1)},
             )
         assert store.get_task(record.task_id) is None
     finally:
@@ -1050,13 +1045,16 @@ def test_restart_marks_active_run_interrupted_with_atomic_event(tmp_path) -> Non
                 task_store=store,
             )
             assert second.get_task_record(record.task_id).state == "interrupted"
-            assert len(
-                store.list_task_events(
-                    task_id=record.task_id,
-                    run_count=1,
-                    after_event_id=0,
+            assert (
+                len(
+                    store.list_task_events(
+                        task_id=record.task_id,
+                        run_count=1,
+                        after_event_id=0,
+                    )
                 )
-            ) == 2
+                == 2
+            )
         finally:
             await first.close()
             if second is not None:
@@ -1313,8 +1311,7 @@ def test_surrogate_delta_artifact_review_and_error_are_stream_safe(tmp_path) -> 
             assert review.data["pending_review"]["review_id"] == "review\ufffdid"
             assert review.data["pending_review_truncated"] is True
             assert all(
-                encode_task_stream_event(event)
-                for event in (delta, artifact, review)
+                encode_task_stream_event(event) for event in (delta, artifact, review)
             )
             assert (await anext(live)).data == {"reason": "review_required"}
 
