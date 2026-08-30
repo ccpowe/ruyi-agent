@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 import ruyi_agent.channels.telegram.adapter as telegram_adapter_module
 import ruyi_agent.channels.telegram.runner as telegram_runner
 from ruyi_agent.channels.telegram.client import TelegramBotAPIClient
+from ruyi_agent.config.runtime_settings import configure_runtime_environment
 
 
 def test_telegram_runner_wires_media_limit_to_all_downloaders(
@@ -19,13 +21,26 @@ def test_telegram_runner_wires_media_limit_to_all_downloaders(
         async def run_forever(self) -> None:
             captured["ran"] = True
 
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot-token")
-    monkeypatch.setenv("TELEGRAM_MEDIA_MAX_BYTES", "4321")
-    monkeypatch.setenv("TELEGRAM_SESSION_DB", str(tmp_path / "sessions.sqlite3"))
-    monkeypatch.setenv("TELEGRAM_UPDATE_DB", str(tmp_path / "updates.sqlite3"))
+    env = {"RUYI_HOME": str(tmp_path / ".ruyi_agent")}
+    base_settings = configure_runtime_environment(
+        workspace=tmp_path,
+        env=env,
+        init_templates=True,
+    )
+    telegram_settings = replace(
+        base_settings.channels.telegram,
+        bot_token="bot-token",
+        media_max_bytes=4321,
+        session_db=tmp_path / "sessions.sqlite3",
+        update_db=tmp_path / "updates.sqlite3",
+    )
+    settings = replace(
+        base_settings,
+        channels=replace(base_settings.channels, telegram=telegram_settings),
+    )
     monkeypatch.setattr(telegram_adapter_module, "TelegramAdapter", AdapterProbe)
 
-    asyncio.run(telegram_runner.run_telegram_adapter())
+    asyncio.run(telegram_runner.run_telegram_adapter(settings))
 
     assert captured["media_max_bytes"] == 4321
     assert captured["gateway_client"]._max_download_bytes == 4321

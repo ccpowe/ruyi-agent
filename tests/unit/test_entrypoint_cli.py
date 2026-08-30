@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import ruyi_agent.entrypoints.main as entrypoint
 
@@ -9,8 +10,30 @@ class FakeRunner:
     def __init__(self) -> None:
         self.calls: list[object] = []
 
-    def run_channels(self, channels: tuple[str, ...]) -> None:
-        self.calls.append(("channels", channels))
+    def run_channels(
+        self,
+        channels: tuple[str, ...],
+        settings: object | None = None,
+    ) -> None:
+        self.calls.append(("channels", channels, settings))
+
+
+def _runtime_settings(
+    *,
+    telegram: bool = False,
+    feishu: bool = False,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        channels=SimpleNamespace(
+            telegram=SimpleNamespace(
+                bot_token="telegram-token" if telegram else None,
+            ),
+            feishu=SimpleNamespace(
+                app_id="feishu-id" if feishu else None,
+                app_secret="feishu-secret" if feishu else None,
+            ),
+        )
+    )
 
 
 def _clear_channel_env(monkeypatch) -> None:
@@ -33,18 +56,20 @@ def test_cli_requires_an_explicit_entrypoint(capsys) -> None:
     assert "select an entrypoint" in capsys.readouterr().err
 
 
-def test_cli_all_starts_gateway_only_when_no_adapters_are_configured(monkeypatch) -> None:
+def test_cli_all_starts_gateway_only_when_no_adapters_are_configured(
+    monkeypatch,
+) -> None:
     _clear_channel_env(monkeypatch)
     monkeypatch.setattr(
         entrypoint,
         "configure_runtime_environment",
-        lambda *, workspace=None, init_force=False, init_templates=False: None,
+        lambda **kwargs: _runtime_settings(),
     )
     runner = FakeRunner()
 
     entrypoint.main(["--all"], runner=runner)
 
-    assert runner.calls == [("channels", ("gateway",))]
+    assert runner.calls[0][:2] == ("channels", ("gateway",))
 
 
 def test_cli_all_starts_only_configured_adapters(monkeypatch) -> None:
@@ -54,13 +79,13 @@ def test_cli_all_starts_only_configured_adapters(monkeypatch) -> None:
     monkeypatch.setattr(
         entrypoint,
         "configure_runtime_environment",
-        lambda *, workspace=None, init_force=False, init_templates=False: None,
+        lambda **kwargs: _runtime_settings(feishu=True),
     )
     runner = FakeRunner()
 
     entrypoint.main(["--all"], runner=runner)
 
-    assert runner.calls == [("channels", ("gateway", "feishu"))]
+    assert runner.calls[0][:2] == ("channels", ("gateway", "feishu"))
 
 
 def test_cli_all_starts_all_configured_adapters(monkeypatch) -> None:
@@ -71,13 +96,16 @@ def test_cli_all_starts_all_configured_adapters(monkeypatch) -> None:
     monkeypatch.setattr(
         entrypoint,
         "configure_runtime_environment",
-        lambda *, workspace=None, init_force=False, init_templates=False: None,
+        lambda **kwargs: _runtime_settings(telegram=True, feishu=True),
     )
     runner = FakeRunner()
 
     entrypoint.main(["--all"], runner=runner)
 
-    assert runner.calls == [("channels", ("gateway", "telegram", "feishu"))]
+    assert runner.calls[0][:2] == (
+        "channels",
+        ("gateway", "telegram", "feishu"),
+    )
 
 
 def test_cli_all_requires_existing_config_without_creating_templates(
@@ -108,26 +136,26 @@ def test_cli_single_channel_starts_gateway_with_selected_adapter(monkeypatch) ->
     monkeypatch.setattr(
         entrypoint,
         "configure_runtime_environment",
-        lambda *, workspace=None, init_force=False, init_templates=False: None,
+        lambda **kwargs: _runtime_settings(telegram=True),
     )
     runner = FakeRunner()
 
     entrypoint.main(["--telegram"], runner=runner)
 
-    assert runner.calls == [("channels", ("gateway", "telegram"))]
+    assert runner.calls[0][:2] == ("channels", ("gateway", "telegram"))
 
 
 def test_cli_gateway_flag_starts_gateway_only(monkeypatch) -> None:
     monkeypatch.setattr(
         entrypoint,
         "configure_runtime_environment",
-        lambda *, workspace=None, init_force=False, init_templates=False: None,
+        lambda **kwargs: _runtime_settings(),
     )
     runner = FakeRunner()
 
     entrypoint.main(["--gateway"], runner=runner)
 
-    assert runner.calls == [("channels", ("gateway",))]
+    assert runner.calls[0][:2] == ("channels", ("gateway",))
 
 
 def test_cli_init_configures_runtime_and_exits(monkeypatch) -> None:
@@ -135,8 +163,8 @@ def test_cli_init_configures_runtime_and_exits(monkeypatch) -> None:
     monkeypatch.setattr(
         entrypoint,
         "configure_runtime_environment",
-        lambda *, workspace=None, init_force=False, init_templates=False: configured_calls.append(
-            (workspace, init_force, init_templates)
+        lambda *, workspace=None, init_force=False, init_templates=False: (
+            configured_calls.append((workspace, init_force, init_templates))
         ),
     )
     runner = FakeRunner()
@@ -152,8 +180,8 @@ def test_cli_init_force_overwrites_bootstrap_files(monkeypatch) -> None:
     monkeypatch.setattr(
         entrypoint,
         "configure_runtime_environment",
-        lambda *, workspace=None, init_force=False, init_templates=False: configured_calls.append(
-            (workspace, init_force, init_templates)
+        lambda *, workspace=None, init_force=False, init_templates=False: (
+            configured_calls.append((workspace, init_force, init_templates))
         ),
     )
     runner = FakeRunner()
@@ -177,9 +205,9 @@ def test_cli_reports_runtime_configuration_errors(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         entrypoint,
         "configure_runtime_environment",
-        lambda *, workspace=None, init_force=False, init_templates=False: (_ for _ in ()).throw(
-            ValueError("Invalid TOML in C:/Users/test/.ruyi_agent/ruyi.toml")
-        ),
+        lambda *, workspace=None, init_force=False, init_templates=False: (
+            _ for _ in ()
+        ).throw(ValueError("Invalid TOML in C:/Users/test/.ruyi_agent/ruyi.toml")),
     )
 
     try:

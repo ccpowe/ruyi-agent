@@ -158,9 +158,16 @@ def test_bootstrapped_app_readiness_tracks_runtime_lifecycle(
 ) -> None:
     teardown_gate_values: list[bool] = []
     app: FastAPI
+    settings = SimpleNamespace(
+        gateway=SimpleNamespace(
+            bearer_token="dev-token",
+            host="127.0.0.1",
+        )
+    )
 
     @asynccontextmanager
-    async def fake_bootstrap_application():
+    async def fake_bootstrap_application(active_settings):
+        assert active_settings is settings
         try:
             yield SimpleNamespace(gateway_service=object())
         finally:
@@ -169,15 +176,14 @@ def test_bootstrapped_app_readiness_tracks_runtime_lifecycle(
     monkeypatch.setattr(
         bootstrap_module,
         "configure_runtime_environment",
-        lambda: None,
+        lambda: settings,
     )
     monkeypatch.setattr(
         bootstrap_module,
         "bootstrap_application",
         fake_bootstrap_application,
     )
-    monkeypatch.setenv("GATEWAY_HOST", "127.0.0.1")
-    app = bootstrap_module.create_bootstrapped_gateway_app()
+    app = bootstrap_module.create_bootstrapped_gateway_app(settings)
 
     async def request_without_lifespan() -> tuple[httpx.Response, httpx.Response]:
         transport = httpx.ASGITransport(app=app)
@@ -208,9 +214,16 @@ def test_bootstrapped_app_clears_readiness_before_failing_teardown(
 ) -> None:
     teardown_gate_values: list[bool] = []
     app: FastAPI
+    settings = SimpleNamespace(
+        gateway=SimpleNamespace(
+            bearer_token="dev-token",
+            host="127.0.0.1",
+        )
+    )
 
     @asynccontextmanager
-    async def failing_bootstrap_application():
+    async def failing_bootstrap_application(active_settings):
+        assert active_settings is settings
         try:
             yield SimpleNamespace(gateway_service=object())
         finally:
@@ -220,15 +233,14 @@ def test_bootstrapped_app_clears_readiness_before_failing_teardown(
     monkeypatch.setattr(
         bootstrap_module,
         "configure_runtime_environment",
-        lambda: None,
+        lambda: settings,
     )
     monkeypatch.setattr(
         bootstrap_module,
         "bootstrap_application",
         failing_bootstrap_application,
     )
-    monkeypatch.setenv("GATEWAY_HOST", "127.0.0.1")
-    app = bootstrap_module.create_bootstrapped_gateway_app()
+    app = bootstrap_module.create_bootstrapped_gateway_app(settings)
 
     with pytest.raises(RuntimeError, match="simulated runtime teardown failure"):
         with TestClient(app) as client:

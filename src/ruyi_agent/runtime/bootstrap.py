@@ -9,7 +9,10 @@ from pathlib import Path
 from fastapi import FastAPI
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from ruyi_agent.config.runtime_settings import configure_runtime_environment
+from ruyi_agent.config.runtime_settings import (
+    RuntimeSettings,
+    configure_runtime_environment,
+)
 from ruyi_agent.config.agent_models import AgentConfigs
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
 from ruyi_agent.runtime.delegation.async_runtime import AgentControl
@@ -23,7 +26,6 @@ from ruyi_agent.config.loader import (
     load_mcp_server_configs,
     load_permission_config,
 )
-from ruyi_agent.runtime.delegation.context import validate_node_id
 from ruyi_agent.channels.http.routes import attach_gateway_routes
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.storage.gateway_command_store import GatewayCommandStore
@@ -37,8 +39,8 @@ from ruyi_agent.runtime.skills.catalog import SkillCatalog
 from ruyi_agent.runtime.skills.sync import SkillSyncer
 from ruyi_agent.runtime.skills.types import SkillEntry
 
-# 默认的配置 代码优先会从env读取。
-# 注意：dev-token 只适合本机开发；对外暴露 Gateway 必须显式设置强 GATEWAY_BEARER_TOKEN。
+# Legacy constants remain import-compatible for scripts; production bootstrap
+# reads the typed RuntimeSettings instance.
 DEFAULT_AGENT_NODE_ID = "local-dev"
 DEFAULT_GATEWAY_TOKEN = "dev-token"
 DEFAULT_GATEWAY_HOST = "127.0.0.1"
@@ -49,26 +51,6 @@ DEFAULT_TASK_DB = "data/tasks.sqlite"
 DEFAULT_REVIEW_AUDIT_DB = "data/review_audit.sqlite"
 DEFAULT_MAX_DELEGATION_DEPTH = 3
 DEFAULT_MAX_TASKS_PER_ROOT = 20
-
-
-def _read_positive_int_env(name: str, default: int) -> int:
-    raw_value = os.getenv(name)
-    if raw_value is None or raw_value == "":
-        return default
-    try:
-        value = int(raw_value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a positive integer") from exc
-    if value < 1:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
-
-
-def _read_node_id_env() -> str:
-    raw_value = os.getenv("AGENT_NODE_ID")
-    if raw_value is None or not raw_value.strip():
-        return DEFAULT_AGENT_NODE_ID
-    return validate_node_id(raw_value.strip())
 
 
 def _ensure_sqlite_parent_dir(path: str) -> None:
@@ -109,7 +91,7 @@ class AppRuntime:
 
 
 @asynccontextmanager
-async def bootstrap_application():
+async def bootstrap_application(settings: RuntimeSettings | None = None):
     """装配并持有当前进程内共享的应用运行时。
 
     Gateway 和 Channel Adapter 需要同一套运行对象：backend、
@@ -117,38 +99,43 @@ async def bootstrap_application():
     这个上下文管理器把启动契约集中在一个地方，并负责在退出时关闭需要释放的资源。
     """
 
-    configure_runtime_environment()
+    configured_settings = settings
+    if configured_settings is None:
+        configured_settings = configure_runtime_environment()
 
-    node_id = _read_node_id_env()
+    # A few external embedders historically replaced the configure hook with a
+    # side-effect-only function. Keep that narrow hook compatibility without
+    # bringing back the old raw/env settings path; production configuration
+    # still produces one immutable typed instance and passes it through.
+    using_legacy_configure_hook = configured_settings is None
+    active_settings = configured_settings or RuntimeSettings.defaults()
+
+    node_id = active_settings.runtime.agent_node_id
 
     # backend 决定 skills、memory 和执行状态所在的位置，所以要先创建 backend，
     # 再把声明式配置翻译成真正可运行的 agent spec。
-    backend_runtime = create_backend_runtime()
+    backend_runtime = (
+        create_backend_runtime()
+        if using_legacy_configure_hook
+        else create_backend_runtime(active_settings)
+    )
     try:
         home_dir = backend_runtime.home_dir
         skills_root = backend_runtime.skills_root
         agent_backend = backend_runtime.backend
-        host_workspace_root = Path(
-            os.getenv("LOCAL_BACKEND_ROOT", os.getcwd())
-        ).resolve()
+        host_workspace_root = active_settings.backend.workspace
         skill_catalog = SkillCatalog(workspace_root=host_workspace_root).scan().skills
         skill_syncer = SkillSyncer(backend=agent_backend, views_root=skills_root)
-        checkpoint_db = os.getenv("CHECKPOINT_DB", DEFAULT_CHECKPOINT_DB)
-        route_db = os.getenv("GATEWAY_ROUTE_DB", DEFAULT_GATEWAY_ROUTE_DB)
-        task_db = os.getenv("TASK_DB", DEFAULT_TASK_DB)
-        review_audit_db = os.getenv("REVIEW_AUDIT_DB", DEFAULT_REVIEW_AUDIT_DB)
-        max_delegation_depth = _read_positive_int_env(
-            "AGENT_MAX_DELEGATION_DEPTH",
-            DEFAULT_MAX_DELEGATION_DEPTH,
-        )
-        max_tasks_per_root = _read_positive_int_env(
-            "AGENT_MAX_TASKS_PER_ROOT",
-            DEFAULT_MAX_TASKS_PER_ROOT,
-        )
-        webhook_url = os.getenv("A2A_WEBHOOK_URL")
+        checkpoint_db = str(active_settings.storage.checkpoint_db)
+        route_db = str(active_settings.storage.gateway_route_db)
+        task_db = str(active_settings.storage.task_db)
+        review_audit_db = str(active_settings.storage.review_audit_db)
+        max_delegation_depth = active_settings.runtime.max_delegation_depth
+        max_tasks_per_root = active_settings.runtime.max_tasks_per_root
+        webhook_url = active_settings.runtime.a2a_webhook_url
         webhook_token = (
-            os.getenv("A2A_WEBHOOK_TOKEN")
-            or os.getenv("GATEWAY_BEARER_TOKEN")
+            active_settings.runtime.a2a_webhook_token
+            or active_settings.gateway.bearer_token
             or DEFAULT_GATEWAY_TOKEN
         )
         # agent 和 MCP 配置在这里从声明式配置变成带 model、tools、memory、skills 的
@@ -276,7 +263,9 @@ async def bootstrap_application():
         backend_runtime.close()
 
 
-def create_bootstrapped_gateway_app() -> FastAPI:
+def create_bootstrapped_gateway_app(
+    settings: RuntimeSettings | None = None,
+) -> FastAPI:
     """创建已经接入共享 runtime bootstrap 的 FastAPI 应用。
 
     Uvicorn 需要一个 app factory，但真正的 runtime 对象是异步资源，只应该在
@@ -284,9 +273,9 @@ def create_bootstrapped_gateway_app() -> FastAPI:
     request.app.state 取到当前可用的 Gateway Task Module。
     """
 
-    configure_runtime_environment()
-    bearer_token = os.getenv("GATEWAY_BEARER_TOKEN") or DEFAULT_GATEWAY_TOKEN
-    gateway_host = os.getenv("GATEWAY_HOST", DEFAULT_GATEWAY_HOST)
+    active_settings = settings or configure_runtime_environment()
+    bearer_token = active_settings.gateway.bearer_token
+    gateway_host = active_settings.gateway.host
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -299,7 +288,7 @@ def create_bootstrapped_gateway_app() -> FastAPI:
                 "Insecure configuration: set a non-default GATEWAY_BEARER_TOKEN "
                 "before exposing Gateway outside localhost."
             )
-        async with bootstrap_application() as runtime:
+        async with bootstrap_application(active_settings) as runtime:
             try:
                 app.state.app_runtime = runtime
                 app.state.gateway_service = runtime.gateway_service

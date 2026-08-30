@@ -48,6 +48,7 @@ from ruyi_agent.channels.turn import (
     ReviewTurn,
     parse_review_command,
 )
+from ruyi_agent.config.runtime_settings import RuntimeSettings
 from ruyi_agent.storage.channel_delivery_store import (
     ChannelDeliveryIntent,
     ChannelDeliveryStore,
@@ -135,12 +136,11 @@ class FeishuAdapter:
             platform="feishu",
             lease_seconds=max(30.0, task_poll_interval * 3.0),
         )
-        normalized_ack_mode = ack_mode.strip().lower()
-        self._ack_mode = (
-            normalized_ack_mode
-            if normalized_ack_mode in FEISHU_ACK_MODES
-            else "reaction"
-        )
+        if ack_mode not in FEISHU_ACK_MODES:
+            raise ValueError(
+                "Unsupported Feishu ack_mode. Expected reaction, message, or off."
+            )
+        self._ack_mode = ack_mode
         self._reactions_enabled = reactions_enabled
         self._processing_reaction = processing_reaction
         self._approval_reaction = approval_reaction
@@ -898,7 +898,8 @@ class FeishuAdapter:
     def _format_review_message(self, task: GatewayTask) -> str:
         return self._delivery.review_presenter.format(task)
 
-async def run_feishu_adapter() -> None:
+
+async def run_feishu_adapter(settings: RuntimeSettings | None = None) -> None:
     from ruyi_agent.channels.feishu.runner import run_feishu_adapter as run
 
-    await run()
+    await run(settings)

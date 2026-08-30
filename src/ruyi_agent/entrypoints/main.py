@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from ruyi_agent.config.runtime_settings import configure_runtime_environment
+from ruyi_agent.config.runtime_settings import (
+    RuntimeSettings,
+    configure_runtime_environment,
+)
 
 ChannelSet = tuple[str, ...]
 DEFAULT_GATEWAY_HOST = "127.0.0.1"
@@ -23,54 +25,62 @@ class CliOptions:
     all_channels: bool = False
 
 
-CHANNEL_ENV_REQUIREMENTS: dict[str, tuple[str, ...]] = {
-    "telegram": ("TELEGRAM_BOT_TOKEN",),
-    "feishu": ("FEISHU_APP_ID", "FEISHU_APP_SECRET"),
-}
-
-
 class EntrypointRunner:
-    def run_channels(self, channels: ChannelSet) -> None:
+    def run_channels(
+        self,
+        channels: ChannelSet,
+        settings: RuntimeSettings | None = None,
+    ) -> None:
+        active_settings = settings or configure_runtime_environment()
         if channels == ("gateway",):
-            run_gateway()
+            run_gateway(active_settings)
             return
-        asyncio.run(run_channels(channels))
+        asyncio.run(run_channels(channels, active_settings))
 
 
-def create_app():
+def create_app(settings: RuntimeSettings | None = None):
     from ruyi_agent.runtime.bootstrap import create_bootstrapped_gateway_app
 
-    return create_bootstrapped_gateway_app()
+    return create_bootstrapped_gateway_app(settings)
 
 
-def run_gateway() -> None:
+def run_gateway(settings: RuntimeSettings | None = None) -> None:
     import uvicorn
 
-    host = os.getenv("GATEWAY_HOST", DEFAULT_GATEWAY_HOST)
-    port = int(os.getenv("GATEWAY_PORT", str(DEFAULT_GATEWAY_PORT)))
-    uvicorn.run(create_app(), host=host, port=port)
+    active_settings = settings or configure_runtime_environment()
+    uvicorn.run(
+        create_app(active_settings),
+        host=active_settings.gateway.host,
+        port=active_settings.gateway.port,
+    )
 
 
-async def run_channels(channels: ChannelSet) -> None:
+async def run_channels(
+    channels: ChannelSet,
+    settings: RuntimeSettings | None = None,
+) -> None:
+    active_settings = settings or configure_runtime_environment()
     async with asyncio.TaskGroup() as task_group:
         if "gateway" in channels:
-            task_group.create_task(_run_gateway_async())
+            task_group.create_task(_run_gateway_async(active_settings))
         if "telegram" in channels:
             from ruyi_agent.channels.telegram.adapter import run_telegram_adapter
 
-            task_group.create_task(run_telegram_adapter())
+            task_group.create_task(run_telegram_adapter(active_settings))
         if "feishu" in channels:
             from ruyi_agent.channels.feishu.adapter import run_feishu_adapter
 
-            task_group.create_task(run_feishu_adapter())
+            task_group.create_task(run_feishu_adapter(active_settings))
 
 
-async def _run_gateway_async() -> None:
+async def _run_gateway_async(settings: RuntimeSettings) -> None:
     import uvicorn
 
-    host = os.getenv("GATEWAY_HOST", DEFAULT_GATEWAY_HOST)
-    port = int(os.getenv("GATEWAY_PORT", str(DEFAULT_GATEWAY_PORT)))
-    config = uvicorn.Config(create_app(), host=host, port=port)
+    config = uvicorn.Config(
+        create_app(settings),
+        host=settings.gateway.host,
+        port=settings.gateway.port,
+    )
     server = uvicorn.Server(config)
     await server.serve()
 
@@ -129,7 +139,7 @@ def main(
 ) -> None:
     options = parse_cli_options(argv)
     try:
-        configure_runtime_environment(
+        settings = configure_runtime_environment(
             workspace=options.workspace,
             init_force=options.init_force,
             init_templates=options.init_only,
@@ -142,24 +152,29 @@ def main(
     active_runner = runner or EntrypointRunner()
     assert options.channels is not None
     channels = (
-        _filter_configured_channels(options.channels)
+        _filter_configured_channels(options.channels, settings=settings)
         if options.all_channels
         else options.channels
     )
-    active_runner.run_channels(channels)
+    active_runner.run_channels(channels, settings=settings)
 
 
 def _filter_configured_channels(
     channels: ChannelSet,
     *,
-    getenv=os.getenv,
+    settings: RuntimeSettings,
 ) -> ChannelSet:
-    selected: list[str] = []
-    for channel in channels:
-        required_env = CHANNEL_ENV_REQUIREMENTS.get(channel)
-        if required_env is None or all(getenv(name) for name in required_env):
-            selected.append(channel)
-    return tuple(selected)
+    configured = {
+        "telegram": bool(settings.channels.telegram.bot_token),
+        "feishu": bool(
+            settings.channels.feishu.app_id and settings.channels.feishu.app_secret
+        ),
+    }
+    return tuple(
+        channel
+        for channel in channels
+        if channel == "gateway" or configured.get(channel, False)
+    )
 
 
 def _select_channels(

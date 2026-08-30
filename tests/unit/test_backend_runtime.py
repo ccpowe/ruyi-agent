@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from ruyi_agent.config.errors import ConfigError
+from ruyi_agent.config.runtime_settings import configure_runtime_environment
 import ruyi_agent.integrations.backend.runtime as backend_runtime
 from ruyi_agent.integrations.backend.runtime import create_backend_runtime
 from ruyi_agent.integrations.backend.runtime import RuyiLocalShellBackend
@@ -12,15 +14,17 @@ from ruyi_agent.integrations.backend.runtime import RuyiLocalShellBackend
 
 def test_create_local_backend_runtime_exposes_shell_and_file_transfer(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     outside_file = tmp_path.parent / "outside-workspace.txt"
     outside_file.write_text("secret", encoding="utf-8")
-    monkeypatch.setenv("BACKEND_KIND", "local")
-    monkeypatch.setenv("LOCAL_BACKEND_ROOT", str(tmp_path))
-    monkeypatch.setenv("LOCAL_BACKEND_INHERIT_ENV", "true")
+    env = {"RUYI_HOME": str(tmp_path / ".ruyi_agent")}
+    settings = configure_runtime_environment(
+        workspace=tmp_path,
+        env=env,
+        init_templates=True,
+    )
 
-    runtime = create_backend_runtime()
+    runtime = create_backend_runtime(settings)
 
     assert runtime.kind == "local"
     assert runtime.home_dir == "/"
@@ -47,13 +51,15 @@ def test_create_local_backend_runtime_exposes_shell_and_file_transfer(
 
 def test_create_local_backend_runtime_uses_fixed_skill_views_root(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("BACKEND_KIND", "localshell")
-    monkeypatch.setenv("LOCAL_BACKEND_ROOT", str(tmp_path))
-    monkeypatch.setenv("LOCAL_BACKEND_SKILLS_ROOT", str(tmp_path / "legacy-skills"))
+    env = {"RUYI_HOME": str(tmp_path / ".ruyi_agent")}
+    settings = configure_runtime_environment(
+        workspace=tmp_path,
+        env=env,
+        init_templates=True,
+    )
 
-    runtime = create_backend_runtime()
+    runtime = create_backend_runtime(settings)
 
     assert runtime.kind == "local"
     assert runtime.home_dir == "/"
@@ -86,9 +92,15 @@ def test_local_shell_backend_decodes_utf8_output_on_windows_codepage(
 
 
 def test_create_backend_runtime_rejects_unknown_kind(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("BACKEND_KIND", "invalid")
+    ruyi_home = tmp_path / ".ruyi_agent"
+    env = {"RUYI_HOME": str(ruyi_home)}
+    configure_runtime_environment(workspace=tmp_path, env=env, init_templates=True)
+    (ruyi_home / "ruyi.toml").write_text(
+        '[backend]\nkind = "invalid"\n',
+        encoding="utf-8",
+    )
 
-    with pytest.raises(ValueError, match="Unsupported BACKEND_KIND"):
-        create_backend_runtime()
+    with pytest.raises(ConfigError, match="backend.kind"):
+        configure_runtime_environment(workspace=tmp_path, env=env)

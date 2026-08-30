@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -61,6 +60,7 @@ from ruyi_agent.channels.turn import (
     ReviewTurn,
     parse_review_command,
 )
+from ruyi_agent.config.runtime_settings import RuntimeSettings
 from ruyi_agent.storage.channel_delivery_store import (
     ChannelDeliveryIntent,
     ChannelDeliveryStore,
@@ -159,6 +159,7 @@ class TelegramAdapter:
         message_parse_mode: str | None = "MarkdownV2",
         mermaid_renderer: KrokiMermaidRenderer | None = None,
         media_max_bytes: int = DEFAULT_TELEGRAM_MEDIA_MAX_BYTES,
+        kroki_base_url: str = "https://kroki.io",
         delivery_store: ChannelDeliveryStore | None = None,
         media_root: object | None = None,
     ) -> None:
@@ -190,7 +191,7 @@ class TelegramAdapter:
         )
         self._message_parse_mode = message_parse_mode
         self._mermaid_renderer = mermaid_renderer or KrokiMermaidRenderer(
-            base_url=os.getenv("KROKI_BASE_URL", "https://kroki.io")
+            base_url=kroki_base_url
         )
         if media_max_bytes <= 0:
             raise ValueError("Telegram media_max_bytes must be positive")
@@ -866,7 +867,8 @@ class TelegramAdapter:
     def _format_review_message(self, task: GatewayTask) -> str:
         return self._delivery.review_presenter.format(task)
 
-async def run_telegram_adapter() -> None:
+
+async def run_telegram_adapter(settings: RuntimeSettings | None = None) -> None:
     from ruyi_agent.channels.telegram.runner import run_telegram_adapter as run
 
-    await run()
+    await run(settings)

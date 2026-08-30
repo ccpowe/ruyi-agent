@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 import pytest
 
-from ruyi_agent.runtime.bootstrap import DEFAULT_AGENT_NODE_ID
 from ruyi_agent.runtime.bootstrap import _is_loopback_gateway_host
-from ruyi_agent.runtime.bootstrap import _read_node_id_env
 from ruyi_agent.runtime.bootstrap import bootstrap_application
 from ruyi_agent.runtime.bootstrap import create_bootstrapped_gateway_app
 import ruyi_agent.runtime.bootstrap as bootstrap_module
@@ -17,22 +16,6 @@ def test_bootstrap_has_no_mutable_control_reference_or_scope_rewrite() -> None:
 
     assert "control_ref" not in source
     assert "attach_delegation" not in source
-
-
-def test_read_node_id_env_uses_default_for_missing_value(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("AGENT_NODE_ID", raising=False)
-
-    assert _read_node_id_env() == DEFAULT_AGENT_NODE_ID
-
-
-def test_read_node_id_env_returns_configured_value(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AGENT_NODE_ID", "node-a")
-
-    assert _read_node_id_env() == "node-a"
 
 
 @pytest.mark.parametrize(
@@ -56,9 +39,17 @@ def test_create_bootstrapped_gateway_app_configures_runtime_environment(
 ) -> None:
     calls = 0
 
-    def fake_configure_runtime_environment() -> None:
+    settings = SimpleNamespace(
+        gateway=SimpleNamespace(
+            bearer_token="dev-token",
+            host="127.0.0.1",
+        )
+    )
+
+    def fake_configure_runtime_environment() -> object:
         nonlocal calls
         calls += 1
+        return settings
 
     monkeypatch.setattr(
         bootstrap_module,

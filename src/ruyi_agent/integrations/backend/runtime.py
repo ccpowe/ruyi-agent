@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import locale
-import os
 import subprocess
 import time
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 from typing import Any
 
 from daytona import (
@@ -23,7 +22,12 @@ from deepagents.backends.protocol import (
 )
 from langchain_daytona import DaytonaSandbox
 
-DEFAULT_BACKEND_KIND = "daytona"
+from ruyi_agent.config.runtime_settings import (
+    RuntimeSettings,
+    configure_runtime_environment,
+)
+
+DEFAULT_BACKEND_KIND = "local"
 DEFAULT_SANDBOX_NAME = "ruyi-agent"
 LOCAL_VIRTUAL_WORKSPACE_ROOT = "/"
 SKILL_VIEWS_SUBDIR = ".ruyi_agent/runtime/skill-views"
@@ -278,20 +282,21 @@ class BackendRuntime:
             _stop_sandbox(self._sandbox)
 
 
-def _create_sandbox() -> Any:
+def _create_sandbox(settings: RuntimeSettings) -> Any:
     """获取或创建当前进程使用的 Daytona sandbox。
 
     Daytona backend 需要一个可执行、可读写文件的远端环境。这里优先复用固定
     名称的 sandbox，找不到时才新建，避免每次启动项目都创建新的远端环境。
     """
 
+    daytona = settings.backend.daytona
     config = DaytonaConfig(
-        api_key=os.getenv("DAYTONA_API_KEY"),
-        api_url=os.getenv("DAYTONA_API_URL"),
-        target=os.getenv("DAYTONA_TARGET"),
+        api_key=daytona.api_key,
+        api_url=daytona.api_url,
+        target=daytona.target,
     )
     daytona = Daytona(config)
-    sandbox_name = os.getenv("DAYTONA_SANDBOX_NAME", DEFAULT_SANDBOX_NAME)
+    sandbox_name = settings.backend.daytona.sandbox_name
     try:
         sandbox = daytona.get(sandbox_name)
         if str(sandbox.state) != "STARTED":
@@ -328,24 +333,14 @@ def _stop_sandbox(sandbox: Any) -> None:
             raise
 
 
-def _env_bool(name: str, *, default: bool) -> bool:
-    """按项目约定解析环境变量里的布尔开关。"""  # 可以用来限制wokespace 需要结合权限管理
-
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _create_daytona_backend_runtime() -> BackendRuntime:
+def _create_daytona_backend_runtime(settings: RuntimeSettings) -> BackendRuntime:
     """创建基于 Daytona sandbox 的 backend runtime。
 
-    这是默认运行方式：agent 的 shell、文件读写和 artifact 都落在 Daytona
-    sandbox 里，从而和宿主机隔离，同时保留一个稳定的 home_dir 给 memory 和
-    skills 路径映射使用。
+    agent 的 shell、文件读写和 artifact 都落在 Daytona sandbox 里，从而和宿主机
+    隔离，同时保留一个稳定的 home_dir 给 memory 和 skills 路径映射使用。
     """
 
-    sandbox = _create_sandbox()
+    sandbox = _create_sandbox(settings)
     home_dir = sandbox.get_user_home_dir()
     backend = AutoStartDaytonaSandbox(sandbox=sandbox)
     agent_backend = CompositeBackend(
@@ -362,19 +357,19 @@ def _create_daytona_backend_runtime() -> BackendRuntime:
     )
 
 
-def _create_local_backend_runtime() -> BackendRuntime:
+def _create_local_backend_runtime(settings: RuntimeSettings) -> BackendRuntime:
     """创建基于本地 shell 的 backend runtime。
 
     local backend 主要用于开发和测试：它复用与 sandbox backend 相同的
     CompositeBackend 接口。文件工具使用虚拟根目录 `/` 映射到
-    LOCAL_BACKEND_ROOT，避免普通文件工具越过工作区；命令仍会直接在
-    LOCAL_BACKEND_ROOT 下以当前用户权限执行，因此没有 Daytona 的进程隔离。
+    typed backend.workspace，避免普通文件工具越过工作区；命令仍会直接在该目录
+    下以当前用户权限执行，因此没有 Daytona 的进程隔离。
     """
 
-    root_dir = Path(os.getenv("LOCAL_BACKEND_ROOT", os.getcwd())).resolve()
-    timeout = int(os.getenv("LOCAL_BACKEND_TIMEOUT", "120"))
-    max_output_bytes = int(os.getenv("LOCAL_BACKEND_MAX_OUTPUT_BYTES", "100000"))
-    inherit_env = _env_bool("LOCAL_BACKEND_INHERIT_ENV", default=True)
+    root_dir = settings.backend.workspace
+    timeout = settings.backend.local.timeout
+    max_output_bytes = settings.backend.local.max_output_bytes
+    inherit_env = settings.backend.local.inherit_env
     local_backend = RuyiLocalShellBackend(
         root_dir=root_dir,
         virtual_mode=True,
@@ -396,18 +391,18 @@ def _create_local_backend_runtime() -> BackendRuntime:
     )
 
 
-def create_backend_runtime() -> BackendRuntime:
-    """根据 BACKEND_KIND 创建当前进程使用的 backend runtime。
+def create_backend_runtime(settings: RuntimeSettings | None = None) -> BackendRuntime:
+    """根据 typed backend settings 创建当前进程使用的 backend runtime。
 
     app_runtime 只调用这个工厂函数，不直接依赖 Daytona 或 LocalShell 的创建细节。
-    这样 CLI、Gateway 和测试都可以通过环境变量切换执行环境，而不需要改装配代码。
     """
 
-    kind = os.getenv("BACKEND_KIND", DEFAULT_BACKEND_KIND).strip().lower()
+    active_settings = settings or configure_runtime_environment()
+    kind = active_settings.backend.kind
     if kind == "daytona":
-        return _create_daytona_backend_runtime()
-    if kind in {"local", "localshell", "local_shell"}:
-        return _create_local_backend_runtime()
+        return _create_daytona_backend_runtime(active_settings)
+    if kind == "local":
+        return _create_local_backend_runtime(active_settings)
     raise ValueError(
-        f"Unsupported BACKEND_KIND: {kind!r}. Expected 'daytona' or 'local'."
+        f"Unsupported backend kind: {kind!r}. Expected 'daytona' or 'local'."
     )

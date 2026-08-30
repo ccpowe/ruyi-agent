@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 from _feishu_adapter_support import (
     FeishuMention,
@@ -13,6 +14,7 @@ from _feishu_adapter_support import (
 import ruyi_agent.channels.feishu.adapter as feishu_adapter_module
 import ruyi_agent.channels.feishu.runner as feishu_runner
 from ruyi_agent.channels.feishu.client import FeishuSDKClient
+from ruyi_agent.config.runtime_settings import configure_runtime_environment
 
 
 def test_parse_feishu_text_event_extracts_sender_and_mentions() -> None:
@@ -155,17 +157,30 @@ def test_feishu_runner_wires_real_sdk_client_factory(monkeypatch, tmp_path) -> N
         async def run_forever(self) -> None:
             captured["ran"] = True
 
-    monkeypatch.setenv("FEISHU_APP_ID", "runner-app")
-    monkeypatch.setenv("FEISHU_APP_SECRET", "runner-secret")
-    monkeypatch.setenv("FEISHU_DOMAIN", "lark")
-    monkeypatch.setenv("FEISHU_API_TIMEOUT", "4.5")
-    monkeypatch.setenv("FEISHU_GROUP_POLICY", "disabled")
-    monkeypatch.setenv("FEISHU_MEDIA_MAX_BYTES", "1234")
-    monkeypatch.setenv("FEISHU_SESSION_DB", str(tmp_path / "sessions.sqlite3"))
-    monkeypatch.setenv("FEISHU_EVENT_DB", str(tmp_path / "events.sqlite3"))
+    env = {"RUYI_HOME": str(tmp_path / ".ruyi_agent")}
+    base_settings = configure_runtime_environment(
+        workspace=tmp_path,
+        env=env,
+        init_templates=True,
+    )
+    feishu_settings = replace(
+        base_settings.channels.feishu,
+        app_id="runner-app",
+        app_secret="runner-secret",
+        domain="lark",
+        api_timeout=4.5,
+        group_policy="disabled",
+        media_max_bytes=1234,
+        session_db=tmp_path / "sessions.sqlite3",
+        event_db=tmp_path / "events.sqlite3",
+    )
+    settings = replace(
+        base_settings,
+        channels=replace(base_settings.channels, feishu=feishu_settings),
+    )
     monkeypatch.setattr(feishu_adapter_module, "FeishuAdapter", AdapterProbe)
 
-    asyncio.run(feishu_runner.run_feishu_adapter())
+    asyncio.run(feishu_runner.run_feishu_adapter(settings))
 
     sdk_client = captured["feishu_client"]
     assert isinstance(sdk_client, FeishuSDKClient)

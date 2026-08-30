@@ -78,6 +78,13 @@ sandbox_name = "learn-deepagents"
 workspace = "C:/Users/name/project"
 ```
 
+运行时配置在启动边界一次性解析为不可变 typed settings；`backend.kind`、
+`backend.workspace`、`gateway.*` 和 `storage.*` 只接受小写 canonical 字段，
+不会被同名旧环境变量反向覆盖。共 64 个兼容环境变量仅可在对应 TOML table 内
+以大写别名出现，并按“canonical > 同表别名 > 初始环境变量 > typed 默认值”选择；
+`BACKEND_KIND`、`LOCAL_BACKEND_ROOT` 与 `GATEWAY_*` 只会被投影给外部 SDK 或脚本，
+不是 TOML 别名。
+
 常用字段：
 
 | 字段 | 说明 |

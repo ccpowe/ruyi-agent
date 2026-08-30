@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 import httpx
 
@@ -29,11 +28,6 @@ IMAGE_ATTACHMENT_EXTENSIONS = {
     ".webp",
 }
 DEFAULT_TELEGRAM_MEDIA_MAX_BYTES = 50 * 1024 * 1024
-
-
-def _env_list(name: str) -> list[str]:
-    raw = os.getenv(name, "")
-    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 @dataclass(slots=True)
@@ -140,12 +134,13 @@ class TelegramBotAPIClient:
         default_parse_mode: str | None = None,
         fallback_resolver: TelegramFallbackResolver | None = None,
         media_max_bytes: int = DEFAULT_TELEGRAM_MEDIA_MAX_BYTES,
+        fallback_ips: Sequence[str] = (),
     ) -> None:
         self._base_url = f"https://api.telegram.org/bot{bot_token}"
         self._timeout = timeout
         self._default_parse_mode = default_parse_mode
         self._fallback_resolver = fallback_resolver or TelegramFallbackResolver(
-            fallback_ips=_env_list("TELEGRAM_FALLBACK_IPS"),
+            fallback_ips=list(fallback_ips),
         )
         if media_max_bytes <= 0:
             raise ValueError("Telegram media_max_bytes must be positive")
