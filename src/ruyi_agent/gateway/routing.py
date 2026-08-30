@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from typing import Any, Literal
-from uuid import uuid4
 
 from ruyi_agent.gateway.create_errors import (
     delegation_depth_error as _delegation_depth_error,
-    recover_create_effect_error as _recover_create_effect_error,
+)
+from ruyi_agent.gateway.create_route_workflow import (
+    CreateRouteRequest,
+    CreateRouteWorkflow,
+    RoutedTask,
 )
 from ruyi_agent.gateway.errors import GatewayTaskError
 from ruyi_agent.gateway.message_cursors import (
@@ -19,20 +21,14 @@ from ruyi_agent.gateway.message_cursors import (
     invalid_message_cursor as _invalid_message_cursor,
 )
 from ruyi_agent.gateway.public_errors import (
-    public_create_route_error,
     public_remote_record,
     public_upstream_error,
     public_upstream_payload_error,
 )
 from ruyi_agent.gateway.route_reservations import (
-    create_evidence_policy,
     has_active_route_binding as _has_active_route_binding,
     has_durable_create_effect as _has_durable_create_effect,
-    reconcile_pending_create,
     reservation_record,
-    route_persistence_error,
-    shield_durable_cleanup,
-    with_route_identity,
 )
 from ruyi_agent.gateway_protocol.sse import SSEProtocolError, task_stream_event_from_gateway
 from ruyi_agent.integrations.a2a.client import A2AClientError
@@ -84,12 +80,6 @@ _FULL_STATE_TASK_EVENT_TYPES = {
 }
 
 
-@dataclass(slots=True)
-class RoutedTask:
-    record: TaskRecord
-    route: TaskRouteRecord
-
-
 class TaskRouter:
     """Hide local/remote routing, recovery, and runtime error translation."""
 
@@ -103,6 +93,16 @@ class TaskRouter:
         self._control = control
         self._route_store = route_store
         self._remote_event_handlers = remote_event_handlers or []
+        try:
+            remote_create_capability = control.remote_create_idempotency_guaranteed
+        except AttributeError:
+            remote_create_capability = None
+        self._create_route_workflow = CreateRouteWorkflow(
+            control=control,
+            route_store=route_store,
+            active_record_reader=self.get_record,
+            remote_create_capability=remote_create_capability,
+        )
 
     def prepare_delegation_metadata(
         self,
@@ -124,17 +124,9 @@ class TaskRouter:
             raise _delegation_depth_error(exc.current_depth, exc.max_depth) from exc
 
     def remote_create_idempotency_guaranteed(self, agent_name: str) -> bool:
-        capability = getattr(
-            self._control,
-            "remote_create_idempotency_guaranteed",
-            None,
+        return self._create_route_workflow.remote_create_idempotency_guaranteed(
+            agent_name
         )
-        if capability is None:
-            return False
-        try:
-            return bool(capability(agent_name))
-        except UnknownAgentTargetError:
-            return False
 
     async def create_task(
         self,
@@ -150,273 +142,24 @@ class TaskRouter:
         idempotency_key: str | None = None,
         before_effect: Callable[[], Awaitable[None]] | None = None,
     ) -> RoutedTask:
-        gateway_task_id = task_id or str(uuid4())
-        remote_replay_safe = (
-            route_kind == "remote_ref"
-            and self.remote_create_idempotency_guaranteed(agent_name)
-        )
-        key_scope, replay_policy = create_evidence_policy(
-            route_kind,
-            external_key=idempotency_key is not None,
-            remote_replay_safe=remote_replay_safe,
-        )
-        reservation = TaskRouteRecord(
-            task_id=gateway_task_id,
+        request = CreateRouteRequest(
             agent_name=agent_name,
-            metadata=dict(metadata),
             route_kind=route_kind,
-            upstream_task_id=(gateway_task_id if route_kind == "local" else None),
-            webhook=dict(webhook) if webhook is not None else None,
-            route_state="pending",
+            input_content=input_content,
+            metadata=metadata,
+            webhook=webhook,
+            delegation_context=delegation_context,
+            attachments=attachments,
+            task_id=task_id,
+            idempotency_key=idempotency_key,
+            before_effect=before_effect,
         )
-        try:
-            reservation = await self._route_store.areserve_route(
-                reservation,
-                create_key_scope=key_scope,
-                create_replay_policy=replay_policy,
-            )
-            evidence = await self._route_store.aget_create_evidence(gateway_task_id)
-        except Exception as exc:
-            raise route_persistence_error(
-                gateway_task_id,
-                route_state="unpersisted",
-                queryable=False,
-                retryable=True,
-                effect_outcome="not_started",
-            ) from exc
-        if evidence is None or evidence.effect_boundary != "reserved":
-            reservation = await self._reconcile_pending_create(reservation)
-        if reservation.route_state == "active":
-            return RoutedTask(
-                record=await self.get_record(reservation),
-                route=reservation,
-            )
-        if reservation.route_state in {"failed", "uncertain"}:
-            error = GatewayTaskError(
-                code="task_creation_not_retryable",
-                message=(
-                    f"Gateway Task creation previously ended with route state "
-                    f"'{reservation.route_state}'"
-                ),
-            )
-            raise with_route_identity(
-                error,
-                reservation,
-                task_id=gateway_task_id,
-                retryable=False,
-                effect_outcome=(
-                    "uncertain"
-                    if reservation.route_state == "uncertain"
-                    else "not_started"
-                ),
-            )
-
-        kwargs: dict[str, Any] = {
-            "webhook": dict(webhook) if webhook is not None else None,
-            "delegation_context": delegation_context,
-            "task_id": gateway_task_id,
-        }
-        if route_kind == "remote_ref":
-            kwargs["attachments"] = attachments or []
-            kwargs["metadata"] = dict(metadata)
-        if idempotency_key is not None:
-            kwargs["idempotency_key"] = idempotency_key
-        elif route_kind == "remote_ref" and self.remote_create_idempotency_guaranteed(
-            agent_name
-        ):
-            kwargs["idempotency_key"] = f"gateway-create:{gateway_task_id}"
-        if before_effect is not None:
-            try:
-                await before_effect()
-            except Exception as exc:
-                durable_route = await self._fail_reservation(
-                    reservation,
-                    "Gateway command effect boundary could not be persisted",
-                    uncertain=False,
-                )
-                raise route_persistence_error(
-                    gateway_task_id,
-                    route_state=(
-                        durable_route.route_state
-                        if durable_route is not None
-                        else "unknown"
-                    ),
-                    queryable=durable_route is not None,
-                    retryable=False,
-                    effect_outcome="not_started",
-                ) from exc
-            except BaseException:
-                await shield_durable_cleanup(
-                    self._reconcile_pending_create(reservation, live_interruption=True)
-                )
-                raise
-        try:
-            await self._route_store.amark_create_effect_started(gateway_task_id)
-        except Exception as exc:
-            durable_route = await self._fail_reservation(
-                reservation,
-                "Gateway create effect boundary could not be persisted",
-                uncertain=False,
-            )
-            raise route_persistence_error(
-                gateway_task_id,
-                route_state=durable_route.route_state if durable_route else "unknown",
-                queryable=durable_route is not None,
-                retryable=False,
-                effect_outcome="not_started",
-            ) from exc
-        except BaseException:
-            await shield_durable_cleanup(
-                self._reconcile_pending_create(reservation, live_interruption=True)
-            )
-            raise
-        try:
-            record = await self._control.spawn_task(
-                agent_name,
-                input_content,
-                **kwargs,
-            )
-        except Exception as exc:
-            raise await _recover_create_effect_error(
-                exc,
-                agent_name=agent_name,
-                route_kind=route_kind,
-                task_id=gateway_task_id,
-                idempotency_key_present=idempotency_key is not None,
-                remote_replay_safe=remote_replay_safe,
-                reservation=reservation,
-                route_store=self._route_store,
-                fail_reservation=lambda route, error, uncertain: self._fail_reservation(
-                    route, error, uncertain=uncertain
-                ),
-            ) from exc
-        except BaseException:
-            await shield_durable_cleanup(
-                self._reconcile_pending_create(reservation, live_interruption=True)
-            )
-            raise
-
-        if route_kind == "remote_ref" and not record.upstream_task_id:
-            error = public_upstream_payload_error(
-                operation="create",
-                task_id=gateway_task_id,
-            )
-            durable_route = await self._fail_reservation(
-                reservation,
-                error,
-                uncertain=True,
-            )
-            raise with_route_identity(
-                error,
-                durable_route,
-                task_id=gateway_task_id,
-                retryable=False,
-                route_state=reservation.route_state,
-                effect_outcome="uncertain",
-            )
-        if not _has_durable_create_effect(record, route_kind=route_kind):
-            error = GatewayTaskError(
-                code="task_effect_not_durable",
-                message="Gateway Task effect has no durable run or remote binding",
-            )
-            durable_route = await self._fail_reservation(
-                reservation,
-                error,
-                uncertain=True,
-            )
-            raise with_route_identity(
-                error,
-                durable_route,
-                task_id=gateway_task_id,
-                retryable=False,
-                route_state=reservation.route_state,
-                effect_outcome="uncertain",
-            )
-        try:
-            route = await self._route_store.atransition_route(
-                gateway_task_id,
-                route_state="active",
-                upstream_task_id=record.upstream_task_id or record.task_id,
-                route_error=None,
-            )
-        except Exception as exc:
-            with_route = TaskRouteRecord(
-                task_id=reservation.task_id,
-                agent_name=reservation.agent_name,
-                metadata=dict(reservation.metadata),
-                route_kind=reservation.route_kind,
-                upstream_task_id=record.upstream_task_id or record.task_id,
-                webhook=reservation.webhook,
-                route_state="uncertain",
-                route_error="Task effect completed but route activation failed",
-            )
-            durable_route = await self._fail_reservation(
-                with_route,
-                with_route.route_error,
-                uncertain=True,
-            )
-            raise route_persistence_error(
-                gateway_task_id,
-                route_state=(
-                    durable_route.route_state
-                    if durable_route is not None
-                    else "unknown"
-                ),
-                queryable=durable_route is not None,
-                retryable=False,
-                effect_outcome="completed",
-            ) from exc
-        return RoutedTask(
-            record=(
-                public_remote_record(record) if route_kind == "remote_ref" else record
-            ),
-            route=route,
-        )
-
-    async def _reconcile_pending_create(
-        self,
-        route: TaskRouteRecord,
-        *,
-        live_interruption: bool = False,
-    ) -> TaskRouteRecord:
-        return await reconcile_pending_create(
-            route,
-            route_store=self._route_store,
-            get_local_record=self._control.get_task_record,
-            live_interruption=live_interruption,
-        )
-
-    async def _fail_reservation(
-        self,
-        route: TaskRouteRecord,
-        error: BaseException | str,
-        *,
-        uncertain: bool,
-    ) -> TaskRouteRecord | None:
-        try:
-            updated = await self._route_store.atransition_route(
-                route.task_id,
-                route_state="uncertain" if uncertain else "failed",
-                upstream_task_id=route.upstream_task_id,
-                route_error=public_create_route_error(
-                    error,
-                    route_kind=route.route_kind,
-                ),
-            )
-        except Exception:
-            try:
-                return await self._route_store.aget_route(route.task_id)
-            except Exception:
-                return None
-        route.upstream_task_id = updated.upstream_task_id
-        route.route_state = updated.route_state
-        route.route_error = updated.route_error
-        return updated
+        return await self._create_route_workflow.run(request)
 
     async def get_route(self, task_id: str) -> TaskRouteRecord:
         route = await self._route_store.aget_route(task_id)
         if route is not None:
-            return await self._reconcile_pending_create(route)
+            return await self._create_route_workflow.reconcile_pending_create(route)
         try:
             record = self._control.get_task_record(task_id)
         except UnknownWorkerTaskError as exc:
@@ -436,7 +179,7 @@ class TaskRouter:
                 continue
             await self._recover_descendant_route(record, visited=set())
         return [
-            await self._reconcile_pending_create(route)
+            await self._create_route_workflow.reconcile_pending_create(route)
             for route in await self._route_store.alist_routes()
         ]
 
