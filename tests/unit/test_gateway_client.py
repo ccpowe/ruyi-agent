@@ -11,8 +11,8 @@ from ruyi_agent.channels.gateway_client import (
     GatewayHTTPClient,
     _filename_from_content_disposition,
 )
-from ruyi_agent.channels.gateway_dto import GatewayTask
-from ruyi_agent.gateway.sse import MAX_SSE_ERROR_BODY_BYTES
+from ruyi_agent.gateway_protocol.dto import GatewayTask
+from ruyi_agent.gateway_protocol.sse import MAX_SSE_ERROR_BODY_BYTES
 
 
 class NeverRespondingTransport(httpx.AsyncBaseTransport):

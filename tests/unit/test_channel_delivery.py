@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from ruyi_agent.channels.gateway_client import GatewayClientError
-from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTask
+from ruyi_agent.gateway_protocol.dto import GatewayPublishedArtifact, GatewayTask
 from ruyi_agent.channels.presentation import (
     ChannelDeliveryCoordinator,
     ChannelDeliveryHooks,

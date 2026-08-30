@@ -32,7 +32,7 @@ from ruyi_agent.channels.feishu.identity import (
 from ruyi_agent.channels.feishu.receipts import FeishuEventClaim, FeishuEventStore
 from ruyi_agent.channels.adapter_lifecycle import ChannelAdapterLifecycle
 from ruyi_agent.channels.gateway_client import GatewayTaskClient
-from ruyi_agent.channels.gateway_dto import GatewayTask
+from ruyi_agent.gateway_protocol.dto import GatewayTask
 from ruyi_agent.channels.media import warn_deprecated_media_root
 from ruyi_agent.channels.presentation import (
     ChannelDeliveryCoordinator,

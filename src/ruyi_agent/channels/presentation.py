@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ruyi_agent.channels.gateway_client import gateway_task_from_payload
-from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTask
+from ruyi_agent.gateway_protocol.dto import GatewayPublishedArtifact, GatewayTask
 from ruyi_agent.channels.task_watch import TaskWatchHooks, TaskWatchManager
 from ruyi_agent.storage.channel_delivery_store import (
     ChannelDeliveryIntent,

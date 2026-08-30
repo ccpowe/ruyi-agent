@@ -12,7 +12,7 @@ from ruyi_agent.gateway.application import (
     GatewayProjection,
 )
 from ruyi_agent.gateway.errors import GatewayTaskError
-from ruyi_agent.gateway.models import TaskListResponse, TaskResponse
+from ruyi_agent.gateway_protocol.dto import TaskListResponse, TaskResponse
 from ruyi_agent.task_models import (
     MetadataScalar,
     TaskRouteRecord,

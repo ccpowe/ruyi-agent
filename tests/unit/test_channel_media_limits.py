@@ -8,7 +8,7 @@ import pytest
 import ruyi_agent.channels.telegram.client as telegram_client_module
 from ruyi_agent.channels.gateway_client import GatewayHTTPClient
 from ruyi_agent.channels.gateway_client import GatewayArtifact
-from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTask
+from ruyi_agent.gateway_protocol.dto import GatewayPublishedArtifact, GatewayTask
 from ruyi_agent.channels.media import MediaLimitError, validate_content_length
 from ruyi_agent.channels.feishu.delivery import FeishuArtifactDelivery
 from ruyi_agent.channels.telegram.delivery import TelegramArtifactDelivery

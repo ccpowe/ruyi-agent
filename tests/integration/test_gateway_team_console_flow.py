@@ -10,7 +10,7 @@ import httpx
 import uvicorn
 
 from ruyi_agent.channels.http.routes import create_gateway_app
-from ruyi_agent.gateway.models import AgentRefResponse
+from ruyi_agent.gateway_protocol.dto import AgentRefResponse
 
 
 class _ConsoleService:

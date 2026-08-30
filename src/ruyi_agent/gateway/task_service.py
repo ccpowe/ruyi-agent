@@ -13,7 +13,7 @@ from ruyi_agent.gateway.application import (
 )
 from ruyi_agent.gateway.attachments import GatewayAttachmentService
 from ruyi_agent.gateway.errors import GatewayTaskError
-from ruyi_agent.gateway.models import (
+from ruyi_agent.gateway_protocol.dto import (
     AttachmentInput,
     TaskMessageListResponse,
     TaskMessageResponse,

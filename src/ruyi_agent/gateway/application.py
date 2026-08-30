@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from ruyi_agent.config.agent_models import AgentConfig, AgentConfigs
 from ruyi_agent.config.agent_parser import coerce_agent_configs
 from ruyi_agent.gateway.errors import GatewayTaskError
-from ruyi_agent.gateway.models import (
+from ruyi_agent.gateway_protocol.dto import (
     AgentRefResponse,
     PublishedArtifactResponse,
     ReviewResponse,

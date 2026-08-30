@@ -9,7 +9,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTask
+from ruyi_agent.gateway_protocol.dto import GatewayPublishedArtifact, GatewayTask
 
 
 FEISHU_TEXT_CHUNK_LIMIT = 4000

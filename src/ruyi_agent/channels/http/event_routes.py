@@ -12,8 +12,8 @@ from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import StreamingResponse
 
 from ruyi_agent.gateway.errors import GatewayTaskError
-from ruyi_agent.gateway.sse import encode_task_stream_event, is_valid_task_event_cursor
-from ruyi_agent.runtime.task_events import TaskStreamEvent
+from ruyi_agent.gateway_protocol.sse import encode_task_stream_event, is_valid_task_event_cursor
+from ruyi_agent.gateway_protocol.contracts import TaskStreamEvent
 
 from .context import GatewayHttpContext
 

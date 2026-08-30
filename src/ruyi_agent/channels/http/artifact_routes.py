@@ -8,8 +8,9 @@ from urllib.parse import quote
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import Response
 
+from ruyi_agent.gateway_protocol.dto import ArtifactDownloadRequest
+
 from .context import GatewayHttpContext
-from .schemas import ArtifactDownloadRequest
 
 
 def attach_artifact_routes(app: FastAPI, context: GatewayHttpContext) -> None:

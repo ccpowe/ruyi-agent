@@ -5,9 +5,11 @@ from __future__ import annotations
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 
-from ruyi_agent.gateway.models import (
+from ruyi_agent.gateway_protocol.dto import (
     AgentListResponse,
     AgentRefResponse,
+    CreateTaskRequest,
+    SendInputRequest,
     TaskListResponse,
     TaskMessageListResponse,
     TaskResponse,
@@ -15,7 +17,6 @@ from ruyi_agent.gateway.models import (
 )
 
 from .context import GatewayHttpContext
-from .schemas import CreateTaskRequest, SendInputRequest
 
 
 def attach_task_routes(app: FastAPI, context: GatewayHttpContext) -> None:

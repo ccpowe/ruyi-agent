@@ -41,7 +41,7 @@ def test_task_storage_facades_keep_public_type_identity() -> None:
     assert FacadeAlreadyExistsError is StoredTaskAlreadyExistsError
     assert FacadeBudgetError is TaskRootBudgetExceededError
     assert TaskEventLedger.__module__.endswith("task_event_ledger")
-    assert TaskStreamEvent.__module__.endswith("task_event_contracts")
+    assert TaskStreamEvent.__module__.endswith("gateway_protocol.contracts")
 
 
 def test_task_storage_modules_stay_below_line_budget() -> None:

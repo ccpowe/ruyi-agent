@@ -11,14 +11,20 @@ from typing import Any, Protocol
 import httpx
 from pydantic import ValidationError
 
-from ruyi_agent.channels.gateway_dto import GatewayAgent, GatewayTask
 from ruyi_agent.channels.media import (
     MediaLimitError,
     read_bounded_media,
     validate_content_length,
 )
-from ruyi_agent.gateway._http_transport import (
-    GatewayHTTPTransport,
+from ruyi_agent.gateway_protocol.client import (
+    GatewayProtocolClient,
+    artifact_download_path,
+    artifact_download_payload,
+    task_artifact_download_path,
+)
+from ruyi_agent.gateway_protocol.dto import GatewayAgent, GatewayTask
+from ruyi_agent.gateway_protocol.sse import GatewayTaskEvent
+from ruyi_agent.gateway_protocol.transport import (
     GatewayTransportHTTPStatusError,
     GatewayTransportInvalidJSONError,
     GatewayTransportInvalidPayloadError,
@@ -26,10 +32,7 @@ from ruyi_agent.gateway._http_transport import (
     GatewayTransportStreamError,
     gateway_bearer_auth_headers,
 )
-from ruyi_agent.gateway.sse import (
-    GatewayTaskEvent,
-)
-from ruyi_agent.runtime.task_events import (
+from ruyi_agent.gateway_protocol.projection import (
     MAX_SHORT_EVENT_TEXT_LENGTH,
     normalize_task_event_text,
 )
@@ -162,7 +165,7 @@ class GatewayHTTPClient:
         if max_download_bytes is not None and max_download_bytes <= 0:
             raise ValueError("max_download_bytes must be positive")
         self._max_download_bytes = max_download_bytes
-        self._http = GatewayHTTPTransport(
+        self._protocol = GatewayProtocolClient(
             base_url=self._base_url,
             timeout=timeout,
             headers=gateway_bearer_auth_headers(bearer_token),
@@ -177,22 +180,21 @@ class GatewayHTTPClient:
         limit: int = 1,
         root_task_id: str | None = None,
     ) -> list[GatewayTask]:
-        params = {
-            "limit": str(limit),
-            **{f"metadata.{key}": value for key, value in metadata.items()},
-        }
-        if agent_name is not None:
-            params["agent_name"] = agent_name
-        if root_task_id is not None:
-            params["root_task_id"] = root_task_id
-        payload = await self._request("GET", "/tasks", params=params)
+        payload = await self._request(
+            self._protocol.list_tasks(
+                agent_name=agent_name,
+                metadata=metadata,
+                limit=limit,
+                root_task_id=root_task_id,
+            )
+        )
         return [
             gateway_task_from_payload(item)
             for item in _gateway_list_items(payload, kind="Task")
         ]
 
     async def list_agents(self) -> list[GatewayAgent]:
-        payload = await self._request("GET", "/agents")
+        payload = await self._request(self._protocol.list_agents())
         return [
             gateway_agent_from_payload(item)
             for item in _gateway_list_items(payload, kind="Agent")
@@ -207,15 +209,15 @@ class GatewayHTTPClient:
         attachments: list[dict[str, str]] | None = None,
         idempotency_key: str | None = None,
     ) -> GatewayTask:
-        input_payload: dict[str, Any] = {"content": content}
-        if attachments:
-            input_payload["attachments"] = attachments
         return gateway_task_from_payload(
             await self._request(
-                "POST",
-                f"/agents/{agent_name}/tasks",
-                json={"input": input_payload, "metadata": metadata},
-                idempotency_key=idempotency_key,
+                self._protocol.create_task(
+                    agent_name=agent_name,
+                    content=content,
+                    metadata=metadata,
+                    attachments=attachments,
+                    idempotency_key=idempotency_key,
+                )
             )
         )
 
@@ -227,23 +229,22 @@ class GatewayHTTPClient:
         attachments: list[dict[str, str]] | None = None,
         idempotency_key: str | None = None,
     ) -> GatewayTask:
-        input_payload: dict[str, Any] = {"content": content}
-        if attachments:
-            input_payload["attachments"] = attachments
         return gateway_task_from_payload(
             await self._request(
-                "POST",
-                f"/tasks/{task_id}/input",
-                json={"input": input_payload},
-                idempotency_key=idempotency_key,
+                self._protocol.send_input(
+                    task_id=task_id,
+                    content=content,
+                    attachments=attachments,
+                    idempotency_key=idempotency_key,
+                )
             )
         )
 
     async def download_artifact(self, *, path: str) -> GatewayArtifact:
         headers, content = await self._download_raw(
             "POST",
-            "/artifacts/download",
-            json={"path": path},
+            "/" + artifact_download_path(),
+            json=artifact_download_payload(path),
         )
         content_disposition = headers.get("content-disposition", "")
         filename = (
@@ -264,7 +265,7 @@ class GatewayHTTPClient:
     ) -> GatewayArtifact:
         headers, content = await self._download_raw(
             "GET",
-            f"/tasks/{task_id}/artifacts/{artifact_id}/download",
+            "/" + task_artifact_download_path(task_id, artifact_id),
         )
         content_disposition = headers.get("content-disposition", "")
         filename = (
@@ -279,7 +280,7 @@ class GatewayHTTPClient:
 
     async def get_task(self, *, task_id: str) -> GatewayTask:
         return gateway_task_from_payload(
-            await self._request("GET", f"/tasks/{task_id}")
+            await self._request(self._protocol.get_task(task_id=task_id))
         )
 
     async def list_task_messages(
@@ -289,13 +290,12 @@ class GatewayHTTPClient:
         cursor: str | None = None,
         limit: int = 20,
     ) -> dict[str, Any]:
-        params = {"limit": str(limit)}
-        if cursor is not None:
-            params["cursor"] = cursor
         return await self._request(
-            "GET",
-            f"/tasks/{task_id}/messages",
-            params=params,
+            self._protocol.list_task_messages(
+                task_id=task_id,
+                cursor=cursor,
+                limit=limit,
+            )
         )
 
     @asynccontextmanager
@@ -309,8 +309,8 @@ class GatewayHTTPClient:
         """Open an opt-in Task SSE stream without expanding adapter protocols."""
 
         try:
-            async with self._http.stream_task_events(
-                f"/tasks/{task_id}/events",
+            async with self._protocol.open_task_event_stream(
+                task_id=task_id,
                 run_count=run_count,
                 last_event_id=last_event_id,
             ) as events:
@@ -352,29 +352,20 @@ class GatewayHTTPClient:
     ) -> GatewayTask:
         return gateway_task_from_payload(
             await self._request(
-                "POST",
-                f"/tasks/{task_id}/reviews/{review_id}/decision",
-                json={"decisions": decisions},
+                self._protocol.submit_review_decision(
+                    task_id=task_id,
+                    review_id=review_id,
+                    decisions=decisions,
+                )
             )
         )
 
     async def _request(
         self,
-        method: str,
-        path: str,
-        *,
-        params: dict[str, str] | None = None,
-        json: dict[str, Any] | None = None,
-        idempotency_key: str | None = None,
+        request: Any,
     ) -> dict[str, Any]:
         try:
-            return await self._http.request_json(
-                method,
-                path,
-                params=params,
-                json=json,
-                idempotency_key=idempotency_key,
-            )
+            return await request
         except GatewayTransportHTTPStatusError as exc:
             raise _gateway_http_status_error(exc) from exc
         except GatewayTransportInvalidJSONError as exc:
@@ -398,7 +389,7 @@ class GatewayHTTPClient:
         json: dict[str, Any] | None = None,
     ) -> httpx.Response:
         try:
-            return await self._http.request_raw(method, path, json=json)
+            return await self._protocol.request_raw(method, path, json=json)
         except GatewayTransportHTTPStatusError as exc:
             raise _gateway_http_status_error(exc) from exc
         except GatewayTransportInvalidJSONError as exc:
@@ -424,47 +415,38 @@ class GatewayHTTPClient:
         if self._max_download_bytes is None:
             response = await self._request_raw(method, path, json=json)
             return response.headers, response.content
-        async with httpx.AsyncClient(
-            base_url=self._base_url,
-            timeout=self._timeout,
-            headers={
-                **gateway_bearer_auth_headers(self._bearer_token),
-                "Accept": "*/*",
-            },
-            transport=self._transport,
-        ) as client:
-            async with client.stream(method, path, json=json) as response:
-                if not response.is_success:
-                    try:
-                        error_body = await read_bounded_media(
-                            response.aiter_bytes(),
-                            max_bytes=min(self._max_download_bytes, 64 * 1024),
-                        )
-                        payload = json_module.loads(error_body)
-                    except MediaLimitError:
-                        raise
-                    except (UnicodeDecodeError, ValueError) as exc:
-                        raise GatewayClientError(
-                            status_code=502,
-                            code="gateway_error",
-                            message="Gateway returned invalid JSON",
-                        ) from exc
-                    raise _gateway_http_status_error(
-                        GatewayTransportHTTPStatusError(
-                            status_code=response.status_code,
-                            payload=payload,
-                        )
+        async with self._protocol.stream_raw(method, path, json=json) as response:
+            if not response.is_success:
+                try:
+                    error_body = await read_bounded_media(
+                        response.aiter_bytes(),
+                        max_bytes=min(self._max_download_bytes, 64 * 1024),
                     )
-                validate_content_length(
-                    response.headers,
-                    max_bytes=self._max_download_bytes,
-                    values=response.headers.get_list("content-length"),
+                    payload = json_module.loads(error_body)
+                except MediaLimitError:
+                    raise
+                except (UnicodeDecodeError, ValueError) as exc:
+                    raise GatewayClientError(
+                        status_code=502,
+                        code="gateway_error",
+                        message="Gateway returned invalid JSON",
+                    ) from exc
+                raise _gateway_http_status_error(
+                    GatewayTransportHTTPStatusError(
+                        status_code=response.status_code,
+                        payload=payload,
+                    )
                 )
-                content = await read_bounded_media(
-                    response.aiter_bytes(),
-                    max_bytes=self._max_download_bytes,
-                )
-                return response.headers, content
+            validate_content_length(
+                response.headers,
+                max_bytes=self._max_download_bytes,
+                values=response.headers.get_list("content-length"),
+            )
+            content = await read_bounded_media(
+                response.aiter_bytes(),
+                max_bytes=self._max_download_bytes,
+            )
+            return response.headers, content
 
 
 async def _map_task_event_errors(

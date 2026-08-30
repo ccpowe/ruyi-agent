@@ -5,10 +5,14 @@ from __future__ import annotations
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from ruyi_agent.gateway.models import ReviewListResponse, ReviewResponse, TaskResponse
+from ruyi_agent.gateway_protocol.dto import (
+    ReviewDecisionInput,
+    ReviewListResponse,
+    ReviewResponse,
+    TaskResponse,
+)
 
 from .context import GatewayHttpContext
-from .schemas import ReviewDecisionInput
 
 
 def attach_review_routes(app: FastAPI, context: GatewayHttpContext) -> None:

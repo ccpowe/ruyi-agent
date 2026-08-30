@@ -14,7 +14,7 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 
-from ruyi_agent.gateway.sse import (
+from ruyi_agent.gateway_protocol.sse import (
     GatewayTaskEvent,
     MAX_SSE_LINE_BYTES,
     SSEProtocolError,
@@ -618,6 +618,43 @@ def test_sse_byte_decoder_handles_utf8_bom_and_split_crlf() -> None:
             GatewayTaskEvent(
                 event_type="assistant.delta",
                 data={"content": "\u4f60\u597d"},
+            )
+        ]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n", "\r"])
+def test_sse_byte_decoder_combines_multidata_and_preserves_cursor(
+    line_ending: str,
+) -> None:
+    wire = line_ending.join(
+        [
+            "id: cursor-1",
+            "retry: 1000",
+            "event: assistant.delta",
+            'data: {"content":"hello",',
+            'data: "suffix":" world"}',
+            "",
+            "",
+        ]
+    ).encode("utf-8")
+
+    async def chunks() -> AsyncIterator[bytes]:
+        midpoint = len(wire) // 2
+        yield wire[:midpoint]
+        yield wire[midpoint:]
+
+    async def scenario() -> None:
+        events = [
+            event
+            async for event in iter_gateway_task_events(iter_utf8_sse_lines(chunks()))
+        ]
+        assert events == [
+            GatewayTaskEvent(
+                event_type="assistant.delta",
+                event_id="cursor-1",
+                data={"content": "hello", "suffix": " world"},
             )
         ]
 

@@ -23,7 +23,7 @@ from ruyi_agent.runtime.delegation.context import (
     ROOT_ID_FIELD,
     VISITED_NODES_FIELD,
 )
-from ruyi_agent.gateway.models import TaskResponse
+from ruyi_agent.gateway_protocol.dto import TaskResponse
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.channels.http.routes import create_gateway_app
 from ruyi_agent.runtime.mailbox.service import AgentMailbox

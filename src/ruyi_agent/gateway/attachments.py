@@ -9,7 +9,8 @@ from typing import Any
 
 from ruyi_agent.gateway.application import GatewayApplicationContext
 from ruyi_agent.gateway.errors import GatewayTaskError
-from ruyi_agent.gateway.models import AttachmentInput, PreparedInput
+from ruyi_agent.gateway.models import PreparedInput
+from ruyi_agent.gateway_protocol.dto import AttachmentInput
 from ruyi_agent.task_models import MetadataScalar
 
 ATTACHMENT_METADATA_KEY = "attachments"

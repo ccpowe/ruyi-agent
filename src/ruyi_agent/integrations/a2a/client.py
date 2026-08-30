@@ -28,8 +28,9 @@ from typing import Any, Literal, TypeAlias
 import httpx
 
 from ruyi_agent.config.loader import RemoteRef
-from ruyi_agent.gateway._http_transport import (
-    GatewayHTTPTransport,
+from ruyi_agent.gateway_protocol.client import GatewayProtocolClient
+from ruyi_agent.gateway_protocol.sse import GatewayTaskEvent
+from ruyi_agent.gateway_protocol.transport import (
     GatewayTransportHTTPStatusError,
     GatewayTransportInvalidJSONError,
     GatewayTransportInvalidPayloadError,
@@ -37,10 +38,7 @@ from ruyi_agent.gateway._http_transport import (
     GatewayTransportStreamError,
     gateway_bearer_auth_headers,
 )
-from ruyi_agent.gateway.sse import (
-    GatewayTaskEvent,
-)
-from ruyi_agent.runtime.task_events import (
+from ruyi_agent.gateway_protocol.projection import (
     MAX_SHORT_EVENT_TEXT_LENGTH,
     normalize_task_event_text,
 )
@@ -159,23 +157,21 @@ class A2AClient:
             )
             task_id = response["task_id"]
         """
-        input_payload: dict[str, Any] = {"content": input_content}
         if remote_ref.create_idempotency_guaranteed and idempotency_key is None:
             raise ValueError(
                 "A remote_ref declaring ruyi_gateway_v1 create idempotency "
                 "requires an Idempotency-Key"
             )
-        if attachments:
-            input_payload["attachments"] = attachments
-        payload: dict[str, Any] = {"input": input_payload, "metadata": metadata}
-        if webhook is not None:
-            payload["webhook"] = webhook
         return await self._request_json(
             remote_ref,
-            "POST",
-            f"agents/{remote_ref.remote_agent_name}/tasks",
-            json=payload,
-            idempotency_key=idempotency_key,
+            self._http_transport(remote_ref).create_task(
+                agent_name=remote_ref.remote_agent_name,
+                content=input_content,
+                metadata=metadata,
+                attachments=attachments,
+                webhook=webhook,
+                idempotency_key=idempotency_key,
+            ),
         )
 
     async def get_task(self, remote_ref: RemoteRef, *, task_id: str) -> dict[str, Any]:
@@ -194,7 +190,10 @@ class A2AClient:
         Raises:
             A2AClientError: 任务不存在、网络错误等
         """
-        return await self._request_json(remote_ref, "GET", f"tasks/{task_id}")
+        return await self._request_json(
+            remote_ref,
+            self._http_transport(remote_ref).get_task(task_id=task_id),
+        )
 
     async def list_task_messages(
         self,
@@ -206,14 +205,13 @@ class A2AClient:
     ) -> dict[str, Any]:
         """Fetch one opaque page of the remote Task's public transcript."""
 
-        params = {"limit": str(limit)}
-        if cursor is not None:
-            params["cursor"] = cursor
         return await self._request_json(
             remote_ref,
-            "GET",
-            f"tasks/{task_id}/messages",
-            params=params,
+            self._http_transport(remote_ref).list_task_messages(
+                task_id=task_id,
+                cursor=cursor,
+                limit=limit,
+            ),
         )
 
     @asynccontextmanager
@@ -227,10 +225,9 @@ class A2AClient:
     ) -> AsyncIterator[AsyncIterator[GatewayTaskEvent]]:
         """Open a downstream Task SSE stream and keep its response alive."""
 
-        transport = self._http_transport(remote_ref)
         try:
-            async with transport.stream_task_events(
-                f"tasks/{task_id}/events",
+            async with self._http_transport(remote_ref).open_task_event_stream(
+                task_id=task_id,
                 run_count=run_count,
                 last_event_id=last_event_id,
             ) as events:
@@ -282,15 +279,14 @@ class A2AClient:
         Raises:
             A2AClientError: 任务不存在、任务正在运行（无法接收输入）等
         """
-        input_payload: dict[str, Any] = {"content": input_content}
-        if attachments:
-            input_payload["attachments"] = attachments
         return await self._request_json(
             remote_ref,
-            "POST",
-            f"tasks/{task_id}/input",
-            json={"input": input_payload},
-            idempotency_key=idempotency_key,
+            self._http_transport(remote_ref).send_input(
+                task_id=task_id,
+                content=input_content,
+                attachments=attachments,
+                idempotency_key=idempotency_key,
+            ),
         )
 
     async def cancel_task(
@@ -314,7 +310,10 @@ class A2AClient:
         Raises:
             A2AClientError: 任务不存在、任务已完成（无法取消）等
         """
-        return await self._request_json(remote_ref, "POST", f"tasks/{task_id}/cancel")
+        return await self._request_json(
+            remote_ref,
+            self._http_transport(remote_ref).cancel_task(task_id=task_id),
+        )
 
     async def submit_review_decision(
         self,
@@ -331,20 +330,17 @@ class A2AClient:
         """
         return await self._request_json(
             remote_ref,
-            "POST",
-            f"tasks/{task_id}/reviews/{review_id}/decision",
-            json={"decisions": decisions},
+            self._http_transport(remote_ref).submit_review_decision(
+                task_id=task_id,
+                review_id=review_id,
+                decisions=decisions,
+            ),
         )
 
     async def _request_json(
         self,
         remote_ref: RemoteRef,
-        method: str,
-        path: str,
-        *,
-        params: dict[str, str] | None = None,
-        json: dict[str, Any] | None = None,
-        idempotency_key: str | None = None,
+        request: Any,
     ) -> dict[str, Any]:
         """
         发送 HTTP 请求并返回 JSON 响应
@@ -376,13 +372,7 @@ class A2AClient:
         4. 远程网关返回错误 → 透传状态码和错误信息
         """
         try:
-            return await self._http_transport(remote_ref).request_json(
-                method,
-                path,
-                params=params,
-                json=json,
-                idempotency_key=idempotency_key,
-            )
+            return await request
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise A2AClientError(
                 status_code=502,
@@ -408,8 +398,8 @@ class A2AClient:
         except GatewayTransportHTTPStatusError as exc:
             raise _remote_http_status_error(remote_ref, exc) from exc
 
-    def _http_transport(self, remote_ref: RemoteRef) -> GatewayHTTPTransport:
-        return GatewayHTTPTransport(
+    def _http_transport(self, remote_ref: RemoteRef) -> GatewayProtocolClient:
+        return GatewayProtocolClient(
             base_url=remote_ref.url,
             timeout=self._timeout,
             headers=self._build_headers(remote_ref),

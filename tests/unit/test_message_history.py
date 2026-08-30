@@ -9,7 +9,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from ruyi_agent.gateway.errors import GatewayTaskError
-from ruyi_agent.gateway.models import TaskRouteRecord
+from ruyi_agent.task_models import TaskRouteRecord
 from ruyi_agent.gateway.routing import (
     TaskRouter,
     _decode_task_message_cursor,

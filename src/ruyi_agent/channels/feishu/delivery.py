@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ruyi_agent.channels.feishu.client import FeishuClient
 from ruyi_agent.channels.gateway_client import GatewayTaskClient
-from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTask
+from ruyi_agent.gateway_protocol.dto import GatewayPublishedArtifact, GatewayTask
 from ruyi_agent.channels.media import MediaLimitError
 
 

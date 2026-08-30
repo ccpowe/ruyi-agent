@@ -15,7 +15,7 @@ from ruyi_agent.gateway.application import (
 )
 from ruyi_agent.gateway.errors import GatewayTaskError
 from ruyi_agent.gateway.listing import GatewayListingService
-from ruyi_agent.gateway.models import ReviewListResponse, ReviewResponse, TaskResponse
+from ruyi_agent.gateway_protocol.dto import ReviewListResponse, ReviewResponse, TaskResponse
 from ruyi_agent.task_models import PendingReviewRecord, TaskRouteRecord
 
 

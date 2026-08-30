@@ -5,7 +5,7 @@ from typing import Any, Protocol, Sequence
 
 import httpx
 
-from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTask
+from ruyi_agent.gateway_protocol.dto import GatewayPublishedArtifact, GatewayTask
 from ruyi_agent.channels.media import (
     MediaLimitError,
     read_bounded_media,

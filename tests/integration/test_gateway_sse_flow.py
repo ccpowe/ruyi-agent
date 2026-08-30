@@ -13,7 +13,7 @@ import uvicorn
 import ruyi_agent.runtime.agent_factory as agent_factory_module
 from ruyi_agent.channels.http.routes import create_gateway_app
 from ruyi_agent.config.loader import LocalWorkerSpec, RemoteRef
-from ruyi_agent.gateway.sse import GatewayTaskEvent, iter_gateway_task_events
+from ruyi_agent.gateway_protocol.sse import GatewayTaskEvent, iter_gateway_task_events
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.runtime.delegation.async_runtime import AgentControl
 from ruyi_agent.storage.task_store import TaskStore

@@ -17,7 +17,7 @@ from pydantic import Field
 from ruyi_agent.channels.gateway_client import GatewayHTTPClient
 from ruyi_agent.channels.http.routes import create_gateway_app
 from ruyi_agent.config.loader import LocalWorkerSpec, RemoteRef
-from ruyi_agent.gateway.models import TaskRouteRecord
+from ruyi_agent.task_models import TaskRouteRecord
 from ruyi_agent.gateway.routing import _encode_task_message_cursor
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.integrations.a2a.client import A2AClient

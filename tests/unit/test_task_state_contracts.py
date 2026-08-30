@@ -6,17 +6,17 @@ from enum import StrEnum
 import pytest
 from fastapi.testclient import TestClient
 
-import ruyi_agent.channels.gateway_dto as channel_dto
+import ruyi_agent.gateway_protocol.dto as channel_dto
 import ruyi_agent.channels.task_watch as task_watch
 import ruyi_agent.channels.turn as channel_turn
-import ruyi_agent.gateway.models as gateway_models
+import ruyi_agent.gateway_protocol.dto as gateway_models
 import ruyi_agent.runtime.mailbox.service as mailbox_service
 from ruyi_agent.channels.gateway_client import (
     GatewayClientError,
     gateway_task_from_payload,
 )
-from ruyi_agent.gateway.models import TaskResponse, TaskWebhookEvent
-from ruyi_agent.gateway.sse import GatewayTaskEvent, task_stream_event_from_gateway
+from ruyi_agent.gateway_protocol.dto import TaskResponse, TaskWebhookEvent
+from ruyi_agent.gateway_protocol.sse import GatewayTaskEvent, task_stream_event_from_gateway
 from ruyi_agent.storage.task_codecs import row_to_task_record, task_record_values
 from ruyi_agent.task_models import (
     EXECUTING_TASK_STATES,

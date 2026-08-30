@@ -13,7 +13,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
-from ruyi_agent.gateway.sse import (
+from ruyi_agent.gateway_protocol.sse import (
     encode_task_stream_event,
 )
 from ruyi_agent.runtime.delegation.async_runtime import AgentControl

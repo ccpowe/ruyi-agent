@@ -26,10 +26,10 @@ from ruyi_agent.gateway.commands import (
     GatewayCommandService,
 )
 from ruyi_agent.gateway.listing import GatewayListingService
-from ruyi_agent.gateway.models import (
+from ruyi_agent.gateway.models import GatewayArtifact
+from ruyi_agent.gateway_protocol.dto import (
     AgentRefResponse,
     AttachmentInput,
-    GatewayArtifact,
     ReviewListResponse,
     ReviewResponse,
     TaskListResponse,

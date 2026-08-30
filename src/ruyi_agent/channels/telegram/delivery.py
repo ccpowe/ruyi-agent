@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ruyi_agent.channels.gateway_client import GatewayTaskClient
-from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTask
+from ruyi_agent.gateway_protocol.dto import GatewayPublishedArtifact, GatewayTask
 from ruyi_agent.channels.media import MediaLimitError
 from ruyi_agent.channels.telegram.client import (
     IMAGE_ATTACHMENT_EXTENSIONS,

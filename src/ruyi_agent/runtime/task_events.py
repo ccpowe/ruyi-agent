@@ -1,6 +1,6 @@
 """Compatibility facade for the durable fixed-run Task event stream."""
 
-from ruyi_agent.runtime.task_event_contracts import (
+from ruyi_agent.gateway_protocol.contracts import (
     DEFAULT_EVENT_BATCH_SIZE,
     DEFAULT_MAX_PENDING_DELTAS,
     DEFAULT_TAIL_POLL_SECONDS,
@@ -27,7 +27,7 @@ from ruyi_agent.runtime.task_event_contracts import (
     TaskRunMismatchError,
     TaskStreamEvent,
 )
-from ruyi_agent.runtime.task_event_cursor import (
+from ruyi_agent.gateway_protocol.cursor import (
     decode_task_event_cursor,
     encode_task_event_cursor,
 )
@@ -35,7 +35,7 @@ from ruyi_agent.runtime.task_event_ledger import (
     TaskEventLedger,
     TaskEventSubscription,
 )
-from ruyi_agent.runtime.task_event_projection import (
+from ruyi_agent.gateway_protocol.projection import (
     artifact_event_data,
     assistant_delta_from_stream_part,
     lifecycle_event_data,

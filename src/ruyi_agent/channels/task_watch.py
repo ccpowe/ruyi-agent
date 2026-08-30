@@ -13,7 +13,7 @@ from ruyi_agent.channels.gateway_client import (
     GatewayTaskClient,
     gateway_task_from_payload,
 )
-from ruyi_agent.channels.gateway_dto import GatewayTask
+from ruyi_agent.gateway_protocol.dto import GatewayTask
 from ruyi_agent.task_models import SETTLED_TASK_STATES
 
 

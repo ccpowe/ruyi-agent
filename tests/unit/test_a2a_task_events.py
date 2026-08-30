@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from ruyi_agent.config.loader import RemoteRef
-from ruyi_agent.gateway.sse import MAX_SSE_ERROR_BODY_BYTES
+from ruyi_agent.gateway_protocol.sse import MAX_SSE_ERROR_BODY_BYTES
 from ruyi_agent.integrations.a2a.client import A2AClient, A2AClientError
 
 

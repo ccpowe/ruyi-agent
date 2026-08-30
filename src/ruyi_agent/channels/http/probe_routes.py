@@ -7,8 +7,13 @@ from collections.abc import Callable
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from ruyi_agent.gateway_protocol.dto import (
+    HealthProbeResponse,
+    NotReadyProbeResponse,
+    ReadyProbeResponse,
+)
+
 from .context import GatewayHttpContext
-from .schemas import HealthProbeResponse, NotReadyProbeResponse, ReadyProbeResponse
 
 _PROBE_HEADERS = {"Cache-Control": "no-store"}
 

@@ -6,6 +6,16 @@ from collections.abc import Callable
 
 from fastapi import FastAPI, Request
 
+from ruyi_agent.gateway_protocol.dto import (
+    ArtifactDownloadRequest as ArtifactDownloadRequest,
+    CreateTaskRequest as CreateTaskRequest,
+    HealthProbeResponse as HealthProbeResponse,
+    NotReadyProbeResponse as NotReadyProbeResponse,
+    ReadyProbeResponse as ReadyProbeResponse,
+    ReviewDecisionInput as ReviewDecisionInput,
+    SendInputRequest as SendInputRequest,
+    TaskInput as TaskInput,
+)
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 
 from .artifact_routes import attach_artifact_routes
@@ -22,16 +32,6 @@ from .event_routes import (
 )
 from .probe_routes import attach_probe_routes
 from .review_routes import attach_review_routes
-from .schemas import (
-    ArtifactDownloadRequest as ArtifactDownloadRequest,
-    CreateTaskRequest as CreateTaskRequest,
-    HealthProbeResponse as HealthProbeResponse,
-    NotReadyProbeResponse as NotReadyProbeResponse,
-    ReadyProbeResponse as ReadyProbeResponse,
-    ReviewDecisionInput as ReviewDecisionInput,
-    SendInputRequest as SendInputRequest,
-    TaskInput as TaskInput,
-)
 from .task_routes import attach_task_routes
 from .team_console_auth import TeamConsoleNoStoreMiddleware
 

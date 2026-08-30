@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from ruyi_agent.channels.gateway_dto import GatewayTask
+from ruyi_agent.gateway_protocol.dto import GatewayTask
 from ruyi_agent.channels.presentation import (
     ChannelDeliveryCoordinator,
     ReviewPresenter,

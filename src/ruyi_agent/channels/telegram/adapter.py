@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ruyi_agent.channels.gateway_client import GatewayTaskClient
-from ruyi_agent.channels.gateway_dto import GatewayTask
+from ruyi_agent.gateway_protocol.dto import GatewayTask
 from ruyi_agent.channels.adapter_lifecycle import ChannelAdapterLifecycle
 from ruyi_agent.channels.media import warn_deprecated_media_root
 from ruyi_agent.channels.presentation import (

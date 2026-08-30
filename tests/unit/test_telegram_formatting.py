@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ruyi_agent.channels.gateway_dto import GatewayTask
+from ruyi_agent.gateway_protocol.dto import GatewayTask
 
 from _telegram_adapter_support import (
     FakeGatewayClient,

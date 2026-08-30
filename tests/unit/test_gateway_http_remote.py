@@ -26,7 +26,7 @@ from ruyi_agent.runtime.delegation.context import (
     ROOT_ID_FIELD,
     VISITED_NODES_FIELD,
 )
-from ruyi_agent.gateway.models import TaskRouteRecord
+from ruyi_agent.task_models import TaskRouteRecord
 from ruyi_agent.gateway.commands import command_request_hash
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.channels.http.routes import create_gateway_app

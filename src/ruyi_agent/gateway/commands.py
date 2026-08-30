@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from ruyi_agent.gateway.application import GatewayApplicationContext
 from ruyi_agent.gateway.errors import GatewayEffectDisposition, GatewayTaskError
-from ruyi_agent.gateway.models import AttachmentInput, TaskResponse
+from ruyi_agent.gateway_protocol.dto import AttachmentInput, TaskResponse
 from ruyi_agent.gateway.task_service import GatewayTaskService
 from ruyi_agent.storage.gateway_command_store import (
     GatewayCommandClaim,
