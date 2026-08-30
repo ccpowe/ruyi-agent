@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import ruyi_agent.entrypoints.main as entrypoint
+from ruyi_agent.config.paths import RuyiPaths
+from ruyi_agent.config.runtime_settings import RuntimeSettings
+from ruyi_agent.config.runtime_settings import load_runtime_settings
 
 
 class FakeRunner:
@@ -13,26 +16,46 @@ class FakeRunner:
     def run_channels(
         self,
         channels: tuple[str, ...],
-        settings: object | None = None,
+        settings: RuntimeSettings,
     ) -> None:
         self.calls.append(("channels", channels, settings))
 
 
 def _runtime_settings(
+    tmp_path: Path,
     *,
     telegram: bool = False,
     feishu: bool = False,
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        channels=SimpleNamespace(
-            telegram=SimpleNamespace(
-                bot_token="telegram-token" if telegram else None,
-            ),
-            feishu=SimpleNamespace(
-                app_id="feishu-id" if feishu else None,
-                app_secret="feishu-secret" if feishu else None,
-            ),
-        )
+) -> RuntimeSettings:
+    ruyi_home = tmp_path / ".ruyi_agent"
+    ruyi_home.mkdir()
+    (ruyi_home / "ruyi.toml").write_text("", encoding="utf-8")
+    settings = load_runtime_settings(
+        RuyiPaths(
+            ruyi_home=ruyi_home,
+            config_dir=ruyi_home / "config",
+            data_dir=ruyi_home / "data",
+            skills_dir=ruyi_home / "skills",
+            workspace=tmp_path,
+        ),
+        env={},
+    )
+    telegram_settings = replace(
+        settings.channels.telegram,
+        bot_token="telegram-token" if telegram else None,
+    )
+    feishu_settings = replace(
+        settings.channels.feishu,
+        app_id="feishu-id" if feishu else None,
+        app_secret="feishu-secret" if feishu else None,
+    )
+    return replace(
+        settings,
+        channels=replace(
+            settings.channels,
+            telegram=telegram_settings,
+            feishu=feishu_settings,
+        ),
     )
 
 
@@ -57,46 +80,52 @@ def test_cli_requires_an_explicit_entrypoint(capsys) -> None:
 
 
 def test_cli_all_starts_gateway_only_when_no_adapters_are_configured(
+    tmp_path: Path,
     monkeypatch,
 ) -> None:
     _clear_channel_env(monkeypatch)
+    settings = _runtime_settings(tmp_path)
     monkeypatch.setattr(
         entrypoint,
         "configure_runtime_environment",
-        lambda **kwargs: _runtime_settings(),
+        lambda **kwargs: settings,
     )
     runner = FakeRunner()
 
     entrypoint.main(["--all"], runner=runner)
 
     assert runner.calls[0][:2] == ("channels", ("gateway",))
+    assert runner.calls[0][2] is settings
 
 
-def test_cli_all_starts_only_configured_adapters(monkeypatch) -> None:
+def test_cli_all_starts_only_configured_adapters(tmp_path: Path, monkeypatch) -> None:
     _clear_channel_env(monkeypatch)
     monkeypatch.setenv("FEISHU_APP_ID", "feishu-id")
     monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret")
+    settings = _runtime_settings(tmp_path, feishu=True)
     monkeypatch.setattr(
         entrypoint,
         "configure_runtime_environment",
-        lambda **kwargs: _runtime_settings(feishu=True),
+        lambda **kwargs: settings,
     )
     runner = FakeRunner()
 
     entrypoint.main(["--all"], runner=runner)
 
     assert runner.calls[0][:2] == ("channels", ("gateway", "feishu"))
+    assert runner.calls[0][2] is settings
 
 
-def test_cli_all_starts_all_configured_adapters(monkeypatch) -> None:
+def test_cli_all_starts_all_configured_adapters(tmp_path: Path, monkeypatch) -> None:
     _clear_channel_env(monkeypatch)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "telegram-token")
     monkeypatch.setenv("FEISHU_APP_ID", "feishu-id")
     monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret")
+    settings = _runtime_settings(tmp_path, telegram=True, feishu=True)
     monkeypatch.setattr(
         entrypoint,
         "configure_runtime_environment",
-        lambda **kwargs: _runtime_settings(telegram=True, feishu=True),
+        lambda **kwargs: settings,
     )
     runner = FakeRunner()
 
@@ -106,6 +135,7 @@ def test_cli_all_starts_all_configured_adapters(monkeypatch) -> None:
         "channels",
         ("gateway", "telegram", "feishu"),
     )
+    assert runner.calls[0][2] is settings
 
 
 def test_cli_all_requires_existing_config_without_creating_templates(
@@ -132,30 +162,37 @@ def test_cli_all_requires_existing_config_without_creating_templates(
     assert not (user_home / ".ruyi_agent").exists()
 
 
-def test_cli_single_channel_starts_gateway_with_selected_adapter(monkeypatch) -> None:
+def test_cli_single_channel_starts_gateway_with_selected_adapter(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = _runtime_settings(tmp_path, telegram=True)
     monkeypatch.setattr(
         entrypoint,
         "configure_runtime_environment",
-        lambda **kwargs: _runtime_settings(telegram=True),
+        lambda **kwargs: settings,
     )
     runner = FakeRunner()
 
     entrypoint.main(["--telegram"], runner=runner)
 
     assert runner.calls[0][:2] == ("channels", ("gateway", "telegram"))
+    assert runner.calls[0][2] is settings
 
 
-def test_cli_gateway_flag_starts_gateway_only(monkeypatch) -> None:
+def test_cli_gateway_flag_starts_gateway_only(tmp_path: Path, monkeypatch) -> None:
+    settings = _runtime_settings(tmp_path)
     monkeypatch.setattr(
         entrypoint,
         "configure_runtime_environment",
-        lambda **kwargs: _runtime_settings(),
+        lambda **kwargs: settings,
     )
     runner = FakeRunner()
 
     entrypoint.main(["--gateway"], runner=runner)
 
     assert runner.calls[0][:2] == ("channels", ("gateway",))
+    assert runner.calls[0][2] is settings
 
 
 def test_cli_init_configures_runtime_and_exits(monkeypatch) -> None:

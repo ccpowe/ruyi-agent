@@ -1291,10 +1291,14 @@ async def test_bootstrap_closes_control_before_stores_checkpointer_and_backend(
         def scan(self) -> Any:
             return SimpleNamespace(skills={})
 
+    def fake_create_backend_runtime(active_settings: Any) -> FakeBackendRuntime:
+        assert active_settings is settings
+        return FakeBackendRuntime()
+
     monkeypatch.setattr(
         bootstrap_module,
         "create_backend_runtime",
-        lambda _settings: FakeBackendRuntime(),
+        fake_create_backend_runtime,
     )
     monkeypatch.setattr(bootstrap_module, "AsyncSqliteSaver", FakeSaver)
     monkeypatch.setattr(bootstrap_module, "GatewayRouteStore", store_type("route"))
@@ -1442,10 +1446,14 @@ async def test_bootstrap_closes_backend_once_for_early_startup_failure(
             raise RuntimeError("config failed")
         return "main", {}
 
+    def fake_create_backend_runtime(active_settings: Any) -> FakeBackendRuntime:
+        assert active_settings is settings
+        return FakeBackendRuntime()
+
     monkeypatch.setattr(
         bootstrap_module,
         "create_backend_runtime",
-        lambda _settings: FakeBackendRuntime(),
+        fake_create_backend_runtime,
     )
     monkeypatch.setattr(bootstrap_module, "SkillCatalog", FakeSkillCatalog)
     monkeypatch.setattr(bootstrap_module, "SkillSyncer", lambda **kwargs: object())

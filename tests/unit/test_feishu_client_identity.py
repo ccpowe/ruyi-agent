@@ -180,7 +180,14 @@ def test_feishu_runner_wires_real_sdk_client_factory(monkeypatch, tmp_path) -> N
     )
     monkeypatch.setattr(feishu_adapter_module, "FeishuAdapter", AdapterProbe)
 
-    asyncio.run(feishu_runner.run_feishu_adapter(settings))
+    real_runner = feishu_runner.run_feishu_adapter
+
+    async def run_probe(active_settings):
+        assert active_settings is settings
+        await real_runner(active_settings)
+
+    monkeypatch.setattr(feishu_runner, "run_feishu_adapter", run_probe)
+    asyncio.run(feishu_adapter_module.run_feishu_adapter(settings))
 
     sdk_client = captured["feishu_client"]
     assert isinstance(sdk_client, FeishuSDKClient)

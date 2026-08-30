@@ -40,7 +40,14 @@ def test_telegram_runner_wires_media_limit_to_all_downloaders(
     )
     monkeypatch.setattr(telegram_adapter_module, "TelegramAdapter", AdapterProbe)
 
-    asyncio.run(telegram_runner.run_telegram_adapter(settings))
+    real_runner = telegram_runner.run_telegram_adapter
+
+    async def run_probe(active_settings):
+        assert active_settings is settings
+        await real_runner(active_settings)
+
+    monkeypatch.setattr(telegram_runner, "run_telegram_adapter", run_probe)
+    asyncio.run(telegram_adapter_module.run_telegram_adapter(settings))
 
     assert captured["media_max_bytes"] == 4321
     assert captured["gateway_client"]._max_download_bytes == 4321

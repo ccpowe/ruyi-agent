@@ -79,5 +79,6 @@ def test_entrypoint_create_app_configures_runtime_environment(
     result = entrypoint_module.create_app()
 
     assert calls == 1
-    assert observed == [settings]
+    assert len(observed) == 1
+    assert observed[0] is settings
     assert result is not None
