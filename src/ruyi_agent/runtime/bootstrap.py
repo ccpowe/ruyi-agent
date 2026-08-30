@@ -11,7 +11,6 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from ruyi_agent.config.runtime_settings import (
     RuntimeSettings,
-    configure_runtime_environment,
 )
 from ruyi_agent.config.agent_models import AgentConfigs
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
@@ -91,7 +90,7 @@ class AppRuntime:
 
 
 @asynccontextmanager
-async def bootstrap_application(settings: RuntimeSettings | None = None):
+async def bootstrap_application(settings: RuntimeSettings):
     """装配并持有当前进程内共享的应用运行时。
 
     Gateway 和 Channel Adapter 需要同一套运行对象：backend、
@@ -99,43 +98,31 @@ async def bootstrap_application(settings: RuntimeSettings | None = None):
     这个上下文管理器把启动契约集中在一个地方，并负责在退出时关闭需要释放的资源。
     """
 
-    configured_settings = settings
-    if configured_settings is None:
-        configured_settings = configure_runtime_environment()
+    if not isinstance(settings, RuntimeSettings):
+        raise TypeError("bootstrap_application requires RuntimeSettings")
 
-    # A few external embedders historically replaced the configure hook with a
-    # side-effect-only function. Keep that narrow hook compatibility without
-    # bringing back the old raw/env settings path; production configuration
-    # still produces one immutable typed instance and passes it through.
-    using_legacy_configure_hook = configured_settings is None
-    active_settings = configured_settings or RuntimeSettings.defaults()
-
-    node_id = active_settings.runtime.agent_node_id
+    node_id = settings.runtime.agent_node_id
 
     # backend 决定 skills、memory 和执行状态所在的位置，所以要先创建 backend，
     # 再把声明式配置翻译成真正可运行的 agent spec。
-    backend_runtime = (
-        create_backend_runtime()
-        if using_legacy_configure_hook
-        else create_backend_runtime(active_settings)
-    )
+    backend_runtime = create_backend_runtime(settings)
     try:
         home_dir = backend_runtime.home_dir
         skills_root = backend_runtime.skills_root
         agent_backend = backend_runtime.backend
-        host_workspace_root = active_settings.backend.workspace
+        host_workspace_root = settings.backend.workspace
         skill_catalog = SkillCatalog(workspace_root=host_workspace_root).scan().skills
         skill_syncer = SkillSyncer(backend=agent_backend, views_root=skills_root)
-        checkpoint_db = str(active_settings.storage.checkpoint_db)
-        route_db = str(active_settings.storage.gateway_route_db)
-        task_db = str(active_settings.storage.task_db)
-        review_audit_db = str(active_settings.storage.review_audit_db)
-        max_delegation_depth = active_settings.runtime.max_delegation_depth
-        max_tasks_per_root = active_settings.runtime.max_tasks_per_root
-        webhook_url = active_settings.runtime.a2a_webhook_url
+        checkpoint_db = str(settings.storage.checkpoint_db)
+        route_db = str(settings.storage.gateway_route_db)
+        task_db = str(settings.storage.task_db)
+        review_audit_db = str(settings.storage.review_audit_db)
+        max_delegation_depth = settings.runtime.max_delegation_depth
+        max_tasks_per_root = settings.runtime.max_tasks_per_root
+        webhook_url = settings.runtime.a2a_webhook_url
         webhook_token = (
-            active_settings.runtime.a2a_webhook_token
-            or active_settings.gateway.bearer_token
+            settings.runtime.a2a_webhook_token
+            or settings.gateway.bearer_token
             or DEFAULT_GATEWAY_TOKEN
         )
         # agent 和 MCP 配置在这里从声明式配置变成带 model、tools、memory、skills 的
@@ -264,7 +251,7 @@ async def bootstrap_application(settings: RuntimeSettings | None = None):
 
 
 def create_bootstrapped_gateway_app(
-    settings: RuntimeSettings | None = None,
+    settings: RuntimeSettings,
 ) -> FastAPI:
     """创建已经接入共享 runtime bootstrap 的 FastAPI 应用。
 
@@ -273,9 +260,10 @@ def create_bootstrapped_gateway_app(
     request.app.state 取到当前可用的 Gateway Task Module。
     """
 
-    active_settings = settings or configure_runtime_environment()
-    bearer_token = active_settings.gateway.bearer_token
-    gateway_host = active_settings.gateway.host
+    if not isinstance(settings, RuntimeSettings):
+        raise TypeError("create_bootstrapped_gateway_app requires RuntimeSettings")
+    bearer_token = settings.gateway.bearer_token
+    gateway_host = settings.gateway.host
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -288,7 +276,7 @@ def create_bootstrapped_gateway_app(
                 "Insecure configuration: set a non-default GATEWAY_BEARER_TOKEN "
                 "before exposing Gateway outside localhost."
             )
-        async with bootstrap_application(active_settings) as runtime:
+        async with bootstrap_application(settings) as runtime:
             try:
                 app.state.app_runtime = runtime
                 app.state.gateway_service = runtime.gateway_service

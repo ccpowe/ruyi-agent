@@ -10,6 +10,7 @@ from ruyi_agent.config.paths import resolve_ruyi_paths
 from ruyi_agent.config.paths import RuyiPaths
 from ruyi_agent.config.runtime_settings import apply_runtime_settings_to_env
 from ruyi_agent.config.runtime_settings import configure_runtime_environment
+from ruyi_agent.config.runtime_settings import GatewayLaunchOverrides
 from ruyi_agent.config.runtime_settings import load_runtime_settings
 from ruyi_agent.config.runtime_settings import TABLE_SCOPED_TOML_ALIASES
 from ruyi_agent.config.runtime_settings import TOML_ALIAS_NAMES
@@ -451,6 +452,14 @@ def test_workspace_and_projection_precedence_excludes_projection_inputs(
         ("[gateway]\nport = 0\n", "gateway.port"),
         ("[gateway]\nport = 65536\n", "gateway.port"),
         ("[channels.telegram]\napi_timeout = nan\n", "channels.telegram.api_timeout"),
+        (
+            "[channels.telegram]\ntask_poll_interval = 0\n",
+            "channels.telegram.task_poll_interval",
+        ),
+        (
+            "[channels.feishu]\ntask_poll_interval = -1\n",
+            "channels.feishu.task_poll_interval",
+        ),
         ("[channels.feishu]\napi_timeout = 0\n", "channels.feishu.api_timeout"),
         (
             '[channels.telegram]\nfallback_ips = "127.0.0.1"\n',
@@ -522,7 +531,7 @@ def test_projection_serializes_typed_values_for_compatibility_consumers(
 [backend.local]
 inherit_env = false
 [channels.telegram]
-fallback_ips = ["1.2.3.4", "::1"]
+fallback_ips = ["1.2.3.4", "5.6.7.8"]
 [channels.feishu]
 allowed_users = ["ou_1", "ou_2"]
 """,
@@ -530,5 +539,97 @@ allowed_users = ["ou_1", "ou_2"]
     projected: dict[str, str] = {}
     apply_runtime_settings_to_env(settings, env=projected)
     assert projected["LOCAL_BACKEND_INHERIT_ENV"] == "false"
-    assert projected["TELEGRAM_FALLBACK_IPS"] == "1.2.3.4,::1"
+    assert projected["TELEGRAM_FALLBACK_IPS"] == "1.2.3.4,5.6.7.8"
     assert projected["FEISHU_ALLOWED_USERS"] == "ou_1,ou_2"
+
+
+@pytest.mark.parametrize("kind", ["local", "localshell", "local_shell"])
+def test_backend_kind_accepts_only_exact_lowercase_spellings(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    settings, _ = _load_text(tmp_path, f'[backend]\nkind = "{kind}"\n')
+    assert settings.backend.kind == "local"
+
+
+@pytest.mark.parametrize("value", ["LOCAL", " local", "local ", "", "unknown"])
+def test_backend_kind_rejects_case_or_whitespace_variants(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    body = f'[backend]\nkind = "{value}"\n'
+    with pytest.raises(ConfigError, match="backend.kind"):
+        _load_text(tmp_path, body)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "", "nan", "inf", "junk"])
+def test_task_poll_interval_environment_values_are_strict(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    with pytest.raises(ConfigError) as raised:
+        _load_text(
+            tmp_path,
+            "",
+            env={"TELEGRAM_TASK_POLL_INTERVAL": value},
+        )
+    message = str(raised.value)
+    assert "channels.telegram.task_poll_interval" in message
+    assert "TELEGRAM_TASK_POLL_INTERVAL" in message
+
+
+@pytest.mark.parametrize("value", ["::1", "example.test", "256.1.1.1", ""])
+def test_fallback_ips_environment_accepts_only_ipv4(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    with pytest.raises(ConfigError) as raised:
+        _load_text(
+            tmp_path,
+            "",
+            env={"TELEGRAM_FALLBACK_IPS": value},
+        )
+    message = str(raised.value)
+    assert "channels.telegram.fallback_ips" in message
+    assert "TELEGRAM_FALLBACK_IPS" in message
+
+
+def test_launch_overrides_are_typed_applied_after_strict_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    ruyi_home = project / ".ruyi_agent"
+    ruyi_home.mkdir(parents=True)
+    (ruyi_home / "ruyi.toml").write_text(
+        '[gateway]\nbearer_token = "keep-me"\nunknown = true\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    env: dict[str, str] = {}
+    with pytest.raises(ConfigError, match="gateway.unknown"):
+        configure_runtime_environment(
+            env=env,
+            launch_overrides=GatewayLaunchOverrides(
+                host="127.0.0.1",
+                port="9000",
+                base_url="http://127.0.0.1:9000",
+            ),
+        )
+
+    (ruyi_home / "ruyi.toml").write_text(
+        '[gateway]\nbearer_token = "keep-me"\n',
+        encoding="utf-8",
+    )
+    settings = configure_runtime_environment(
+        env=env,
+        launch_overrides=GatewayLaunchOverrides(
+            host="127.0.0.1",
+            port="9000",
+            base_url="http://127.0.0.1:9000",
+        ),
+    )
+    assert settings.gateway.port == 9000
+    assert settings.gateway.bearer_token == "keep-me"
+    assert env["GATEWAY_PORT"] == "9000"

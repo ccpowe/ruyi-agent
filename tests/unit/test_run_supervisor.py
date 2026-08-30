@@ -12,6 +12,8 @@ import pytest
 
 import ruyi_agent.runtime.bootstrap as bootstrap_module
 import ruyi_agent.runtime.delegation.async_runtime as runtime_module
+from ruyi_agent.config.paths import RuyiPaths
+from ruyi_agent.config.runtime_settings import load_runtime_settings
 from ruyi_agent.runtime.delegation.contracts import (
     TaskAlreadyRunningError,
     UnknownWorkerTaskError,
@@ -41,6 +43,22 @@ def async_test(function: Any) -> Any:
         return asyncio.run(function(*args, **kwargs))
 
     return run
+
+
+def _typed_runtime_settings(tmp_path: Path):
+    ruyi_home = tmp_path / ".ruyi_agent"
+    ruyi_home.mkdir()
+    (ruyi_home / "ruyi.toml").write_text("", encoding="utf-8")
+    return load_runtime_settings(
+        RuyiPaths(
+            ruyi_home=ruyi_home,
+            config_dir=ruyi_home / "config",
+            data_dir=ruyi_home / "data",
+            skills_dir=ruyi_home / "skills",
+            workspace=tmp_path,
+        ),
+        env={},
+    )
 
 
 class ReleasableAgent:
@@ -177,9 +195,7 @@ class HangingRemoteOperationClient:
         await self._hang()
         raise AssertionError
 
-    async def submit_review_decision(
-        self, *args: Any, **kwargs: Any
-    ) -> dict[str, Any]:
+    async def submit_review_decision(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         del args, kwargs
         assert self.operation == "review"
         await self._hang()
@@ -1045,9 +1061,7 @@ async def test_cancelled_remote_mutation_is_durable_and_refresh_reconciles(
     assert uncertain.external_outcome_uncertain is True
 
     reconciled = await control.refresh_task(record.task_id)
-    assert reconciled.state == (
-        "cancelled" if operation == "cancel" else "completed"
-    )
+    assert reconciled.state == ("cancelled" if operation == "cancel" else "completed")
     assert reconciled.external_operation is None
     assert reconciled.external_operation_identity is None
     assert reconciled.external_outcome_uncertain is False
@@ -1186,6 +1200,7 @@ async def test_bootstrap_closes_control_before_stores_checkpointer_and_backend(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    settings = _typed_runtime_settings(tmp_path)
     order: list[str] = []
     open_resources = {
         "checkpointer",
@@ -1276,11 +1291,10 @@ async def test_bootstrap_closes_control_before_stores_checkpointer_and_backend(
         def scan(self) -> Any:
             return SimpleNamespace(skills={})
 
-    monkeypatch.setattr(bootstrap_module, "configure_runtime_environment", lambda: None)
     monkeypatch.setattr(
         bootstrap_module,
         "create_backend_runtime",
-        lambda: FakeBackendRuntime(),
+        lambda _settings: FakeBackendRuntime(),
     )
     monkeypatch.setattr(bootstrap_module, "AsyncSqliteSaver", FakeSaver)
     monkeypatch.setattr(bootstrap_module, "GatewayRouteStore", store_type("route"))
@@ -1327,7 +1341,7 @@ async def test_bootstrap_closes_control_before_stores_checkpointer_and_backend(
     entered = asyncio.Event()
 
     async def run_lifespan() -> None:
-        async with bootstrap_module.bootstrap_application():
+        async with bootstrap_module.bootstrap_application(settings):
             assert order == []
             entered.set()
             await asyncio.Event().wait()
@@ -1370,7 +1384,7 @@ async def test_bootstrap_closes_control_before_stores_checkpointer_and_backend(
 
     monkeypatch.setattr(bootstrap_module, "GatewayTaskModule", fail_gateway)
     with pytest.raises(RuntimeError, match="gateway assembly failed"):
-        async with bootstrap_module.bootstrap_application():
+        async with bootstrap_module.bootstrap_application(settings):
             raise AssertionError("failed startup must not yield")
     assert order == [
         "control",
@@ -1392,6 +1406,7 @@ async def test_bootstrap_closes_backend_once_for_early_startup_failure(
     tmp_path: Path,
     failure_stage: str,
 ) -> None:
+    settings = _typed_runtime_settings(tmp_path)
     closes = 0
 
     class FakeBackendRuntime:
@@ -1427,11 +1442,10 @@ async def test_bootstrap_closes_backend_once_for_early_startup_failure(
             raise RuntimeError("config failed")
         return "main", {}
 
-    monkeypatch.setattr(bootstrap_module, "configure_runtime_environment", lambda: None)
     monkeypatch.setattr(
         bootstrap_module,
         "create_backend_runtime",
-        lambda: FakeBackendRuntime(),
+        lambda _settings: FakeBackendRuntime(),
     )
     monkeypatch.setattr(bootstrap_module, "SkillCatalog", FakeSkillCatalog)
     monkeypatch.setattr(bootstrap_module, "SkillSyncer", lambda **kwargs: object())
@@ -1447,9 +1461,10 @@ async def test_bootstrap_closes_backend_once_for_early_startup_failure(
     monkeypatch.setattr(bootstrap_module, "MCPRegistry", FakeRegistry)
 
     with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
-        async with bootstrap_module.bootstrap_application():
+        async with bootstrap_module.bootstrap_application(settings):
             raise AssertionError("failed startup must not yield")
     assert closes == 1
+
 
 async def _async_value(value: Any) -> Any:
     return value

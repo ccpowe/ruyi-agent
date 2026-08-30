@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
@@ -16,6 +17,24 @@ from ruyi_agent.channels.http.routes import (
     create_gateway_app,
 )
 from ruyi_agent.gateway.tasks import GatewayTaskModule
+from ruyi_agent.config.paths import RuyiPaths
+from ruyi_agent.config.runtime_settings import load_runtime_settings
+
+
+def _runtime_settings(tmp_path: Path):
+    ruyi_home = tmp_path / ".ruyi_agent"
+    ruyi_home.mkdir()
+    (ruyi_home / "ruyi.toml").write_text("", encoding="utf-8")
+    return load_runtime_settings(
+        RuyiPaths(
+            ruyi_home=ruyi_home,
+            config_dir=ruyi_home / "config",
+            data_dir=ruyi_home / "data",
+            skills_dir=ruyi_home / "skills",
+            workspace=tmp_path,
+        ),
+        env={},
+    )
 
 
 class ProbeCallbacks:
@@ -155,15 +174,11 @@ def test_injected_gateway_app_is_ready_immediately() -> None:
 
 def test_bootstrapped_app_readiness_tracks_runtime_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     teardown_gate_values: list[bool] = []
     app: FastAPI
-    settings = SimpleNamespace(
-        gateway=SimpleNamespace(
-            bearer_token="dev-token",
-            host="127.0.0.1",
-        )
-    )
+    settings = _runtime_settings(tmp_path)
 
     @asynccontextmanager
     async def fake_bootstrap_application(active_settings):
@@ -173,11 +188,6 @@ def test_bootstrapped_app_readiness_tracks_runtime_lifecycle(
         finally:
             teardown_gate_values.append(bool(app.state.gateway_ready))
 
-    monkeypatch.setattr(
-        bootstrap_module,
-        "configure_runtime_environment",
-        lambda: settings,
-    )
     monkeypatch.setattr(
         bootstrap_module,
         "bootstrap_application",
@@ -211,15 +221,11 @@ def test_bootstrapped_app_readiness_tracks_runtime_lifecycle(
 
 def test_bootstrapped_app_clears_readiness_before_failing_teardown(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     teardown_gate_values: list[bool] = []
     app: FastAPI
-    settings = SimpleNamespace(
-        gateway=SimpleNamespace(
-            bearer_token="dev-token",
-            host="127.0.0.1",
-        )
-    )
+    settings = _runtime_settings(tmp_path)
 
     @asynccontextmanager
     async def failing_bootstrap_application(active_settings):
@@ -230,11 +236,6 @@ def test_bootstrapped_app_clears_readiness_before_failing_teardown(
             teardown_gate_values.append(bool(app.state.gateway_ready))
             raise RuntimeError("simulated runtime teardown failure")
 
-    monkeypatch.setattr(
-        bootstrap_module,
-        "configure_runtime_environment",
-        lambda: settings,
-    )
     monkeypatch.setattr(
         bootstrap_module,
         "bootstrap_application",

@@ -8,7 +8,6 @@ from ruyi_agent.storage.channel_delivery_store import ChannelDeliveryStore
 from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 from ruyi_agent.config.runtime_settings import (
     RuntimeSettings,
-    configure_runtime_environment,
 )
 
 
@@ -16,19 +15,20 @@ DEFAULT_GATEWAY_BEARER_TOKEN = "dev-token"
 DEFAULT_CHANNEL_SESSION_DB = "data/channel_sessions.sqlite3"
 
 
-async def run_telegram_adapter(settings: RuntimeSettings | None = None) -> None:
+async def run_telegram_adapter(settings: RuntimeSettings) -> None:
     from ruyi_agent.channels.telegram.adapter import (
         TelegramAdapter,
         TelegramUpdateStore,
     )
 
-    active_settings = settings or configure_runtime_environment()
-    telegram = active_settings.channels.telegram
+    if not isinstance(settings, RuntimeSettings):
+        raise TypeError("run_telegram_adapter requires RuntimeSettings")
+    telegram = settings.channels.telegram
     bot_token = telegram.bot_token
     if not bot_token:
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
-    gateway_base_url = active_settings.gateway.base_url
-    gateway_bearer_token = active_settings.gateway.bearer_token
+    gateway_base_url = settings.gateway.base_url
+    gateway_bearer_token = settings.gateway.bearer_token
     default_agent_name = telegram.default_agent
     session_db_path = str(telegram.session_db)
     update_db_path = str(telegram.update_db)

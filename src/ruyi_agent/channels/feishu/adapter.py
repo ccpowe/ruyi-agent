@@ -899,7 +899,7 @@ class FeishuAdapter:
         return self._delivery.review_presenter.format(task)
 
 
-async def run_feishu_adapter(settings: RuntimeSettings | None = None) -> None:
+async def run_feishu_adapter(settings: RuntimeSettings) -> None:
     from ruyi_agent.channels.feishu.runner import run_feishu_adapter as run
 
     await run(settings)

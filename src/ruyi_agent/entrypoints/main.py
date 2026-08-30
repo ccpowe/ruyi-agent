@@ -29,53 +29,64 @@ class EntrypointRunner:
     def run_channels(
         self,
         channels: ChannelSet,
-        settings: RuntimeSettings | None = None,
+        settings: RuntimeSettings,
     ) -> None:
-        active_settings = settings or configure_runtime_environment()
+        if not isinstance(settings, RuntimeSettings):
+            raise TypeError("EntrypointRunner.run_channels requires RuntimeSettings")
         if channels == ("gateway",):
-            run_gateway(active_settings)
+            run_gateway(settings)
             return
-        asyncio.run(run_channels(channels, active_settings))
+        asyncio.run(run_channels(channels, settings))
 
 
 def create_app(settings: RuntimeSettings | None = None):
     from ruyi_agent.runtime.bootstrap import create_bootstrapped_gateway_app
 
-    return create_bootstrapped_gateway_app(settings)
+    active_settings = configure_runtime_environment() if settings is None else settings
+    if not isinstance(active_settings, RuntimeSettings):
+        raise TypeError(
+            "create_app requires configure_runtime_environment to return "
+            "RuntimeSettings"
+        )
+    return create_bootstrapped_gateway_app(active_settings)
 
 
-def run_gateway(settings: RuntimeSettings | None = None) -> None:
+def run_gateway(settings: RuntimeSettings) -> None:
     import uvicorn
 
-    active_settings = settings or configure_runtime_environment()
+    if not isinstance(settings, RuntimeSettings):
+        raise TypeError("run_gateway requires RuntimeSettings")
     uvicorn.run(
-        create_app(active_settings),
-        host=active_settings.gateway.host,
-        port=active_settings.gateway.port,
+        create_app(settings),
+        host=settings.gateway.host,
+        port=settings.gateway.port,
     )
 
 
 async def run_channels(
     channels: ChannelSet,
-    settings: RuntimeSettings | None = None,
+    settings: RuntimeSettings,
 ) -> None:
-    active_settings = settings or configure_runtime_environment()
+    if not isinstance(settings, RuntimeSettings):
+        raise TypeError("run_channels requires RuntimeSettings")
     async with asyncio.TaskGroup() as task_group:
         if "gateway" in channels:
-            task_group.create_task(_run_gateway_async(active_settings))
+            task_group.create_task(_run_gateway_async(settings))
         if "telegram" in channels:
             from ruyi_agent.channels.telegram.adapter import run_telegram_adapter
 
-            task_group.create_task(run_telegram_adapter(active_settings))
+            task_group.create_task(run_telegram_adapter(settings))
         if "feishu" in channels:
             from ruyi_agent.channels.feishu.adapter import run_feishu_adapter
 
-            task_group.create_task(run_feishu_adapter(active_settings))
+            task_group.create_task(run_feishu_adapter(settings))
 
 
 async def _run_gateway_async(settings: RuntimeSettings) -> None:
     import uvicorn
 
+    if not isinstance(settings, RuntimeSettings):
+        raise TypeError("_run_gateway_async requires RuntimeSettings")
     config = uvicorn.Config(
         create_app(settings),
         host=settings.gateway.host,

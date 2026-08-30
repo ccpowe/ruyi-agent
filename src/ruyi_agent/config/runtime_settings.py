@@ -7,7 +7,6 @@ SDKs, dynamic provider/remote-reference secrets, and legacy scripts.
 
 from __future__ import annotations
 
-import copy
 import math
 import os
 import re
@@ -77,6 +76,15 @@ class GatewaySettings:
     port: int = 8000
     base_url: str = "http://127.0.0.1:8000"
     bearer_token: str = "dev-token"
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayLaunchOverrides:
+    """Launch-time gateway values supplied by the Paseo launcher."""
+
+    host: str
+    port: int | str
+    base_url: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,44 +211,6 @@ class RuntimeSettings:
     @property
     def feishu(self) -> FeishuSettings:
         return self.channels.feishu
-
-    @classmethod
-    def defaults(cls, paths: RuyiPaths | None = None) -> RuntimeSettings:
-        """Build typed defaults for legacy embedding shims.
-
-        Normal application startup always calls :func:`configure_runtime_environment`.
-        This constructor is only a narrow compatibility fallback for embedders that
-        still invoke an older configure hook which returns no settings object.
-        """
-
-        active_paths = paths or resolve_ruyi_paths(env={})
-        data_dir = active_paths.data_dir
-        storage = StorageSettings(
-            checkpoint_db=data_dir / DEFAULT_STORAGE_FILES["CHECKPOINT_DB"],
-            gateway_route_db=data_dir / DEFAULT_STORAGE_FILES["GATEWAY_ROUTE_DB"],
-            task_db=data_dir / DEFAULT_STORAGE_FILES["TASK_DB"],
-            review_audit_db=data_dir / DEFAULT_STORAGE_FILES["REVIEW_AUDIT_DB"],
-            channel_session_db=data_dir / DEFAULT_STORAGE_FILES["CHANNEL_SESSION_DB"],
-        )
-        return cls(
-            paths=active_paths,
-            credentials=CredentialsSettings(),
-            backend=BackendSettings(workspace=active_paths.workspace),
-            gateway=GatewaySettings(),
-            storage=storage,
-            runtime=RuntimeLimits(),
-            channels=ChannelsSettings(
-                telegram=TelegramSettings(
-                    session_db=storage.channel_session_db,
-                    update_db=data_dir / "telegram_updates.sqlite3",
-                ),
-                feishu=FeishuSettings(
-                    session_db=storage.channel_session_db,
-                    event_db=data_dir / "feishu_events.sqlite3",
-                ),
-            ),
-            langsmith=LangSmithSettings(),
-        )
 
 
 DEFAULT_STORAGE_FILES = {
@@ -386,19 +356,13 @@ class _EnvironmentValue:
     name: str
 
 
-@dataclass(frozen=True, slots=True)
-class _OverrideValue:
-    value: Any
-
-
 def configure_runtime_environment(
     *,
     workspace: str | Path | None = None,
     env: MutableMapping[str, str] | None = None,
     init_force: bool = False,
     init_templates: bool = False,
-    overrides: Mapping[str, Mapping[str, Any]] | None = None,
-    gateway_overrides: Mapping[str, Any] | None = None,
+    launch_overrides: GatewayLaunchOverrides | None = None,
 ) -> RuntimeSettings:
     """Load, validate, and project runtime settings exactly once."""
 
@@ -424,15 +388,19 @@ def configure_runtime_environment(
         _require_initialized_runtime_settings(paths)
         ensure_runtime_dirs(paths)
 
-    effective_overrides = _merge_overrides(overrides, gateway_overrides)
     settings = load_runtime_settings(
         paths,
         workspace_override=(
             workspace_override if not _is_unset(workspace_override) else None
         ),
         env=target,
-        overrides=effective_overrides,
     )
+    if not isinstance(settings, RuntimeSettings):
+        raise ConfigError(
+            "runtime settings loader must return RuntimeSettings, "
+            f"got {type(settings).__name__}"
+        )
+    settings = _apply_launch_overrides(settings, launch_overrides)
     apply_runtime_settings_to_env(settings, env=env)
     return settings
 
@@ -479,16 +447,11 @@ def load_runtime_settings(
     *,
     workspace_override: str | Path | None = None,
     env: Mapping[str, str] | None = None,
-    overrides: Mapping[str, Mapping[str, Any]] | None = None,
-    gateway_overrides: Mapping[str, Any] | None = None,
 ) -> RuntimeSettings:
     """Parse one runtime TOML document into immutable typed submodels."""
 
     settings_path = (paths.ruyi_home / "ruyi.toml").resolve()
     data = _load_settings_toml(settings_path)
-    effective_overrides = _merge_overrides(overrides, gateway_overrides)
-    if effective_overrides:
-        data = _apply_overrides(data, effective_overrides, settings_path)
     _validate_shape(data, settings_path)
     source_env = os.environ if env is None else env
 
@@ -520,7 +483,7 @@ def load_runtime_settings(
     resolved_paths = replace(paths, workspace=workspace)
 
     backend_settings = BackendSettings(
-        kind=_enum_value(
+        kind=_backend_kind(
             _selected(
                 backend,
                 "kind",
@@ -530,8 +493,8 @@ def load_runtime_settings(
                 allow_alias=False,
                 allow_env=False,
                 table_path="backend",
+                preserve_empty=True,
             ),
-            allowed={"local", "daytona"},
             path=settings_path,
             field="backend.kind",
         ),
@@ -850,8 +813,10 @@ def load_runtime_settings(
                 default=2.0,
                 env=source_env,
                 table_path="channels.telegram",
+                preserve_empty=True,
             ),
             minimum=0.0,
+            exclusive_minimum=True,
             path=settings_path,
             field="channels.telegram.task_poll_interval",
         ),
@@ -893,14 +858,15 @@ def load_runtime_settings(
             path=settings_path,
             field="channels.telegram.media_max_bytes",
         ),
-        "fallback_ips": _string_tuple(
+        "fallback_ips": _fallback_ips(
             _selected(
                 telegram,
                 "fallback_ips",
                 TELEGRAM_ENV["fallback_ips"],
-                default=(),
+                default=None,
                 env=source_env,
                 table_path="channels.telegram",
+                preserve_empty=True,
             ),
             path=settings_path,
             field="channels.telegram.fallback_ips",
@@ -1157,8 +1123,10 @@ def load_runtime_settings(
                 default=2.0,
                 env=source_env,
                 table_path="channels.feishu",
+                preserve_empty=True,
             ),
             minimum=0.0,
+            exclusive_minimum=True,
             path=settings_path,
             field="channels.feishu.task_poll_interval",
         ),
@@ -1379,6 +1347,8 @@ def _project_runtime_settings(settings: RuntimeSettings) -> dict[str, str]:
             env[env_name] = _string_value(value)
     for field_name, env_name in TELEGRAM_ENV.items():
         value = getattr(settings.channels.telegram, field_name)
+        if field_name == "fallback_ips" and not value:
+            continue
         if value is not None:
             env[env_name] = _string_value(value)
     for field_name, env_name in TELEGRAM_PATH_ENV.items():
@@ -1535,40 +1505,56 @@ def _shape_error(path: Path, field: str, reason: str) -> None:
     raise ConfigError(f"{path.resolve()}: {field} {reason}")
 
 
-def _merge_overrides(
-    overrides: Mapping[str, Mapping[str, Any]] | None,
-    gateway_overrides: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    for table, values in (overrides or {}).items():
-        # Keep malformed values intact so _apply_overrides can report the
-        # originating dotted table path as ConfigError instead of leaking a
-        # generic dict-construction exception.
-        merged[table] = dict(values) if isinstance(values, Mapping) else values
-    if gateway_overrides:
-        gateway = merged.setdefault("gateway", {})
-        if not isinstance(gateway, Mapping):
-            merged["gateway"] = gateway
-        else:
-            merged["gateway"] = {**gateway, **gateway_overrides}
-    return merged
+def _apply_launch_overrides(
+    settings: RuntimeSettings,
+    launch_overrides: GatewayLaunchOverrides | None,
+) -> RuntimeSettings:
+    if launch_overrides is None:
+        return settings
+    if not isinstance(launch_overrides, GatewayLaunchOverrides):
+        raise ConfigError(
+            "launch_overrides must be GatewayLaunchOverrides, "
+            f"got {type(launch_overrides).__name__}"
+        )
+    settings_path = (settings.paths.ruyi_home / "ruyi.toml").resolve()
+    host = _gateway_host(
+        launch_overrides.host,
+        path=settings_path,
+        field="gateway.host (launch override)",
+    )
+    port = _launch_port(launch_overrides.port, path=settings_path)
+    base_url = _http_url(
+        launch_overrides.base_url,
+        path=settings_path,
+        field="gateway.base_url (launch override)",
+    )
+    return replace(
+        settings,
+        gateway=replace(
+            settings.gateway,
+            host=host,
+            port=port,
+            base_url=base_url,
+        ),
+    )
 
 
-def _apply_overrides(
-    data: Mapping[str, Any],
-    overrides: Mapping[str, Mapping[str, Any]],
-    path: Path,
-) -> dict[str, Any]:
-    merged = copy.deepcopy(dict(data))
-    for table, values in overrides.items():
-        if not isinstance(values, Mapping):
-            _shape_error(path, table, "override must be a table")
-        current = merged.get(table, {})
-        if not isinstance(current, dict):
-            _shape_error(path, table, "must be a table")
-        current.update({key: _OverrideValue(value) for key, value in values.items()})
-        merged[table] = current
-    return merged
+def _launch_port(value: int | str, *, path: Path) -> int:
+    field = "gateway.port (launch override)"
+    if isinstance(value, bool):
+        _value_error(path, field, "must be an integer")
+    if isinstance(value, str):
+        if not value or value != value.strip():
+            _value_error(path, field, "must be an integer")
+        try:
+            value = int(value, 10)
+        except ValueError as exc:
+            raise ConfigError(f"{path.resolve()}: {field} must be an integer") from exc
+    if type(value) is not int:
+        _value_error(path, field, "must be an integer")
+    if value < 1 or value > 65_535:
+        _value_error(path, field, "must be between 1 and 65535")
+    return value
 
 
 def _select_workspace(
@@ -1599,23 +1585,24 @@ def _selected(
     table_path: str,
     allow_alias: bool = True,
     allow_env: bool = True,
+    preserve_empty: bool = False,
 ) -> Any:
     value = table.get(field, _MISSING)
-    if value is not _MISSING and not _is_unset(value):
+    if value is not _MISSING and (preserve_empty or not _is_unset(value)):
         return value
     if allow_alias and env_name is not None:
         value = table.get(env_name, _MISSING)
-        if value is not _MISSING and not _is_unset(value):
+        if value is not _MISSING and (preserve_empty or not _is_unset(value)):
             return value
     if allow_env and env_name is not None:
         value = env.get(env_name, _MISSING)
-        if value is not _MISSING and not _is_unset(value):
+        if value is not _MISSING and (preserve_empty or not _is_unset(value)):
             return _EnvironmentValue(value, env_name)
     return default
 
 
 def _is_unset(value: Any) -> bool:
-    if isinstance(value, (_EnvironmentValue, _OverrideValue)):
+    if isinstance(value, _EnvironmentValue):
         value = value.value
     return (
         value is None
@@ -1632,6 +1619,7 @@ def _path_value(
     source: str,
     path: Path,
 ) -> Path:
+    source = _source_field(value, source)
     value = _unwrap(value)
     if _is_unset(value):
         return default.resolve()
@@ -1683,6 +1671,7 @@ def _path_from_table(
 
 
 def _optional_string(value: Any, *, path: Path, field: str) -> str | None:
+    field = _source_field(value, field)
     value = _unwrap(value)
     if _is_unset(value):
         return None
@@ -1692,6 +1681,7 @@ def _optional_string(value: Any, *, path: Path, field: str) -> str | None:
 
 
 def _non_empty_string(value: Any, *, path: Path, field: str) -> str:
+    field = _source_field(value, field)
     value = _unwrap(value)
     if not isinstance(value, str):
         _value_error(path, field, "must be a string")
@@ -1702,6 +1692,7 @@ def _non_empty_string(value: Any, *, path: Path, field: str) -> str:
 
 
 def _node_id(value: Any, *, path: Path, field: str) -> str:
+    field = _source_field(value, field)
     value = _unwrap(value)
     if not isinstance(value, str):
         _value_error(path, field, "must be a string")
@@ -1720,6 +1711,7 @@ def _enum_value(
     path: Path,
     field: str,
 ) -> str:
+    field = _source_field(value, field)
     value = _unwrap(value)
     result = _non_empty_string(value, path=path, field=field).lower()
     if result not in allowed:
@@ -1731,6 +1723,24 @@ def _enum_value(
     return result
 
 
+def _backend_kind(value: Any, *, path: Path, field: str) -> BackendKind:
+    field = _source_field(value, field)
+    value = _unwrap(value)
+    if not isinstance(value, str):
+        _value_error(
+            path, field, "must be one of local, localshell, local_shell, daytona"
+        )
+    if value == "local":
+        return "local"
+    if value in {"localshell", "local_shell"}:
+        return "local"
+    if value == "daytona":
+        return "daytona"
+    _value_error(
+        path, field, "must be exactly local, localshell, local_shell, or daytona"
+    )
+
+
 def _int_value(
     value: Any,
     *,
@@ -1739,7 +1749,8 @@ def _int_value(
     path: Path,
     field: str,
 ) -> int:
-    if isinstance(value, (_EnvironmentValue, _OverrideValue)):
+    field = _source_field(value, field)
+    if isinstance(value, _EnvironmentValue):
         value = value.value
         if not isinstance(value, str):
             if type(value) is not int:
@@ -1768,7 +1779,8 @@ def _finite_float(
     path: Path,
     field: str,
 ) -> float:
-    external = isinstance(value, (_EnvironmentValue, _OverrideValue))
+    field = _source_field(value, field)
+    external = isinstance(value, _EnvironmentValue)
     value = _unwrap(value)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         if not external or not isinstance(value, str):
@@ -1790,9 +1802,10 @@ def _finite_float(
 
 
 def _bool_value(value: Any, *, path: Path, field: str) -> bool:
+    field = _source_field(value, field)
     if type(value) is bool:
         return value
-    external = isinstance(value, (_EnvironmentValue, _OverrideValue))
+    external = isinstance(value, _EnvironmentValue)
     value = _unwrap(value)
     if external and isinstance(value, str):
         token = value.strip().lower()
@@ -1805,7 +1818,8 @@ def _bool_value(value: Any, *, path: Path, field: str) -> bool:
 
 
 def _string_tuple(value: Any, *, path: Path, field: str) -> tuple[str, ...]:
-    external = isinstance(value, (_EnvironmentValue, _OverrideValue))
+    field = _source_field(value, field)
+    external = isinstance(value, _EnvironmentValue)
     value = _unwrap(value)
     if external and isinstance(value, str):
         values = value.split(",")
@@ -1823,7 +1837,35 @@ def _string_tuple(value: Any, *, path: Path, field: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _fallback_ips(value: Any, *, path: Path, field: str) -> tuple[str, ...]:
+    field = _source_field(value, field)
+    external = isinstance(value, _EnvironmentValue)
+    value = _unwrap(value)
+    if external and isinstance(value, str):
+        values = value.split(",")
+    elif isinstance(value, list):
+        values = value
+    elif value is None:
+        return ()
+    else:
+        _value_error(path, field, "must be a non-empty list of IPv4 addresses")
+    if not values:
+        return ()
+    result: list[str] = []
+    for item in values:
+        if not isinstance(item, str) or not item.strip():
+            _value_error(path, field, "must contain only IPv4 addresses")
+        try:
+            result.append(str(IPv4Address(item.strip())))
+        except ValueError as exc:
+            raise ConfigError(
+                f"{path.resolve()}: {field} must contain only IPv4 addresses"
+            ) from exc
+    return tuple(result)
+
+
 def _parse_mode(value: Any, *, path: Path, field: str) -> str:
+    field = _source_field(value, field)
     value = _unwrap(value)
     result = _non_empty_string(value, path=path, field=field)
     if result not in {"Markdown", "MarkdownV2", "HTML"}:
@@ -1832,6 +1874,7 @@ def _parse_mode(value: Any, *, path: Path, field: str) -> str:
 
 
 def _optional_http_url(value: Any, *, path: Path, field: str) -> str | None:
+    field = _source_field(value, field)
     value = _unwrap(value)
     if _is_unset(value):
         return None
@@ -1839,6 +1882,7 @@ def _optional_http_url(value: Any, *, path: Path, field: str) -> str | None:
 
 
 def _http_url(value: Any, *, path: Path, field: str) -> str:
+    field = _source_field(value, field)
     value = _unwrap(value)
     if not isinstance(value, str):
         _value_error(path, field, "must be a URL string")
@@ -1857,6 +1901,7 @@ def _http_url(value: Any, *, path: Path, field: str) -> str:
 
 
 def _gateway_host(value: Any, *, path: Path, field: str) -> str:
+    field = _source_field(value, field)
     value = _unwrap(value)
     if not isinstance(value, str):
         _value_error(path, field, "must be a host, not a URL or path")
@@ -1919,15 +1964,27 @@ def _value_error(path: Path, field: str, reason: str) -> None:
     raise ConfigError(f"{path.resolve()}: {field} {reason}")
 
 
+def _source_field(value: Any, field: str) -> str:
+    if isinstance(value, _EnvironmentValue):
+        return f"{field} (environment {value.name})"
+    return field
+
+
 def _unwrap(value: Any) -> Any:
-    return (
-        value.value if isinstance(value, (_EnvironmentValue, _OverrideValue)) else value
-    )
+    return value.value if isinstance(value, _EnvironmentValue) else value
 
 
 def _string_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ConfigError("cannot project a non-finite runtime float")
+        if value == 0.0:
+            return "0"
+        if value.is_integer():
+            return str(int(value))
+        return repr(value)
     if isinstance(value, (list, tuple)):
         return ",".join(_string_value(item) for item in value)
     return str(value)
@@ -1946,6 +2003,7 @@ __all__ = [
     "FEISHU_PATH_ENV",
     "FeishuSettings",
     "GatewaySettings",
+    "GatewayLaunchOverrides",
     "LANGSMITH_ENV",
     "LangSmithSettings",
     "LocalBackendSettings",

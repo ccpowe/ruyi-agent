@@ -868,7 +868,7 @@ class TelegramAdapter:
         return self._delivery.review_presenter.format(task)
 
 
-async def run_telegram_adapter(settings: RuntimeSettings | None = None) -> None:
+async def run_telegram_adapter(settings: RuntimeSettings) -> None:
     from ruyi_agent.channels.telegram.runner import run_telegram_adapter as run
 
     await run(settings)

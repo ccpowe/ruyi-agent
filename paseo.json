@@ -20,7 +20,7 @@
     },
     "gateway": {
       "type": "service",
-      "command": "uv run python -c 'import os; from ruyi_agent.config.runtime_settings import configure_runtime_environment; from ruyi_agent.entrypoints.main import run_gateway; settings=configure_runtime_environment(overrides={\"gateway\": {\"host\": os.environ.get(\"HOST\", \"127.0.0.1\"), \"port\": os.environ[\"PASEO_PORT\"], \"base_url\": os.environ.get(\"PASEO_URL\", \"http://127.0.0.1:\" + os.environ[\"PASEO_PORT\"])}}); run_gateway(settings)'"
+      "command": "uv run python -c 'import os; from ruyi_agent.config.runtime_settings import GatewayLaunchOverrides, configure_runtime_environment; from ruyi_agent.entrypoints.main import run_gateway; launch=GatewayLaunchOverrides(host=os.environ.get(\"HOST\", \"127.0.0.1\"), port=os.environ[\"PASEO_PORT\"], base_url=os.environ.get(\"PASEO_URL\", \"http://127.0.0.1:\" + os.environ[\"PASEO_PORT\"])); settings=configure_runtime_environment(launch_overrides=launch); run_gateway(settings)'"
     }
   },
   "metadataGeneration": {

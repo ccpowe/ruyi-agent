@@ -24,7 +24,6 @@ from langchain_daytona import DaytonaSandbox
 
 from ruyi_agent.config.runtime_settings import (
     RuntimeSettings,
-    configure_runtime_environment,
 )
 
 DEFAULT_BACKEND_KIND = "local"
@@ -391,18 +390,19 @@ def _create_local_backend_runtime(settings: RuntimeSettings) -> BackendRuntime:
     )
 
 
-def create_backend_runtime(settings: RuntimeSettings | None = None) -> BackendRuntime:
+def create_backend_runtime(settings: RuntimeSettings) -> BackendRuntime:
     """根据 typed backend settings 创建当前进程使用的 backend runtime。
 
     app_runtime 只调用这个工厂函数，不直接依赖 Daytona 或 LocalShell 的创建细节。
     """
 
-    active_settings = settings or configure_runtime_environment()
-    kind = active_settings.backend.kind
+    if not isinstance(settings, RuntimeSettings):
+        raise TypeError("create_backend_runtime requires RuntimeSettings")
+    kind = settings.backend.kind
     if kind == "daytona":
-        return _create_daytona_backend_runtime(active_settings)
+        return _create_daytona_backend_runtime(settings)
     if kind == "local":
-        return _create_local_backend_runtime(active_settings)
+        return _create_local_backend_runtime(settings)
     raise ValueError(
         f"Unsupported backend kind: {kind!r}. Expected 'daytona' or 'local'."
     )

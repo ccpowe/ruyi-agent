@@ -9,7 +9,6 @@ from ruyi_agent.storage.channel_delivery_store import ChannelDeliveryStore
 from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 from ruyi_agent.config.runtime_settings import (
     RuntimeSettings,
-    configure_runtime_environment,
 )
 
 
@@ -17,19 +16,20 @@ DEFAULT_GATEWAY_BEARER_TOKEN = "dev-token"
 DEFAULT_CHANNEL_SESSION_DB = "data/channel_sessions.sqlite3"
 
 
-async def run_feishu_adapter(settings: RuntimeSettings | None = None) -> None:
+async def run_feishu_adapter(settings: RuntimeSettings) -> None:
     from ruyi_agent.channels.feishu.adapter import FeishuAdapter
 
-    active_settings = settings or configure_runtime_environment()
-    feishu = active_settings.channels.feishu
+    if not isinstance(settings, RuntimeSettings):
+        raise TypeError("run_feishu_adapter requires RuntimeSettings")
+    feishu = settings.channels.feishu
     app_id = feishu.app_id
     app_secret = feishu.app_secret
     if not app_id:
         raise SystemExit("Missing FEISHU_APP_ID")
     if not app_secret:
         raise SystemExit("Missing FEISHU_APP_SECRET")
-    gateway_base_url = active_settings.gateway.base_url
-    gateway_bearer_token = active_settings.gateway.bearer_token
+    gateway_base_url = settings.gateway.base_url
+    gateway_bearer_token = settings.gateway.bearer_token
     default_agent_name = feishu.default_agent
     session_db_path = str(feishu.session_db)
     event_db_path = str(feishu.event_db)
