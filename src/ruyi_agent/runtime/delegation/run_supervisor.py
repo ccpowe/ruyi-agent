@@ -20,11 +20,7 @@ _T = TypeVar("_T")
 
 
 class RunCompletionPort(Protocol):
-    def on_run_finished(
-        self,
-        task_id: str,
-        task: asyncio.Task[None],
-    ) -> None: ...
+    def on_run_finished(self, task_id: str, task: asyncio.Task[None]) -> None: ...
 
 
 class RuntimeClosingError(RuntimeError):
@@ -344,7 +340,7 @@ class RunSupervisor:
             await self._lifecycle_condition.acquire()
         except asyncio.CancelledError:
             await self._await_cleanup(cleanup(), name=f"release-{kind}")
-            raise AssertionError("cancellation-safe cleanup must propagate")
+            raise
         try:
             self._consume_permit_locked(
                 permit,

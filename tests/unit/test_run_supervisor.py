@@ -952,7 +952,7 @@ async def test_permit_cleanup_survives_double_cancel_while_condition_is_locked(
     task.cancel()
     await second_cleanup_acquire_started.wait()
     cleanup_acquire_release.set()
-    with pytest.raises(AssertionError, match="cancellation-safe cleanup"):
+    with pytest.raises(asyncio.CancelledError):
         await task
 
     new_permit = await supervisor.acquire_mutation()
