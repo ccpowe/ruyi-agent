@@ -25,6 +25,7 @@ from ruyi_agent.storage.task_store import TaskStore
 
 
 NOW = "2026-08-30T00:00:00+00:00"
+CHANNEL_STORE_TYPES = (ChannelSessionStore, ChannelDeliveryStore)
 THREAD_COUNT = 12
 STRESS_ROUND_COUNT = 60
 URI_STRESS_ROUND_COUNT = 6
@@ -291,7 +292,7 @@ def _open_channel_store_in_process(
     db_path: str, store_index: int, barrier: Any
 ) -> None:
     barrier.wait(timeout=30)
-    (ChannelSessionStore if store_index % 2 == 0 else ChannelDeliveryStore)(db_path).close()
+    CHANNEL_STORE_TYPES[store_index % 2](db_path).close()
 
 
 def test_wal_negotiation_retries_only_locked_errors(
@@ -870,9 +871,7 @@ def test_legacy_command_schema_initializes_concurrently_without_duplicate_column
     for round_index in range(STRESS_ROUND_COUNT):
         db_path = tmp_path / f"legacy-commands-{round_index}.sqlite"
         _create_legacy_command_database(db_path)
-        _open_stores_concurrently(
-            lambda _index: GatewayCommandStore(str(db_path))
-        )
+        _open_stores_concurrently(lambda _index: GatewayCommandStore(str(db_path)))
 
     connection = sqlite3.connect(db_path)
     try:
@@ -1085,21 +1084,41 @@ def test_command_schema_migration_rolls_back_as_one_transaction(
     store.close()
 
 
-def test_channel_stores_initialize_mixed_concurrently_without_partial_schema(tmp_path: Path) -> None:
+def test_channel_schema_cold_start_concurrency(tmp_path: Path) -> None:
     def assert_tables(db_path: Path) -> None:
         with sqlite3.connect(db_path) as connection:
-            assert {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")} == set("channel_sessions channel_turn_receipts channel_delivery_intents channel_delivery_steps".split())
+            assert {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            } == {
+                "channel_sessions",
+                "channel_turn_receipts",
+                "channel_delivery_intents",
+                "channel_delivery_steps",
+            }
 
     for round_index in range(10):
         thread_db_path = tmp_path / f"channel-thread-{round_index}.sqlite"
-        _open_stores_concurrently(lambda index, db_path=thread_db_path: ChannelSessionStore(str(db_path)) if index % 2 == 0 else ChannelDeliveryStore(str(db_path)))
+        _open_stores_concurrently(
+            lambda index, db_path=thread_db_path: CHANNEL_STORE_TYPES[index % 2](
+                str(db_path)
+            )
+        )
         assert_tables(thread_db_path)
 
     process_context = multiprocessing.get_context("fork")
     for round_index in range(10):
         process_db_path = tmp_path / f"channel-process-{round_index}.sqlite"
         barrier = process_context.Barrier(8)
-        processes = [process_context.Process(target=_open_channel_store_in_process, args=(str(process_db_path), index, barrier)) for index in range(8)]
+        processes = [
+            process_context.Process(
+                target=_open_channel_store_in_process,
+                args=(str(process_db_path), index, barrier),
+            )
+            for index in range(8)
+        ]
         try:
             for process in processes:
                 process.start()
@@ -1114,8 +1133,8 @@ def test_channel_stores_initialize_mixed_concurrently_without_partial_schema(tmp
         assert_tables(process_db_path)
 
 
-@pytest.mark.parametrize("store_type", [ChannelSessionStore, ChannelDeliveryStore], ids=["session", "delivery"])
-def test_channel_store_constructor_preserves_initialization_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store_type: type[ChannelSessionStore] | type[ChannelDeliveryStore]) -> None:
+@pytest.mark.parametrize("store_type", CHANNEL_STORE_TYPES)
+def test_channel_store_init_failure(tmp_path, monkeypatch, store_type) -> None:
     init_failure = RuntimeError("init sentinel")
     cleanup_failure = RuntimeError("cleanup sentinel")
     connections: list[sqlite3.Connection] = []
