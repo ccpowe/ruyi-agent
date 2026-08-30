@@ -498,6 +498,7 @@ def _remote_http_status_error(
 ) -> A2AClientError:
     error_payload = exc.payload.get("error") if isinstance(exc.payload, dict) else None
     if isinstance(error_payload, dict):
+        details = error_payload.get("details")
         return A2AClientError(
             status_code=exc.status_code,
             code=(
@@ -510,7 +511,7 @@ def _remote_http_status_error(
                 if isinstance(error_payload.get("message"), str)
                 else f"Remote gateway request failed for '{remote_ref.name}'"
             ),
-            details=error_payload.get("details"),
+            details=details if isinstance(details, dict) else None,
         )
     return A2AClientError(
         status_code=502,

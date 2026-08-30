@@ -214,6 +214,46 @@ def test_a2a_client_preserves_error_mapping() -> None:
     assert errors[4].details == {"ok": 1, "secret": "drop"}
 
 
+@pytest.mark.parametrize(
+    ("details", "expected"),
+    [
+        (["unexpected"], None),
+        ("unexpected", None),
+        (None, None),
+        ({"task_id": "task-1"}, {"task_id": "task-1"}),
+    ],
+)
+def test_a2a_client_error_details_accept_only_objects(
+    details: Any,
+    expected: dict[str, Any] | None,
+) -> None:
+    remote_ref = _remote_ref()
+    client = A2AClient(
+        transports={
+            remote_ref.url: httpx.MockTransport(
+                lambda request: httpx.Response(
+                    409,
+                    json={
+                        "error": {
+                            "code": "task_conflict",
+                            "message": "busy",
+                            "details": details,
+                        }
+                    },
+                )
+            )
+        }
+    )
+
+    async def scenario() -> A2AClientError:
+        with pytest.raises(A2AClientError) as raised:
+            await client.get_task(remote_ref, task_id="task-1")
+        return raised.value
+
+    error = asyncio.run(scenario())
+    assert error.details == expected
+
+
 def test_a2a_client_marks_missing_credentials_before_transport_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
