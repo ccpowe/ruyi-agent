@@ -269,7 +269,7 @@ def test_direct_mailbox_retry_does_not_poison_seen_key(
     ]
 
 
-def test_parent_wake_retries_after_targeted_trigger_probe_failure(
+def test_first_outbox_write_failure_retries_and_does_not_block_webhook(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
     caplog: pytest.LogCaptureFixture,
@@ -280,9 +280,6 @@ def test_parent_wake_retries_after_targeted_trigger_probe_failure(
     setup_store.insert_task(parent)
     setup_store.close()
     active_mailbox: list[AgentMailbox] = []
-    first_probe_failed = asyncio.Event()
-    parent_message_claimed = asyncio.Event()
-    parent_finish = asyncio.Event()
 
     class ParentWakeAgent(FakeAgent):
         def __init__(self) -> None:
@@ -305,8 +302,6 @@ def test_parent_wake_retries_after_targeted_trigger_probe_failure(
                 active_mailbox[0].acknowledge(
                     [message.message_id for message in self.parent_messages]
                 )
-                parent_message_claimed.set()
-                await parent_finish.wait()
             return {"messages": [{"role": "assistant", "content": "done"}]}
 
     agent = ParentWakeAgent()
@@ -321,36 +316,49 @@ def test_parent_wake_retries_after_targeted_trigger_probe_failure(
         agent_factory=factory,
     )
     active_mailbox.append(mailbox)
-    original_has_triggering = AgentMailbox.has_triggering_messages
-    probe_attempts = 0
+    original_publish = MailboxStore.publish_claimed_settled_outbox
+    publish_attempts = 0
+    webhook_calls: list[str] = []
 
-    def fail_first_target_probe(
-        store: AgentMailbox,
-        recipient_task_id: str,
-    ) -> bool:
-        nonlocal probe_attempts
-        if recipient_task_id == parent.task_id and not parent_message_claimed.is_set():
-            probe_attempts += 1
-            if probe_attempts == 1:
-                first_probe_failed.set()
-                raise RuntimeError("target mailbox probe unavailable")
-        return original_has_triggering(store, recipient_task_id)
+    def flaky_publish(store: MailboxStore, intent) -> bool:
+        nonlocal publish_attempts
+        publish_attempts += 1
+        if publish_attempts == 1:
+            raise RuntimeError("mailbox unavailable")
+        return original_publish(store, intent)
+
+    class CapturingClient:
+        def __init__(self, *, timeout: float) -> None:
+            del timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+
+        async def post(self, url, *, headers, json):
+            del headers, json
+            webhook_calls.append(url)
 
     monkeypatch.setattr(
-        AgentMailbox,
-        "has_triggering_messages",
-        fail_first_target_probe,
+        MailboxStore,
+        "publish_claimed_settled_outbox",
+        flaky_publish,
     )
+    monkeypatch.setattr(httpx, "AsyncClient", CapturingClient)
 
     async def scenario() -> tuple[TaskRecord, list, list, list]:
-        await control.spawn_task(
+        record = await control.spawn_task(
             "background_research",
             "run",
             task_id="child-task",
             parent_task_id=parent.task_id,
             parent_thread_id="parent-thread",
+            webhook={"url": "https://client.example/settled"},
         )
-        await asyncio.wait_for(first_probe_failed.wait(), timeout=1)
+        await wait_for_task_state(control, record.task_id, states={"completed"})
+        assert task_store.list_settled_outbox()[0]["status"] == "pending"
         await control.close()
         mailbox_store.close()
         task_store.close()
@@ -368,20 +376,16 @@ def test_parent_wake_retries_after_targeted_trigger_probe_failure(
         )
         try:
             await reopened.wake_pending_mailbox_tasks()
-            await asyncio.wait_for(parent_message_claimed.wait(), timeout=1)
-            parent_before_finish = reopened.get_task_record(parent.task_id)
-            assert parent_before_finish.run_count == 2
-            empty = reopened_mailbox.claim(
-                recipient_task_id=parent.task_id,
-                recipient_thread_id=parent.thread_id,
-            )
-            parent_finish.set()
             parent_after = await wait_for_task_state(
                 reopened,
                 parent.task_id,
                 states={"completed"},
             )
             messages = list(agent.parent_messages)
+            empty = reopened_mailbox.claim(
+                recipient_task_id=parent.task_id,
+                recipient_thread_id=parent.thread_id,
+            )
             rows = reopened_tasks.list_settled_outbox()
             return parent_after, messages, empty, rows
         finally:
@@ -391,9 +395,10 @@ def test_parent_wake_retries_after_targeted_trigger_probe_failure(
 
     parent_after, messages, empty, rows = asyncio.run(scenario())
 
-    assert probe_attempts == 2
-    assert "target mailbox probe unavailable" in caplog.text
-    assert "Non-authoritative local run tail failed: child-task" in caplog.text
+    assert webhook_calls == ["https://client.example/settled"]
+    assert publish_attempts == 2
+    assert "mailbox unavailable" in caplog.text
+    assert "dispatch settled:parent-thread:child-task:1" in caplog.text
     assert len(messages) == 1
     assert messages[0].child_task_id == "child-task"
     assert messages[0].run_count == 1
@@ -677,49 +682,137 @@ def test_background_reconciler_starts_and_closes_cleanly(
         task_store.close()
 
 
-def test_parent_wake_failure_is_consumed_and_retried_from_durable_mailbox(
+def test_parent_wake_retries_after_targeted_trigger_probe_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    db_path = str(tmp_path / "parent-wake.sqlite")
-    control, task_store, mailbox_store, mailbox = _control(monkeypatch, db_path)
-    manager = TaskManager(task_store, settled_outbox_enabled=True)
+    db_path = str(tmp_path / "retry.sqlite")
+    setup_store = TaskStore(db_path)
+    parent = _record("parent-task", parent_thread_id=None)
+    setup_store.insert_task(parent)
+    setup_store.close()
+    active_mailbox: list[AgentMailbox] = []
+    first_probe_failed = asyncio.Event()
+    parent_message_claimed = asyncio.Event()
+    parent_finish = asyncio.Event()
 
-    async def scenario() -> tuple[list, list[str]]:
-        parent = manager.create_task_record(
-            "parent-task",
+    class ParentWakeAgent(FakeAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.parent_messages: list = []
+
+        async def ainvoke(self, payload, *, config, version):
+            self.calls.append(
+                {"payload": payload, "config": config, "version": version}
+            )
+            if payload == {"messages": []}:
+                task_id = config["configurable"]["task_id"]
+                thread_id = config["configurable"]["thread_id"]
+                self.parent_messages.extend(
+                    active_mailbox[0].claim(
+                        recipient_task_id=task_id,
+                        recipient_thread_id=thread_id,
+                    )
+                )
+                active_mailbox[0].acknowledge(
+                    [message.message_id for message in self.parent_messages]
+                )
+                parent_message_claimed.set()
+                await parent_finish.wait()
+            return {"messages": [{"role": "assistant", "content": "done"}]}
+
+    agent = ParentWakeAgent()
+
+    def factory(**kwargs):
+        del kwargs
+        return agent
+
+    control, task_store, mailbox_store, mailbox = _control(
+        monkeypatch,
+        db_path,
+        agent_factory=factory,
+    )
+    active_mailbox.append(mailbox)
+    original_has_triggering = AgentMailbox.has_triggering_messages
+    probe_attempts = 0
+
+    def fail_first_target_probe(
+        store: AgentMailbox,
+        recipient_task_id: str,
+    ) -> bool:
+        nonlocal probe_attempts
+        if recipient_task_id == parent.task_id and not parent_message_claimed.is_set():
+            probe_attempts += 1
+            if probe_attempts == 1:
+                first_probe_failed.set()
+                raise RuntimeError("target mailbox probe unavailable")
+        return original_has_triggering(store, recipient_task_id)
+
+    monkeypatch.setattr(
+        AgentMailbox,
+        "has_triggering_messages",
+        fail_first_target_probe,
+    )
+
+    async def scenario() -> tuple[TaskRecord, list, list, list]:
+        await control.spawn_task(
             "background_research",
-            parent_task_id=None,
-            root_task_id="parent-task",
-            depth=1,
-        )
-        child = manager.create_task_record(
-            "child-task",
-            "background_research",
+            "run",
+            task_id="child-task",
             parent_task_id=parent.task_id,
-            root_task_id=parent.task_id,
-            depth=2,
-            parent_thread_id=parent.thread_id,
+            parent_thread_id="parent-thread",
         )
-        manager.mark_running(child.task_id, asyncio.current_task())  # type: ignore[arg-type]
-        manager.mark_completed(child.task_id, "done")
-        notifier = _notifier(task_store, mailbox, manager=manager)
-        assert notifier.publish_settled_message(child.task_id) == [parent.task_id]
-        wake_ids = await notifier.reconcile()
-        messages = mailbox.claim(
-            recipient_task_id=parent.task_id,
-            recipient_thread_id=parent.thread_id,
-        )
-        return messages, wake_ids
-
-    try:
-        messages, wake_ids = asyncio.run(scenario())
-    finally:
+        await asyncio.wait_for(first_probe_failed.wait(), timeout=1)
+        await control.close()
         mailbox_store.close()
         task_store.close()
 
-    assert wake_ids == ["parent-task"]
-    assert [message.child_task_id for message in messages] == ["child-task"]
+        reopened_tasks = TaskStore(db_path)
+        reopened_mailbox_store = MailboxStore(db_path)
+        reopened_mailbox = AgentMailbox(reopened_mailbox_store)
+        active_mailbox[0] = reopened_mailbox
+        reopened, _, _, _ = _control(
+            monkeypatch,
+            db_path,
+            task_store=reopened_tasks,
+            mailbox_store=reopened_mailbox_store,
+            agent_factory=factory,
+        )
+        try:
+            await reopened.wake_pending_mailbox_tasks()
+            await asyncio.wait_for(parent_message_claimed.wait(), timeout=1)
+            parent_before_finish = reopened.get_task_record(parent.task_id)
+            assert parent_before_finish.run_count == 2
+            empty = reopened_mailbox.claim(
+                recipient_task_id=parent.task_id,
+                recipient_thread_id=parent.thread_id,
+            )
+            parent_finish.set()
+            parent_after = await wait_for_task_state(
+                reopened,
+                parent.task_id,
+                states={"completed"},
+            )
+            messages = list(agent.parent_messages)
+            rows = reopened_tasks.list_settled_outbox()
+            return parent_after, messages, empty, rows
+        finally:
+            await reopened.close()
+            reopened_mailbox_store.close()
+            reopened_tasks.close()
+
+    parent_after, messages, empty, rows = asyncio.run(scenario())
+
+    assert probe_attempts == 2
+    assert "target mailbox probe unavailable" in caplog.text
+    assert "Non-authoritative local run tail failed: child-task" in caplog.text
+    assert len(messages) == 1
+    assert messages[0].child_task_id == "child-task"
+    assert messages[0].run_count == 1
+    assert parent_after.run_count == 2
+    assert empty == []
+    assert len(rows) == 1 and rows[0]["status"] == "delivered"
 
 
 def test_claim_then_suppress_fences_publish_and_reconciles_retraction(
