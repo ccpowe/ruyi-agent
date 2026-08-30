@@ -71,14 +71,22 @@ def _sanitize_codex_error(
         if not isinstance(source, dict):
             source = payload
 
+        redaction_values: list[str] = []
+        for secret in (authorization, api_key, chatgpt_account_id):
+            if secret and secret not in redaction_values:
+                redaction_values.append(secret)
+        redaction_values.sort(
+            key=lambda secret: len(secret.encode("utf-8")),
+            reverse=True,
+        )
+
         error: dict[str, str] = {}
         for field_name in _CODEX_ERROR_FIELDS:
             value = source.get(field_name)
             if not isinstance(value, str) or not value:
                 continue
-            for secret in (authorization, api_key, chatgpt_account_id):
-                if secret:
-                    value = value.replace(secret, _CODEX_REDACTED)
+            for secret in redaction_values:
+                value = value.replace(secret, _CODEX_REDACTED)
             error[field_name] = _truncate_codex_error_text(value)
         if not error:
             return None

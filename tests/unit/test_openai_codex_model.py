@@ -306,6 +306,7 @@ def test_codex_chat_model_streams_tool_call_chunks_without_text(
 
 
 class _CodexHTTPErrorHandler(BaseHTTPRequestHandler):
+    request_count = 0
     payload = {
         "code": "top-level-code",
         "error": {
@@ -323,6 +324,7 @@ class _CodexHTTPErrorHandler(BaseHTTPRequestHandler):
     }
 
     def do_POST(self) -> None:
+        type(self).request_count += 1
         body = json.dumps(type(self).payload, ensure_ascii=False).encode()
         self.send_response(400)
         self.send_header("content-type", "application/json")
@@ -337,6 +339,7 @@ class _CodexHTTPErrorHandler(BaseHTTPRequestHandler):
 def test_codex_http_error_diagnostics_are_safe_for_sync_and_async(
     run_http_server,
 ) -> None:
+    _CodexHTTPErrorHandler.request_count = 0
     server = run_http_server(_CodexHTTPErrorHandler)
     model = CodexChatModel(
         model="gpt-5.4",
@@ -352,7 +355,11 @@ def test_codex_http_error_diagnostics_are_safe_for_sync_and_async(
     with pytest.raises(httpx.HTTPStatusError) as async_error:
         asyncio.run(model.ainvoke([HumanMessage(content="Say hi.")]))
 
-    for error in (sync_error.value, async_error.value):
+    sync_exception = sync_error.value
+    async_exception = async_error.value
+    assert _CodexHTTPErrorHandler.request_count == 2
+    assert str(sync_exception) == str(async_exception)
+    for error in (sync_exception, async_exception):
         message = str(error)
         assert message.startswith("Codex Responses request failed with HTTP 400; error=")
         assert "secret-token" not in message
@@ -365,13 +372,25 @@ def test_codex_http_error_diagnostics_are_safe_for_sync_and_async(
         assert "[REDACTED]" in diagnostics["message"]
         assert len(diagnostics["message"].encode("utf-8")) <= 512
         assert isinstance(error, httpx.HTTPStatusError)
+        assert error.request.method == "POST"
+        assert str(error.request.url) == (
+            f"http://127.0.0.1:{server.server_port}/responses"
+        )
+        assert error.response.request is error.request
         assert error.response.status_code == 400
 
 
 class _OversizedMalformedCodexHTTPErrorHandler(BaseHTTPRequestHandler):
-    body = b'{"error":{"message":"' + (b"x" * (64 * 1024))
+    request_count = 0
+    sentinel = b"codex-error-sentinel-after-budget"
+    body = (
+        b'{"error":{"message":"'
+        + (b"x" * (64 * 1024))
+        + sentinel
+    )
 
     def do_POST(self) -> None:
+        type(self).request_count += 1
         body = type(self).body
         self.send_response(502)
         self.send_header("content-type", "application/json")
@@ -386,6 +405,7 @@ class _OversizedMalformedCodexHTTPErrorHandler(BaseHTTPRequestHandler):
 def test_codex_http_error_oversized_malformed_body_is_status_only(
     run_http_server,
 ) -> None:
+    _OversizedMalformedCodexHTTPErrorHandler.request_count = 0
     server = run_http_server(_OversizedMalformedCodexHTTPErrorHandler)
     model = CodexChatModel(
         model="gpt-5.4",
@@ -399,11 +419,13 @@ def test_codex_http_error_oversized_malformed_body_is_status_only(
 
     with pytest.raises(httpx.HTTPStatusError) as sync_error:
         model.invoke([HumanMessage(content="Say hi.")])
-    with pytest.raises(httpx.HTTPStatusError) as async_error:
-        asyncio.run(model.ainvoke([HumanMessage(content="Say hi.")]))
 
-    assert str(sync_error.value) == expected
-    assert str(async_error.value) == expected
+    message = str(sync_error.value)
+    assert _OversizedMalformedCodexHTTPErrorHandler.request_count == 1
+    assert _OversizedMalformedCodexHTTPErrorHandler.sentinel.decode() not in message
+    assert "secret-token" not in message
+    assert "acct-123" not in message
+    assert message == expected
 
 
 def test_resolve_codex_credentials_reads_ruyi_auth_json(tmp_path) -> None:
