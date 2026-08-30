@@ -9,7 +9,8 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Callable, cast
+from unittest.mock import Mock
 from urllib.parse import quote
 
 import pytest
@@ -26,6 +27,7 @@ from ruyi_agent.storage.task_store import TaskStore
 
 NOW = "2026-08-30T00:00:00+00:00"
 CHANNEL_STORE_TYPES = (ChannelSessionStore, ChannelDeliveryStore)
+CHANNEL_TABLE_QUERY = "SELECT name FROM sqlite_master WHERE type = 'table'"
 THREAD_COUNT = 12
 STRESS_ROUND_COUNT = 60
 URI_STRESS_ROUND_COUNT = 6
@@ -288,9 +290,7 @@ def _index_names(connection: sqlite3.Connection, table: str) -> set[str]:
     }
 
 
-def _open_channel_store_in_process(
-    db_path: str, store_index: int, barrier: Any
-) -> None:
+def _open_channel_store_in_process(db_path: str, store_index: int, barrier) -> None:
     barrier.wait(timeout=30)
     CHANNEL_STORE_TYPES[store_index % 2](db_path).close()
 
@@ -1087,12 +1087,7 @@ def test_command_schema_migration_rolls_back_as_one_transaction(
 def test_channel_schema_cold_start_concurrency(tmp_path: Path) -> None:
     def assert_tables(db_path: Path) -> None:
         with sqlite3.connect(db_path) as connection:
-            assert {
-                row[0]
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                )
-            } == {
+            assert {row[0] for row in connection.execute(CHANNEL_TABLE_QUERY)} == {
                 "channel_sessions",
                 "channel_turn_receipts",
                 "channel_delivery_intents",
@@ -1102,9 +1097,7 @@ def test_channel_schema_cold_start_concurrency(tmp_path: Path) -> None:
     for round_index in range(10):
         thread_db_path = tmp_path / f"channel-thread-{round_index}.sqlite"
         _open_stores_concurrently(
-            lambda index, db_path=thread_db_path: CHANNEL_STORE_TYPES[index % 2](
-                str(db_path)
-            )
+            lambda index, path=str(thread_db_path): CHANNEL_STORE_TYPES[index % 2](path)
         )
         assert_tables(thread_db_path)
 
@@ -1133,30 +1126,48 @@ def test_channel_schema_cold_start_concurrency(tmp_path: Path) -> None:
         assert_tables(process_db_path)
 
 
-@pytest.mark.parametrize("store_type", CHANNEL_STORE_TYPES)
-def test_channel_store_init_failure(tmp_path, monkeypatch, store_type) -> None:
+@pytest.mark.parametrize(
+    ("store_type", "schema_marker"),
+    zip(
+        CHANNEL_STORE_TYPES, ("channel_turn_receipts", "idx_channel_delivery_recovery")
+    ),
+)
+def test_channel_store_init_failure(tmp_path, monkeypatch, store_type, schema_marker):
     init_failure = RuntimeError("init sentinel")
-    cleanup_failure = RuntimeError("cleanup sentinel")
-    connections: list[sqlite3.Connection] = []
+    rollback_failure = RuntimeError("rollback sentinel")
+    close_failure = RuntimeError("close sentinel")
+    db_path = tmp_path / f"{store_type.__name__}.sqlite"
+    real_connection = sqlite3.connect(db_path)
+    connection = Mock(wraps=real_connection)
     original_close = store_type.close
+    schemas_before_close = []
 
-    def fail_init(store: Any) -> None:
-        connections.append(store._conn)
-        raise init_failure
+    def execute(statement: str):
+        if schema_marker in statement:
+            raise init_failure
+        return real_connection.execute(statement)
 
-    def close(store: Any) -> None:
+    def rollback() -> None:
+        real_connection.rollback()
+        raise rollback_failure
+
+    def close(store) -> None:
+        schemas_before_close.append(
+            real_connection.execute(CHANNEL_TABLE_QUERY).fetchall()
+        )
         original_close(store)
-        raise cleanup_failure
+        raise close_failure
 
-    monkeypatch.setattr(store_type, "_init_db", fail_init)
+    connection.execute.side_effect = execute
+    connection.rollback.side_effect = rollback
+    monkeypatch.setattr(sqlite3, "connect", Mock(return_value=connection))
     monkeypatch.setattr(store_type, "close", close)
-    db_path = tmp_path / f"{store_type.__name__}-failure.sqlite"
 
     with pytest.raises(RuntimeError) as caught:
         store_type(str(db_path))
 
     assert caught.value is init_failure
-    assert len(connections) == 1
-    connection = connections[0]
+    assert (connection.rollback.call_count, connection.close.call_count) == (1, 1)
+    assert schemas_before_close == [[]]
     with pytest.raises(sqlite3.ProgrammingError):
-        connection.execute("SELECT 1")
+        real_connection.execute("SELECT 1")

@@ -510,7 +510,10 @@ class ChannelDeliveryStore:
                 )
                 self._conn.commit()
             except BaseException:
-                self._conn.rollback()
+                try:
+                    self._conn.rollback()
+                except BaseException:
+                    pass
                 raise
 
     @staticmethod

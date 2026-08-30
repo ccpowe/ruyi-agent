@@ -312,7 +312,10 @@ class ChannelSessionStore:
                 )
                 self._conn.commit()
             except BaseException:
-                self._conn.rollback()
+                try:
+                    self._conn.rollback()
+                except BaseException:
+                    pass
                 raise
 
     def _insert_or_validate_turn_receipt(
