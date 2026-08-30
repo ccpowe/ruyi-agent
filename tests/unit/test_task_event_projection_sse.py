@@ -25,6 +25,10 @@ from ruyi_agent.gateway_protocol.sse import (
     iter_utf8_sse_lines,
     task_stream_event_from_gateway,
 )
+from ruyi_agent.gateway_protocol.projection import (
+    AssistantDelta,
+    assistant_delta_from_stream_part as project_assistant_delta,
+)
 from ruyi_agent.runtime.task_events import (
     MAX_ASSISTANT_DELTA_TEXT_LENGTH,
     MAX_DURABLE_TASK_EVENT_DATA_BYTES,
@@ -137,91 +141,142 @@ class SecretStreamingModel(BaseChatModel):
 
 
 def _message_stream_parts_containing(
-    parts: list[dict[str, Any]],
-    text: str,
+    parts: list[dict[str, Any]], text: str
 ) -> list[dict[str, Any]]:
-    matches: list[dict[str, Any]] = []
-    for part in parts:
-        data = part.get("data")
-        if (
-            part.get("type") == "messages"
-            and isinstance(data, tuple)
-            and isinstance(data[0], AIMessageChunk)
-            and text in str(data[0].content)
-        ):
-            matches.append(part)
-    return matches
+    return [
+        part
+        for part in parts
+        if part.get("type") == "messages"
+        and isinstance(data := part.get("data"), tuple)
+        and isinstance(data[0], AIMessageChunk)
+        and text in str(data[0].content)
+    ]
+
 
 def test_assistant_delta_projection_excludes_tools_reasoning_and_metadata() -> None:
-    assert assistant_delta_from_stream_part(
-        {
-            "type": "messages",
-            "ns": (),
-            "data": (
-                AIMessageChunk(content="hello"),
-                {
-                    "provider": "secret",
-                    "langgraph_node": "model",
-                    "langgraph_path": ("__pregel_pull", "model"),
-                },
-            ),
-        }
-    ) == "hello"
-    assert assistant_delta_from_stream_part(
-        {
-            "type": "messages",
-            "ns": (),
-            "data": (
-                AIMessageChunk(
-                    content=[
-                        {"type": "reasoning", "reasoning": "hidden"},
-                        {"type": "text", "text": "safe"},
-                        {"type": "output_text", "text": " output"},
-                    ]
+    assert (
+        assistant_delta_from_stream_part(
+            {
+                "type": "messages",
+                "ns": (),
+                "data": (
+                    AIMessageChunk(content="hello"),
+                    {
+                        "provider": "secret",
+                        "langgraph_node": "model",
+                        "langgraph_path": ("__pregel_pull", "model"),
+                    },
                 ),
-                {
-                    "langgraph_node": "model",
-                    "langgraph_path": ("__pregel_pull", "model"),
-                },
-            ),
-        }
-    ) == "safe output"
-    assert assistant_delta_from_stream_part(
+            }
+        )
+        == "hello"
+    )
+    assert (
+        assistant_delta_from_stream_part(
+            {
+                "type": "messages",
+                "ns": (),
+                "data": (
+                    AIMessageChunk(
+                        content=[
+                            {"type": "reasoning", "reasoning": "hidden"},
+                            {"type": "text", "text": "safe"},
+                            {"type": "output_text", "text": " output"},
+                        ]
+                    ),
+                    {
+                        "langgraph_node": "model",
+                        "langgraph_path": ("__pregel_pull", "model"),
+                    },
+                ),
+            }
+        )
+        == "safe output"
+    )
+    assert (
+        assistant_delta_from_stream_part(
+            {
+                "type": "messages",
+                "ns": (),
+                "data": (
+                    ToolMessage(content="secret", tool_call_id="call-1"),
+                    {
+                        "langgraph_node": "model",
+                        "langgraph_path": ("__pregel_pull", "model"),
+                    },
+                ),
+            }
+        )
+        is None
+    )
+    assert (
+        assistant_delta_from_stream_part(
+            {
+                "type": "messages",
+                "ns": (),
+                "data": (
+                    AIMessageChunk(content="tool-internal secret"),
+                    {"langgraph_node": "tools"},
+                ),
+            }
+        )
+        is None
+    )
+    assert (
+        assistant_delta_from_stream_part(
+            {
+                "type": "messages",
+                "ns": ("tool-subgraph:call-1",),
+                "data": (
+                    AIMessageChunk(content="nested model secret"),
+                    {
+                        "langgraph_node": "model",
+                        "langgraph_path": ("__pregel_pull", "model"),
+                    },
+                ),
+            }
+        )
+        is None
+    )
+
+
+def test_assistant_delta_boundary_accepts_nominal_subclass_and_neutral_dto() -> None:
+    class DerivedAIMessageChunk(AIMessageChunk):
+        pass
+
+    provenance = {
+        "langgraph_node": "model",
+        "langgraph_path": ("__pregel_pull", "model"),
+    }
+    assert (
+        assistant_delta_from_stream_part(
+            {
+                "type": "messages",
+                "ns": (),
+                "data": (DerivedAIMessageChunk(content="hello"), provenance),
+            }
+        )
+        == "hello"
+    )
+    delta = AssistantDelta(
+        content="hello",
+        provenance={"ns": (), **provenance},
+    )
+    projected = project_assistant_delta(
         {
             "type": "messages",
             "ns": (),
-            "data": (
-                ToolMessage(content="secret", tool_call_id="call-1"),
-                {
-                    "langgraph_node": "model",
-                    "langgraph_path": ("__pregel_pull", "model"),
-                },
-            ),
+            "data": (delta, {"private": "ignored"}),
         }
-    ) is None
-    assert assistant_delta_from_stream_part(
-        {
-            "type": "messages",
-            "ns": (),
-            "data": (
-                AIMessageChunk(content="tool-internal secret"),
-                {"langgraph_node": "tools"},
-            ),
-        }
-    ) is None
-    assert assistant_delta_from_stream_part(
-        {
-            "type": "messages",
-            "ns": ("tool-subgraph:call-1",),
-            "data": (
-                AIMessageChunk(content="nested model secret"),
-                {
-                    "langgraph_node": "model",
-                    "langgraph_path": ("__pregel_pull", "model"),
-                },
-            ),
-        }
-    ) is None
+    )
+    assert projected == delta
+    lookalike = type("Lookalike", (), {"content": "hello"})()
+    assert (
+        assistant_delta_from_stream_part(
+            {"type": "messages", "ns": (), "data": (lookalike, provenance)}
+        )
+        is None
+    )
 
 
 def test_real_agent_stream_excludes_model_tokens_invoked_inside_tool() -> None:
@@ -268,9 +323,7 @@ def test_real_agent_stream_excludes_model_tokens_invoked_inside_tool() -> None:
     assert secret_parts
     assert all(part["ns"] == () for part in secret_parts)
     assert all(part["data"][1]["langgraph_node"] == "tools" for part in secret_parts)
-    assert all(
-        assistant_delta_from_stream_part(part) is None for part in secret_parts
-    )
+    assert all(assistant_delta_from_stream_part(part) is None for part in secret_parts)
     safe_parts = _message_stream_parts_containing(parts, "SAFE FINAL")
     assert safe_parts
     assert all(part["ns"] == () for part in safe_parts)
@@ -337,9 +390,7 @@ def test_real_tool_model_cannot_forge_public_model_node_metadata() -> None:
         part["data"][1]["langgraph_path"] != ("__pregel_pull", "model")
         for part in secret_parts
     )
-    assert all(
-        assistant_delta_from_stream_part(part) is None for part in secret_parts
-    )
+    assert all(assistant_delta_from_stream_part(part) is None for part in secret_parts)
     safe_parts = _message_stream_parts_containing(parts, "SAFE OVERRIDE FINAL")
     assert safe_parts
     assert all(part["ns"] == () for part in safe_parts)
@@ -405,9 +456,7 @@ def test_real_nested_agent_stream_excludes_subgraph_model_tokens() -> None:
     assert secret_parts
     assert all(part["ns"] for part in secret_parts)
     assert all(part["data"][1]["langgraph_node"] == "model" for part in secret_parts)
-    assert all(
-        assistant_delta_from_stream_part(part) is None for part in secret_parts
-    )
+    assert all(assistant_delta_from_stream_part(part) is None for part in secret_parts)
 
 
 def test_lifecycle_projection_excludes_review_arguments_and_artifact_paths() -> None:
@@ -461,24 +510,32 @@ def test_lifecycle_projection_excludes_review_arguments_and_artifact_paths() -> 
             "run_count": 1,
         }
     ]
-    assert assistant_delta_from_stream_part(
-        {
-            "type": "messages",
-            "ns": (),
-            "data": (
-                AIMessageChunk(
-                    content="",
-                    tool_call_chunks=[
-                        {"name": "execute", "args": "{}", "id": "call-1", "index": 0}
-                    ],
+    assert (
+        assistant_delta_from_stream_part(
+            {
+                "type": "messages",
+                "ns": (),
+                "data": (
+                    AIMessageChunk(
+                        content="",
+                        tool_call_chunks=[
+                            {
+                                "name": "execute",
+                                "args": "{}",
+                                "id": "call-1",
+                                "index": 0,
+                            }
+                        ],
+                    ),
+                    {
+                        "langgraph_node": "model",
+                        "langgraph_path": ("__pregel_pull", "model"),
+                    },
                 ),
-                {
-                    "langgraph_node": "model",
-                    "langgraph_path": ("__pregel_pull", "model"),
-                },
-            ),
-        }
-    ) is None
+            }
+        )
+        is None
+    )
 
 
 def test_lifecycle_projection_has_an_aggregate_wire_budget() -> None:
@@ -505,14 +562,17 @@ def test_lifecycle_projection_has_an_aggregate_wire_budget() -> None:
     assert data["pending_review_truncated"] is True
     assert data["artifacts_truncated"] is True
     assert len(data["artifacts"]) < len(record.artifacts)
-    assert len(
-        json.dumps(
-            data,
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ) <= MAX_DURABLE_TASK_EVENT_DATA_BYTES
+    assert (
+        len(
+            json.dumps(
+                data,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        <= MAX_DURABLE_TASK_EVENT_DATA_BYTES
+    )
     assert encode_task_stream_event(
         TaskStreamEvent(
             event_type="task.snapshot",
@@ -720,9 +780,7 @@ def test_sse_encoder_applies_the_limit_to_the_final_data_line() -> None:
             separators=(",", ":"),
         ).encode("utf-8")
     )
-    content_length = (
-        MAX_SSE_LINE_BYTES - len(b"data: ") - empty_payload_size + 1
-    )
+    content_length = MAX_SSE_LINE_BYTES - len(b"data: ") - empty_payload_size + 1
     event = GatewayTaskEvent(
         event_type="assistant.delta",
         data={"content": "x" * content_length},

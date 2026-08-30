@@ -35,14 +35,10 @@ from ruyi_agent.gateway_protocol.transport import (
     GatewayTransportInvalidJSONError,
     GatewayTransportInvalidPayloadError,
     GatewayTransportInvalidStreamError,
+    GatewayTransportResponseTimeoutError,
     GatewayTransportStreamError,
     gateway_bearer_auth_headers,
 )
-from ruyi_agent.gateway_protocol.projection import (
-    MAX_SHORT_EVENT_TEXT_LENGTH,
-    normalize_task_event_text,
-)
-
 
 A2AEffectBoundary: TypeAlias = Literal["not_dispatched", "possibly_dispatched"]
 
@@ -159,8 +155,7 @@ class A2AClient:
         """
         if remote_ref.create_idempotency_guaranteed and idempotency_key is None:
             raise ValueError(
-                "A remote_ref declaring ruyi_gateway_v1 create idempotency "
-                "requires an Idempotency-Key"
+                "A remote_ref declaring ruyi_gateway_v1 create idempotency requires an Idempotency-Key"
             )
         return await self._request_json(
             remote_ref,
@@ -240,18 +235,34 @@ class A2AClient:
                 status_code=502,
                 code="upstream_gateway_error",
                 message=(
-                    f"Remote gateway for '{remote_ref.name}' returned "
-                    f"an invalid Task event {label}"
+                    f"Remote gateway for '{remote_ref.name}' returned an invalid Task event {label}"
                 ),
             ) from exc
         except httpx.InvalidURL as exc:
-            raise _remote_task_event_stream_error(remote_ref) from exc
+            raise _remote_task_event_stream_error(
+                remote_ref,
+                effect_boundary="not_dispatched",
+            ) from exc
         except (
+            GatewayTransportResponseTimeoutError,
             GatewayTransportInvalidJSONError,
             GatewayTransportInvalidPayloadError,
             GatewayTransportStreamError,
         ) as exc:
-            raise _remote_task_event_stream_error(remote_ref) from exc
+            raise _remote_task_event_stream_error(
+                remote_ref,
+                effect_boundary=(
+                    exc.effect_boundary
+                    if isinstance(
+                        exc,
+                        (
+                            GatewayTransportResponseTimeoutError,
+                            GatewayTransportStreamError,
+                        ),
+                    )
+                    else "possibly_dispatched"
+                ),
+            ) from exc
 
     async def send_input(
         self,
@@ -391,9 +402,15 @@ class A2AClient:
                 status_code=502,
                 code="upstream_gateway_error",
                 message=(
-                    f"Remote gateway for '{remote_ref.name}' returned an invalid "
-                    "response payload"
+                    f"Remote gateway for '{remote_ref.name}' returned an invalid response payload"
                 ),
+            ) from exc
+        except GatewayTransportResponseTimeoutError as exc:
+            raise A2AClientError(
+                status_code=502,
+                code="upstream_gateway_error",
+                message=f"Remote gateway request failed for '{remote_ref.name}'",
+                effect_boundary=exc.effect_boundary,
             ) from exc
         except GatewayTransportHTTPStatusError as exc:
             raise _remote_http_status_error(remote_ref, exc) from exc
@@ -449,8 +466,7 @@ class A2AClient:
                 status_code=503,
                 code="runtime_unavailable",
                 message=(
-                    f"Remote ref '{remote_ref.name}' requires environment variable "
-                    f"{token_env!r}"
+                    f"Remote ref '{remote_ref.name}' requires environment variable {token_env!r}"
                 ),
                 effect_boundary="not_dispatched",
             )
@@ -484,18 +500,17 @@ def _remote_http_status_error(
     if isinstance(error_payload, dict):
         return A2AClientError(
             status_code=exc.status_code,
-            code=str(error_payload.get("code", "upstream_gateway_error")),
-            message=str(
-                error_payload.get(
-                    "message",
-                    f"Remote gateway request failed for '{remote_ref.name}'",
-                )
+            code=(
+                error_payload.get("code")
+                if isinstance(error_payload.get("code"), str)
+                else "upstream_gateway_error"
             ),
-            details=(
-                error_payload.get("details")
-                if isinstance(error_payload.get("details"), dict)
-                else None
+            message=(
+                error_payload.get("message")
+                if isinstance(error_payload.get("message"), str)
+                else f"Remote gateway request failed for '{remote_ref.name}'"
             ),
+            details=error_payload.get("details"),
         )
     return A2AClientError(
         status_code=502,
@@ -512,14 +527,22 @@ async def _map_remote_task_event_errors(
         async for event in events:
             yield event
     except GatewayTransportStreamError as exc:
-        raise _remote_task_event_stream_error(remote_ref) from exc
+        raise _remote_task_event_stream_error(
+            remote_ref,
+            effect_boundary=exc.effect_boundary,
+        ) from exc
 
 
-def _remote_task_event_stream_error(remote_ref: RemoteRef) -> A2AClientError:
+def _remote_task_event_stream_error(
+    remote_ref: RemoteRef,
+    *,
+    effect_boundary: A2AEffectBoundary = "possibly_dispatched",
+) -> A2AClientError:
     return A2AClientError(
         status_code=502,
         code="upstream_gateway_error",
         message=f"Remote Task event stream failed for '{remote_ref.name}'",
+        effect_boundary=effect_boundary,
     )
 
 
@@ -529,12 +552,7 @@ def _task_event_response_error(
 ) -> A2AClientError:
     error = exc.payload.get("error") if isinstance(exc.payload, dict) else None
     code = error.get("code") if isinstance(error, dict) else None
-    raw_message = error.get("message") if isinstance(error, dict) else None
-    message = (
-        normalize_task_event_text(raw_message)[:MAX_SHORT_EVENT_TEXT_LENGTH]
-        if isinstance(raw_message, str)
-        else None
-    )
+    message = error.get("message") if isinstance(error, dict) else None
     if (
         exc.status_code == 400
         and code == "invalid_request"

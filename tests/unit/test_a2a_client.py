@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Literal
+import json
+from typing import Any
 
 import httpx
 import pytest
@@ -12,8 +13,7 @@ from ruyi_agent.integrations.a2a.client import A2AClient, A2AClientError
 
 class HangingSuccessStream(httpx.AsyncByteStream):
     def __init__(self) -> None:
-        self.started = asyncio.Event()
-        self.closed = False
+        self.started, self.closed = asyncio.Event(), False
 
     async def __aiter__(self):
         self.started.set()
@@ -24,18 +24,13 @@ class HangingSuccessStream(httpx.AsyncByteStream):
         self.closed = True
 
 
-def _remote_ref(
-    *,
-    auth: dict[str, str] | None = None,
-    create_idempotency: Literal["none", "ruyi_gateway_v1"] = "none",
-) -> RemoteRef:
+def _remote_ref(**kwargs: Any) -> RemoteRef:
     return RemoteRef(
         name="remote",
         description="remote",
         url="https://remote.test/a2a",
         remote_agent_name="worker",
-        auth=auth,
-        create_idempotency=create_idempotency,
+        **kwargs,
     )
 
 
@@ -154,6 +149,16 @@ def test_declared_create_idempotency_requires_and_forwards_a_key() -> None:
 
 
 def test_a2a_client_preserves_error_mapping() -> None:
+    malicious = json.dumps(
+        {
+            "error": {
+                "code": "\ud800" + "c" * 5000,
+                "message": "\ud800" + "m" * 5000,
+                "details": {"ok": 1, "secret": "drop"},
+            },
+            "unexpected": "drop",
+        }
+    ).encode()
     responses = iter(
         [
             httpx.Response(
@@ -169,6 +174,7 @@ def test_a2a_client_preserves_error_mapping() -> None:
             httpx.Response(503, json={"unexpected": True}),
             httpx.Response(503, json=["unexpected"]),
             httpx.Response(503, content=b"temporarily unavailable"),
+            httpx.Response(400, content=malicious),
         ]
     )
     remote_ref = _remote_ref()
@@ -180,7 +186,7 @@ def test_a2a_client_preserves_error_mapping() -> None:
 
     async def scenario() -> list[A2AClientError]:
         errors: list[A2AClientError] = []
-        for _ in range(4):
+        for _ in range(5):
             try:
                 await client.get_task(remote_ref, task_id="task-1")
             except A2AClientError as exc:
@@ -188,17 +194,24 @@ def test_a2a_client_preserves_error_mapping() -> None:
         return errors
 
     errors = asyncio.run(scenario())
-    assert [error.status_code for error in errors] == [409, 502, 502, 502]
+    assert [error.status_code for error in errors] == [409, 502, 502, 502, 400]
     assert [error.code for error in errors] == [
         "task_conflict",
         "upstream_gateway_error",
         "upstream_gateway_error",
         "upstream_gateway_error",
+        "\ufffd" + "c" * 4095,
     ]
     assert errors[0].details == {"task_id": "task-1"}
-    assert errors[1].message == "Remote gateway request failed for 'remote'"
-    assert errors[2].message == "Remote gateway request failed for 'remote'"
+    assert (
+        errors[1].message
+        == errors[2].message
+        == "Remote gateway request failed for 'remote'"
+    )
     assert errors[3].message == "Remote gateway for 'remote' returned invalid JSON"
+    assert len(errors[4].code) == len(errors[4].message) == 4096
+    assert errors[4].code[0] == errors[4].message[0] == "\ufffd"
+    assert errors[4].details == {"ok": 1, "secret": "drop"}
 
 
 def test_a2a_client_marks_missing_credentials_before_transport_dispatch(
@@ -223,17 +236,12 @@ def test_a2a_client_marks_missing_credentials_before_transport_dispatch(
         return raised.value
 
     error = asyncio.run(scenario())
-    assert error.effect_boundary == "not_dispatched"
-    assert requests == []
+    assert error.effect_boundary == "not_dispatched" and requests == []
 
 
 def test_a2a_client_marks_invalid_url_before_transport_dispatch() -> None:
-    remote_ref = RemoteRef(
-        name="invalid-remote",
-        description="invalid remote",
-        url="not-a-valid-http-url",
-        remote_agent_name="worker",
-    )
+    remote_ref = _remote_ref()
+    remote_ref.url = "not-a-valid-http-url"
     client = A2AClient()
 
     async def scenario() -> A2AClientError:
@@ -264,9 +272,7 @@ def test_a2a_client_preserves_http_effect_boundary(
     def fail(request: httpx.Request) -> httpx.Response:
         raise error_type("injected transport failure", request=request)
 
-    client = A2AClient(
-        transports={remote_ref.url: httpx.MockTransport(fail)}
-    )
+    client = A2AClient(transports={remote_ref.url: httpx.MockTransport(fail)})
 
     async def scenario() -> A2AClientError:
         with pytest.raises(A2AClientError) as raised:
@@ -309,6 +315,35 @@ def test_a2a_client_closes_task_event_stream_when_consumer_is_cancelled() -> Non
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+    asyncio.run(scenario())
+    assert stream.closed is True
+
+
+@pytest.mark.parametrize("mode", ["timeout", "cancel"])
+def test_a2a_json_timeout_cancel_closes_and_preserves_effect(mode: str) -> None:
+    stream = HangingSuccessStream()
+    remote_ref = _remote_ref()
+    client = A2AClient(
+        timeout=0.01 if mode == "timeout" else 5,
+        transports={
+            remote_ref.url: httpx.MockTransport(
+                lambda request: httpx.Response(200, stream=stream)
+            )
+        },
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(client.get_task(remote_ref, task_id="task-1"))
+        await stream.started.wait()
+        if mode == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(A2AClientError) as exc_info:
+                await task
+            assert exc_info.value.effect_boundary == "possibly_dispatched"
 
     asyncio.run(scenario())
     assert stream.closed is True

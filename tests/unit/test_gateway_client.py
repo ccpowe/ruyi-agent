@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 from typing import Any
 
 import httpx
@@ -11,8 +13,11 @@ from ruyi_agent.channels.gateway_client import (
     GatewayHTTPClient,
     _filename_from_content_disposition,
 )
+from ruyi_agent.channels.media import MediaLimitError
 from ruyi_agent.gateway_protocol.dto import GatewayTask
+import ruyi_agent.gateway_protocol.contracts as contracts
 from ruyi_agent.gateway_protocol.sse import MAX_SSE_ERROR_BODY_BYTES
+import ruyi_agent.gateway_protocol.transport as protocol_transport
 
 
 class NeverRespondingTransport(httpx.AsyncBaseTransport):
@@ -24,9 +29,11 @@ class NeverRespondingTransport(httpx.AsyncBaseTransport):
 
 class HangingErrorStream(httpx.AsyncByteStream):
     def __init__(self) -> None:
+        self.started = asyncio.Event()
         self.closed = False
 
     async def __aiter__(self):
+        self.started.set()
         yield b'{"error":{"code":"invalid_request"'
         await asyncio.Event().wait()
 
@@ -38,8 +45,10 @@ class CloseTrackingStream(httpx.AsyncByteStream):
     def __init__(self, body: bytes) -> None:
         self.body = body
         self.closed = False
+        self.iterations = 0
 
     async def __aiter__(self):
+        self.iterations += 1
         yield self.body
 
     async def aclose(self) -> None:
@@ -57,6 +66,23 @@ class ErrorStreamTransport(httpx.AsyncBaseTransport):
             headers={"content-type": "application/json"},
             stream=self.stream,
         )
+
+
+def _gateway_client_for_stream(
+    stream: httpx.AsyncByteStream,
+    *,
+    status: int = 200,
+    headers: dict[str, str] | None = None,
+    max_download_bytes: int | None = None,
+) -> GatewayHTTPClient:
+    return GatewayHTTPClient(
+        base_url="http://gateway.test",
+        bearer_token="token",
+        max_download_bytes=max_download_bytes,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(status, headers=headers, stream=stream)
+        ),
+    )
 
 
 class FakeGatewayHTTPClient(GatewayHTTPClient):
@@ -598,7 +624,16 @@ def test_gateway_http_client_rejects_oversized_error_body() -> None:
 
 
 def test_gateway_http_client_sanitizes_error_text() -> None:
-    body = b'{"error":{"code":"invalid\\ud800request","message":"bad\\ud800message"}}'
+    body = json.dumps(
+        {
+            "error": {
+                "code": "\ud800" + "c" * 5000,
+                "message": "\ud800" + "m" * 5000,
+                "details": {"ok": 1, "secret": "drop"},
+            },
+            "unexpected": "drop",
+        }
+    ).encode()
     client = GatewayHTTPClient(
         base_url="http://gateway.test",
         bearer_token="token",
@@ -613,8 +648,9 @@ def test_gateway_http_client_sanitizes_error_text() -> None:
 
     with pytest.raises(GatewayClientError) as exc_info:
         asyncio.run(scenario())
-    assert exc_info.value.code == "invalid\ufffdrequest"
-    assert exc_info.value.message == "bad\ufffdmessage"
+    assert len(exc_info.value.code) == len(exc_info.value.message) == 4096
+    assert exc_info.value.code[0] == exc_info.value.message[0] == "\ufffd"
+    assert exc_info.value.details == {"ok": 1, "secret": "drop"}
 
 
 def test_gateway_http_client_maps_deep_error_json_to_client_error() -> None:
@@ -687,3 +723,99 @@ def test_gateway_http_client_discards_unterminated_stream_end() -> None:
     with pytest.raises(GatewayClientError) as exc_info:
         asyncio.run(scenario())
     assert exc_info.value.status_code == 502
+
+
+@pytest.mark.parametrize("limit", [None, 1024, 3])
+def test_gateway_raw_artifact_streams_binary_metadata_and_closes(
+    limit: int | None,
+) -> None:
+    stream = CloseTrackingStream(b"artifact")
+    client = _gateway_client_for_stream(
+        stream,
+        headers={
+            "content-type": "application/octet-stream",
+            "content-disposition": 'attachment; filename="a.bin"',
+        },
+        max_download_bytes=limit,
+    )
+    if limit == 3:
+        with pytest.raises(MediaLimitError):
+            asyncio.run(client.download_artifact(path="/a.bin"))
+    else:
+        artifact = asyncio.run(client.download_artifact(path="/a.bin"))
+        assert artifact.content == b"artifact"
+        assert artifact.filename == "a.bin"
+        assert artifact.content_type == "application/octet-stream"
+    assert stream.iterations == 1
+    assert stream.closed is True
+
+
+def test_gateway_raw_artifact_error_uses_canonical_limit_and_closes() -> None:
+    stream = CloseTrackingStream(b"x" * (1024 * 1024))
+    client = _gateway_client_for_stream(stream, status=500, max_download_bytes=1)
+    with pytest.raises(GatewayClientError) as exc_info:
+        asyncio.run(client.download_artifact(path="/a.bin"))
+    assert (exc_info.value.status_code, exc_info.value.code) == (502, "gateway_error")
+    assert stream.iterations == 1
+    assert stream.closed is True
+
+
+@pytest.mark.parametrize(
+    "case",
+    "utf8 json nan depth declared_error undeclared_error near_limit gzip_ok gzip_success_over gzip_error_over".split(),
+)
+def test_gateway_transport_strict_decoded_json_cases(case: str) -> None:
+    status = 500 if "error" in case else 200
+    if case == "utf8":
+        body = b"\xff"
+    elif case == "json":
+        body = b"{"
+    elif case == "nan":
+        body = b'{"value":NaN}'
+    elif case == "depth":
+        body = b"[" * 101 + b"0" + b"]" * 101
+    elif case == "declared_error":
+        body = b"{}"
+    elif case == "undeclared_error":
+        body = b"x" * (contracts.MAX_JSON_ERROR_BODY_BYTES + 1)
+    elif case == "near_limit":
+        body = (
+            b'{"value":"' + b"x" * (contracts.MAX_JSON_RESPONSE_BODY_BYTES - 12) + b'"}'
+        )
+    else:
+        raw = b'{"value":"ok"}'
+        if case == "gzip_success_over":
+            raw = b'{"value":"' + b"x" * contracts.MAX_JSON_RESPONSE_BODY_BYTES + b'"}'
+        elif case == "gzip_error_over":
+            raw = (
+                b'{"error":{"code":"x","message":"'
+                + b"x" * contracts.MAX_JSON_ERROR_BODY_BYTES
+                + b'"}}'
+            )
+        body = gzip.compress(raw)
+    headers = {}
+    if case == "declared_error":
+        headers["content-length"] = str(contracts.MAX_JSON_ERROR_BODY_BYTES + 1)
+    if case.startswith("gzip"):
+        headers.update({"content-encoding": "gzip", "content-length": str(len(body))})
+    stream = CloseTrackingStream(body)
+    client_transport = protocol_transport.GatewayHTTPTransport(
+        base_url="http://gateway.test",
+        timeout=1,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(status, headers=headers, stream=stream)
+        ),
+    )
+    if case in {"near_limit", "gzip_ok"}:
+        payload = asyncio.run(client_transport.request_json("GET", "/data"))
+        assert isinstance(payload.get("value"), str) and payload["value"]
+    else:
+        with pytest.raises(
+            (
+                protocol_transport.GatewayTransportInvalidJSONError,
+                protocol_transport.GatewayTransportInvalidPayloadError,
+            )
+        ):
+            asyncio.run(client_transport.request_json("GET", "/data"))
+    assert stream.closed is True
+    assert stream.iterations == (0 if case == "declared_error" else 1)

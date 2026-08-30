@@ -35,7 +35,8 @@ from ruyi_agent.runtime.task_event_ledger import (
     TaskEventLedger,
     TaskEventSubscription,
 )
-from ruyi_agent.gateway_protocol.projection import (
+from ruyi_agent.runtime.task_event_projection import (
+    AssistantDelta,
     artifact_event_data,
     assistant_delta_from_stream_part,
     lifecycle_event_data,
@@ -72,6 +73,7 @@ __all__ = [
     "TaskLifecycleEventType",
     "TaskRunMismatchError",
     "TaskStreamEvent",
+    "AssistantDelta",
     "artifact_event_data",
     "assistant_delta_from_stream_part",
     "decode_task_event_cursor",

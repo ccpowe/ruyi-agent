@@ -1,19 +1,38 @@
 from __future__ import annotations
-import asyncio
+
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-from ruyi_agent.gateway_protocol.contracts import MAX_ASSISTANT_DELTA_TEXT_LENGTH, MAX_EVENT_ARTIFACTS, MAX_EVENT_TEXT_LENGTH, MAX_REVIEW_DECISIONS, MAX_REVIEW_ITEMS, MAX_SHORT_EVENT_TEXT_LENGTH, MAX_TASK_EVENT_CURSOR_LENGTH, TaskStreamEvent
+
+from ruyi_agent.gateway_protocol.contracts import (
+    MAX_ASSISTANT_DELTA_TEXT_LENGTH,
+    MAX_EVENT_ARTIFACTS,
+    MAX_EVENT_TEXT_LENGTH,
+    MAX_JSON_DEPTH,
+    MAX_JSON_ERROR_BODY_BYTES,
+    MAX_JSON_READ_SECONDS,
+    MAX_REVIEW_DECISIONS,
+    MAX_REVIEW_ITEMS,
+    MAX_SHORT_EVENT_TEXT_LENGTH,
+    MAX_TASK_EVENT_CURSOR_LENGTH,
+    BoundedBodyLimitError,
+    BoundedBodyTimeoutError,
+    TaskStreamEvent,
+    decode_strict_json_bytes,
+    decode_strict_json_text,
+    read_bounded_bytes,
+)
 from ruyi_agent.gateway_protocol.projection import normalize_task_event_text
 from ruyi_agent.task_models import TaskState, parse_task_state
+
 MAX_SSE_LINE_BYTES = 768 * 1024
 MAX_SSE_EVENT_BYTES = 768 * 1024
-MAX_SSE_ERROR_BODY_BYTES = 64 * 1024
-MAX_SSE_ERROR_READ_SECONDS = 5.0
+MAX_SSE_ERROR_BODY_BYTES = MAX_JSON_ERROR_BODY_BYTES
+MAX_SSE_ERROR_READ_SECONDS = MAX_JSON_READ_SECONDS
 MAX_SSE_HANDSHAKE_SECONDS = 10.0
-MAX_SSE_JSON_DEPTH = 100
+MAX_SSE_JSON_DEPTH = MAX_JSON_DEPTH
 LIFECYCLE_EVENT_TYPES = {
     "task.created",
     "task.running",
@@ -43,13 +62,19 @@ _STREAM_END_REASONS = {
     "superseded",
     "error",
 }
+
+
 class SSEProtocolError(ValueError):
     pass
+
+
 @dataclass(frozen=True, slots=True)
 class GatewayTaskEvent:
     event_type: str
     data: dict[str, Any]
     event_id: str | None = None
+
+
 def is_valid_task_event_cursor(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -58,35 +83,36 @@ def is_valid_task_event_cursor(value: object) -> bool:
         and value == value.strip(" ")
         and all(0x20 <= ord(character) <= 0x7E for character in value)
     )
+
+
 def has_identity_content_encoding(value: str) -> bool:
     return not value.strip() or value.strip().lower() == "identity"
+
+
 async def read_bounded_sse_error_body(
     chunks: AsyncIterator[bytes],
     *,
     timeout_seconds: float = MAX_SSE_ERROR_READ_SECONDS,
 ) -> bytes:
-    if timeout_seconds <= 0:
-        raise ValueError("timeout_seconds must be positive")
-    async def collect() -> bytes:
-        body = bytearray()
-        async for chunk in chunks:
-            if len(body) + len(chunk) > MAX_SSE_ERROR_BODY_BYTES:
-                raise SSEProtocolError("SSE error response exceeds the size limit")
-            body.extend(chunk)
-        return bytes(body)
     try:
-        async with asyncio.timeout(timeout_seconds):
-            return await collect()
-    except TimeoutError as exc:
+        return await read_bounded_bytes(
+            chunks,
+            max_bytes=MAX_SSE_ERROR_BODY_BYTES,
+            timeout_seconds=timeout_seconds,
+        )
+    except BoundedBodyLimitError as exc:
+        raise SSEProtocolError("SSE error response exceeds the size limit") from exc
+    except BoundedBodyTimeoutError as exc:
         raise SSEProtocolError("SSE error response timed out") from exc
+
+
 def decode_sse_error_json(body: bytes) -> Any:
-    if len(body) > MAX_SSE_ERROR_BODY_BYTES:
-        raise SSEProtocolError("SSE error response exceeds the size limit")
     try:
-        value = body.decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise SSEProtocolError("SSE error response is not valid UTF-8") from exc
-    return _decode_json_text(value)
+        return decode_strict_json_bytes(body, max_bytes=MAX_SSE_ERROR_BODY_BYTES)
+    except ValueError as exc:
+        raise SSEProtocolError("SSE error response is invalid JSON") from exc
+
+
 def encode_task_stream_event(event: TaskStreamEvent) -> bytes:
     payload = {
         "task_id": event.task_id,
@@ -101,16 +127,12 @@ def encode_task_stream_event(event: TaskStreamEvent) -> bytes:
             data=payload,
         )
     )
+
+
 def encode_gateway_task_event(event: GatewayTaskEvent) -> bytes:
-    if (
-        not event.event_type
-        or "\n" in event.event_type
-        or "\r" in event.event_type
-    ):
+    if not event.event_type or "\n" in event.event_type or "\r" in event.event_type:
         raise SSEProtocolError("Invalid SSE event name")
-    if event.event_id is not None and not is_valid_task_event_cursor(
-        event.event_id
-    ):
+    if event.event_id is not None and not is_valid_task_event_cursor(event.event_id):
         raise SSEProtocolError("Invalid SSE event id")
     try:
         encoded_data = json.dumps(
@@ -137,6 +159,8 @@ def encode_gateway_task_event(event: GatewayTaskEvent) -> bytes:
     if sum(len(line) for line in encoded_lines) > MAX_SSE_EVENT_BYTES:
         raise SSEProtocolError("SSE record exceeds the size limit")
     return b"\n".join(encoded_lines) + b"\n\n"
+
+
 async def iter_utf8_sse_lines(
     chunks: AsyncIterator[bytes],
 ) -> AsyncIterator[str]:
@@ -161,6 +185,8 @@ async def iter_utf8_sse_lines(
             buffer.append(byte)
     if buffer:
         yield _decode_utf8_sse_line(buffer, strip_bom=first_line)
+
+
 async def iter_gateway_task_events(
     lines: AsyncIterator[str],
 ) -> AsyncIterator[GatewayTaskEvent]:
@@ -201,6 +227,8 @@ async def iter_gateway_task_events(
                 raise SSEProtocolError("SSE retry field is invalid")
         else:
             raise SSEProtocolError("SSE record contains an unsupported field")
+
+
 def task_stream_event_from_gateway(
     event: GatewayTaskEvent,
     *,
@@ -212,9 +240,7 @@ def task_stream_event_from_gateway(
         raise SSEProtocolError("Remote Gateway returned an unsupported Task event")
     if event.event_type in _DURABLE_WIRE_EVENT_TYPES:
         if not is_valid_task_event_cursor(event.event_id):
-            raise SSEProtocolError(
-                "Remote durable Task event has an invalid event id"
-            )
+            raise SSEProtocolError("Remote durable Task event has an invalid event id")
     elif event.event_id is not None:
         raise SSEProtocolError("Remote transient Task event unexpectedly has an id")
     raw = event.data
@@ -246,9 +272,9 @@ def task_stream_event_from_gateway(
     elif event.event_type == "assistant.delta":
         _require_keys(event_data, {"content"})
         clean_data = {
-            "content": _bounded_required_text(
-                event_data.get("content"), "content"
-            )[:MAX_ASSISTANT_DELTA_TEXT_LENGTH]
+            "content": _bounded_required_text(event_data.get("content"), "content")[
+                :MAX_ASSISTANT_DELTA_TEXT_LENGTH
+            ]
         }
     elif event.event_type == "stream.end":
         _require_keys(event_data, {"reason"})
@@ -274,6 +300,8 @@ def task_stream_event_from_gateway(
     )
     encode_task_stream_event(stream_event)
     return stream_event
+
+
 def _decode_record(
     event_type: str | None,
     event_id: str | None,
@@ -285,10 +313,15 @@ def _decode_record(
         raise SSEProtocolError("SSE record is missing an event name")
     if not data_lines:
         raise SSEProtocolError("SSE record is missing data")
-    data = _decode_json_text("\n".join(data_lines))
+    try:
+        data = decode_strict_json_text("\n".join(data_lines))
+    except ValueError as exc:
+        raise SSEProtocolError("SSE record data is invalid JSON") from exc
     if not isinstance(data, dict):
         raise SSEProtocolError("SSE record data is not an object")
     return GatewayTaskEvent(event_type=event_type, event_id=event_id, data=data)
+
+
 def _decode_utf8_sse_line(value: bytearray, *, strip_bom: bool) -> str:
     try:
         decoded = bytes(value).decode("utf-8", errors="strict")
@@ -297,38 +330,8 @@ def _decode_utf8_sse_line(value: bytearray, *, strip_bom: bool) -> str:
     if strip_bom:
         return decoded.removeprefix("\ufeff")
     return decoded
-def _reject_non_finite_json_number(value: str) -> None:
-    raise ValueError(f"Non-finite JSON number is not allowed: {value}")
-def _decode_json_text(value: str) -> Any:
-    try:
-        _validate_json_nesting(value)
-        return json.loads(
-            value,
-            parse_constant=_reject_non_finite_json_number,
-        )
-    except (ValueError, RecursionError) as exc:
-        raise SSEProtocolError("SSE record data is invalid JSON") from exc
-def _validate_json_nesting(value: str) -> None:
-    depth = 0
-    in_string = False
-    escaped = False
-    for character in value:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
-            continue
-        if character == '"':
-            in_string = True
-        elif character in "[{":
-            depth += 1
-            if depth > MAX_SSE_JSON_DEPTH:
-                raise ValueError("JSON nesting exceeds the limit")
-        elif character in "]}":
-            depth = max(0, depth - 1)
+
+
 def _validate_lifecycle_data(
     raw: dict[str, Any],
     *,
@@ -395,6 +398,8 @@ def _validate_lifecycle_data(
     if event_type == "task.review_requested" and not clean["pending_review"]:
         raise SSEProtocolError("Remote review event has no pending review")
     return clean
+
+
 def _validate_artifact_event_data(raw: dict[str, Any]) -> dict[str, Any]:
     _require_keys(
         raw,
@@ -412,11 +417,15 @@ def _validate_artifact_event_data(raw: dict[str, Any]) -> dict[str, Any]:
             raise SSEProtocolError("Remote artifact_truncated field is invalid")
         clean["artifact_truncated"] = True
     return clean
+
+
 def _parse_remote_task_state(value: object) -> TaskState:
     try:
         return parse_task_state(value, path="Remote Task event status")
     except ValueError as exc:
         raise SSEProtocolError("Remote Task event status is invalid") from exc
+
+
 def _validate_pending_review(
     value: Any,
     *,
@@ -458,10 +467,7 @@ def _validate_pending_review(
             }:
                 raise SSEProtocolError("Remote review config is invalid")
             decisions = item.get("allowed_decisions")
-            if (
-                not isinstance(decisions, list)
-                or len(decisions) > MAX_REVIEW_DECISIONS
-            ):
+            if not isinstance(decisions, list) or len(decisions) > MAX_REVIEW_DECISIONS:
                 raise SSEProtocolError("Remote review decisions are invalid")
             clean["review_configs"].append(
                 {
@@ -475,10 +481,14 @@ def _validate_pending_review(
                 }
             )
     return clean
+
+
 def _validate_artifacts(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list) or len(value) > MAX_EVENT_ARTIFACTS:
         raise SSEProtocolError("Remote artifacts field is invalid")
     return [_validate_artifact(item) for item in value]
+
+
 def _validate_artifact(value: Any) -> dict[str, Any]:
     keys = {"artifact_id", "name", "caption", "content_type", "size", "run_count"}
     if not isinstance(value, dict) or set(value) != keys:
@@ -503,12 +513,12 @@ def _validate_artifact(value: Any) -> dict[str, Any]:
         "artifact_id": _short_required_text(value.get("artifact_id"), "artifact_id"),
         "name": _short_required_text(value.get("name"), "name"),
         "caption": caption,
-        "content_type": _short_required_text(
-            value.get("content_type"), "content_type"
-        ),
+        "content_type": _short_required_text(value.get("content_type"), "content_type"),
         "size": size,
         "run_count": artifact_run,
     }
+
+
 def _require_keys(
     value: dict[str, Any],
     required: set[str],
@@ -517,14 +527,20 @@ def _require_keys(
     allowed = required | (optional or set())
     if not required <= set(value) or not set(value) <= allowed:
         raise SSEProtocolError("Remote Task event fields do not match the schema")
+
+
 def _bounded_optional_text(value: Any, field: str) -> str | None:
     if value is None:
         return None
     return _bounded_required_text(value, field)
+
+
 def _bounded_required_text(value: Any, field: str) -> str:
     if not isinstance(value, str) or len(value) > MAX_EVENT_TEXT_LENGTH:
         raise SSEProtocolError(f"Remote Task event field '{field}' is invalid")
     return normalize_task_event_text(value)
+
+
 def _short_required_text(value: Any, field: str) -> str:
     if (
         not isinstance(value, str)
@@ -533,18 +549,20 @@ def _short_required_text(value: Any, field: str) -> str:
     ):
         raise SSEProtocolError(f"Remote Task event field '{field}' is invalid")
     return normalize_task_event_text(value)
+
+
 def _parse_timestamp(value: Any, field: str) -> datetime:
     if not isinstance(value, str) or len(value) > 128:
         raise SSEProtocolError(f"Remote Task event field '{field}' is invalid")
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
-        raise SSEProtocolError(
-            f"Remote Task event field '{field}' is invalid"
-        ) from exc
+        raise SSEProtocolError(f"Remote Task event field '{field}' is invalid") from exc
     if parsed.tzinfo is None:
         raise SSEProtocolError(f"Remote Task event field '{field}' has no timezone")
     return parsed
+
+
 def _isoformat(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)

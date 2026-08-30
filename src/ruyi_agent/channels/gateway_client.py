@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json as json_module
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -12,7 +11,6 @@ import httpx
 from pydantic import ValidationError
 
 from ruyi_agent.channels.media import (
-    MediaLimitError,
     read_bounded_media,
     validate_content_length,
 )
@@ -29,12 +27,9 @@ from ruyi_agent.gateway_protocol.transport import (
     GatewayTransportInvalidJSONError,
     GatewayTransportInvalidPayloadError,
     GatewayTransportInvalidStreamError,
+    GatewayTransportResponseTimeoutError,
     GatewayTransportStreamError,
     gateway_bearer_auth_headers,
-)
-from ruyi_agent.gateway_protocol.projection import (
-    MAX_SHORT_EVENT_TEXT_LENGTH,
-    normalize_task_event_text,
 )
 
 
@@ -47,11 +42,19 @@ class GatewayArtifact:
 
 
 class GatewayClientError(Exception):
-    def __init__(self, *, status_code: int, code: str, message: str) -> None:
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        code: str,
+        message: str,
+        details: Any = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.details = details
 
 
 class GatewayTaskClient(Protocol):
@@ -316,19 +319,13 @@ class GatewayHTTPClient:
             ) as events:
                 yield _map_task_event_errors(events)
         except GatewayTransportHTTPStatusError as exc:
-            raise _gateway_http_status_error(exc, sanitize=True) from exc
-        except GatewayTransportInvalidJSONError as exc:
-            raise GatewayClientError(
-                status_code=502,
-                code="gateway_error",
-                message="Gateway returned invalid JSON",
-            ) from exc
-        except GatewayTransportInvalidPayloadError as exc:
-            raise GatewayClientError(
-                status_code=502,
-                code="gateway_error",
-                message="Gateway returned invalid payload",
-            ) from exc
+            raise _gateway_http_status_error(exc) from exc
+        except (
+            GatewayTransportInvalidJSONError,
+            GatewayTransportInvalidPayloadError,
+            GatewayTransportResponseTimeoutError,
+        ) as exc:
+            raise _gateway_transport_error(exc) from exc
         except GatewayTransportInvalidStreamError as exc:
             label = "error" if exc.phase == "error_response" else "stream"
             raise GatewayClientError(
@@ -368,18 +365,12 @@ class GatewayHTTPClient:
             return await request
         except GatewayTransportHTTPStatusError as exc:
             raise _gateway_http_status_error(exc) from exc
-        except GatewayTransportInvalidJSONError as exc:
-            raise GatewayClientError(
-                status_code=502,
-                code="gateway_error",
-                message="Gateway returned invalid JSON",
-            ) from exc
-        except GatewayTransportInvalidPayloadError as exc:
-            raise GatewayClientError(
-                status_code=502,
-                code="gateway_error",
-                message="Gateway returned invalid payload",
-            ) from exc
+        except (
+            GatewayTransportInvalidJSONError,
+            GatewayTransportInvalidPayloadError,
+            GatewayTransportResponseTimeoutError,
+        ) as exc:
+            raise _gateway_transport_error(exc) from exc
 
     async def _request_raw(
         self,
@@ -404,6 +395,12 @@ class GatewayHTTPClient:
                 code="gateway_error",
                 message="Gateway returned invalid payload",
             ) from exc
+        except GatewayTransportResponseTimeoutError as exc:
+            raise GatewayClientError(
+                status_code=502,
+                code="gateway_error",
+                message="Gateway response timed out",
+            ) from exc
 
     async def _download_raw(
         self,
@@ -415,38 +412,26 @@ class GatewayHTTPClient:
         if self._max_download_bytes is None:
             response = await self._request_raw(method, path, json=json)
             return response.headers, response.content
-        async with self._protocol.stream_raw(method, path, json=json) as response:
-            if not response.is_success:
-                try:
-                    error_body = await read_bounded_media(
-                        response.aiter_bytes(),
-                        max_bytes=min(self._max_download_bytes, 64 * 1024),
-                    )
-                    payload = json_module.loads(error_body)
-                except MediaLimitError:
-                    raise
-                except (UnicodeDecodeError, ValueError) as exc:
-                    raise GatewayClientError(
-                        status_code=502,
-                        code="gateway_error",
-                        message="Gateway returned invalid JSON",
-                    ) from exc
-                raise _gateway_http_status_error(
-                    GatewayTransportHTTPStatusError(
-                        status_code=response.status_code,
-                        payload=payload,
-                    )
+        try:
+            async with self._protocol.stream_raw(method, path, json=json) as response:
+                validate_content_length(
+                    response.headers,
+                    max_bytes=self._max_download_bytes,
+                    values=response.headers.get_list("content-length"),
                 )
-            validate_content_length(
-                response.headers,
-                max_bytes=self._max_download_bytes,
-                values=response.headers.get_list("content-length"),
-            )
-            content = await read_bounded_media(
-                response.aiter_bytes(),
-                max_bytes=self._max_download_bytes,
-            )
-            return response.headers, content
+                content = await read_bounded_media(
+                    response.aiter_bytes(),
+                    max_bytes=self._max_download_bytes,
+                )
+                return response.headers, content
+        except GatewayTransportHTTPStatusError as exc:
+            raise _gateway_http_status_error(exc) from exc
+        except (
+            GatewayTransportInvalidJSONError,
+            GatewayTransportInvalidPayloadError,
+            GatewayTransportResponseTimeoutError,
+        ) as exc:
+            raise _gateway_transport_error(exc) from exc
 
 
 async def _map_task_event_errors(
@@ -463,10 +448,17 @@ async def _map_task_event_errors(
         ) from exc
 
 
+def _gateway_transport_error(exc: Exception) -> GatewayClientError:
+    message = {
+        GatewayTransportInvalidJSONError: "Gateway returned invalid JSON",
+        GatewayTransportInvalidPayloadError: "Gateway returned invalid payload",
+        GatewayTransportResponseTimeoutError: "Gateway response timed out",
+    }[type(exc)]
+    return GatewayClientError(status_code=502, code="gateway_error", message=message)
+
+
 def _gateway_http_status_error(
     exc: GatewayTransportHTTPStatusError,
-    *,
-    sanitize: bool = False,
 ) -> GatewayClientError:
     if not isinstance(exc.payload, dict):
         return GatewayClientError(
@@ -476,26 +468,13 @@ def _gateway_http_status_error(
         )
     error = exc.payload.get("error")
     if isinstance(error, dict):
-        raw_code = error.get("code")
-        raw_message = error.get("message")
-        if sanitize:
-            code = (
-                normalize_task_event_text(raw_code)[:MAX_SHORT_EVENT_TEXT_LENGTH]
-                if isinstance(raw_code, str)
-                else "gateway_error"
-            )
-            message = (
-                normalize_task_event_text(raw_message)[:MAX_SHORT_EVENT_TEXT_LENGTH]
-                if isinstance(raw_message, str)
-                else "Gateway request failed"
-            )
-        else:
-            code = str(error.get("code", "gateway_error"))
-            message = str(error.get("message", "Gateway request failed"))
+        code = error.get("code")
+        message = error.get("message")
         return GatewayClientError(
             status_code=exc.status_code,
-            code=code,
-            message=message,
+            code=code if isinstance(code, str) else "gateway_error",
+            message=message if isinstance(message, str) else "Gateway request failed",
+            details=error.get("details"),
         )
     return GatewayClientError(
         status_code=exc.status_code,
