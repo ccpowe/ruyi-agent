@@ -9,6 +9,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ruyi_agent.storage.task_database import (
+    configure_connection_for_initialization,
+    database_initialization_lock,
+)
+
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -49,7 +54,15 @@ class ChannelSessionStore:
             check_same_thread=False,
             timeout=30.0,
         )
-        self._init_db()
+        try:
+            with database_initialization_lock(self._db_path):
+                self._init_db()
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                pass
+            raise
 
     @property
     def db_path(self) -> str:
@@ -262,39 +275,45 @@ class ChannelSessionStore:
 
     def _init_db(self) -> None:
         with self._lock:
-            self._conn.execute("PRAGMA busy_timeout = 30000")
-            if self._db_path != ":memory:":
-                self._conn.execute("PRAGMA journal_mode = WAL")
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS channel_sessions (
-                    session_key TEXT PRIMARY KEY,
-                    platform TEXT NOT NULL,
-                    agent_name TEXT NOT NULL,
-                    current_task_id TEXT,
-                    chat_id TEXT,
-                    user_id TEXT,
-                    thread_id TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
+            configure_connection_for_initialization(
+                self._conn,
+                db_path=self._db_path,
             )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS channel_turn_receipts (
-                    idempotency_key TEXT PRIMARY KEY,
-                    platform TEXT NOT NULL,
-                    session_key TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    request_hash TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    response_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS channel_sessions (
+                        session_key TEXT PRIMARY KEY,
+                        platform TEXT NOT NULL,
+                        agent_name TEXT NOT NULL,
+                        current_task_id TEXT,
+                        chat_id TEXT,
+                        user_id TEXT,
+                        thread_id TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            self._conn.commit()
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS channel_turn_receipts (
+                        idempotency_key TEXT PRIMARY KEY,
+                        platform TEXT NOT NULL,
+                        session_key TEXT NOT NULL,
+                        operation TEXT NOT NULL,
+                        request_hash TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        response_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     def _insert_or_validate_turn_receipt(
         self,

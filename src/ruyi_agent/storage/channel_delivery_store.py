@@ -9,6 +9,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from ruyi_agent.storage.task_database import (
+    configure_connection_for_initialization,
+    database_initialization_lock,
+)
+
 
 FINAL_DELIVERY_STATES = {"delivered", "superseded"}
 RECOVERABLE_DELIVERY_STATES = {
@@ -68,7 +73,15 @@ class ChannelDeliveryStore:
         self._lock = threading.RLock()
         self._ensure_parent_dir()
         self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
-        self._init_db()
+        try:
+            with database_initialization_lock(self._db_path):
+                self._init_db()
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                pass
+            raise
 
     def ensure_watch(
         self,
@@ -445,54 +458,60 @@ class ChannelDeliveryStore:
 
     def _init_db(self) -> None:
         with self._lock:
-            self._conn.execute("PRAGMA busy_timeout = 30000")
-            if self._db_path != ":memory:":
-                self._conn.execute("PRAGMA journal_mode = WAL")
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS channel_delivery_intents (
-                    intent_id TEXT PRIMARY KEY,
-                    platform TEXT NOT NULL,
-                    session_key TEXT NOT NULL,
-                    chat_id TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    run_count INTEGER NOT NULL CHECK (run_count >= 0),
-                    delivery_kind TEXT NOT NULL,
-                    review_id TEXT,
-                    state TEXT NOT NULL,
-                    cursor INTEGER NOT NULL DEFAULT 0,
-                    attempt_count INTEGER NOT NULL DEFAULT 0,
-                    next_attempt_at REAL,
-                    last_error TEXT,
-                    lease_owner TEXT,
-                    lease_token TEXT,
-                    lease_until REAL,
-                    fence INTEGER NOT NULL DEFAULT 0,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    UNIQUE(platform, session_key, task_id, run_count)
+            configure_connection_for_initialization(
+                self._conn,
+                db_path=self._db_path,
+            )
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS channel_delivery_intents (
+                        intent_id TEXT PRIMARY KEY,
+                        platform TEXT NOT NULL,
+                        session_key TEXT NOT NULL,
+                        chat_id TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        run_count INTEGER NOT NULL CHECK (run_count >= 0),
+                        delivery_kind TEXT NOT NULL,
+                        review_id TEXT,
+                        state TEXT NOT NULL,
+                        cursor INTEGER NOT NULL DEFAULT 0,
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        next_attempt_at REAL,
+                        last_error TEXT,
+                        lease_owner TEXT,
+                        lease_token TEXT,
+                        lease_until REAL,
+                        fence INTEGER NOT NULL DEFAULT 0,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        UNIQUE(platform, session_key, task_id, run_count)
+                    )
+                    """
                 )
-                """
-            )
-            self._conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_channel_delivery_recovery
-                ON channel_delivery_intents(platform, state, next_attempt_at)
-                """
-            )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS channel_delivery_steps (
-                    intent_id TEXT NOT NULL,
-                    step_key TEXT NOT NULL,
-                    delivered_at REAL NOT NULL,
-                    PRIMARY KEY(intent_id, step_key),
-                    FOREIGN KEY(intent_id) REFERENCES channel_delivery_intents(intent_id)
-                        ON DELETE CASCADE
+                self._conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_channel_delivery_recovery
+                    ON channel_delivery_intents(platform, state, next_attempt_at)
+                    """
                 )
-                """
-            )
-            self._conn.commit()
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS channel_delivery_steps (
+                        intent_id TEXT NOT NULL,
+                        step_key TEXT NOT NULL,
+                        delivered_at REAL NOT NULL,
+                        PRIMARY KEY(intent_id, step_key),
+                        FOREIGN KEY(intent_id) REFERENCES channel_delivery_intents(intent_id)
+                            ON DELETE CASCADE
+                    )
+                    """
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     @staticmethod
     def _row(row: tuple[object, ...]) -> ChannelDeliveryIntent:

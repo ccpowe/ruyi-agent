@@ -4,18 +4,23 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import json
+import multiprocessing
 import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Callable, cast
+from typing import Any, Callable, cast
 from urllib.parse import quote
 
 import pytest
 
+import ruyi_agent.storage.channel_delivery_store as channel_delivery_store_module
+import ruyi_agent.storage.channel_session_store as channel_session_store_module
 import ruyi_agent.storage.gateway_command_store as gateway_command_store_module
 import ruyi_agent.storage.task_database as task_database_module
 import ruyi_agent.storage.task_schema as task_schema_module
+from ruyi_agent.storage.channel_delivery_store import ChannelDeliveryStore
+from ruyi_agent.storage.channel_session_store import ChannelSessionStore
 from ruyi_agent.storage.gateway_command_store import GatewayCommandStore
 from ruyi_agent.storage.task_database import TaskDatabase
 from ruyi_agent.storage.task_store import TaskStore
@@ -282,6 +287,44 @@ def _index_names(connection: sqlite3.Connection, table: str) -> set[str]:
         str(row[1])
         for row in connection.execute(f"PRAGMA index_list({table})").fetchall()
     }
+
+
+def _assert_channel_schema(db_path: Path) -> None:
+    connection = sqlite3.connect(db_path)
+    try:
+        table_names = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert {
+            "channel_sessions",
+            "channel_turn_receipts",
+            "channel_delivery_intents",
+            "channel_delivery_steps",
+        } <= table_names
+        assert "idx_channel_delivery_recovery" in _index_names(
+            connection,
+            "channel_delivery_intents",
+        )
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    finally:
+        connection.close()
+
+
+def _open_channel_store_in_process(
+    db_path: str,
+    store_kind: str,
+    barrier: Any,
+) -> None:
+    barrier.wait(timeout=30)
+    store_type = (
+        ChannelSessionStore if store_kind == "session" else ChannelDeliveryStore
+    )
+    store = store_type(db_path)
+    store.close()
 
 
 def test_wal_negotiation_retries_only_locked_errors(
@@ -1071,3 +1114,146 @@ def test_command_schema_migration_rolls_back_as_one_transaction(
         _column_names(store._conn, "gateway_commands")
     )
     store.close()
+
+
+def test_channel_stores_initialize_mixed_concurrently_without_partial_schema(
+    tmp_path: Path,
+) -> None:
+    thread_db_path = tmp_path / "channel-thread-cold-start.sqlite"
+    factory_lock = threading.Lock()
+    next_store = 0
+
+    def mixed_store_factory() -> object:
+        nonlocal next_store
+        with factory_lock:
+            store_type = (
+                ChannelSessionStore
+                if next_store % 2 == 0
+                else ChannelDeliveryStore
+            )
+            next_store += 1
+        return store_type(str(thread_db_path))
+
+    _open_stores_concurrently(mixed_store_factory)
+    _assert_channel_schema(thread_db_path)
+
+    process_db_path = tmp_path / "channel-process-cold-start.sqlite"
+    process_context = multiprocessing.get_context("fork")
+    barrier = process_context.Barrier(THREAD_COUNT)
+    processes = [
+        process_context.Process(
+            target=_open_channel_store_in_process,
+            args=(
+                str(process_db_path),
+                "session" if index % 2 == 0 else "delivery",
+                barrier,
+            ),
+        )
+        for index in range(THREAD_COUNT)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=30)
+            assert not process.is_alive()
+            assert process.exitcode == 0
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=30)
+    _assert_channel_schema(process_db_path)
+
+
+@pytest.mark.parametrize(
+    ("store_type", "store_module"),
+    [
+        pytest.param(
+            ChannelSessionStore,
+            channel_session_store_module,
+            id="session",
+        ),
+        pytest.param(
+            ChannelDeliveryStore,
+            channel_delivery_store_module,
+            id="delivery",
+        ),
+    ],
+)
+def test_channel_store_constructor_rolls_back_and_preserves_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    store_type: type[ChannelSessionStore] | type[ChannelDeliveryStore],
+    store_module: Any,
+) -> None:
+    class InitializationFailure(BaseException):
+        pass
+
+    failure = InitializationFailure(f"injected {store_type.__name__} failure")
+    close_error = RuntimeError("injected close failure")
+    connections: list[sqlite3.Connection] = []
+    original_connect = store_module.sqlite3.connect
+
+    class FailingConnection(sqlite3.Connection):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.ddl_count = 0
+            self.closed = False
+            self.rollback_count = 0
+
+        def execute(
+            self,
+            statement: str,
+            parameters: tuple[object, ...] = (),
+        ) -> Any:
+            normalized = statement.lstrip().upper()
+            if normalized.startswith(("CREATE TABLE", "CREATE INDEX")):
+                self.ddl_count += 1
+                if self.ddl_count == 2:
+                    raise failure
+            if parameters:
+                return super().execute(statement, parameters)
+            return super().execute(statement)
+
+        def rollback(self) -> None:
+            self.rollback_count += 1
+            super().rollback()
+
+        def close(self) -> None:
+            already_closed = self.closed
+            self.closed = True
+            try:
+                super().close()
+            finally:
+                if not already_closed:
+                    raise close_error
+
+    def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        kwargs["factory"] = FailingConnection
+        connection = original_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", connect)
+    db_path = tmp_path / f"{store_type.__name__}-failure.sqlite"
+
+    with pytest.raises(InitializationFailure) as caught:
+        store_type(str(db_path))
+
+    assert caught.value is failure
+    assert len(connections) == 1
+    connection = connections[0]
+    assert connection.closed
+    assert connection.rollback_count == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
+
+    reopened = original_connect(db_path)
+    try:
+        assert reopened.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall() == []
+        assert reopened.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    finally:
+        reopened.close()
