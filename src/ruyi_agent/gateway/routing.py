@@ -12,6 +12,7 @@ from ruyi_agent.gateway.create_errors import (
 from ruyi_agent.gateway.create_route_workflow import (
     CreateRouteRequest,
     CreateRouteWorkflow,
+    RouteRecordPort,
     RoutedTask,
 )
 from ruyi_agent.gateway.errors import GatewayTaskError
@@ -28,7 +29,6 @@ from ruyi_agent.gateway.public_errors import (
 from ruyi_agent.gateway.route_reservations import (
     has_active_route_binding as _has_active_route_binding,
     has_durable_create_effect as _has_durable_create_effect,
-    reservation_record,
 )
 from ruyi_agent.gateway_protocol.sse import SSEProtocolError, task_stream_event_from_gateway
 from ruyi_agent.integrations.a2a.client import A2AClientError
@@ -36,7 +36,6 @@ from ruyi_agent.runtime.delegation.async_runtime import AgentControl
 from ruyi_agent.runtime.delegation.contracts import (
     DurableTaskMailboxRequiredError,
     TaskAlreadyRunningError,
-    UnknownAgentTargetError,
     UnknownWorkerTaskError,
 )
 from ruyi_agent.runtime.delegation.context import (
@@ -93,16 +92,8 @@ class TaskRouter:
         self._control = control
         self._route_store = route_store
         self._remote_event_handlers = remote_event_handlers or []
-        try:
-            remote_create_capability = control.remote_create_idempotency_guaranteed
-        except AttributeError:
-            remote_create_capability = None
-        self._create_route_workflow = CreateRouteWorkflow(
-            control=control,
-            route_store=route_store,
-            active_record_reader=self.get_record,
-            remote_create_capability=remote_create_capability,
-        )
+        self._record_port = RouteRecordPort(control)
+        self._create_route_workflow = CreateRouteWorkflow(control, route_store)
 
     def prepare_delegation_metadata(
         self,
@@ -231,31 +222,7 @@ class TaskRouter:
             return None
 
     def ensure_record(self, route: TaskRouteRecord) -> TaskRecord:
-        if not _has_active_route_binding(route):
-            return reservation_record(route)
-        if route.route_kind != "remote_ref":
-            return self._get_local_record(route.task_id)
-        try:
-            return public_remote_record(
-                self._control.ensure_remote_task_record(
-                    agent_name=route.agent_name,
-                    task_id=route.task_id,
-                    upstream_task_id=route.upstream_task_id,
-                    webhook=(
-                        dict(route.webhook) if route.webhook is not None else None
-                    ),
-                )
-            )
-        except UnknownAgentTargetError as exc:
-            raise GatewayTaskError(
-                code="runtime_unavailable",
-                message=f"Runtime is not configured for agent '{route.agent_name}'",
-            ) from exc
-        except ValueError as exc:
-            raise public_upstream_payload_error(
-                operation="get",
-                route=route,
-            ) from exc
+        return self._record_port.ensure(route)
 
     async def get_record(
         self,
@@ -263,22 +230,7 @@ class TaskRouter:
         *,
         refresh_remote: bool = True,
     ) -> TaskRecord:
-        if not _has_active_route_binding(route):
-            return reservation_record(route)
-        if route.route_kind != "remote_ref" or not refresh_remote:
-            return self.ensure_record(route)
-        self.ensure_record(route)
-        try:
-            return public_remote_record(await self._control.refresh_task(route.task_id))
-        except UnknownWorkerTaskError as exc:
-            raise _task_not_found(route.task_id) from exc
-        except A2AClientError as exc:
-            raise public_upstream_error(exc, operation="get", route=route) from exc
-        except ValueError as exc:
-            raise public_upstream_payload_error(
-                operation="get",
-                route=route,
-            ) from exc
+        return await self._record_port.read(route, refresh_remote=refresh_remote)
 
     async def list_task_messages(
         self,
@@ -637,12 +589,6 @@ class TaskRouter:
             if await handler.handle_remote_task_event(payload):
                 delivered += 1
         return delivered
-
-    def _get_local_record(self, task_id: str) -> TaskRecord:
-        try:
-            return self._control.get_task_record(task_id)
-        except UnknownWorkerTaskError as exc:
-            raise _task_not_found(task_id) from exc
 
     async def require_active_route(self, route: TaskRouteRecord) -> None:
         if _has_active_route_binding(route):

@@ -52,6 +52,10 @@ class RecordingControl:
         self.ensure_calls: list[dict[str, Any]] = []
         self.refresh_calls: list[str] = []
 
+    def remote_create_idempotency_guaranteed(self, agent_name: str) -> bool:
+        del agent_name
+        return False
+
     async def spawn_task(self, agent_name: str, task: str, **kwargs: Any) -> TaskRecord:
         del task
         is_remote = "metadata" in kwargs
