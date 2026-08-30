@@ -321,7 +321,8 @@ def test_channel_delivery_contract_and_legacy_migration(tmp_path: Path) -> None:
         connection.commit()
         before = tuple(
             connection.execute(
-                f"SELECT {', '.join(legacy_columns)} FROM channel_delivery_intents"
+                f"SELECT {', '.join(legacy_columns)} FROM channel_delivery_intents "
+                "ORDER BY intent_id"
             ).fetchall()
         )
         connection.close()
@@ -329,12 +330,67 @@ def test_channel_delivery_contract_and_legacy_migration(tmp_path: Path) -> None:
 
     valid_path = tmp_path / "legacy-valid.sqlite3"
     before = create_legacy(valid_path, state="error")
+    connection = sqlite3.connect(valid_path)
+    all_states = (
+        "watching",
+        "retry_wait",
+        "error",
+        "delivering",
+        "review_waiting",
+        "terminal_grace",
+        "delivered",
+        "superseded",
+    )
+    for kind_index, kind in enumerate(("watch", "review", "terminal")):
+        for state_index, state in enumerate(all_states):
+            if kind == "watch" and state == "error":
+                continue
+            run_count = 100 + kind_index * len(all_states) + state_index
+            intent_id = f"legacy-{kind}-{state}"
+            values = (
+                intent_id,
+                "telegram",
+                f"telegram:session-{run_count}",
+                f"chat-{run_count}",
+                f"task-{run_count}",
+                run_count,
+                kind,
+                None,
+                state,
+                run_count,
+                2,
+                None,
+                None,
+                None,
+                None,
+                None,
+                run_count,
+                1000.0 + run_count,
+                2000.0 + run_count,
+            )
+            connection.execute(
+                f"INSERT INTO channel_delivery_intents ({', '.join(legacy_columns)}) "
+                f"VALUES ({', '.join('?' for _ in legacy_columns)})",
+                values,
+            )
+            connection.execute(
+                "INSERT INTO channel_delivery_steps VALUES (?, ?, ?)",
+                (intent_id, f"step:{intent_id}", 3000.0 + run_count),
+            )
+    connection.commit()
+    before = tuple(
+        connection.execute(
+            f"SELECT {', '.join(legacy_columns)} FROM channel_delivery_intents "
+            "ORDER BY intent_id"
+        ).fetchall()
+    )
+    connection.close()
     store = ChannelDeliveryStore(str(valid_path))
     intent = store.get("legacy-1")
     assert intent is not None
     assert intent.delivery_kind == "watch"
     assert intent.state == "error"
-    assert intent.next_attempt_at == 20.0
+    assert intent.next_attempt_at is None
     assert intent.redrive_count == 0
     assert store.step_delivered("legacy-1", step_key="review:r1:message")
     store.close()
@@ -350,15 +406,50 @@ def test_channel_delivery_contract_and_legacy_migration(tmp_path: Path) -> None:
     connection.rollback()
     migrated = tuple(
         connection.execute(
-            f"SELECT {', '.join(legacy_columns)} FROM channel_delivery_intents"
+            f"SELECT {', '.join(legacy_columns)} FROM channel_delivery_intents "
+            "ORDER BY intent_id"
         ).fetchall()
     )
-    assert migrated[0][:11] + migrated[0][12:] == before[0][:11] + before[0][12:]
-    assert migrated[0][11] == 20.0
+    assert migrated == before
+    table_info = connection.execute(
+        "PRAGMA table_info(channel_delivery_intents)"
+    ).fetchall()
+    assert [row[1] for row in table_info] == [
+        *legacy_columns[:11],
+        "redrive_count",
+        *legacy_columns[11:],
+    ]
+    assert all(
+        row[3] == 1
+        for row in table_info
+        if row[1] in {"delivery_kind", "state", "redrive_count"}
+    )
+    table_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'channel_delivery_intents'"
+    ).fetchone()[0]
+    assert all(
+        value in table_sql for value in all_states + ("watch", "review", "terminal")
+    )
+    assert connection.execute("SELECT COUNT(*) FROM channel_delivery_steps").fetchone()[
+        0
+    ] == len(before)
     assert {
         row[2]
         for row in connection.execute("PRAGMA foreign_key_list(channel_delivery_steps)")
     } == {"channel_delivery_intents"}
+    connection.close()
+    idempotent = ChannelDeliveryStore(str(valid_path))
+    idempotent.close()
+    connection = sqlite3.connect(valid_path)
+    assert (
+        tuple(
+            connection.execute(
+                f"SELECT {', '.join(legacy_columns)} FROM channel_delivery_intents "
+                "ORDER BY intent_id"
+            ).fetchall()
+        )
+        == before
+    )
     connection.close()
 
     for suffix, kind, state in (
@@ -378,7 +469,7 @@ def test_channel_delivery_contract_and_legacy_migration(tmp_path: Path) -> None:
             tuple(
                 connection.execute(
                     f"SELECT {', '.join(legacy_columns)} "
-                    "FROM channel_delivery_intents"
+                    "FROM channel_delivery_intents ORDER BY intent_id"
                 ).fetchall()
             )
             == invalid_before
@@ -446,9 +537,7 @@ def test_partial_artifact_failure_retries_without_duplicate_message(
         )
         delivered = store.get(intent_id)
         assert delivered is not None and delivered.state == "delivered"
-        assert store.step_delivered(
-            intent_id, step_key="terminal:1:message"
-        )
+        assert store.step_delivered(intent_id, step_key="terminal:1:message")
         assert store.step_delivered(
             intent_id, step_key="terminal:1:artifact:artifact-1"
         )
@@ -736,9 +825,7 @@ def test_restart_during_terminal_grace_skips_terminal_and_delivers_late_review(
         await second.wait()
 
         assert second_events == ["review"]
-        assert second_store.step_delivered(
-            intent_id, step_key="terminal:1:message"
-        )
+        assert second_store.step_delivered(intent_id, step_key="terminal:1:message")
         assert second_store.step_delivered(
             intent_id, step_key="review:review-late:message"
         )
@@ -914,9 +1001,7 @@ def test_accepted_then_blocked_send_may_repeat_after_fenced_lease_loss(
             task_id="task-1",
             run_count=1,
         )
-        assert second_store.step_delivered(
-            intent_id, step_key="terminal:1:message"
-        )
+        assert second_store.step_delivered(intent_id, step_key="terminal:1:message")
         await first.close()
         await second.close()
         first_store.close()
@@ -1068,8 +1153,7 @@ def test_adapter_start_failure_compensates_and_can_retry(
             first_start, second_start, return_exceptions=True
         )
         assert all(
-            isinstance(outcome, RuntimeError)
-            and str(outcome) == "recovery hook failed"
+            isinstance(outcome, RuntimeError) and str(outcome) == "recovery hook failed"
             for outcome in outcomes
         )
         assert hook_calls == 2

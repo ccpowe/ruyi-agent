@@ -13,6 +13,7 @@ from ruyi_agent.channels.gateway_dto import GatewayPublishedArtifact, GatewayTas
 from ruyi_agent.channels.task_watch import TaskWatchHooks, TaskWatchManager
 from ruyi_agent.storage.channel_delivery_store import (
     ChannelDeliveryIntent,
+    ChannelDeliverySchedule,
     DELIVERY_KIND_REVIEW,
     DELIVERY_KIND_TERMINAL,
     DELIVERY_STATE_DELIVERED,
@@ -63,7 +64,11 @@ class ChannelDeliveryRedrivePolicy:
         exponent = min(31, max(0, redrive_count - 1))
         base = min(self.max_delay, self.base_delay * (2**exponent))
         jitter = base * self.jitter_ratio * max(0.0, min(1.0, random_value))
-        return min(self.max_delay, max(1e-06, base + jitter))
+        previous = 0.0
+        if exponent:
+            previous_base = min(self.max_delay, self.base_delay * (2 ** (exponent - 1)))
+            previous = min(self.max_delay, previous_base * (1 + self.jitter_ratio))
+        return min(self.max_delay, max(1e-06, previous, base + jitter))
 
 
 # A short name is useful for embedders while retaining one implementation.
@@ -78,6 +83,9 @@ class ChannelDeliveryHooks:
     on_superseded: TaskCallback | None = None
     on_terminal_delivered: TaskCallback | None = None
     on_error: Callable[[Exception], Awaitable[None]] | None = None
+
+
+HooksFactory = Callable[[ChannelDeliveryIntent], ChannelDeliveryHooks]
 
 
 class ReviewPresenter:
@@ -253,6 +261,7 @@ class ChannelDeliveryCoordinator:
             tuple[str, int], tuple[ChannelDeliveryIntent, ChannelDeliveryHooks]
         ] = {}
         self._hooks_by_intent: dict[str, ChannelDeliveryHooks] = {}
+        self._hooks_factory: HooksFactory | None = None
         self._delivery_events: dict[str, asyncio.Event] = {}
         self._reconcile_wakeup = asyncio.Event()
         self._reconciler: asyncio.Task[None] | None = None
@@ -378,22 +387,24 @@ class ChannelDeliveryCoordinator:
 
     async def recover(
         self,
-        hooks_for: Callable[[ChannelDeliveryIntent], ChannelDeliveryHooks],
+        hooks_for: HooksFactory,
     ) -> int:
         if self._closed:
             raise RuntimeError("ChannelDeliveryCoordinator is closed")
         if self._store is None or self._platform is None:
             return 0
         recovered = 0
-        started: list[tuple[str, int, str]] = []
+        pending_hooks: dict[str, ChannelDeliveryHooks] = {}
         try:
-            for intent in await self._store.alist_recoverable(platform=self._platform):
+            intents = await self._store.alist_recoverable(platform=self._platform)
+            now = self._store.now()
+            for intent in intents:
                 hooks = hooks_for(intent)
-                self._hooks_by_intent[intent.intent_id] = hooks
+                pending_hooks[intent.intent_id] = hooks
                 if (
                     intent.state == DELIVERY_STATE_ERROR
                     and intent.next_attempt_at is not None
-                    and intent.next_attempt_at > self._store.now()
+                    and intent.next_attempt_at > now
                 ):
                     # A persistent query-error backoff survives a restart.  The
                     # reconciler owns the eventual due claim; explicit delivery
@@ -401,15 +412,31 @@ class ChannelDeliveryCoordinator:
                     continue
                 if self._start_intent(intent, hooks=hooks):
                     recovered += 1
-                    started.append((intent.task_id, intent.run_count, intent.intent_id))
+            if self._closed:
+                raise RuntimeError("ChannelDeliveryCoordinator is closed")
+            self._hooks_by_intent.clear()
+            self._hooks_by_intent.update(pending_hooks)
+            self._hooks_factory = hooks_for
             self._start_reconciler()
             return recovered
         except BaseException:
-            for task_id, run_count, intent_id in started:
+            self._restart_requests.clear()
+            reconciler = self._reconciler
+            if reconciler is not None and not reconciler.done():
+                reconciler.cancel()
+                await asyncio.gather(reconciler, return_exceptions=True)
+            for (task_id, run_count), (intent_id, token) in list(self._tokens.items()):
                 await self.task_watch.cancel(task_id=task_id, run_count=run_count)
-                owned = self._tokens.pop((task_id, run_count), None)
-                if owned is not None:
-                    self._store.release(intent_id, token=owned[1])
+                try:
+                    self._store.release(intent_id, token=token)
+                except BaseException:
+                    pass
+            self._tokens.clear()
+            self._restart_requests.clear()
+            self._hooks_by_intent.clear()
+            self._hooks_factory = None
+            self._reconciler_enabled = False
+            self._reconcile_wakeup.set()
             raise
 
     def _start_reconciler(self) -> None:
@@ -425,83 +452,137 @@ class ChannelDeliveryCoordinator:
         self._reconciler.add_done_callback(self._consume_reconciler_result)
 
     async def _reconcile_loop(self) -> None:
-        failure_attempt = 0
+        discovery_attempt = 0
         try:
             while not self._closed:
                 try:
-                    await self._reconcile_once()
-                    failure_attempt = 0
-                    await self._wait_for_reconcile_signal()
+                    if self._store is None or self._platform is None:
+                        return
+                    schedule = await self._store.aschedule_snapshot(
+                        platform=self._platform,
+                        limit=self._redrive_policy.batch_limit,
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    failure_attempt += 1
-                    _LOGGER.warning(
-                        "Channel delivery reconciliation failed; retrying with backoff",
-                        extra={
-                            "platform": self._platform,
-                            "owner_id": self._owner_id,
-                            "failure_attempt": failure_attempt,
-                            "error_type": type(exc).__name__,
-                        },
-                        exc_info=True,
+                    discovery_attempt += 1
+                    self._log_reconcile_failure(exc, discovery_attempt)
+                    await self._wait_for_schedule(
+                        None,
+                        self._discovery_delay(discovery_attempt),
+                        backoff=True,
                     )
-                    delay = self._redrive_policy.delay(
-                        failure_attempt,
-                        random_value=self._random_value(),
+                    continue
+                failed = False
+                progressed = False
+                for intent in schedule.due_errors:
+                    try:
+                        outcome = await self._redrive_due(intent, schedule.observed_at)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        failed = True
+                        self._log_reconcile_failure(exc, discovery_attempt + 1)
+                        continue
+                    if outcome:
+                        progressed = True
+                    elif outcome is None:
+                        failed = True
+                if failed:
+                    discovery_attempt += 1
+                    await self._wait_for_schedule(
+                        schedule,
+                        self._discovery_delay(discovery_attempt),
+                        backoff=True,
                     )
-                    await self._reconcile_sleep(delay)
-                    # Keep even injected/test sleepers from turning a
-                    # repeatedly failing supervisor into an event-loop hog.
+                elif progressed:
+                    discovery_attempt = 0
                     await asyncio.sleep(0)
+                else:
+                    if schedule.earliest_due_at is not None:
+                        timeout = min(
+                            self._redrive_policy.scan_interval,
+                            max(0.0, schedule.earliest_due_at - schedule.observed_at),
+                        )
+                        discovery_attempt = 0
+                    else:
+                        discovery_attempt += 1
+                        timeout = self._discovery_delay(discovery_attempt)
+                    await self._wait_for_schedule(schedule, timeout)
         finally:
             if self._reconciler is asyncio.current_task():
                 self._reconciler = None
 
-    async def _reconcile_once(self) -> None:
-        if self._store is None or self._platform is None:
-            return
-        now = self._store.now()
-        intents = await self._store.alist_due_errors(
-            platform=self._platform,
-            limit=self._redrive_policy.batch_limit,
-            now=now,
+    async def _redrive_due(
+        self,
+        intent: ChannelDeliveryIntent,
+        observed_at: float,
+    ) -> bool | None:
+        if self._store is None:
+            return False
+        token = self._store.claim_due_error(
+            intent.intent_id,
+            owner=self._owner_id,
+            lease_seconds=self._lease_seconds,
+            now=observed_at,
         )
-        for intent in intents:
-            hooks = self._hooks_by_intent.get(intent.intent_id)
+        if token is None:
+            return None
+        hooks = self._hooks_by_intent.get(intent.intent_id)
+        started = False
+        try:
             if hooks is None:
-                # Startup recovery normally populates this map.  A row without
-                # transport hooks cannot be safely sent and is left durable for
-                # the next startup/recovery attempt.
-                continue
-            token = self._store.claim_due_error(
-                intent.intent_id,
-                owner=self._owner_id,
-                lease_seconds=self._lease_seconds,
-                now=self._store.now(),
-            )
-            if token is None:
-                continue
+                if self._hooks_factory is None:
+                    return None
+                hooks = self._hooks_factory(intent)
             if not self._start_intent(intent, hooks=hooks, token=token):
-                self._store.release(intent.intent_id, token=token)
-            await asyncio.sleep(0)
+                return None
+            started = True
+            self._hooks_by_intent.setdefault(intent.intent_id, hooks)
+            return True
+        finally:
+            if not started:
+                try:
+                    self._store.release(intent.intent_id, token=token)
+                except BaseException:
+                    pass
 
-    async def _wait_for_reconcile_signal(self) -> None:
-        if self._store is None or self._platform is None or self._closed:
-            return
-        self._reconcile_wakeup.clear()
-        now = self._store.now()
-        earliest = await self._store.anext_due_error_at(
-            platform=self._platform,
-            now=now,
+    def _discovery_delay(self, attempt: int) -> float:
+        base = min(1.0, self._redrive_policy.scan_interval / 4.0)
+        return min(
+            self._redrive_policy.scan_interval,
+            base * (2 ** min(5, max(0, attempt - 1))),
         )
-        timeout = self._redrive_policy.scan_interval
-        if earliest is not None and earliest > now:
-            timeout = min(timeout, earliest - now)
-        # A due row that lost a race with another owner must not cause an
-        # immediate full-table loop; the bounded scan interval handles it.
+
+    def _log_reconcile_failure(self, exc: Exception, attempt: int) -> None:
+        _LOGGER.warning(
+            "Channel delivery reconciliation failed; retrying with backoff",
+            extra={
+                "platform": self._platform,
+                "owner_id": self._owner_id,
+                "failure_attempt": attempt,
+                "error_type": type(exc).__name__,
+            },
+            exc_info=True,
+        )
+
+    async def _wait_for_schedule(
+        self,
+        schedule: ChannelDeliverySchedule | None,
+        timeout: float,
+        *,
+        backoff: bool = False,
+    ) -> None:
+        if self._closed:
+            return
         if timeout <= 0:
-            timeout = self._redrive_policy.scan_interval
+            await asyncio.sleep(0)
+            return
+        if not backoff and self._reconcile_wakeup.is_set():
+            self._reconcile_wakeup.clear()
+            return
+        if backoff:
+            self._reconcile_wakeup.clear()
         wake = asyncio.create_task(self._reconcile_wakeup.wait())
         timer = asyncio.create_task(self._reconcile_sleep(timeout))
         try:
@@ -552,7 +633,6 @@ class ChannelDeliveryCoordinator:
         if token is None:
             return False
         self._tokens[key] = (intent.intent_id, token)
-        self._hooks_by_intent[intent.intent_id] = hooks
         redrive_delay: float | None = None
 
         async def observed(_: GatewayTask) -> None:
@@ -879,14 +959,17 @@ class ChannelDeliveryCoordinator:
         if reconciler is not None:
             await asyncio.gather(reconciler, return_exceptions=True)
         await self.task_watch.close()
-        if self._store is not None:
-            self._store.release_owner(self._owner_id)
-        self._tokens.clear()
-        self._restart_requests.clear()
-        self._hooks_by_intent.clear()
-        for event in self._delivery_events.values():
-            event.set()
-        self._delivery_events.clear()
+        try:
+            if self._store is not None:
+                self._store.release_owner(self._owner_id)
+        finally:
+            self._tokens.clear()
+            self._restart_requests.clear()
+            self._hooks_by_intent.clear()
+            self._hooks_factory = None
+            for event in self._delivery_events.values():
+                event.set()
+            self._delivery_events.clear()
 
 
 def delivery_session_key(
