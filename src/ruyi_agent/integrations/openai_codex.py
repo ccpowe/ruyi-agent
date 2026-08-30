@@ -27,6 +27,11 @@ DEFAULT_CODEX_INSTRUCTIONS = (
     "You are a Codex backend model used by ruyi-agent. Answer directly."
 )
 CODEX_USER_AGENT = "codex_cli_rs/0.0.0 (ruyi-agent)"
+_CODEX_ERROR_BODY_MAX_BYTES = 64 * 1024
+_CODEX_ERROR_BODY_CHUNK_SIZE = 8192
+_CODEX_ERROR_FIELD_MAX_BYTES = 512
+_CODEX_ERROR_FIELDS = ("code", "message", "param", "type")
+_CODEX_REDACTED = "[REDACTED]"
 
 
 def _retryable_codex_stream_error(exc: BaseException) -> bool:
@@ -34,6 +39,114 @@ def _retryable_codex_stream_error(exc: BaseException) -> bool:
         return True
     return isinstance(exc, httpx.HTTPStatusError) and (
         exc.response.status_code == 429 or exc.response.status_code >= 500
+    )
+
+
+def _reject_codex_non_finite_json_number(value: str) -> None:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+def _truncate_codex_error_text(value: str) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= _CODEX_ERROR_FIELD_MAX_BYTES:
+        return value
+    return encoded[:_CODEX_ERROR_FIELD_MAX_BYTES].decode("utf-8", errors="ignore")
+
+
+def _sanitize_codex_error(
+    body: bytes,
+    *,
+    authorization: str | None,
+    api_key: str | None,
+    chatgpt_account_id: str | None,
+) -> str | None:
+    try:
+        payload = json.loads(
+            body.decode("utf-8", errors="strict"),
+            parse_constant=_reject_codex_non_finite_json_number,
+        )
+        if not isinstance(payload, dict):
+            return None
+        source = payload.get("error")
+        if not isinstance(source, dict):
+            source = payload
+
+        error: dict[str, str] = {}
+        for field_name in _CODEX_ERROR_FIELDS:
+            value = source.get(field_name)
+            if not isinstance(value, str) or not value:
+                continue
+            for secret in (authorization, api_key, chatgpt_account_id):
+                if secret:
+                    value = value.replace(secret, _CODEX_REDACTED)
+            error[field_name] = _truncate_codex_error_text(value)
+        if not error:
+            return None
+        return json.dumps(error, ensure_ascii=True, separators=(",", ":"))
+    except Exception:
+        return None
+
+
+def _codex_error_body(response: httpx.Response) -> bytes | None:
+    body = bytearray()
+    try:
+        for chunk in response.iter_bytes(chunk_size=_CODEX_ERROR_BODY_CHUNK_SIZE):
+            if not chunk:
+                continue
+            remaining = _CODEX_ERROR_BODY_MAX_BYTES + 1 - len(body)
+            if len(chunk) >= remaining:
+                body.extend(chunk[:remaining])
+                return None
+            body.extend(chunk)
+    except Exception:
+        return None
+    return bytes(body)
+
+
+async def _async_codex_error_body(response: httpx.Response) -> bytes | None:
+    body = bytearray()
+    try:
+        async for chunk in response.aiter_bytes(
+            chunk_size=_CODEX_ERROR_BODY_CHUNK_SIZE
+        ):
+            if not chunk:
+                continue
+            remaining = _CODEX_ERROR_BODY_MAX_BYTES + 1 - len(body)
+            if len(chunk) >= remaining:
+                body.extend(chunk[:remaining])
+                return None
+            body.extend(chunk)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return None
+    return bytes(body)
+
+
+def _codex_http_status_error(
+    response: httpx.Response,
+    *,
+    body: bytes | None,
+    headers: dict[str, str],
+    api_key: str,
+) -> httpx.HTTPStatusError:
+    error = (
+        _sanitize_codex_error(
+            body,
+            authorization=headers.get("Authorization"),
+            api_key=api_key,
+            chatgpt_account_id=headers.get("ChatGPT-Account-ID"),
+        )
+        if body is not None
+        else None
+    )
+    message = f"Codex Responses request failed with HTTP {response.status_code}"
+    if error is not None:
+        message += f"; error={error}"
+    return httpx.HTTPStatusError(
+        message,
+        request=response.request,
+        response=response,
     )
 
 
@@ -560,7 +673,18 @@ class CodexChatModel(ChatOpenAI):
                         headers=headers,
                         json=payload,
                     ) as response:
-                        response.raise_for_status()
+                        if not response.is_success:
+                            api_key = (
+                                self.openai_api_key.get_secret_value()
+                                if self.openai_api_key
+                                else ""
+                            )
+                            raise _codex_http_status_error(
+                                response,
+                                body=_codex_error_body(response),
+                                headers=headers,
+                                api_key=api_key,
+                            )
                         event_name: str | None = None
                         data_lines: list[str] = []
 
@@ -625,7 +749,18 @@ class CodexChatModel(ChatOpenAI):
                         headers=headers,
                         json=payload,
                     ) as response:
-                        response.raise_for_status()
+                        if not response.is_success:
+                            api_key = (
+                                self.openai_api_key.get_secret_value()
+                                if self.openai_api_key
+                                else ""
+                            )
+                            raise _codex_http_status_error(
+                                response,
+                                body=await _async_codex_error_body(response),
+                                headers=headers,
+                                api_key=api_key,
+                            )
                         event_name: str | None = None
                         data_lines: list[str] = []
 

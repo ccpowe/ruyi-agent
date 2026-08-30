@@ -5,6 +5,9 @@ import base64
 import json
 import socket
 from http.server import BaseHTTPRequestHandler
+
+import httpx
+import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 
 import ruyi_agent.integrations.openai_codex as openai_codex
@@ -300,6 +303,107 @@ def test_codex_chat_model_streams_tool_call_chunks_without_text(
             "type": "tool_call",
         }
     ]
+
+
+class _CodexHTTPErrorHandler(BaseHTTPRequestHandler):
+    payload = {
+        "code": "top-level-code",
+        "error": {
+            "code": "invalid_request",
+            "message": (
+                "Authorization: Bearer secret-token; account=acct-123; "
+                "token=secret-token; "
+                + "长"
+                * 400
+            ),
+            "param": "input",
+            "type": "invalid_request_error",
+            "ignored": "not exposed",
+        },
+    }
+
+    def do_POST(self) -> None:
+        body = json.dumps(type(self).payload, ensure_ascii=False).encode()
+        self.send_response(400)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def test_codex_http_error_diagnostics_are_safe_for_sync_and_async(
+    run_http_server,
+) -> None:
+    server = run_http_server(_CodexHTTPErrorHandler)
+    model = CodexChatModel(
+        model="gpt-5.4",
+        api_key="secret-token",
+        base_url=f"http://127.0.0.1:{server.server_port}",
+        default_headers={"ChatGPT-Account-ID": "acct-123"},
+        codex_session_id="session-http-error",
+        max_retries=0,
+    )
+
+    with pytest.raises(httpx.HTTPStatusError) as sync_error:
+        model.invoke([HumanMessage(content="Say hi.")])
+    with pytest.raises(httpx.HTTPStatusError) as async_error:
+        asyncio.run(model.ainvoke([HumanMessage(content="Say hi.")]))
+
+    for error in (sync_error.value, async_error.value):
+        message = str(error)
+        assert message.startswith("Codex Responses request failed with HTTP 400; error=")
+        assert "secret-token" not in message
+        assert "acct-123" not in message
+        diagnostics = json.loads(message.split("; error=", 1)[1])
+        assert set(diagnostics) == {"code", "message", "param", "type"}
+        assert diagnostics["code"] == "invalid_request"
+        assert diagnostics["param"] == "input"
+        assert diagnostics["type"] == "invalid_request_error"
+        assert "[REDACTED]" in diagnostics["message"]
+        assert len(diagnostics["message"].encode("utf-8")) <= 512
+        assert isinstance(error, httpx.HTTPStatusError)
+        assert error.response.status_code == 400
+
+
+class _OversizedMalformedCodexHTTPErrorHandler(BaseHTTPRequestHandler):
+    body = b'{"error":{"message":"' + (b"x" * (64 * 1024))
+
+    def do_POST(self) -> None:
+        body = type(self).body
+        self.send_response(502)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def test_codex_http_error_oversized_malformed_body_is_status_only(
+    run_http_server,
+) -> None:
+    server = run_http_server(_OversizedMalformedCodexHTTPErrorHandler)
+    model = CodexChatModel(
+        model="gpt-5.4",
+        api_key="secret-token",
+        base_url=f"http://127.0.0.1:{server.server_port}",
+        default_headers={"ChatGPT-Account-ID": "acct-123"},
+        codex_session_id="session-http-error-oversized",
+        max_retries=0,
+    )
+    expected = "Codex Responses request failed with HTTP 502"
+
+    with pytest.raises(httpx.HTTPStatusError) as sync_error:
+        model.invoke([HumanMessage(content="Say hi.")])
+    with pytest.raises(httpx.HTTPStatusError) as async_error:
+        asyncio.run(model.ainvoke([HumanMessage(content="Say hi.")]))
+
+    assert str(sync_error.value) == expected
+    assert str(async_error.value) == expected
 
 
 def test_resolve_codex_credentials_reads_ruyi_auth_json(tmp_path) -> None:
