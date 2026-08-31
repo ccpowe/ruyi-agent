@@ -42,8 +42,10 @@ flowchart LR
 `bootstrap` 是进程的 composition 和 lifecycle root。它创建共享的 backend、MCP
 registry、LangGraph checkpointer、SQLite stores、`AgentControl` 和 Gateway
 service；FastAPI lifespan 结束时按相反方向释放它们。Gateway 与 channel adapter
-在同一进程的 TaskGroup 中运行，但 adapter 只经 loopback Gateway HTTP client 访问
-Gateway 的公开面，不接收 `AppRuntime` 或 Gateway service。
+在同一进程的 TaskGroup 中运行，但 adapter 通过 `settings.gateway.base_url` 配置的
+Gateway HTTP endpoint 访问 Gateway 的公开面；starter/default 为 loopback，同进程
+TaskGroup 不强制 endpoint 必须 loopback。adapter 不接收 `AppRuntime` 或 Gateway
+service。
 
 ## 3. 入口与进程拓扑
 
@@ -59,9 +61,11 @@ Gateway 的公开面，不接收 `AppRuntime` 或 Gateway service。
    退出前先停止接受新请求，再关闭 worker、stores、checkpointer 和 backend。
 3. `--gateway` 启动 Gateway-only 进程。`--telegram`、`--feishu` 和 `--all` 都
    把 Gateway 与所选 Telegram/Feishu adapter 放入同一个 `asyncio.TaskGroup`；
-   `--all` 只保留已配置凭据的 adapter。adapter 只经 loopback
-   `GatewayHTTPClient`/`GatewayProtocolClient` 访问 Gateway/runtime 的公开 HTTP
-   surface，不被注入 `AppRuntime` 或 Gateway service；各 adapter 自己拥有
+   `--all` 只保留已配置凭据的 adapter。adapter 通过
+   `settings.gateway.base_url` 配置的 Gateway HTTP endpoint 访问 Gateway/runtime
+   的公开 HTTP surface；starter/default 为 loopback，但同进程 TaskGroup 不强制
+   endpoint 必须 loopback。adapter 不被注入 `AppRuntime` 或 Gateway service；各
+   adapter 自己拥有
    channel-specific session、receipt 和 delivery stores，也不访问 Gateway/runtime
    的 Task、route、command stores 或 LangGraph。
 4. [`channels/http/routes.py`](../src/ruyi_agent/channels/http/routes.py) 是 HTTP
@@ -169,8 +173,8 @@ CLI -> RuntimeSettings -> bootstrap/lifespan
    内部 delegation 的 proxy Task/reconciliation 各自保留可查询身份与不确定性。
 5. 对公开 Gateway remote route 的 message page，先验证返回的 `task_id` 等于 route
    保存的 upstream id，再**只重写顶层 `task_id`** 为 public id，并保留 `items` 和
-   opaque `cursor`。这只保证该 identity 校验和顶层改写，不承诺其他保留字段绝不
-   含 upstream identity。
+   opaque `cursor`。这只保证该 identity 校验和顶层改写；这些保留字段不在“不含
+   upstream identity”的保证范围内。
 
 ### 6.3 channel inbound / track / delivery
 
@@ -242,9 +246,10 @@ lifecycle 或 artifact event；durable event 的 id 可用于断线续传。
 不是任意底层 transcript 的直接透传。local page 的 cursor 绑定 task 与 checkpoint；
 读取 latest 时先定位并重新读取精确 checkpoint，避免把 pending write 混入一页。
 
-remote page 先校验 upstream task identity，再将 public task id 放在响应顶层，保留
-上游的 `items` 与 opaque `cursor`。因此 message projection 和 SSE 都能跨 remote
-route 保持 public identity，同时不泄露 upstream identity 到稳定 API。
+remote page 先校验 upstream task identity，将响应顶层 `task_id` 投影为 public Gateway
+task id，并保留 `items` 和 opaque `cursor`；这些保留字段不在“不含 upstream identity”
+的保证范围内。message projection 和 SSE 仍以 public identity 作为公开
+顶层边界。
 
 ## 8. 外部与信任边界
 
