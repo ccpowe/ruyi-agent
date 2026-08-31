@@ -1,438 +1,92 @@
 # Ruyi Agent
 
-`ruyi-agent` 是一个面向工程化场景的 Agent Runtime。它把 HTTP Gateway、Telegram Bot、Feishu/Lark Bot 接到同一套任务控制面，支持多 Agent 委派、MCP 工具、skills、HITL 审批、SQLite 状态持久化、附件上传和任务产物下载。
+Ruyi Agent 是一个面向工程任务的 Python Agent Runtime。它通过统一的运行时和配置，提供 HTTP Gateway、Telegram、Feishu/Lark 入口，以及可委派的本地或远程 Agent、模型 Provider、MCP 工具、人工审批、工作区文件和持久化任务状态。
 
-项目仍在快速演进阶段，适合研究、二次开发和小规模自托管验证。生产环境使用前请重点检查权限策略、Gateway 暴露方式、backend 隔离和密钥管理。
+## 主要能力
 
-## Demos
+- `ruyi` CLI 可启动 Gateway、Telegram、Feishu/Lark，或启动所有已配置的入口。
+- FastAPI Gateway 提供 Agent 发现、任务创建与续写、任务消息和事件、审批、附件/产物以及 Team Console。
+- TOML 配置支持 local Agent、`remote_ref`、worker、模型 Provider、MCP server、skills 和权限 profile。
+- 运行时使用 SQLite 保存任务、checkpoint、路由、审批审计和 channel session 等状态。
+- backend 支持 `local` 和 `daytona`；`local` 适合开发和测试，Daytona 可用于隔离执行环境。
 
-![Ruyi Agent 简短演示](docs/简短演示.gif)
-
-- [PPT generation demo](https://github.com/ccpowe/ruyi-agent/releases/download/%E6%BC%94%E7%A4%BA/ruyi_ppt.mp4)：通过 agent workflow 生成演示 PPT。
-- [Snake web app demo](https://github.com/ccpowe/ruyi-agent/releases/download/%E6%BC%94%E7%A4%BA/ruyi_snake.mp4)：通过 agent workflow 生成并运行 Web 贪吃蛇应用。
-
-## 核心能力
-
-- 多入口接入：FastAPI Gateway、Telegram、Feishu/Lark。
-- 多 Agent 委派：支持本地 worker 和远端 `remote_ref`，统一通过 task 控制面调度。
-- MCP 工具治理：支持多 MCP server、工具搜索、schema 校验、按 agent scope 注入。
-- Skills：按 agent 配置控制 skill 可见性，并同步到 backend 内部 skill view。
-- HITL 审批：把 root agent 和 worker/subagent 的审批请求统一投影为 review 资源。
-- 权限策略：用 `permissions.toml` 声明工具白名单、shell 命令规则、审批策略和拒绝策略。
-- 任务状态：基于 SQLite 保存 task、route、checkpoint、review audit、channel session 等状态。
-- 文件流转：Gateway 支持附件上传，任务可发布 artifact，HTTP/Telegram/Feishu 可返回产物文件。
-- Backend 隔离：支持 `local` 和 `daytona` backend；生产或高风险任务建议使用隔离 backend。
-
-## 安装
-
-前置要求：
+## 运行要求
 
 - Python `>=3.13`
 - [`uv`](https://docs.astral.sh/uv/)
+- 一个已配置的模型 Provider 凭据；starter 配置默认使用 OpenRouter。
 
-推荐把 Ruyi 安装成 `uv tool`。安装后会得到 `ruyi` 命令。
+## 安装
 
-当前发布版通过 GitHub Releases 提供 wheel 文件：
-
-```bash
-uv tool install https://github.com/ccpowe/ruyi-agent/releases/download/v0.1.0/ruyi_agent-0.1.0-py3-none-any.whl
-```
-
-安装完成后初始化配置并启动：
+在源码目录执行：
 
 ```bash
-ruyi --init
-ruyi
+uv sync --dev
+uv run ruyi --help
 ```
 
-如果希望直接跟随 GitHub 源码版本：
+## 最小初始化和启动
+
+显式指定一个独立的配置目录，避免覆盖仓库中的本地配置：
 
 ```bash
-uv tool install git+https://github.com/ccpowe/ruyi-agent.git
+RUYI_HOME=/path/to/ruyi-home uv run ruyi --init
 ```
 
-`ruyi-agent` 暂未发布到 PyPI，因此 `uv tool install ruyi-agent` 暂不可用。发布到 Python Package Index 后，才可以直接用包名安装。
-
-本地开发使用源码环境：
+初始化会生成 `ruyi.toml` 和 `config/` 下的 starter 配置。默认的
+`config/agents.toml` 使用 OpenRouter 的 `qwen/qwen3.6-plus`；请在生成的
+`ruyi.toml` 的 `[model_credentials]` 中填写 `openrouter_api_key`，或通过
+`OPENROUTER_API_KEY` 提供凭据，然后启动 Gateway：
 
 ```bash
-uv sync
-uv run ruyi --init
-uv run ruyi
+RUYI_HOME=/path/to/ruyi-home uv run ruyi --gateway
 ```
 
-也可以把当前源码目录以可编辑 tool 安装：
+Gateway 默认监听 `http://127.0.0.1:8000`。默认 bearer token `dev-token` 只适合
+本机调试；对外监听前，必须在 `ruyi.toml` 的 `[gateway]` 中改为强随机 token，
+并配置 HTTPS 和网络访问控制。
+
+配置目录的选择顺序是：显式的 `RUYI_HOME`，当前目录中已有配置的
+`.ruyi_agent/`，最后是用户目录下的 `~/.ruyi_agent/`。执行时可用
+`--workspace PATH` 指定 Agent 工作区。
+
+## 配置速览
+
+- `ruyi.toml`：backend、Gateway、存储路径和 channel 凭据。
+- `config/agents.toml`：主 Agent、local/remote Agent、worker、模型、MCP/工具和 skills 范围。
+- `config/llm_providers.toml`：Provider 类型、地址和凭据环境变量名。
+- `config/mcp_servers.toml`：MCP server 连接信息。
+- `config/permissions.toml`：工具和 shell 命令的权限策略。
+
+启用 Telegram 时配置 `[channels.telegram].bot_token`；启用 Feishu/Lark 时配置
+`[channels.feishu].app_id` 和 `app_secret`。对应入口命令是：
 
 ```bash
-uv tool install --editable .
+uv run ruyi --telegram
+uv run ruyi --feishu
+uv run ruyi --all
 ```
 
-## 初始化
+`--all` 会跳过缺少必要凭据的 Telegram/Feishu 入口，但仍启动 Gateway。
 
-首次使用需要生成运行配置：
-
-```bash
-ruyi --init
-```
-
-如果需要用当前包内模板覆盖已生成的 starter config：
-
-```bash
-ruyi --init --force
-```
-
-`--force` 会覆盖生成文件。真实密钥和自定义 agent 配置也可能被覆盖，执行前先确认不需要保留。
-
-Ruyi 的配置目录选择规则：
-
-- 如果设置了 `RUYI_HOME`，使用 `RUYI_HOME`。
-- 否则，如果当前目录存在 `.ruyi_agent/ruyi.toml` 或 `.ruyi_agent/config/`，使用当前项目的 `.ruyi_agent/`。
-- 否则，使用 `~/.ruyi_agent/`。
-
-## 配置
-
-主要配置文件：
-
-- `ruyi.toml`：运行参数、凭据、Gateway、channel、backend、storage 设置。
-- `config/agents.toml`：agent、worker、remote_ref、模型和权限 profile。
-- `config/llm_providers.toml`：模型 provider 声明。
-- `config/mcp_servers.toml`：MCP server 声明。
-- `config/permissions.toml`：工具和 shell 命令权限策略。
-
-starter config 默认使用 OpenRouter provider 和 `qwen/qwen3.6-plus` 模型。运行 Gateway 时，最小配置是填入模型 key：
-
-```toml
-[model_credentials]
-openrouter_api_key = "<your-openrouter-api-key>"
-```
-
-如果你在 `config/agents.toml` 中改用了 DeepSeek、Kimi、Z.AI、OpenAI 或 Anthropic，则改填对应字段：
-
-```toml
-[model_credentials]
-deepseek_api_key = "<your-deepseek-api-key>"
-kimi_api_key = "<your-kimi-api-key>"
-zai_api_key = "<your-zai-api-key>"
-openai_api_key = "<your-openai-api-key>"
-anthropic_api_key = "<your-anthropic-api-key>"
-```
-
-Telegram 模式还需要：
-
-```toml
-[channels.telegram]
-bot_token = "<your-telegram-bot-token>"
-default_agent = "main"
-```
-
-Feishu/Lark 模式还需要：
-
-```toml
-[channels.feishu]
-app_id = "<your-feishu-app-id>"
-app_secret = "<your-feishu-app-secret>"
-domain = "feishu"
-default_agent = "main"
-```
-
-`domain = "feishu"` 对应飞书中国站；国际版 Lark 使用 `domain = "lark"`。群聊默认关闭，如需群聊可设置 `group_policy = "open"`，并保持 `require_mention = true` 或配置访问白名单。
-
-Gateway 默认 token 是 `dev-token`，只适合本地调试。对外暴露 Gateway 前必须改成强随机 token，并放在 TLS、反向代理和网络访问控制之后。
-
-详细配置见 [配置指南](docs/configuration.zh-CN.md)。
-
-## 使用
-
-指定工作区：
-
-```bash
-ruyi --workspace /path/to/workspace --gateway
-```
-
-启动 Gateway：
-
-```bash
-ruyi --gateway
-```
-
-默认监听：
-
-```text
-http://127.0.0.1:8000
-```
-
-启动 Telegram：
-
-```bash
-ruyi --telegram
-```
-
-启动 Feishu/Lark：
-
-```bash
-ruyi --feishu
-```
-
-启动所有已配置的 channel：
-
-```bash
-ruyi --all
-```
-
-`--all` 会自动跳过缺少必要凭据的 Telegram/Feishu channel。
-
-## Gateway API
-
-除公开的运行探针外，所有 Gateway 业务 API 都需要 Bearer Token：
-
-```bash
-export GATEWAY_BEARER_TOKEN=dev-token
-```
-
-存活与就绪探针不需要认证，只返回最小状态且禁止缓存：
-
-```bash
-curl http://127.0.0.1:8000/health
-# {"status":"ok"}
-
-curl http://127.0.0.1:8000/ready
-# {"status":"ready"}
-```
-
-`GET /health` 是恒定、无依赖的进程存活信号；只要 ASGI 应用还能响应就返回
-`200`。`GET /ready` 只在 runtime 启动完成且 Gateway Task Module 已安装时返回
-`200`，启动前或关闭过程中返回 `503 {"status":"not_ready"}` 和
-`Retry-After: 1`。探针不会调用模型、MCP、remote agent，也不承诺检测运行期间的
-磁盘耗尽或 SQLite 损坏；具体业务依赖故障仍由对应 API 返回。
-
-Kubernetes 可分别配置：
-
-```yaml
-livenessProbe:
-  httpGet:
-    path: /health
-    port: 8000
-readinessProbe:
-  httpGet:
-    path: /ready
-    port: 8000
-```
-
-浏览器调试台位于：
-
-```text
-http://127.0.0.1:8000/debug/team
-```
-
-首次访问会跳转到服务端登录页。Gateway Token 只通过登录表单的 POST body
-提交；服务端验证后签发最长 8 小时的 `HttpOnly`、`SameSite=Strict` 浏览器
-会话，调试台不再把 Gateway Token 保存到 `localStorage`，也不接受 query
-参数中的 token。退出调试台或轮换 `GATEWAY_BEARER_TOKEN` 会使浏览器重新
-登录。
-
-调试台在 HTTP 下只允许 `localhost` 和 loopback IP；非本机部署必须使用
-HTTPS。TLS 若在反向代理终止，必须只信任受控代理，并让 ASGI scope 获得正确的
-`https` scheme；应用不会直接相信客户端传入的 `X-Forwarded-Proto`。这些浏览器
-会话只代表当前全局 Gateway principal，不提供用户级或租户级权限隔离。
-
-列出 public agent：
-
-```bash
-curl -H "Authorization: Bearer $GATEWAY_BEARER_TOKEN" \
-  http://127.0.0.1:8000/agents
-```
-
-创建任务：
-
-```bash
-curl -X POST \
-  -H "Authorization: Bearer $GATEWAY_BEARER_TOKEN" \
-  -H "Idempotency-Key: create-$(uuidgen)" \
-  -H "Content-Type: application/json" \
-  http://127.0.0.1:8000/agents/main/tasks \
-  -d '{
-    "input": {
-      "content": "分析这个项目的 Agent Runtime 架构，并总结核心模块。"
-    },
-    "metadata": {
-      "source": "readme-example"
-    }
-  }'
-```
-
-创建任务和发送后续输入都支持可选的 `Idempotency-Key`。键必须是 1–255
-个不含空白的可见 ASCII 字符。同一个键和相同请求重试时，Gateway 返回第一次
-成功保存的响应，并设置 `Idempotency-Replayed: true`；同一个键用于不同请求时
-返回 `409 idempotency_key_reused`。当前单一 Bearer Token 下，键在整个 Gateway
-范围内唯一，不按 endpoint 或 task 分区。
-
-标准 `ruyi` runtime 已为本地续写配置持久化 Task Mailbox。若自定义嵌入
-`GatewayTaskModule` 时没有配置持久 Mailbox，带幂等键的本地续写会返回
-`503 idempotency_unavailable`，避免给出无法跨崩溃兑现的保证。
-
-向已有任务发送输入：
-
-```bash
-curl -X POST \
-  -H "Authorization: Bearer $GATEWAY_BEARER_TOKEN" \
-  -H "Idempotency-Key: input-$(uuidgen)" \
-  -H "Content-Type: application/json" \
-  http://127.0.0.1:8000/tasks/{task_id}/input \
-  -d '{
-    "input": {
-      "content": "补充约束：只分析运行时边界。"
-    }
-  }'
-```
-
-查询任务：
-
-```bash
-curl -H "Authorization: Bearer $GATEWAY_BEARER_TOKEN" \
-  http://127.0.0.1:8000/tasks/{task_id}
-```
-
-分页查询任务的公开文本消息记录（按最旧到最新排列）：
-
-```bash
-curl -H "Authorization: Bearer $GATEWAY_BEARER_TOKEN" \
-  'http://127.0.0.1:8000/tasks/{task_id}/messages?limit=20'
-```
-
-响应包含 `task_id`、`items` 和不透明的 `next_cursor`。继续分页时原样传回
-`cursor`；游标固定第一次查询选中的持久 checkpoint，所以分页期间新增输入不会
-造成重复或漏项。每条消息公开 `sequence`、`message_id`、`role`、文本
-`content`，以及适用的 tool call/result 关联字段。
-
-这里的“消息记录”是 Agent 当前规范会话状态的公开文本投影，不是原始
-LangChain 消息 dump 或不可变审计日志。它不包含 system prompt、隐藏推理、媒体
-块和 provider metadata，也没有推测性的逐消息时间或 `run_count`。工具参数和工具
-结果正文仍属于任务数据，可能包含敏感内容。Remote Task 会把查询和不透明游标代理
-到下游 Gateway；旧版本下游不支持该接口时会明确返回上游错误，不会伪装成空记录。
-
-订阅某一轮任务的实时事件：
-
-```bash
-curl -N \
-  -H "Authorization: Bearer $GATEWAY_BEARER_TOKEN" \
-  -H "Accept: text/event-stream" \
-  'http://127.0.0.1:8000/tasks/{task_id}/events?run_count={run_count}'
-```
-
-`run_count` 必填，并把连接固定在任务的某一轮。首次连接先收到带不透明 `id`
-的 `task.snapshot`，随后可能收到无 `id`、不持久化的 `assistant.delta`，以及带
-`id` 的生命周期事件；每条流最终以无 `id` 的 `stream.end` 结束。断线重连时把
-最后收到的 `id` 原样放入 `Last-Event-ID` 请求头。完整消息恢复仍使用
-`/tasks/{task_id}/messages`，不能依赖可能因慢客户端而丢弃或截短的 delta。
-过大的持久化公开字段会在写入事件账本前按编码字节预算截短，并附带对应的
-`*_truncated: true` 标记，确保该事件在首次连接和游标重放时始终可传输。
-
-事件流沿用 Gateway Bearer Token，token 不接受 query 参数。浏览器原生
-`EventSource` 不能设置 `Authorization` 请求头，因此浏览器端应使用带请求头的
-`fetch`/`ReadableStream`，或通过已认证的同源后端代理。Remote Task 会验证并代理
-下游 SSE，游标保持不透明且逐层原样传递。
-
-提交 HITL 审批：
-
-```bash
-curl -X POST \
-  -H "Authorization: Bearer $GATEWAY_BEARER_TOKEN" \
-  -H "Content-Type: application/json" \
-  http://127.0.0.1:8000/tasks/{task_id}/reviews/{review_id}/decision \
-  -d '{
-    "decisions": [
-      { "type": "approve" }
-    ]
-  }'
-```
-
-下载任务发布的 artifact：
-
-```bash
-curl -L \
-  -H "Authorization: Bearer $GATEWAY_BEARER_TOKEN" \
-  -o artifact.out \
-  http://127.0.0.1:8000/tasks/{task_id}/artifacts/{artifact_id}/download
-```
-
-## Skills
-
-Ruyi 会从固定目录扫描 skills，并在创建任务时按 agent 配置同步成 backend 内部 skill view。扫描目录按优先级从高到低为：
-
-```text
-workspace/.agents/skills
-~/.agents/skills
-~/.ruyi_agent/skills
-```
-
-`config/agents.toml` 中的 `skills` 字段表示可见性：
-
-```toml
-skills = ["repo-workflow", "frontend"]  # 只允许这些 skill name
-skills = "inherit"                      # 继承父任务 effective skills；根任务使用扫描到的 skills
-skills = "none"                         # 禁用 skills
-```
-
-## 模型 Provider
-
-OpenRouter、DeepSeek、Kimi/Moonshot、LiteLLM/Z.AI、OpenAI、Anthropic 和 OpenAI Codex OAuth provider 通过 `config/llm_providers.toml` 配置，agent 在 `config/agents.toml` 中通过 `provider` 字段引用。
-
-示例：
-
-```toml
-provider = "deepseek"
-model = "deepseek-v4-pro"
-
-provider = "zai"
-model = "zai/glm-5.1"
-```
-
-OpenAI Codex OAuth provider 可用于本机实验。先完成一次 device login：
-
-```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/probe_openai_codex.py \
-  --device-login \
-  --save-auth-json \
-  --list-models \
-  --live-response
-```
-
-认证会保存到 `~/.ruyi_agent/openai_codex_auth.json`。之后可在 `config/agents.toml` 中配置：
-
-```toml
-provider = "openai_codex"
-model = "gpt-5.6-sol"
-```
-
-## 开发
-
-运行测试：
+## 常用命令和代码入口
 
 ```bash
 uv run pytest
-```
-
-运行基础静态检查：
-
-```bash
+uv run pytest tests/unit
+uv run pytest tests/integration
 uv run ruff check src tests scripts
-```
-
-构建 wheel 和 sdist：
-
-```bash
 uv build
 ```
 
-`dist/` 是本地构建产物，不需要提交到 git。
-
-## 安全提示
-
-- 不要提交真实凭据、SQLite 数据库、日志、运行工作区、OAuth token 或 bot token。
-- `BACKEND_KIND=local` 会在本机执行 shell 命令，不提供 Daytona 级别的进程隔离。
-- 对公网暴露 Gateway 前，必须修改默认 `dev-token`。
-- 开源发布前请脱敏 `.ruyi_agent/ruyi.toml` 和 `.ruyi_agent/config/agents.toml`。
+- [CLI 入口](src/ruyi_agent/entrypoints/main.py)
+- [运行时配置](src/ruyi_agent/config/runtime_settings.py)
+- [配置加载与模型](src/ruyi_agent/config/loader.py)
+- [Gateway HTTP 路由](src/ruyi_agent/channels/http/)
+- [starter 配置模板](src/ruyi_agent/templates/ruyi_home/)
+- [测试](tests/)
+- [文档目录](docs/)
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT License，见 [LICENSE](LICENSE)。
