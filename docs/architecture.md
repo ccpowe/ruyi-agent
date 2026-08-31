@@ -28,11 +28,12 @@ flowchart LR
     Settings --> Boot["bootstrap / FastAPI lifespan"]
     Boot --> GW["GatewayTaskModule\nHTTP task command/route/effect"]
     Boot --> RT["AgentControl\nTaskRuntime execution/coordination"]
-    Boot --> DB["Ruyi SQLite stores"]
+    Boot --> DB["Ruyi SQLite stores\nTask/route/command/mailbox"]
     Boot --> CP["LangGraph\nSQLite checkpoint"]
     Boot --> BE["Backend\nlocal or Daytona"]
     GW --> GP["gateway_protocol\nDTO / client / SSE"]
     CH["Telegram / Feishu"] --> GC["GatewayHTTPClient\nGatewayProtocolClient"]
+    CH --> CDB["Channel session/receipt/delivery\nstores"]
     GC --> GW
     RT --> REM["A2A / upstream Gateway"]
     GW --> CONSOLE["Team console\nHTTP session cookie"]
@@ -40,8 +41,9 @@ flowchart LR
 
 `bootstrap` 是进程的 composition 和 lifecycle root。它创建共享的 backend、MCP
 registry、LangGraph checkpointer、SQLite stores、`AgentControl` 和 Gateway
-service；FastAPI lifespan 结束时按相反方向释放它们。Gateway 和 channel adapter
-看到的是同一份进程内运行时，而不是各自重新创建一套 Agent。
+service；FastAPI lifespan 结束时按相反方向释放它们。Gateway 与 channel adapter
+在同一进程的 TaskGroup 中运行，但 adapter 只经 loopback Gateway HTTP client 访问
+Gateway 的公开面，不接收 `AppRuntime` 或 Gateway service。
 
 ## 3. 入口与进程拓扑
 
@@ -57,8 +59,11 @@ service；FastAPI lifespan 结束时按相反方向释放它们。Gateway 和 ch
    退出前先停止接受新请求，再关闭 worker、stores、checkpointer 和 backend。
 3. `--gateway` 启动 Gateway-only 进程。`--telegram`、`--feishu` 和 `--all` 都
    把 Gateway 与所选 Telegram/Feishu adapter 放入同一个 `asyncio.TaskGroup`；
-   `--all` 只保留已配置凭据的 adapter。channel adapter 和 Gateway 因而共享同一
-   backend、checkpointer、AgentControl、TaskStore 与 Gateway service。
+   `--all` 只保留已配置凭据的 adapter。adapter 只经 loopback
+   `GatewayHTTPClient`/`GatewayProtocolClient` 访问 Gateway/runtime 的公开 HTTP
+   surface，不被注入 `AppRuntime` 或 Gateway service；各 adapter 自己拥有
+   channel-specific session、receipt 和 delivery stores，也不访问 Gateway/runtime
+   的 Task、route、command stores 或 LangGraph。
 4. [`channels/http/routes.py`](../src/ruyi_agent/channels/http/routes.py) 是 HTTP
    组合面：它挂载 probes、task、event、review、artifact 和 team-console 路由。
    路由只从 request context 取得当前 Gateway service；业务认证、错误投影和传输
@@ -72,8 +77,8 @@ service；FastAPI lifespan 结束时按相反方向释放它们。Gateway 和 ch
 | Gateway | 公开 Agent/Task/Review/Artifact 操作；创建 command、预留 route、选择 local/remote route、编排 effect、恢复和对外错误 | 不执行 Agent turn；不直接重建 channel 的 session 或 delivery 语义 |
 | gateway_protocol | wire DTO、HTTP client/transport、opaque cursor、SSE 编解码/校验、Task event public projection | 不拥有稳定 API response projection；`Agent/Task/Review/Artifact` response 由 `gateway/application.py::GatewayProjection` 拥有 |
 | runtime / delegation / middleware / skills | `AgentControl` 与 `TaskRuntime`；local execution、remote delegation/reconciliation、mailbox、supervisor、policy；task hydration、tool/approval/artifact/skills middleware；skill catalog、解析和 view 同步 | 不成为外部 HTTP command 的认证/路由入口；不把 wire DTO 当作执行状态 |
-| storage / checkpoint | Ruyi SQLite schema、stores、repositories、Unit of Work；Task、route、command、session、receipt、delivery、outbox 等 durable 记录；LangGraph checkpoint 的存储配合 | checkpoint lifecycle 由 bootstrap 管理；业务 projection 语义在 runtime/Gateway；storage 不拥有 public response 或 channel 文案 |
-| channels | platform turn、identity、session、receipt、presentation、delivery，以及 Telegram/Feishu 外部 API 适配；HTTP transport routes | 通过 `GatewayHTTPClient`/`GatewayProtocolClient` 访问 Gateway，不直接读写 TaskStore 或调用内部 Agent executor |
+| storage / checkpoint | Ruyi SQLite schema、stores、repositories、Unit of Work；runtime 的 Task、Gateway 的 route/command 和 runtime settled outbox 等 durable 记录；LangGraph checkpoint 的存储配合；channel-specific store 实现 | checkpoint lifecycle 由 bootstrap 管理；业务 projection 语义在 runtime/Gateway；storage 不拥有 public response 或 channel 文案 |
+| channels | platform turn、identity、session、receipt、presentation、delivery，以及 Telegram/Feishu 外部 API 适配；channel-specific session/receipt/delivery store 的语义与生命周期；HTTP transport routes | 只通过 `GatewayHTTPClient`/`GatewayProtocolClient` 访问 Gateway，不直接读写 Gateway/runtime 的 Task、route、command stores 或调用内部 Agent executor |
 | integrations | Provider 工厂与命名环境变量、OpenAI Codex、A2A remote-ref/client、MCP registry、local/Daytona backend runtime | 不替代 Gateway route ownership；凭据不进入 wire DTO、Task projection 或日志 |
 | team console | 随包分发的静态 UI 资源；以浏览器 session cookie 访问 debug console | 静态资源不拥有服务路由或任务业务；服务路由和 session auth 仍由 `channels/http` 管理 |
 
@@ -110,7 +115,8 @@ CLI -> RuntimeSettings -> bootstrap/lifespan
 - Telegram/Feishu channel 只通过
   [`GatewayHTTPClient`](../src/ruyi_agent/channels/gateway_client.py) 和
   `GatewayProtocolClient` 走 Gateway HTTP；channel 不绕过 Gateway 直接调用
-  `AgentControl`、SQLite repository 或 LangGraph。
+  `AgentControl`、Gateway/runtime 的 SQLite repository 或 LangGraph；它们自己的
+  session/receipt/delivery durable state 仍由 channel 边界管理。
 - runtime 依赖 storage/checkpoint/backend/integrations 的接口和对象；storage
   可以被 runtime/Gateway 调用以持久化，但不回调 public projection，也不拥有
   任务的业务展示语义。
@@ -122,9 +128,11 @@ CLI -> RuntimeSettings -> bootstrap/lifespan
 1. HTTP task route 先通过业务 bearer 校验，再把请求交给 Gateway command service。
    service 校验 public/available Agent，解析输入和附件，并把带
    `Idempotency-Key` 的 create/input 交给 `GatewayCommandStore`。
-2. `TaskRouter` 建立 local route；Task identity、route 状态和首次 lifecycle
-   记录进入 SQLite 的原子 Unit of Work。成功返回的 `task_id` 是 Gateway 的公开
-   任务身份。
+2. `TaskRouter` 选择并建立 local route。TaskStore 内部只把 Task row 与首个
+   lifecycle event 在同一个 TaskStore Unit of Work 内原子提交；
+   `GatewayRouteStore` 则维护独立的 route ledger/数据库，route reservation 与
+   activation 不和这个 UoW 合并，而由 effect boundary、route 状态机和
+   reconciliation 协调。成功返回的 `task_id` 是 Gateway 的公开任务身份。
 3. Gateway 调用 `AgentControl.spawn_task`，runtime 的 local executor 使用配置的
    Agent、middleware、backend 和 LangGraph checkpointer 执行一轮。review、完成、
    失败、中断和取消都回到 runtime 的 Task state/ledger。
@@ -135,23 +143,34 @@ CLI -> RuntimeSettings -> bootstrap/lifespan
 
 ### 6.2 remote route / delegation
 
-1. 公开 Gateway 或 runtime delegation 选择 `remote_ref` 时，`TaskRouter` 先为本地
-   public `task_id` 预留 route，再由 runtime 的 remote port 调用
-   [`A2AClient`](../src/ruyi_agent/integrations/a2a/client.py)。A2A 调用继续使用
-   Gateway protocol 的 JSON/SSE transport。
-2. route record 同时保存 public Gateway task id、route kind 和 upstream task id。
-   upstream id 只用于与上游交互，不能取代 public id；对外 Task、event、message
-   和错误都以本地 public id 作为边界。
-3. 查询、输入、取消、webhook 或事件到达时，Gateway 先按 route 查找并按需要
-   reconcile。上游响应和 SSE 必须通过 protocol/runtime 校验 task、run、event
-   形状；fresh stream 先有 snapshot，resume stream 不凭空插入 snapshot。
-4. 远端 message page 先验证返回的 `task_id` 等于 route 保存的 upstream id，随后
-   **只重写顶层 `task_id`** 为 public id，原样保留 `items` 和 `cursor`；不存在
-   把单条 item 或 cursor 重新标记成另一个 source 的步骤。
-5. 请求效果可能尚未发出，也可能已发出但响应丢失。route/command 会保留可查询
-   身份并区分 pending、active、uncertain 等安全边界；对于 uncertain effect，
-   不把普通网络重试当作安全重放。A2A client 将这类 effect boundary 传回 Gateway
-   的错误/恢复逻辑。
+远端执行有两条 ownership 不同的路径；它们都可以调用 A2A 和 gateway protocol，
+但不能把两种状态混为一谈。
+
+**公开 Gateway remote create**
+
+1. 公开 Gateway 的 remote create 由 `TaskRouter`/`CreateRouteWorkflow` 处理，先经
+   `GatewayRouteStore` 预留本地 public `task_id` 的 remote route，再由 runtime
+   remote port 调用 [`A2AClient`](../src/ruyi_agent/integrations/a2a/client.py)。
+   route ledger 维护 reservation、activation、reconciliation 以及 public task id
+   到 upstream task id 的绑定。
+2. upstream id 只用于与上游交互，不能取代 public id；对外 Task、event、message
+   和错误都以 Gateway public id 作为边界。查询、输入、取消、webhook 或事件到达
+   时，Gateway 按 route 查找并按需要 reconcile；上游响应和 SSE 必须校验 task、
+   run、event 形状，fresh stream 先有 snapshot，resume stream 不凭空插入 snapshot。
+
+**runtime 内部 worker delegation**
+
+3. runtime 内部 worker delegation 由 `TaskRuntime` + `RemoteTaskPort` 创建和维护
+   本地 proxy Task，直接调用 A2A；它不经过 `TaskRouter`，也不会凭空建立 Gateway
+   route。该路径的 ownership 是 runtime 的 delegation、Task state、mailbox 和
+   reconciliation，而不是公开 Gateway route ledger。
+4. 两条路径都要区分请求尚未发出与可能已发出的 effect boundary；possibly
+   dispatched 不应被普通网络重试当作安全重放。公开 route 的 route/command 状态和
+   内部 delegation 的 proxy Task/reconciliation 各自保留可查询身份与不确定性。
+5. 对公开 Gateway remote route 的 message page，先验证返回的 `task_id` 等于 route
+   保存的 upstream id，再**只重写顶层 `task_id`** 为 public id，并保留 `items` 和
+   opaque `cursor`。这只保证该 identity 校验和顶层改写，不承诺其他保留字段绝不
+   含 upstream identity。
 
 ### 6.3 channel inbound / track / delivery
 
@@ -166,8 +185,10 @@ CLI -> RuntimeSettings -> bootstrap/lifespan
 3. adapter 使用 `GatewayHTTPClient` 的 Task response、list/get 和 SSE 来 track；
    Gateway 的 public projection 让不同平台不必各自重建 Task/Review/Artifact
    schema。事件状态转换由 channel presentation 决定何时发送文本、文件或操作按钮。
-4. inbound receipt 只表示该外部事件已被本 adapter 占有处理；settled outbox 和
-   delivery store 记录可恢复的发送步骤。外部发送的结果可能不确定，所以 delivery
+4. inbound receipt 只表示该外部事件已被本 adapter 占有处理。runtime 的 settled
+   outbox 记录 child Task settlement 到 parent Agent mailbox 的意图，并与 Task
+   state/event 的 UoW 协调；`ChannelDeliveryStore` 则记录 Gateway Task observation
+   到平台外部发送的 channel durable steps。外部发送结果可能不确定，所以 delivery
    能跳过已确认 step，但不保证跨崩溃/网络边界的绝对去重。
 
 ## 7. 状态与一致性
@@ -182,9 +203,11 @@ CLI -> RuntimeSettings -> bootstrap/lifespan
   `MailboxStore` 和 review audit store，并为 LangGraph 创建
   `AsyncSqliteSaver`。checkpoint 的打开、注入、恢复和关闭是 bootstrap 的
   lifecycle 责任；runtime 通过 reader/executor 使用它，不自行管理连接寿命。
-- TaskStore/MailboxStore 用于 durable settlement 时必须共享同一 SQLite 数据库；
-  否则任务状态、mailbox 与 delivery 无法在同一个事务边界内协调。storage 保存
-  记录和事件，但不因此拥有 runtime 的状态机或 Gateway 的 response projection。
+- TaskStore/MailboxStore 用于 runtime settled settlement 时必须共享同一 SQLite
+  数据库；否则 child Task state、parent mailbox 与 settled outbox 无法在同一个
+  事务边界内协调。`ChannelDeliveryStore` 是 channel 边界的另一套 durable state，
+  不因与 Gateway observation 相关就并入这个 runtime UoW。storage 保存记录和事件，
+  但不因此拥有 runtime 的状态机或 Gateway 的 response projection。
 
 ### 7.2 route、command、event、session、receipt、delivery、outbox
 
@@ -196,7 +219,8 @@ CLI -> RuntimeSettings -> bootstrap/lifespan
 | command | 以 principal、`Idempotency-Key` 和 request hash claim create/input；成功响应和 terminal error 可 exact replay；效果已开始且不能安全重放时保留身份并进入 uncertain/terminal 处理 |
 | event ledger | durable lifecycle event、event id 和 run 维度；另有仅在进程内 fan-out 的 assistant delta |
 | session / receipt | channel 当前 agent/Task 绑定，以及 inbound turn 的处理占有与同请求 replay |
-| delivery / outbox | 可恢复的 channel 发送意图、claim、settlement 和重启后 recovery；外部 side effect 不确定时不宣称 exactly-once |
+| settled outbox | runtime 的 child Task settlement -> parent Agent mailbox；与 Task state/event 的 UoW 协调，支持 claim、recovery 和不确定效果处理 |
+| channel delivery | `ChannelDeliveryStore` 的 Gateway Task observation -> 平台外部发送步骤；可 claim/settle/recover，但外部 side effect 不确定时不宣称 exactly-once |
 
 没有 `Idempotency-Key` 的旧 create/input 路径不能被视为自动幂等。成功与终态
 错误的 replay 只适用于已持久化 claim；未决的外部效果必须先查询或进入显式
@@ -249,18 +273,21 @@ route 保持 public identity，同时不泄露 upstream identity 到稳定 API�
 
 扩展应沿已有边界进入：
 
-- 新配置字段先进入 `RuntimeSettings`/loader，再由 bootstrap 注入 typed consumer；
-  Provider、MCP 和 remote-ref 的凭据解析留在 integrations/config 边界。
-- 新 Agent route 或 HTTP operation 通过 Gateway service、`GatewayProjection`、
-  `TaskRouter` 和 HTTP context；需要跨进程时同时扩展 protocol DTO/client/transport
-  的 wire 校验，不让 channel 复制 response schema。
+- 只有 runtime TOML 字段进入 `RuntimeSettings`，再由 bootstrap 注入 typed consumer；
+  Agent、Provider、permission 继续由独立 loader/parser 装配，MCP 保留 raw，
+  remote-ref 的命名环境变量解析留在 integrations/config 边界。
+- 新 Agent route 或 HTTP operation 按实际责任接入 Gateway service 和 HTTP context；
+  需要 route selection 时才使用 `TaskRouter`，需要稳定 response projection 时才使用
+  `GatewayProjection`。只有确有跨进程 wire 变化时才扩展 protocol DTO/client/transport，
+  不让 channel 复制 response schema。
 - 新 local/remote worker 通过 runtime registry、delegation policy、middleware 或
   skill catalog；执行需要的 backend 能力由 backend runtime factory 提供。
 - 新 channel adapter 实现 platform normalization、identity/session、receipt 和
   delivery，再以 `GatewayTaskClient`/protocol client 访问 Gateway；不直接持有
   storage connection。
-- 新 durable 资源在 storage 增加 repository/UoW，并沿既有 SQLite transaction
-  边界提交；public projection 仍由 runtime/Gateway 所属层生成。
+- 新 durable 资源按需要增加单资源 store/repository；只有确有跨资源原子性时才增加
+  Unit of Work，并沿既有 SQLite transaction 边界提交；public projection 仍由
+  runtime/Gateway 所属层生成。
 
 与这些边界对应的定向证据入口：
 
