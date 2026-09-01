@@ -340,7 +340,8 @@ review resource projection 和 public event 由 [Task execution runtime](task-ex
 validation；permission gate 在 tool execution 前做 policy decision；artifact 只接收
 backend workspace path。上述是 runtime guardrail，不是 host-level sandbox：local
 backend 的 `execute`、网络、绝对 host path 和进程权限仍按 backend 实际边界运行。
-provider/MCP/A2A secret 由配置/integrations 的命名环境变量解析；普通 `ToolError`
+Provider/A2A 命名环境变量由 `integrations` 解析；MCP 配置保留 raw connection dict
+并交给底层 client；普通 `ToolError`
 不主动注入 secret，但会把 exception class/message 原样扁平化且不做 redaction，
 因此底层 tool/provider exception 文本不得包含凭据。`ToolRuntime.config` 也不是
 secret boundary，runtime 不应把它当作凭据过滤器。
