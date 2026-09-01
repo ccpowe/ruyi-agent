@@ -30,8 +30,9 @@
   [`backend/runtime.py`](../../src/ruyi_agent/integrations/backend/runtime.py)。
 - tool permission、审批和命令策略；它们属于
   [`permissions.py`](../../src/ruyi_agent/control_plane/permissions.py)。
-- MCP server 自身的进程、会话、部署或生命周期。Registry 只在自己的刷新和调用
-  边界内使用底层 MCP client。
+- MCP server 自身的进程、会话、部署或生命周期。Registry 不拥有独立的长期或周期
+  server lifecycle；connection/session 及 stdio 子进程由底层 client 在
+  `get_tools()`/session 范围按 adapter 约定启动和清理。
 
 ## A：Model Providers 与 OpenAI Codex
 
@@ -105,11 +106,11 @@ Agent 的 `available`/`unavailable_reason`，但这不是 Provider 边界的状�
 `resolve_codex_credentials()`；路径先 `expanduser`，文件不存在或结构不含可用
 access token 时报告明确的 `ValueError`。
 
-凭据解析优先使用当前认证文件中有有效 access token 的
-`providers.openai-codex.tokens`；没有 provider-scoped token 时使用顶层
-`tokens`；如果仍没有可用 access token，则回退到
-`credential_pool.openai-codex` 中第一个有 access token 且不在
-`last_error_reset_at` 冷却期的条目。
+若 `providers` table 中存在可识别的 `openai-codex` state table，凭据解析先选择
+其中的 `tokens`；只有该 state 不存在时才选择顶层 `tokens`。对所选位置若没有非空
+access token，才回退到 `credential_pool.openai-codex` 中第一个有 access token
+且不在 `last_error_reset_at` 冷却期的条目；不会在 provider state 的 tokens 无效
+时再尝试顶层 `tokens`。
 
 `account_id` 优先取 token 数据中的值，也可从 JWT claim 得到，用于构造
 `ChatGPT-Account-ID`；access token 作为模型的 API key 使用。直接传入 API key 时
@@ -180,10 +181,12 @@ dict 会去掉这个字段；刷新后 description 用于 server/tool source 的
 其余连接键值保持 raw 形状交给底层 client。因而 `description` 是本地目录元数据，
 不是 MCP server capability 或 authorization 声明。
 
-此边界没有通用的 `${ENV}` secret resolver：MCP raw dict 中的字符串不会因为
-看起来像占位符而自动读取环境变量，也不会复用 Provider 的 `api_key_env` 规则。
-Registry 不保存、轮换或投影 MCP 凭据；连接所需的 secret 解析若存在，也不属于
-这里定义的通用机制。
+此边界没有由 Registry 提供的通用 `${ENV}` secret resolver、凭据轮换或对外 secret
+投影。Registry 在进程内保留完整 raw connection config，并将去掉本地
+`description` 元数据后的连接字典传给底层 `MultiServerMCPClient`；底层 transport/
+adapter 仍可按自己的约定解释特定字段，例如 stdio adapter 的 `env` 可展开
+`${VAR}`。这种解释不是 Registry 的通用规则，也不能把 raw 字符串永不展开或凭据
+绝不保留当作本边界保证；Provider 的 `api_key_env` 规则同样不会自动套用到 MCP。
 
 ### Bootstrap refresh、并发与 inventory
 
@@ -203,8 +206,10 @@ Registry 不保存、轮换或投影 MCP 凭据；连接所需的 secret 解析�
 刷新完成后，Registry 一次性替换 process-local 的 server status、按 server 分组的
 tool inventory、qualified-name 索引和可执行 tool 索引。`list_tools()`、`pick_tools()`、
 `search_tools()`、`get_tool()` 等读路径在 refresh 前会拒绝访问，并要求调用方先
-`await refresh()`。当前 bootstrap 只有显式的启动刷新；Registry 不启动或停止
-MCP server，也没有由本文定义的周期性刷新服务。
+`await refresh()`。当前 bootstrap 只有显式的启动刷新；Registry 不拥有独立的长期
+或周期性 server lifecycle。connection/session 及 stdio 子进程由底层 client 在
+`get_tools()`/session 范围按 adapter 约定启动和清理；本文只定义 Registry 的
+refresh、inventory 和调用边界。
 
 ### ToolInfo、qualified name 与重名
 
@@ -282,7 +287,8 @@ server 的 `get_tools()` 异常则收敛到该 server 的 failed status 和空 i
 
 scope 只限制 registry 可见/可调用的工具集合，**不是 authorization**；是否需要
 审批、允许什么系统 tool 或 shell 命令由独立 permission 边界决定。MCP raw dict
-也不会因为调用了 `call_tool` 就获得额外 secret 解析或凭据持久化能力。
+仍由 Registry 保留并交给底层 client；调用 `call_tool` 不会改变 Registry 没有通用
+secret resolver、轮换或投影的边界。
 
 ## 入口与独立生命周期
 
