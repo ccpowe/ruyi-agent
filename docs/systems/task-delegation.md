@@ -153,8 +153,8 @@ allowlist 与注册目标展示。已有 Task 的操作 scope 由已解析 calle
 `list_agents` 不再按 allowlist 过滤，而只按上表的 caller/parent/child 关系作用。
 没有 caller 而按 `parent_thread_id` fallback 时，Task 列表才会再与 allowlist 求交。
 因此 child 可以用 `send_input` 向 direct parent 发送澄清，但不能对 parent 使用
-`wait_agent`、`check_agent` 或 `cancel_agent`。sibling、其他 thread 的 Task 和未
-授权目标不会因为 Task ID 可猜测而变得可见。越权/未知 ID 的工具结果只列出当前
+`wait_agent`、`check_agent` 或 `cancel_agent`。sibling、其他 thread 的 Task，以及不在上述
+caller/direct-parent/direct-child 关系中的 Task，不会因为 Task ID 可猜测而变得可见。越权/未知 ID 的工具结果只列出当前
 scope 的允许 IDs，不回显无关 Task 的状态。
 
 `waiting_for_human` 是 runtime 的真实控制面状态；工具文本将其表现为
