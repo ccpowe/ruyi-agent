@@ -14,9 +14,10 @@ runtime delegation 拥有以下行为：
 - `AgentRegistry` 的统一目标命名空间，以及 local worker、`remote_ref` 和
   unavailable 目标的解析；
 - `DelegationContext` 的 root、depth、预算和 visited-node 传播与校验；
-- `DelegationPolicy` 的委派树、权限 profile 继承和目标/深度/数量准入；
+- `DelegationPolicy` 的委派树、权限 profile 继承和深度/数量准入；
 - `DelegationTools` 暴露给模型的 `spawn_agent`、`wait_agent`、`check_agent`、
-  `send_input`、`cancel_agent`、`list_agents` 及其调用者可见性；
+  `send_input`、`cancel_agent`、`list_agents`，以及目标 allowlist、注册目标展示和
+  调用者可见性；
 - `TaskRuntime` 对本地 child Task 和远端 proxy Task 的创建、输入、取消、等待、
   review continuation、状态同步和生命周期收口；
 - `TaskManager` 对 `TaskRecord`、parent/root 关系、pending review、Task lifecycle
@@ -87,8 +88,10 @@ backend、A2A client 和 [`AgentControl`](../../src/ruyi_agent/runtime/delegatio
 bootstrap
   └─ AgentControl
       └─ TaskRuntime
-          ├─ AgentRegistry + DelegationPolicy
-          ├─ DelegationTools ── TaskCommandPort ──┘
+          ├─ AgentRegistry ── target resolution
+          ├─ DelegationPolicy ── context/tree/budget
+          ├─ DelegationTools ── target allowlist + caller scope
+          │    └─ TaskCommandPort ──┘
           ├─ TaskManager ── TaskStore / TaskEventLedger
           ├─ RunSupervisor ── LocalTaskExecutor ── local worker
           └─ RemoteTaskPort ── A2AClient ── remote Gateway
@@ -115,10 +118,14 @@ bootstrap 构造 local spec 时可以按 Agent 粒度捕获构造错误并登记
 中删除。`get_spec` 只允许 local worker；对 `remote_ref` 的本地执行请求会被拒绝，
 避免把 transport target 当成 local model。
 
-主 Agent 的 delegation tools 使用 registry 全量目标。local worker 的 tools 则按
-其 `delegation_targets` 白名单构造；白名单同时覆盖 local worker 和 remote ref，
-并在 tool description 中分别列出两类目标。`list_agents` 只列白名单内的注册目标。
-目标 scope 是能力准入，不等于 Task visibility；二者都必须通过才能完成工具调用。
+每个已编译的 local Agent（包括 `main`）都通过 `build_tools_for(agent_name)` 按
+自身的 `delegation_targets` 构造 delegation tools；白名单同时覆盖 local worker
+和 remote ref，并在 tool description 中分别列出两类目标。`build_tools()` 使用
+全量目标，仅是兼容/直接入口，不代表已编译 Agent 的默认 scope。
+`AgentRegistry` 负责目标解析和注册项，`DelegationTools` 负责 spawn 的目标
+allowlist 与注册目标展示。已有 Task 的操作 scope 由已解析 caller 的 parent/child
+关系决定；只有没有 caller、退回 `parent_thread_id` 的路径才同时按 allowlist 过滤
+可见 Task。
 
 ### 调用者与 Task 可见性
 
@@ -141,6 +148,10 @@ bootstrap 构造 local spec 时可以按 Agent 粒度捕获构造错误并登记
 | `list_agents` | 当前 scope 内的注册目标和 caller/parent/children 中可见记录 |
 | `spawn_agent` | 目标必须在当前 Agent 的 `delegation_targets` 中；新 Task 的 parent 是 caller |
 
+这里的目标 allowlist 只约束 `spawn_agent` 及注册目标的展示；caller Task 已经解析
+后，`wait_agent`、`check_agent`、`send_input`、`cancel_agent` 和已跟踪 Task 的
+`list_agents` 不再按 allowlist 过滤，而只按上表的 caller/parent/child 关系作用。
+没有 caller 而按 `parent_thread_id` fallback 时，Task 列表才会再与 allowlist 求交。
 因此 child 可以用 `send_input` 向 direct parent 发送澄清，但不能对 parent 使用
 `wait_agent`、`check_agent` 或 `cancel_agent`。sibling、其他 thread 的 Task 和未
 授权目标不会因为 Task ID 可猜测而变得可见。越权/未知 ID 的工具结果只列出当前
@@ -185,7 +196,9 @@ parent-child visibility 和 settlement 协作；它不是 Task identity。
 
 ### Policy 的职责
 
-`DelegationPolicy` 只计算和守护结构约束，不调度 run，也不执行 transport I/O。它：
+`DelegationPolicy` 只计算和守护委派树结构约束，不调度 run，也不执行 transport
+I/O；目标名称解析和目标 allowlist 不是它的职责，而由 `AgentRegistry` 与
+`DelegationTools` 完成。它：
 
 - 从 run config 解析 caller Task/thread；
 - 为 root 创建 context，为 child 继承 root/预算/visited 并递增 depth；
@@ -208,8 +221,8 @@ identity 检查；区别从 Task 建档后的 execution leg 开始。
 
 ```text
 模型 spawn_agent
-  -> scope/target 校验
-  -> TaskRuntime + DelegationPolicy
+  -> AgentRegistry/DelegationTools: target resolution + allowlist
+  -> TaskRuntime + DelegationPolicy: parent/tree/context/budget
   -> TaskManager: pending local TaskRecord
   -> RunSupervisor: admission + mark running + run_count += 1
   -> LocalTaskExecutor: 编译/调用 local worker
@@ -231,15 +244,17 @@ identity 检查；区别从 Task 建档后的 execution leg 开始。
    decision/resume 或 settled follow-up 会在同一 Task 上开启下一代并递增
    `run_count`，不会隐式创建新的 sibling。
 5. Task settled 后，runtime 通过 mailbox-facing notifier 将 child settlement 暴露
-   给 parent；`wait_agent`/`check_agent` 可以在模型已经消费结果时抑制这次 parent
-   通知，避免同一结果同时走主动等待和后台回投。mailbox 与 settled outbox 的
-   claim/settle/recovery 状态不属于本文。
+   给 parent。`wait_agent` 在等待开始时即抑制当前 run 后续 settlement 的 parent
+   回投；`check_agent` 只有在读取到 settled 状态时才接管这次回投，避免同一结果
+   同时走主动等待和后台通知。mailbox 与 settled outbox 的 claim/settle/recovery
+   状态不属于本文。
 
 ### Remote-ref child / local proxy
 
 ```text
 模型 spawn_agent
-  -> scope/policy/context/budget
+  -> AgentRegistry/DelegationTools: target resolution + allowlist
+  -> TaskRuntime + DelegationPolicy: parent/tree/context/budget
   -> TaskManager: pending remote_ref proxy（本地 task_id）
   -> RemoteTaskPort: persist create intent
   -> A2AClient: remote create + injected context
@@ -277,14 +292,15 @@ identity 检查；区别从 Task 建档后的 execution leg 开始。
 | 工具 | 阻塞/效果 | 结果和安全边界 |
 | --- | --- | --- |
 | `spawn_agent` | 创建 local child 或 remote proxy，立即返回 task ID/route | 目标必须注册且在 caller 白名单；深度/树预算在建档前拒绝；不等待结果 |
-| `wait_agent` | local 等 process-local run；remote 周期 refresh | settled 返回状态/结果；review 无 resolver 时返回 agent-facing `running`，不会无限等待；等待者取消不会取消被监督 run |
-| `check_agent` | 非阻塞读取；remote 先 refresh | 返回最近已知状态；远端暂时不可用时保留该状态并附 warning，不伪造失败 |
+| `wait_agent` | local 等 process-local run；remote 周期 refresh | 等待开始即接管当前 run eventual settlement delivery；settled 返回状态/结果；review 无 resolver 时返回 agent-facing `running`，不会无限等待；等待者取消不会取消被监督 run |
+| `check_agent` | 非阻塞读取；remote 先 refresh | 只有本次读取到 settled 才接管 settlement delivery；返回最近已知状态；远端暂时不可用时保留该状态并附 warning，不伪造失败 |
 | `send_input` | 向 direct parent/child 发送后续 input | local settled Task 复用同一 Task/thread 开新 run；active local run 通过 mailbox 在安全边界接收；remote 转发 A2A input；同 Task 并发 run 被拒绝 |
 | `cancel_agent` | 取消 direct child 的当前 run | local 设置 cancel marker 并取消 handle；remote 转发 cancel；settled Task 是 no-op；cancel 不销毁长期会话 |
 | `list_agents` | 无外部 Task effect | 列出当前目标 scope 和可见 caller/parent/children；不列 sibling、其他 thread 或无关 Task |
 
-`wait_agent` 和 `check_agent` 在观察到 settled child 后都可调用 notifier 的抑制
-入口。该抑制只表示主动观察已经接管 child settlement 的 parent 协作，不改变
+`wait_agent` 在等待开始时就调用 notifier 的抑制入口，接管当前 run 的 eventual
+settlement delivery；`check_agent` 只有在本次读取确认 child 已 settled 时才调用
+该入口。抑制只表示主动观察已经接管 child settlement 的 parent 协作，不改变
 Task state，也不取消远端 webhook；mailbox/outbox 的具体状态机在其所属边界。
 
 ## 状态、并发、预算与恢复
@@ -447,12 +463,12 @@ remote intent 的可查询性，但不宣称“Task + route + checkpoint + A2A +
 
 以下稳定行为变化必须同步本文，并调整相应证据链接：
 
-- `LocalWorkerSpec`、`RemoteRef`、AgentRegistry 的目标 namespace、unavailable 处理或
-  `delegation_targets` scope 改变；
+- `LocalWorkerSpec`、`RemoteRef`、AgentRegistry 的目标 namespace、unavailable 处理、
+  `delegation_targets` scope 或目标 allowlist/注册目标展示改变；
 - `DelegationContext` 的字段、metadata 保留名、版本/长度/visited 校验，或
   `DelegationPolicy` 的 root/depth/task budget、permission inheritance 改变；
-- delegation tool 名称、参数/返回语义、caller visibility、direct parent/child
-  控制关系、wait/check suppression 改变；
+- delegation tool 名称、参数/返回语义、spawn/target 展示 allowlist、caller
+  visibility、direct parent/child 控制关系、wait/check suppression 时机改变；
 - `TaskRecord` 的 parent/root/depth/route/upstream/uncertainty 字段、canonical state、
   `run_count` 或 local/remote child lifecycle 改变；
 - `TaskRuntime`、`TaskManager`、`RemoteTaskPort` 的 admission、concurrency、refresh、
