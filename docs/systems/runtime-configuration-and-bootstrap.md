@@ -117,6 +117,14 @@ runtime TOML。它校验顶层和嵌套 table 的允许字段、类型、范围�
 这些 projection 是输出兼容面，不是下一轮 runtime TOML 的权威来源；后续 runtime
 消费者使用 settings 或其 typed 子模型。
 
+有一个刻意的 re-entry 例外：当再次调用 configure 时环境已有
+`RUYI_RUNTIME_CONFIGURED=1` 且没有新的 workspace 参数，loader 会回读 projection
+出的 `RUYI_WORKSPACE` 作为 workspace override，以保留首次显式选择。这只服务于
+configured re-entry，不把一般 projection 变成配置输入。另有
+`GatewayLaunchOverrides` 这一 typed launch 输入：它在严格 TOML 校验之后只覆盖
+Gateway 的 `host`、`port`、`base_url`，保留 TOML 中的 bearer token；[`paseo.json`](../../paseo.json)
+的 Gateway service script 使用该入口。
+
 ## 独立配置 loader/parser 与动态 secret
 
 bootstrap 从所选 Ruyi home 的 `config/` 读取四类声明。公共读取入口在
@@ -271,6 +279,8 @@ credential 缺失写成全局配置文件损坏。
 和对应测试：
 
 - Ruyi home/workspace 发现顺序、路径规范化、`--init` 模板集合或 `--force` 覆盖边界；
+- `GatewayLaunchOverrides`/Paseo 的 Gateway 覆盖范围，或 `RUYI_RUNTIME_CONFIGURED=1`
+  configured re-entry 对 `RUYI_WORKSPACE` 的回读规则；
 - runtime TOML 字段、类型/范围/URL 约束、env alias 集合、优先级、projection 或
   `RuntimeSettings` 可变性；
 - Agent/Provider/permission loader/parser 的输入文件、MCP raw boundary、动态
