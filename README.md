@@ -85,7 +85,7 @@ uv build
 - [Gateway HTTP 路由](src/ruyi_agent/channels/http/)
 - [starter 配置模板](src/ruyi_agent/templates/ruyi_home/)
 - [测试](tests/)
-- [文档目录](docs/)
+- [文档索引](docs/README.md)
 
 ## License
 

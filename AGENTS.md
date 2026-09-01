@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本规则适用于仓库全部源代码、测试、配置、脚本和文档。Ruyi Agent 是以 Gateway 为任务控制面、以 runtime 为执行面、以 SQLite stores 保存任务与投影状态、以 HTTP/Telegram/Feishu 作为入口的 Python Agent Runtime：`ruyi` CLI 从当前工作目录的 `.ruyi_agent/ruyi.toml`（或显式 `RUYI_HOME`）读取 runtime TOML，只接受代码列明的有限 env alias，并产出不可变 `RuntimeSettings`；bootstrap 随后分别加载 Agent、Provider、permission 配置，MCP 保留 raw connection dict；Provider 和 A2A remote-ref 的命名环境变量由 integrations 层解析，Telegram/Feishu 适配器通过 Gateway 协议提交和跟踪任务。修改关键区域前，应先读对应实现和测试；当前正式系统文档尚未建立，空的 `docs/` 骨架不是权威事实来源。
+本规则适用于仓库全部源代码、测试、配置、脚本和文档。Ruyi Agent 是以 Gateway 为任务控制面、以 runtime 为执行面、以 SQLite stores 保存任务与投影状态、以 HTTP/Telegram/Feishu 作为入口的 Python Agent Runtime：`ruyi` CLI 从当前工作目录的 `.ruyi_agent/ruyi.toml`（或显式 `RUYI_HOME`）读取 runtime TOML，只接受代码列明的有限 env alias，并产出不可变 `RuntimeSettings`；bootstrap 随后分别加载 Agent、Provider、permission 配置，MCP 保留 raw connection dict；Provider 和 A2A remote-ref 的命名环境变量由 integrations 层解析，Telegram/Feishu 适配器通过 Gateway 协议提交和跟踪任务。修改关键区域前，应先读对应实现和测试；当前架构总览与 systems 文档从 [docs 索引](docs/README.md) 进入，并与代码、行为测试一起作为 active context。
 
 ## 修改前的阅读顺序
 
@@ -15,10 +15,10 @@
 
 - 根文件：`pyproject.toml` 负责依赖、`ruyi` script、pytest/Ruff/coverage 和打包；`uv.lock` 锁定环境；`.python-version` 固定 Python 3.13；`paseo.json` 提供工作台启动/测试脚本；`main.py` 提供根级 ASGI/嵌入包装；`LICENSE` 是许可文本。
 - `.github/workflows/ci.yml`：CI 的安装、compileall、Ruff、带 coverage 的完整测试、跨平台路径/打包 smoke；workflow 是 gate 的事实来源。
-- `README.md` 和 `AGENTS.md` 是当前 active docs/instructions；`README.copy.md` 和 `AGENTS.copy.md` 是按迁移前原文保留的 archival snapshots，不是当前规范权威，其历史链接不受 active-link maintenance rule 约束。
+- `README.md`、`AGENTS.md`、`docs/README.md`、`docs/architecture.md` 和 `docs/systems/*.md` 是当前 active docs/instructions；`README.copy.md` 和 `AGENTS.copy.md` 是按迁移前原文保留的 archival snapshots，不是当前规范权威，其历史链接不受 active-link maintenance rule 约束。
 - `.impeccable/`：tracked workbench generated artifacts，含方向/构建选择、答案、日志和易失 state；它记录工作台输入，不拥有 runtime、测试或用户契约。
 - `.ruyi_agent/`：仓库内跟踪的 starter/local `ruyi.toml`、`config/*.toml`、`config/*.toml.example` 和 `data/.gitkeep` 目录标记；运行数据库、runtime、skills 和认证文件属于本地运行数据，不应当成为源代码行为的替代品。
-- `docs/systems/`、`docs/decisions/`、`docs/guides/`：第一阶段只保留用途骨架和 `.gitkeep`；在有实际内容前不得把它们当作系统、决策或开发规则的权威。
+- `docs/`：入口见 [docs 索引](docs/README.md)；`docs/architecture.md` 和 `docs/systems/` 是当前 active 文档，按子系统记录已验证边界；`docs/decisions/` 与 `docs/guides/` 当前保留目录骨架和 `.gitkeep` 占位。
 - `scripts/`：Provider/reasoning 探针及其脚本测试；它们用于诊断特定集成，不是默认 Gateway 启动入口。
 - `src/ruyi_agent/`：可安装的 Python 包；根部 `task_models.py` 保存跨边界任务模型，`__main__.py`/`entrypoints/` 承载 CLI 启动。
   - `config/`：路径发现、runtime TOML 加载、不可变 `RuntimeSettings`、Agent/Provider/permission 模型和校验；它不包揽 bootstrap 的全部配置。bootstrap 分别装配 Agent/Provider/permission，MCP loader 保留 raw connection dict，Provider/A2A remote-ref 的命名环境变量由 `integrations/` 解析。
@@ -119,9 +119,9 @@ uv build --wheel --out-dir dist-ci --clear  # CI 使用的 wheel 构建；打包
 
 ## 文档同步
 
-- 只有新根 `README.md`、新根 `AGENTS.md` 和未来写入的 docs 正文属于 active docs；`README.copy.md`、`AGENTS.copy.md` 必须按迁移前原文保留为 archival snapshots，不是当前规范权威，其历史链接不纳入 active-link maintenance rule。
+- 当前 active docs/instructions 包括新根 `README.md`、新根 `AGENTS.md`、`docs/README.md`、`docs/architecture.md` 和 `docs/systems/*.md`；`README.copy.md`、`AGENTS.copy.md` 必须按迁移前原文保留为 archival snapshots，不是当前规范权威，其历史链接不受 active-link maintenance rule 约束。
 - 代码改变用户可见行为、CLI、配置格式、HTTP/channel 协议或其他稳定契约时，必须同步受影响的当前文档；至少核对 `README.md`、starter 配置和实现/测试中的示例。
-- 当前没有 Ruyi 的 `doc-sync` 命令；禁止发明或把它写成现有 gate。未来建立文档 gate 后，再把已验证命令登记到这里和 CI。`docs/systems/`、`docs/decisions/`、`docs/guides/` 目前只是骨架，不预先规定空文档内容。
+- 当前没有 Ruyi 的 `doc-sync` 命令；禁止发明或把它写成现有 gate。文档同步以受影响的 active 文档、当前文件、`pyproject.toml`、CI 和轻量命令核实；`docs/decisions/` 与 `docs/guides/` 的占位状态见 [docs 索引](docs/README.md)。
 - 文档命令、路径和本地链接在提交前必须以当前文件、`pyproject.toml`、CI 和轻量命令核实；失效引用应随产生它的代码或文档变更一起修正。
 
 ## 维护这些指令
@@ -133,6 +133,7 @@ uv build --wheel --out-dir dist-ci --clear  # CI 使用的 wheel 构建；打包
 ## 相关入口
 
 - 用户快速开始、能力和最小配置：[README.md](README.md)
+- 当前架构与系统文档索引：[docs/README.md](docs/README.md)
 - 依赖、CLI script、pytest、Ruff、coverage 和打包：[pyproject.toml](pyproject.toml)
 - CI 安装与 gate：[.github/workflows/ci.yml](.github/workflows/ci.yml)
 - CLI 启动：[src/ruyi_agent/entrypoints/main.py](src/ruyi_agent/entrypoints/main.py)

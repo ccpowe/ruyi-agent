@@ -77,13 +77,13 @@ service。
 
 | 子系统 | 拥有的当前行为 | 明确不拥有的行为 |
 | --- | --- | --- |
-| config / bootstrap | 发现路径、解析 runtime TOML、产出 `RuntimeSettings`；分别加载 Agent、Provider、permission；保留 MCP raw connection dict；装配并管理进程级资源生命周期 | 不把 bootstrap 里的全部对象伪装成 config ownership；不让下游重复解析原始配置 |
-| Gateway | 公开 Agent/Task/Review/Artifact 操作；创建 command、预留 route、选择 local/remote route、编排 effect、恢复和对外错误 | 不执行 Agent turn；不直接重建 channel 的 session 或 delivery 语义 |
-| gateway_protocol | wire DTO、HTTP client/transport、opaque cursor、SSE 编解码/校验、Task event public projection | 不拥有稳定 API response projection；`Agent/Task/Review/Artifact` response 由 `gateway/application.py::GatewayProjection` 拥有 |
-| runtime / delegation / middleware / skills | `AgentControl` 与 `TaskRuntime`；local execution、remote delegation/reconciliation、mailbox、supervisor、policy；task hydration、tool/approval/artifact/skills middleware；skill catalog、解析和 view 同步 | 不成为外部 HTTP command 的认证/路由入口；不把 wire DTO 当作执行状态 |
+| config / bootstrap（[运行时配置与 Bootstrap](systems/runtime-configuration-and-bootstrap.md)） | 发现路径、解析 runtime TOML、产出 `RuntimeSettings`；分别加载 Agent、Provider、permission；保留 MCP raw connection dict；装配并管理进程级资源生命周期 | 不把 bootstrap 里的全部对象伪装成 config ownership；不让下游重复解析原始配置 |
+| Gateway（[Gateway Task 控制面](systems/gateway-task-control-plane.md)） | 公开 Agent/Task/Review/Artifact 操作；创建 command、预留 route、选择 local/remote route、编排 effect、恢复和对外错误 | 不执行 Agent turn；不直接重建 channel 的 session 或 delivery 语义 |
+| gateway_protocol（[Gateway HTTP 与 gateway_protocol](systems/gateway-http-protocol.md)） | wire DTO、HTTP client/transport、opaque cursor、SSE 编解码/校验、Task event public projection | 不拥有稳定 API response projection；`Agent/Task/Review/Artifact` response 由 `gateway/application.py::GatewayProjection` 拥有 |
+| runtime / delegation / middleware / skills（[Task execution runtime](systems/task-execution.md)、[Runtime 委派系统](systems/task-delegation.md)、[Agent graph 与 tool runtime](systems/agent-tool-runtime.md)、[Task Mailbox 与 child settlement](systems/task-mailbox-settlement.md)、[Skills 系统](systems/skills.md)） | `AgentControl` 与 `TaskRuntime`；local execution、remote delegation/reconciliation、mailbox、supervisor、policy；task hydration、tool/approval/artifact/skills middleware；skill catalog、解析和 view 同步 | 不成为外部 HTTP command 的认证/路由入口；不把 wire DTO 当作执行状态 |
 | storage / checkpoint | Ruyi SQLite schema、stores、repositories、Unit of Work；runtime 的 Task、Gateway 的 route/command 和 runtime settled outbox 等 durable 记录；LangGraph checkpoint 的存储配合；channel-specific store 实现 | checkpoint lifecycle 由 bootstrap 管理；业务 projection 语义在 runtime/Gateway；storage 不拥有 public response 或 channel 文案 |
-| channels | platform turn、identity、session、receipt、presentation、delivery，以及 Telegram/Feishu 外部 API 适配；channel-specific session/receipt/delivery store 的语义与生命周期；HTTP transport routes | 只通过 `GatewayHTTPClient`/`GatewayProtocolClient` 访问 Gateway，不直接读写 Gateway/runtime 的 Task、route、command stores 或调用内部 Agent executor |
-| integrations | Provider 工厂与命名环境变量、OpenAI Codex、A2A remote-ref/client、MCP registry、local/Daytona backend runtime | 不替代 Gateway route ownership；凭据不进入 wire DTO、Task projection 或日志 |
+| channels（[Channel 系统](systems/channels.md)） | platform turn、identity、session、receipt、presentation、delivery，以及 Telegram/Feishu 外部 API 适配；channel-specific session/receipt/delivery store 的语义与生命周期；HTTP transport routes | 只通过 `GatewayHTTPClient`/`GatewayProtocolClient` 访问 Gateway，不直接读写 Gateway/runtime 的 Task、route、command stores 或调用内部 Agent executor |
+| integrations（[Model Provider 与 MCP 工具集成](systems/model-and-tool-integrations.md)、[Execution backend 与 workspace 边界](systems/execution-backends-and-workspace.md)） | Provider 工厂与命名环境变量、OpenAI Codex、A2A remote-ref/client、MCP registry、local/Daytona backend runtime | 不替代 Gateway route ownership；凭据不应主动投影到 wire DTO 或 Task projection；日志没有统一 redaction 保证，MCP/tool/provider 底层异常不得含凭据 |
 | team console | 随包分发的静态 UI 资源；以浏览器 session cookie 访问 debug console | 静态资源不拥有服务路由或任务业务；服务路由和 session auth 仍由 `channels/http` 管理 |
 
 实现入口分别见 [backend runtime](../src/ruyi_agent/integrations/backend/runtime.py)、
@@ -262,8 +262,9 @@ task id，并保留 `items` 和 opaque `cursor`；这些保留字段不在“不
   服务端入口和 cookie middleware 位于 HTTP channel 层。
 - Provider API key、OpenAI Codex auth、Telegram bot token、Feishu app secret、
   A2A/Daytona token 和 Gateway bearer 都在 integration/config 的 env 或本地未跟踪
-  凭据边界解析；`RemoteRef.auth.token_env` 只取命名环境变量，不把 token 放入
-  remote DTO、Task event 或错误详情。
+  凭据边界解析；`RemoteRef.auth.token_env` 只取命名环境变量。凭据不应主动投影到
+  wire DTO 或 Task projection；日志没有统一 redaction 保证，MCP/tool/provider
+  底层异常不得含凭据。
 - backend 选择决定执行信任边界。Daytona backend 把 shell、文件读写和 artifact
   放进 sandbox；`local` backend 主要用于开发/测试，文件工具映射到 typed
   workspace，但 shell 仍以当前用户权限运行，**不提供 Daytona 的进程隔离**。

@@ -203,6 +203,10 @@ adapter 仍可按自己的约定解释特定字段，例如 stdio adapter 的 `e
 - `RefreshResult` 汇总 server 总数、成功/失败数、tool 总数和按配置顺序排列的
   status 列表；空配置也是合法的空 inventory。
 
+`ServerLoadStatus.error` 保存底层异常的原始 `str(exc)` 文本，bootstrap 当前也会把
+它直接输出为 `[mcp] ... error=...`；这两个边界都没有统一 redaction。MCP/tool/provider
+底层异常不得含凭据，调用方应把 status/bootstrap 输出当作不可信错误文本处理。
+
 刷新完成后，Registry 一次性替换 process-local 的 server status、按 server 分组的
 tool inventory、qualified-name 索引和可执行 tool 索引。`list_tools()`、`pick_tools()`、
 `search_tools()`、`get_tool()` 等读路径在 refresh 前会拒绝访问，并要求调用方先
@@ -257,12 +261,14 @@ system tools 仍可进一步筛选它们。具体 middleware 组合不属于本�
 1. [`tool_search.py`](../../src/ruyi_agent/runtime/middleware/tool_search.py) 暴露
    稳定的 `tool_search` 和 `call_tool` 两个入口；search 返回 JSON，包含匹配工具的
    `qualified_name`、server/raw name、description、`args_schema` 以及 scope 提示。
-2. Agent 必须先用 `tool_search` 得到精确 qualified name，再以该 name 调
-   `call_tool`；不能直接把搜索结果中的 raw name 当成 callable，也不能臆造
+2. middleware 注入的 system prompt **推荐**模型在需要时先调用 `tool_search`，再
+   使用返回的 qualified name 调用 `call_tool`；这是模型侧提示，不是 runtime 的
+   search-state 强制条件。runtime 不记录“已经搜索过”的状态，也不要求每次
+   `call_tool` 之前先调用 `tool_search`。
+3. `call_tool` 的 runtime 契约只强制精确 qualified name、该 Agent scope 和
+   arguments 的 JSON Schema；通过后取得真实 tool，调用其 async/sync invoke 入口，
+   并将结果序列化为文本或 JSON。模型不能直接把 raw name 当成 callable，也不能臆造
    qualified name。
-3. `call_tool` 先检查 name 是否为 qualified name、是否在该 Agent scope 内，以及
-   arguments 是否符合 Registry 提取的 JSON Schema；通过后取得真实 tool，调用其
-   async/sync invoke 入口，并将结果序列化为文本或 JSON。
 
 ### JSON Schema arguments
 
@@ -325,44 +331,28 @@ Codex auth JSON 不进入 MCP registry；MCP raw connection dict、description�
 
 ## 测试证据
 
-以下测试文件是当前边界的行为证据入口；它们验证的是实现契约，不是外部服务的
-可用性承诺：
+以下是当前边界的少量 canonical 行为证据入口：
 
-| 范围 | 证据 |
-| --- | --- |
-| Provider parser/factory、Agent provider/model 引用、reserved kwargs、API key 缺失、Codex `auth_json` 映射和单 Agent unavailable | [`test_config_loader.py`](../../tests/unit/test_config_loader.py) |
-| Codex auth JSON 读取、credential-pool fallback、access refresh/writeback、Responses payload、SSE text/tool chunks、retry、HTTP error redaction/size bound | [`test_openai_codex_model.py`](../../tests/unit/test_openai_codex_model.py) |
-| 探针 dry-run/live SSE、auth JSON save 与 pool 同步 | [`test_probe_openai_codex.py`](../../tests/unit/test_probe_openai_codex.py) |
-| bootstrap 的 MCP refresh 调用与启动/关闭失败时的资源清理 | [`test_runtime_bootstrap_shutdown.py`](../../tests/unit/test_runtime_bootstrap_shutdown.py) |
-| MCP refresh 并发/顺序、per-server status、inventory、qualified/raw name、重名、scope、搜索和 JSON Schema 校验 | [`test_mcp_registry.py`](../../tests/unit/test_mcp_registry.py) |
-| `tool_search`/`call_tool` 的 metadata、精确 qualified name、scope 拒绝、schema 校验和真实 Agent tool path | [`test_tool_search_middleware.py`](../../tests/unit/test_tool_search_middleware.py) |
-| system-tool 自动/显式/disabled 合并，以及 tool-search pair 的启用边界 | [`test_system_tools.py`](../../tests/unit/test_system_tools.py) |
+- Provider parser/factory、Agent provider/model 引用、Codex 配置映射和单 Agent
+  unavailable：[test_config_loader.py](../../tests/unit/test_config_loader.py)。
+- Codex auth JSON、refresh/writeback、Responses streaming、retry 和 HTTP 错误处理：
+  [test_openai_codex_model.py](../../tests/unit/test_openai_codex_model.py)。
+- MCP refresh/status/inventory，以及 bootstrap 的刷新与生命周期：
+  [test_mcp_registry.py](../../tests/unit/test_mcp_registry.py) 和
+  [test_runtime_bootstrap_shutdown.py](../../tests/unit/test_runtime_bootstrap_shutdown.py)。
+- `tool_search`/`call_tool`、精确 qualified name、scope、schema 和 system-tool pair：
+  [test_tool_search_middleware.py](../../tests/unit/test_tool_search_middleware.py) 和
+  [test_system_tools.py](../../tests/unit/test_system_tools.py)。
 
 ## 文档同步触发
 
-下列现有契约发生变化时，应在同一变更中核对本文、对应配置模板和行为测试：
+仅在以下 ownership 或长期契约变化时同步本文、相关模板和 canonical 证据：
 
-- `LLMProviderSpec` 字段、Provider parser 的允许/保留字段、factory 的 secret 注入
-  或 local Agent unavailable 处理变化：核对
-  [`provider_models.py`](../../src/ruyi_agent/config/provider_models.py)、
-  [`provider_parser.py`](../../src/ruyi_agent/config/provider_parser.py)、
-  [`model_providers.py`](../../src/ruyi_agent/integrations/model_providers.py)、
-  [`agent_runtime.py`](../../src/ruyi_agent/config/agent_runtime.py) 和
-  [`test_config_loader.py`](../../tests/unit/test_config_loader.py)。
-- Codex auth 文件形状、refresh/writeback、Responses stream、重试或错误清理变化：
-  核对 [`openai_codex.py`](../../src/ruyi_agent/integrations/openai_codex.py)、
-  [`probe_openai_codex.py`](../../scripts/probe_openai_codex.py) 及其测试。
-- MCP raw config、description、refresh 并发/status/inventory、名称解析、Agent
-  scope、eager/tool-search 选择或 JSON Schema 校验变化：核对
-  [`loader.py`](../../src/ruyi_agent/config/loader.py)、
-  [`registry.py`](../../src/ruyi_agent/integrations/mcp/registry.py)、
-  [`tool_search.py`](../../src/ruyi_agent/runtime/middleware/tool_search.py)、
-  [`agents.toml`](../../src/ruyi_agent/templates/ruyi_home/config/agents.toml) 和
-  [`mcp_servers.toml`](../../src/ruyi_agent/templates/ruyi_home/config/mcp_servers.toml)，
-  以及对应 MCP/tool-search tests。
-- bootstrap 的加载顺序、refresh 触发或失败清理变化：核对
-  [`bootstrap.py`](../../src/ruyi_agent/runtime/bootstrap.py) 和
-  [`test_runtime_bootstrap_shutdown.py`](../../tests/unit/test_runtime_bootstrap_shutdown.py)。
+- ownership：Provider、MCP Registry 或 bootstrap 的责任边界变化；
+- public contract：Provider/MCP 配置字段、qualified name、arguments schema、
+  `tool_search`/`call_tool` 或 Responses 适配契约变化；
+- trust：凭据注入/可见性、错误文本 redaction、Agent scope 或 permission 边界变化；
+- recovery：Codex refresh/writeback/retry，MCP refresh status，或启动/关闭失败清理变化。
 
 本文只描述已经存在的入口和边界；探针、scope 或 `description` 都不能被解释成
 另一套共享凭据、授权或生命周期机制。
