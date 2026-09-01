@@ -209,7 +209,7 @@ I/O；目标名称解析和目标 allowlist 不是它的职责，而由 `AgentRe
 数量预算是整棵树的累计预算，而不是每个 parent 的 child 数量。持久化模式下，
 `TaskStore`/repository 在 immediate transaction 中按 `root_task_id` 统计已存在的
 记录并再次执行上限检查；因此 lazy restore、多个 runtime instance 或并发 spawn
-不能通过各自的内存缓存超卖最后一个 slot。无持久 store 的测试/进程内模式仍由
+不能通过各自的内存缓存超卖最后一个 slot。无持久 store 的进程内模式仍由
 TaskManager 统计当前记录。
 
 ## 两类 child 流程
@@ -443,41 +443,27 @@ remote intent 的可查询性，但不宣称“Task + route + checkpoint + A2A +
 
 ## 测试证据
 
-下列文件是当前行为证据入口；它们是契约索引，不表示本文编辑时执行过测试：
+以下行为证据按 delegation ownership 汇总：
 
 | 关注点 | 证据 |
 | --- | --- |
-| root/child context、保留 metadata 清理、有效预算、loop/depth/visited 校验 | [`test_delegation_context.py`](../../tests/unit/test_delegation_context.py) |
-| root identity、parent/depth、local/remote child、树预算、并发 slot、same-thread continuation、cancel/interruption、restart 和 remote refresh | [`test_async_subagent_task_runtime.py`](../../tests/unit/test_async_subagent_task_runtime.py) |
-| model tools、目标白名单、caller visibility、direct-parent send 与 parent cancel/wait/check 拒绝；settlement/suppression 协作入口 | [`test_async_subagent_tools_and_delivery.py`](../../tests/unit/test_async_subagent_tools_and_delivery.py) |
-| local executor、run config context、local stream/review/resume 和 safe completion | [`test_async_subagent_local_executor.py`](../../tests/unit/test_async_subagent_local_executor.py) |
-| RemoteTaskPort A2A create、refresh retry、last-known status、remote event、caller webhook relay | [`test_async_subagent_remote_port.py`](../../tests/unit/test_async_subagent_remote_port.py) |
-| remote payload identity、public/local projection、uncertain operation、webhook/outbox 安全边界 | [`test_remote_record_trust_boundary.py`](../../tests/unit/test_remote_record_trust_boundary.py) |
-| A2A HTTP method/credential/error/effect-boundary 和 response close | [`test_a2a_client.py`](../../tests/unit/test_a2a_client.py) |
-| A2A Task-event SSE 的 cursor、handshake、stream error/end、取消清理 | [`test_a2a_task_events.py`](../../tests/unit/test_a2a_task_events.py) |
-| AgentControl facade、runtime ownership、remote network isolation 和 boundary split | [`test_delegation_runtime_boundaries.py`](../../tests/unit/test_delegation_runtime_boundaries.py) |
-| admission permit、单 Task 并发、mark-running rollback、caller cancellation、graceful/forced close | [`test_run_supervisor.py`](../../tests/unit/test_run_supervisor.py) |
-| TaskRecord 不携带 process-local handle，以及 canonical state/storage contract | [`test_task_model_boundaries.py`](../../tests/unit/test_task_model_boundaries.py)、[`test_task_state_contracts.py`](../../tests/unit/test_task_state_contracts.py) |
+| context、保留 metadata、root/depth/visited 与树预算 | [`test_delegation_context.py`](../../tests/unit/test_delegation_context.py) |
+| local/remote child lifecycle、same-thread continuation、cancel/interruption、restart 与 refresh | [`test_async_subagent_task_runtime.py`](../../tests/unit/test_async_subagent_task_runtime.py) |
+| delegation tools、目标 allowlist、caller visibility、parent/child 控制与 settlement 协作 | [`test_async_subagent_tools_and_delivery.py`](../../tests/unit/test_async_subagent_tools_and_delivery.py) |
+| remote identity、effect uncertainty、A2A reconciliation 与 remote event boundary | [`test_async_subagent_remote_port.py`](../../tests/unit/test_async_subagent_remote_port.py)、[`test_remote_record_trust_boundary.py`](../../tests/unit/test_remote_record_trust_boundary.py) |
+| runtime admission、TaskRecord/state contract 与 close | [`test_run_supervisor.py`](../../tests/unit/test_run_supervisor.py) |
 
 ## 同步触发
 
-以下稳定行为变化必须同步本文，并调整相应证据链接：
+以下变化应同步更新本文：
 
-- `LocalWorkerSpec`、`RemoteRef`、AgentRegistry 的目标 namespace、unavailable 处理、
-  `delegation_targets` scope 或目标 allowlist/注册目标展示改变；
-- `DelegationContext` 的字段、metadata 保留名、版本/长度/visited 校验，或
-  `DelegationPolicy` 的 root/depth/task budget、permission inheritance 改变；
-- delegation tool 名称、参数/返回语义、spawn/target 展示 allowlist、caller
-  visibility、direct parent/child 控制关系、wait/check suppression 时机改变；
-- `TaskRecord` 的 parent/root/depth/route/upstream/uncertainty 字段、canonical state、
-  `run_count` 或 local/remote child lifecycle 改变；
-- `TaskRuntime`、`TaskManager`、`RemoteTaskPort` 的 admission、concurrency、refresh、
-  webhook/event、identity validation、effect disposition、reconciliation、restart
-  或 close 语义改变；
-- runtime 与 parent mailbox/settled outbox 的协作接口改变，或 Gateway remote create
-  与 runtime internal delegation 的 ownership 边界改变。
+- delegation、Gateway remote route、A2A transport、mailbox 或其他相邻组件的 ownership
+  边界改变；
+- 目标 namespace、caller scope、context、tool 参数/结果或 remote identity 等稳定
+  输入输出改变；
+- Task tree、budget、admission、child lifecycle、remote effect、reconciliation、
+  restart/close 或 parent settlement 的状态、事务或恢复语义改变；
+- allowlist、保留 metadata、远端 payload 校验、凭据/错误投影或其他 trust/security
+  boundary 改变。
 
-仅仅改变 mailbox/outbox 的内部 claim/settle/recovery、A2A wire codec、Gateway route
-ledger 或 channel delivery 细节时，应更新其所属实现/文档；除非同时改变本文列出的
-runtime delegation contract，不在本文复制那些状态机。实现与行为测试是事实权威；
-当前文档链接只指向仓库中已存在的文件。
+只改变其他子系统的内部实现时更新其所属文档；跨越上述边界时再同步受影响的文档。

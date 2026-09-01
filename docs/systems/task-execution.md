@@ -104,8 +104,7 @@ flowchart TD
 [`TaskRecord`](../../src/ruyi_agent/task_models.py) 只包含可持久化、可恢复的字段：
 `task_id`/Agent/thread 绑定、父/根关系、状态、结果/错误、`run_count`、远端绑定、
 review/artifact projection，以及外部操作不确定性标记。它不包含 `asyncio.Task`、
-`active_run` 或 `cancel_requested`；这由
-[`test_task_model_boundaries.py`](../../tests/unit/test_task_model_boundaries.py) 约束。
+`active_run` 或 `cancel_requested`。
 
 进程内对象的边界如下：
 
@@ -115,7 +114,7 @@ review/artifact projection，以及外部操作不确定性标记。它不包含
 | process-local | `LiveRunRegistry.LiveRun`、`RunSupervisor._runs`、permit、lock、编译 Agent cache | 不可恢复；必须释放或由恢复逻辑把孤儿执行标成 `interrupted` |
 | LangGraph durable state | 独立 checkpoint DB 中的 graph state/messages | 由 `TaskMessageStateReader` 按 Task 的 thread 读取；不与 Task row 共用事务 |
 
-若未配置 `TaskStore`（例如纯进程内测试），TaskManager 的 Task/review 只存在内存，
+若未配置 `TaskStore`（例如纯进程内模式），TaskManager 的 Task/review 只存在内存，
 也不会建立 durable lifecycle event ledger；本地 event stream 会报告不可用，不能把
 这种模式当作可跨重启恢复的运行时。
 
@@ -328,8 +327,8 @@ Task 的 `thread_id` 调 reader：
 message 投影为文本、tool call、tool result status 和 sequence；没有底层 id 时按
 Task 与内容 fingerprint 生成稳定 fallback id。Gateway 的分页/cursor 和 public
 response 包装属于 Gateway，不在本文重新定义。当前 message reader/projection 的
-checkpoint 精确读取、pending write 隔离和非法 payload 处理由
-[`test_message_history.py`](../../tests/unit/test_message_history.py) 覆盖。
+checkpoint 精确读取、pending write 隔离和非法 payload 处理属于 message history
+的行为边界。
 
 checkpoint 与 Task event 有不同的恢复职责：checkpoint 保存 graph state/messages；
 TaskStore lifecycle event 保存 public Task 状态。一个 checkpoint 已写入，不等于
@@ -410,9 +409,7 @@ parent thread 或列举 persisted records 懒加载；已存在且仍有 live ha
 cancel 与 interruption 持久化，再清理 compiled Agent/cache、input lock 和
 event ledger。bootstrap 外层随后按反向资源顺序关闭 review audit、mailbox、Task
 store、command/route stores、checkpointer 和 backend；并在停止接收 HTTP traffic
-后才离开 lifespan。具体顺序由
-[`test_runtime_bootstrap_shutdown.py`](../../tests/unit/test_runtime_bootstrap_shutdown.py)
-验证。
+后才离开 lifespan。
 
 `RunSupervisor.close` 使用独立的内部 close task；即使 close 的调用者被取消，内部
 cleanup 仍会完成，下一次 close 可等待同一结果。这保证 Task 被标记
@@ -438,9 +435,7 @@ cleanup 仍会完成，下一次 close 可等待同一结果。这保证 Task �
 owner/root/review 也不会留下部分更新。`mark_running` 的 admission 写失败时，run
 不会越过 schedule 的 release gate 执行。只有由 `_review_memory_transaction` 保护的
 Task state/review/live-handle transition 才同时恢复进程内快照；通用 UoW（例如
-`add_artifact`）不承诺这一内存回滚。TaskStore 的单元测试也直接证明了更新与 event
-append 的 rollback，以及 review transition 的 rollback；见
-[`test_task_store.py`](../../tests/unit/test_task_store.py)。
+`add_artifact`）不承诺这一内存回滚。
 
 ### 明确不是跨库事务
 
@@ -478,8 +473,7 @@ runtime 的错误先按是否影响 Task authority 分类：
 Task state/lifecycle event 一旦由 TaskManager 的权威写入口提交，后续 side effect
 失败不能把 `completed` 改回 `running`/`failed`，也不能把 `cancelled` 改回 active。
 例如 review resume 先持久化 review transition 并调度新 run，audit 失败只记录
-“non-authoritative review audit failed”；测试
-[`test_run_supervisor.py`](../../tests/unit/test_run_supervisor.py) 覆盖这一点。
+“non-authoritative review audit failed”。
 已 settled 的 local run 在 webhook 等尾部逻辑中出现异常时，supervisor/runtime
 也只记录尾部错误，不重新进入状态机。
 
@@ -516,41 +510,23 @@ bootstrap
 
 ## 测试证据索引
 
-以下是当前仓库中与本文契约直接对应的行为证据（本文没有把它们当作本次编辑时
-实际执行过的测试命令）：
+以下行为证据按 runtime ownership 汇总：
 
 | 关注点 | 证据 |
 | --- | --- |
-| Task/Run model separation、canonical states、LiveRunRegistry replacement/cancel | [`test_task_model_boundaries.py`](../../tests/unit/test_task_model_boundaries.py)、[`test_task_state_contracts.py`](../../tests/unit/test_task_state_contracts.py) |
-| spawn → run → settled、same-thread follow-up、cancel/interrupted、restart 和 remote proxy refresh | [`test_async_subagent_task_runtime.py`](../../tests/unit/test_async_subagent_task_runtime.py) |
-| local stream invocation、safe assistant delta、无 values 时读 state、stream failure、artifact 与 review resume | [`test_async_subagent_local_executor.py`](../../tests/unit/test_async_subagent_local_executor.py) |
-| mutation/operation permit、并发 schedule、mark-running rollback、graceful/forced close、caller cancellation、side-effect failure | [`test_run_supervisor.py`](../../tests/unit/test_run_supervisor.py) |
-| durable snapshot/lifecycle/delta/end、fixed-run cursor、replay/superseded、slow subscriber、restart event 和 race | [`test_task_events.py`](../../tests/unit/test_task_events.py) |
-| TaskStore row/event rollback、review transition 原子性、duplicate identity 和存储边界 | [`test_task_store.py`](../../tests/unit/test_task_store.py)、[`test_task_storage_boundaries.py`](../../tests/unit/test_task_storage_boundaries.py) |
-| pending review authoritative set、root mirror、sibling independence、restart rebuild 和 retry | [`test_async_subagent_task_manager_reviews.py`](../../tests/unit/test_async_subagent_task_manager_reviews.py) |
-| exact checkpoint read、latest re-read、textual message projection 与非法 remote page | [`test_message_history.py`](../../tests/unit/test_message_history.py) |
-| bootstrap 资源装配、runtime close 先于 stores/checkpointer/backend | [`test_runtime_bootstrap_shutdown.py`](../../tests/unit/test_runtime_bootstrap_shutdown.py)、[`test_app_runtime.py`](../../tests/unit/test_app_runtime.py) |
-
-局部改动应优先运行与其契约相符的定向测试；跨 runtime/Gateway/storage 或 CI gate
-需要时再执行仓库规定的更大范围验证。文档本身提交前至少检查链接目标和
-`git diff --check`。
+| Task lifecycle、run generation、local/remote continuation 与 restart | [`test_async_subagent_task_runtime.py`](../../tests/unit/test_async_subagent_task_runtime.py) |
+| local execution、stream、artifact 与 review resume | [`test_async_subagent_local_executor.py`](../../tests/unit/test_async_subagent_local_executor.py) |
+| admission、并发、rollback、cancel、shutdown 与非权威尾部效果 | [`test_run_supervisor.py`](../../tests/unit/test_run_supervisor.py) |
+| durable Task/event UoW、fixed-run observation 与 checkpoint message projection | [`test_task_store.py`](../../tests/unit/test_task_store.py)、[`test_task_events.py`](../../tests/unit/test_task_events.py)、[`test_message_history.py`](../../tests/unit/test_message_history.py) |
 
 ## 同步触发
 
-下列代码或稳定行为变化应同步更新本文，并同时补充/调整对应测试证据链接：
+以下变化应同步更新本文：
 
-- `AgentControl` 的稳定调用面、TaskRuntime 的 admission/调度/close/recovery
-  契约改变；
-- canonical Task states、`run_count`、cancel/interrupted/resume 规则、review
-  authority 或 TaskRecord/live handle 边界改变；
-- TaskStore 的 Task/event/review UoW 原子性、lifecycle event 类型、fixed-run
-  stream 或 transient delta 规则改变；
-- LangGraph checkpoint 注入、精确 snapshot 读取、message projection 的稳定字段
-  或错误边界改变；
-- local execution 在“Task 状态提交 → Agent payload → completion/side effect”
-  顺序、远端 proxy uncertainty 对 Task 状态的影响或 runtime shutdown 顺序上改变。
+- runtime execution、Task state、review、run handle 或其他组件的 ownership 边界改变；
+- Task/run 的稳定输入输出改变，包括 `run_count`、lifecycle event、fixed-run stream、
+  message projection、artifact 或 remote proxy 字段；
+- TaskStore/事件/checkpoint 的事务边界、取消关闭、重启恢复或 uncertain effect 语义改变；
+- provenance、remote identity、artifact path 或其他 runtime trust/security boundary 改变。
 
-以下变化只应更新其所属文档，除非同时改变了上面的 runtime contract：Gateway
-route/command/public remote route、delegation tree/budget、middleware/tool 语义、
-skills、mailbox/settled outbox、A2A transport，以及 channel delivery。实现和测试
-是事实权威；若它们与本页文字冲突，应先修正文字或明确边界，再合入行为变化。
+只改变其他子系统的内部实现时更新其所属文档；跨越上述边界时再同步受影响的文档。

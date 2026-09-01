@@ -72,16 +72,13 @@ flowchart LR
    指令正文留在 view 中，由模型使用 filesystem tool 读取。
 
 remote-ref 不在本地编译或运行 `RuyiSkillsMiddleware`；它不会获得本地 Task 的
-skill view。没有 `TaskStore` 的进程内测试仍可执行解析和物化，但 names/path/hash
+skill view。没有 `TaskStore` 的进程内模式仍可执行解析和物化，但 names/path/hash
 不会获得跨重启的 durable binding。
 
 ## Host roots、catalog snapshot 与有效性
 
 [`SkillCatalog`](../../src/ruyi_agent/runtime/skills/catalog.py) 只把以下三个固定
-root 当作 discovery roots；它们不是 resolved containment boundary。每个 root 只
-枚举直接子项，但 `is_dir()`/`is_file()` 检查没有把候选路径 `resolve()` 后再确认
-仍位于 root 内：直接子项的目录 symlink 可以指向 root 外，`SKILL.md` symlink 也
-可以通过检查。
+root 当作 discovery roots；这些 roots 是发现来源，不是 resolved containment boundary。
 
 | 扫描顺序（低到高） | root |
 | --- | --- |
@@ -99,21 +96,11 @@ catalog key。冲突时后扫描的条目覆盖前一条，因此同名优先级
 roots 不是“任何 Ruyi home 下的 skills_dir”别名。workspace root 则来自已经解析的
 `settings.backend.workspace`，不是 backend namespace 中的 `/`。
 
-一个目录只有同时满足以下条件，才会成为 `SkillEntry`：
-
-- 子项的 `is_dir()` 为真，且 `SKILL.md` 路径的 `is_file()` 为真（这两个检查
-  都可能跟随 symlink）；
-- 文件以精确的 `---\n` 开始，并能将 frontmatter 解析成 YAML mapping；
-- `name` 和 `description` 都是字符串，去掉首尾空白后仍非空。
-
-缺少 frontmatter、YAML 无法解析、mapping 类型不对、字段缺失或字段为空的项会被
-跳过，不会进入 catalog；目录名不需要等于 frontmatter name。catalog 解析的是
-发现和选择所需的 `name`/`description`，不会在这一层解析正文或 `allowed-tools`。
-`name` 的有效性只有“字符串且 trim 后非空”这一层；没有 basename、绝对路径、路径
-separator 或 `..` 检查。因而 frontmatter name 既可能含 separator，也可能是绝对的
-POSIX path，并会影响之后拼接出的 backend path。源文件的普通读取异常不被伪装成
-有效 skill；它会在扫描边界暴露为 bootstrap 失败，而不是产生一个不完整条目。目录
-不存在也只是没有该 root 的条目。
+一个目录只有在存在可解析的 `SKILL.md`、frontmatter 是 YAML mapping 且包含非空
+字符串 `name`/`description` 时才会成为 `SkillEntry`。无效项会被跳过，目录名不
+需要等于 frontmatter name；catalog 只解析发现和选择所需的 metadata，不在这一层
+解析正文或 `allowed-tools`。源文件的普通读取异常会在扫描边界暴露为 bootstrap
+失败，目录不存在则没有该 root 的条目。
 
 bootstrap 只扫描一次，保存的是 name、description、host directory 和 source root
 的 snapshot；它不是后台 watcher。新增或删除的目录要到下一次 bootstrap 才能进入
@@ -131,17 +118,10 @@ local Agent 的 `skills` 在配置边界接受三种形态；最终由
 - 字符串列表：每项必须是非空字符串并去掉首尾空白。列表顺序被保留，随后逐项
   在 catalog 中查找；当前实现不把列表当作集合去重。
 
-显式列表中的任意名称不在 catalog 时，resolver 抛出
-`ValueError("Unknown skills: ...")`，并列出排序后的未知名称。这个错误发生在
-TaskRecord 创建和 view 绑定前；调用方得到失败，不应把部分选中结果当成可运行
-Task。`inherit` 的 parent 分支不重新按 child 声明或当前 catalog 选取名称，而是
-读取 parent 的 exact tuple；因此 parent 的选择顺序也是 child effective snapshot
-的一部分。child 使用 `inherit` 时仍会为 child 调用 materializer，内容未变时会
-得到相同的 path/hash；若 host 文件在此期间发生变化，child 可以因新内容得到新
-view，但 names 仍来自 parent snapshot。若 parent 持久的某个 name 已不在当前
-catalog，resolver 仍返回这个 tuple；随后 `ensure_view` 的 `catalog[name]` 查找会
-失败（当前表现为 lookup error），不会静默丢弃该 skill。显式列表的 unknown
-仍由 resolver 以排序后的名称抛出 `ValueError("Unknown skills: ...")`。
+显式列表中的任意名称不在 catalog 时，resolver 在 TaskRecord 创建和 view 绑定前
+抛出 `ValueError("Unknown skills: ...")`，调用方不会得到部分选中的可运行 Task。
+`inherit` 的 parent 分支读取 parent 的 exact tuple，不按 child 声明或当前 catalog
+重新选取名称；因此 parent 的选择顺序也是 child effective snapshot 的一部分。
 
 选择和物化的关键区别是：Agent 配置的 declaration 不是 Task 的运行时事实。
 `effective_skill_names` 是 create 时算出的事实；Task 后续输入、review resume 和
@@ -158,26 +138,10 @@ catalog，resolver 仍返回这个 tuple；随后 `ensure_view` 的 `catalog[nam
 <views_root>/<view_hash>/<skill-name>/<relative-file>
 ```
 
-上面的 `<skill-name>` 只是说明代码中的 path 拼接位置，并不是已经校验过的安全
-namespace component。syncer 同样不对 `entry.path` 或递归枚举出的文件做 resolved
-containment；skill directory 的 symlink、`SKILL.md`/文件 symlink 会被跟随读取。
-frontmatter name 没有 separator、绝对 POSIX path 或 `..` 防护，因此 name 可能让
-`PurePosixPath(view_path) / entry.name / relative` 进入不同的 backend location，
-甚至离开预期的 view/per-skill 前缀。不能无条件把每项描述成位于独立的
-`<view_path>/<skill-name>/` namespace。
-
-每个 skill 的 hash 是 SHA-256 对如下序列的摘要：每个文件的相对 POSIX path、NUL
-字节、文件 bytes、NUL 字节，按排序顺序拼接。view hash 再按 effective names 的
-顺序拼接 `name:skill_hash` 和 NUL，取 SHA-256 的前 16 个十六进制字符。在 source
-tree 在各次读取间保持稳定时，文件 bytes、相对路径或选中顺序变化会改变 view
-hash；相同 names、顺序和内容会指向同一个 backend view path。hash 没有包含 host
-source path，也不在 middleware 使用时重新验证 view bytes。
-
-这里没有 host snapshot 或 atomic publish：`ensure_view` 先独立枚举/读取一次来算
-skill hash，随后再次枚举/读取来准备 upload。host 文件在两次 pass 之间或某次
-pass 中变化时，hash 可能不描述实际上传的 bytes，新增/删除文件也可能只出现在
-其中一次 pass。upload 虽然以 batch 形式提交，但 skills 代码没有 view commit
-marker、回滚或跨文件原子发布保证。
+每个 skill 的 hash 是文件相对路径与 bytes 的 SHA-256；view hash 再按 effective
+names 顺序组合各 skill hash，取前 16 个十六进制字符。相同 names、顺序和内容会
+指向同一个 backend view path；hash 不包含 host source path，也不在 middleware
+使用时重新验证 view bytes。
 
 view 根由 backend runtime 提供：当前 local 为
 `/.ruyi_agent/runtime/skill-views`，Daytona 为 sandbox user home 下的同一相对
@@ -197,35 +161,25 @@ view 根由 backend runtime 提供：当前 local 为
 }
 ```
 
-manifest 是 view 的内部诊断/物化记录，"internal" 描述 ownership/contract，不
-描述保密性或 access control。`source` 是 host 路径，不能当成模型的公开路径、稳定
-API、权限证明或可供外部 caller 使用的 locator；但 manifest 已上传到 backend view，
-拥有 filesystem tool 的模型可能直接读取 `<view_path>/.manifest.json` 并看到该
-source 字符串。模型 metadata 中的 `path` 始终是 backend view 下的 `SKILL.md`
-path。middleware 列目录时只把子目录当作 skills，`.manifest.json` 本身不会被列成
-skill metadata。
+manifest 是 view 的内部物化记录；`source` 是 host 路径，不是模型的公开路径、稳定
+API、权限证明或外部 locator。它已上传到 backend view，拥有 filesystem tool 的模型
+可能直接读取 `<view_path>/.manifest.json` 并看到该 source。模型 metadata 中的
+`path` 是 backend view 下的 `SKILL.md` path，`.manifest.json` 不会被列成 skill
+metadata。
 
 任何 upload response 带 error 时，syncer 汇总错误并抛出
-`ValueError("Failed to sync skills: ...")`。这不是一个声明式事务或回滚保证；
-调用方不能把部分已上传文件视为成功的 Task view。
+`ValueError("Failed to sync skills: ...")`；调用方不能把部分已上传文件视为成功的
+Task view。
 
 ## Host 到 backend 的信任边界
 
-host catalog 是运行进程信任的来源边界：runtime 在 host 上读取通过 catalog 的
-目录树和 bytes，然后把这些 bytes 上传到 backend；backend 不按 manifest 的
-`source` 回读 host 路径。catalog 和 syncer 都没有 resolved containment，因此
-目录 symlink 或文件 symlink 可能把 source tree 带到 discovery root/skill directory
-之外。对于 skills 内容，Agent/model 的正常读取路径是 middleware 给出的 backend
-path；middleware 不会把 host path 当作 skill 的读取路径。模型仍可能通过独立
-filesystem/tool runtime 看到其它 backend 文件，这不属于 skills 子系统对可见文件
-的承诺。
-
-这次复制不是内容审查、签名验证或任意 host ACL。选中的 skill 目录下的文件会被
-递归复制；host 上的 skill 内容因此成为模型可读的指令数据。local backend 的
-virtual file root 和 shell 权限、Daytona 的 sandbox 隔离分别由 backend 层决定，
-不会因为 skills view 存在就获得额外的 skill-specific tool permission。尤其是
-manifest 中的 source 字段不构成 host 文件系统的沙箱边界；它也不因被称为 internal
-而成为秘密。
+host catalog 是运行进程信任的来源边界：runtime 读取 host 上选中的 skill source
+并将内容上传到 backend，backend 不按 manifest 的 `source` 回读 host 路径。skill
+source 和 frontmatter `name` 应视为 trusted input。当前实现不保证 source/view 的
+resolved containment、不保证 atomic materialization，也不保证 manifest 中
+source path 的 confidentiality；这些都不是现有安全保证。选中的 skill 内容会成为
+模型可读的指令数据，tool permission、shell 隔离和 backend 访问边界仍由各自系统
+负责。
 
 Task 已绑定的 view 不会因为 host 变化而隐式切换：修改已存在目录的文件不会改写
 现有 TaskRecord 的 names/path/hash，新增或删除 root 下目录也不会更新当前进程的
@@ -296,36 +250,30 @@ system prompt，正文仍由模型通过 backend filesystem path 读取。
 没有与系统 tool 列表或 permission policy 自动合并。能否读取 `SKILL.md` 仍取决于
 独立的 filesystem/tool runtime 和其权限边界。
 
-## 测试证据与文档同步触发
+## 测试证据
 
-现有行为证据按边界分组（以下只列当前测试实际断言的范围，不把未覆盖的边界当作
-测试保证）：
+以下行为证据按 skills ownership 汇总：
 
-- 固定 roots 的扫描、跨 root 的 workspace 覆盖，以及以有效 frontmatter 构造条目：
-  [`test_skills_catalog.py`](../../tests/unit/test_skills_catalog.py)；该测试没有断言
-  invalid frontmatter 或同一 root 内的 duplicate name。配置列表的 trim/空项校验
-  见 [`test_typed_config_contracts.py`](../../tests/unit/test_typed_config_contracts.py)。
-- `none`、带 parent names 的 `inherit`、显式选择和单个 unknown error：
-  [`test_skills_resolver.py`](../../tests/unit/test_skills_resolver.py)；typed worker
-  spec 保留特殊 mode 的证据在 [`test_config_loader.py`](../../tests/unit/test_config_loader.py)。
-- 所选 skill 根目录文件复制、view path 形状、已上传 `SKILL.md`/辅助文件和
-  manifest 文件存在：[`test_skills_sync.py`](../../tests/unit/test_skills_sync.py)。
-  该测试没有断言 digest 算法、manifest 字段内容或 upload error。
-- Task 的 names/path/hash 绑定、parent effective snapshot 和 SQLite round-trip：
-  [`test_async_subagent_local_executor.py`](../../tests/unit/test_async_subagent_local_executor.py)
-  与 [`test_task_store.py`](../../tests/unit/test_task_store.py)；runtime stack
-  装配 middleware 的证据见 [`test_runtime_middleware_stack.py`](../../tests/unit/test_runtime_middleware_stack.py)。
-- 从配置 view 成功读取一个 skill 的 metadata、backend path 和默认
-  `allowed_tools`：[`test_ruyi_skills_middleware.py`](../../tests/unit/test_ruyi_skills_middleware.py)。
-  该测试没有覆盖 state hash cache、system prompt、malformed metadata 或 backend
-  error。
-- backend skill view root 与 bootstrap 阶段的关闭路径：
-  [`test_backend_runtime.py`](../../tests/unit/test_backend_runtime.py) 和
-  [`test_runtime_bootstrap_shutdown.py`](../../tests/unit/test_runtime_bootstrap_shutdown.py)。
+- catalog、配置声明与 effective-name resolution：
+  [`test_skills_catalog.py`](../../tests/unit/test_skills_catalog.py)、
+  [`test_skills_resolver.py`](../../tests/unit/test_skills_resolver.py)。
+- view materialization、Task binding 与持久 round-trip：
+  [`test_skills_sync.py`](../../tests/unit/test_skills_sync.py)、
+  [`test_task_store.py`](../../tests/unit/test_task_store.py)。
+- middleware stack 与 model-facing metadata/path exposure：
+  [`test_ruyi_skills_middleware.py`](../../tests/unit/test_ruyi_skills_middleware.py)。
 
-以下行为变化必须同步本文及相应证据链接：host roots/优先级、frontmatter 有效性、
-selection mode、parent snapshot、hash/view/manifest 格式、TaskRecord binding、
-middleware 的 metadata/content 读取、或 bootstrap/lifespan/trust/error 边界。仅有
-不改变这些契约的内部重命名不应凭空增加新的 skills 语义。提交前只需确认链接仍
-指向当前文件并检查补丁格式；当前没有另一个 `doc-sync` 命令，也不把安装、更新
-或热重载写成现有能力。
+## 同步触发
+
+以下变化应同步更新本文：
+
+- skills catalog、resolver、syncer、Task binding 或 middleware 与其他组件的 ownership
+  边界改变；
+- host discovery、skill declaration、effective names、view/hash/manifest 或
+  model-facing metadata/path 等稳定输入输出改变；
+- Task binding、bootstrap/lifespan、materialization 或 view reuse 的状态、事务或恢复
+  语义改变；
+- skill source/name 的信任假设、resolved containment、atomic materialization、manifest
+  source-path confidentiality 或其他 trust/security boundary 改变。
+
+只改变其他子系统的内部实现时更新其所属文档；跨越上述边界时再同步受影响的文档。

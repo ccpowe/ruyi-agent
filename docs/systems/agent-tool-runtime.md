@@ -346,7 +346,7 @@ Provider/A2A 命名环境变量由 `integrations` 解析；MCP 配置保留 raw 
 因此底层 tool/provider exception 文本不得包含凭据。`ToolRuntime.config` 也不是
 secret boundary，runtime 不应把它当作凭据过滤器。
 
-## 依赖与行为证据
+## 依赖
 
 主要代码依赖及其边界如下：
 
@@ -359,55 +359,30 @@ secret boundary，runtime 不应把它当作凭据过滤器。
 | PermissionPolicy/ReviewAuditStore | tool policy、execute risk 和 audit；Task pending review 仍由 TaskManager/TaskStore 持有。 |
 | TaskManager/AgentMailbox/SkillSyncer | 通过 callback/context 接入 Task、mailbox、预物化 skill view；各自的 durable/catalog/materialization ownership 不在本页。 |
 
-对应行为证据：
+## 测试证据
 
-- graph state、DeltaChannel 和 shared SQLite checkpoint continuation：
-  [`test_agent_factory.py`](../../tests/unit/test_agent_factory.py)；
-- 条件 stack、system-tool 过滤和 middleware presence：
-  [`test_runtime_middleware_stack.py`](../../tests/unit/test_runtime_middleware_stack.py)、
-  [`test_system_tools.py`](../../tests/unit/test_system_tools.py)；
-- hydration/mailbox claim/ack 和 tool history repair：
-  [`test_mailbox.py`](../../tests/unit/test_mailbox.py)、
-  [`test_tool_call_protocol.py`](../../tests/unit/test_tool_call_protocol.py)；
-- MCP search scope、qualified name、schema validation 和 call path：
-  [`test_tool_search_middleware.py`](../../tests/unit/test_tool_search_middleware.py)、
-  [`test_mcp_registry.py`](../../tests/unit/test_mcp_registry.py)；
-- artifact tracked-Task、size/name/path boundary 和 registration：
-  [`test_artifact_publishing_middleware.py`](../../tests/unit/test_artifact_publishing_middleware.py)、
-  [`test_async_subagent_local_executor.py`](../../tests/unit/test_async_subagent_local_executor.py)；
-- skill view metadata exposure：
-  [`test_ruyi_skills_middleware.py`](../../tests/unit/test_ruyi_skills_middleware.py)；
-- permission allow/approval/deny、execute prefix/risk 和 shell segment deny：
-  [`test_permission_policy.py`](../../tests/unit/test_permission_policy.py)、
-  [`test_human_approval_middleware.py`](../../tests/unit/test_human_approval_middleware.py)；
-- interrupt/resume、review identity 以及非权威 audit failure：
-  [`test_agent_turn.py`](../../tests/unit/test_agent_turn.py)、
-  [`test_async_subagent_task_manager_reviews.py`](../../tests/unit/test_async_subagent_task_manager_reviews.py)、
-  [`test_run_supervisor.py`](../../tests/unit/test_run_supervisor.py)、
-  [`test_review_audit.py`](../../tests/unit/test_review_audit.py)；
-- ToolError exception group、分类、一次重试、cancel 传播和并行 success/error：
-  [`test_tool_error_middleware.py`](../../tests/unit/test_tool_error_middleware.py)、
-  [`test_tool_error_integration.py`](../../tests/unit/test_tool_error_integration.py)。
+以下行为证据按 tool-plane ownership 汇总：
 
-本文编辑时不把上述测试称为已执行命令；它们是当前仓库的行为证据入口。
+- graph state、DeltaChannel、checkpointer continuation、middleware stack 与 system-tool
+  exposure：[`test_agent_factory.py`](../../tests/unit/test_agent_factory.py)、
+  [`test_runtime_middleware_stack.py`](../../tests/unit/test_runtime_middleware_stack.py)。
+- MCP scope、qualified name、schema validation 与 call path：
+  [`test_tool_search_middleware.py`](../../tests/unit/test_tool_search_middleware.py)。
+- permission profiles、execute risk、approval interrupt/resume 与 review audit：
+  [`test_human_approval_middleware.py`](../../tests/unit/test_human_approval_middleware.py)。
+- ToolError 分类、retry、取消传播与并行 success/error：
+  [`test_tool_error_middleware.py`](../../tests/unit/test_tool_error_middleware.py)。
 
 ## 同步触发
 
-以下变化应同步更新本文及相应证据链接：
+以下变化应同步更新本文：
 
-- `create_runtime_agent` 的 state schema、graph compile、compiled-agent cache、
-  checkpointer 注入或 run context 字段改变；
-- `build_runtime_middleware` 的条件、相对顺序、tool exposure 或 prompt/hook 语义
-  改变；
-- Tool-call repair、MCP scope/schema/call、filesystem/artifact path boundary、skill
-  metadata exposure 或第三方 adapter 的接入方式改变；
-- PermissionPolicy 的 profile fallback、allow/require_approval/deny、execute
-  prefix/risk、edit re-evaluation，或 HumanApproval 的 interrupt/resume contract
-  改变；
-- ToolError 的分类、retry attempt/window、取消传播或 ToolMessage 字段改变；
-- middleware 与 TaskRuntime、Gateway Review/public projection、backend isolation、
-  MCP refresh、delegation tree、mailbox durability、skill materialization 或 artifact
-  HTTP 边界的 ownership 发生变化。
+- graph、middleware、permission、tool execution 与相邻组件的 ownership 边界改变；
+- graph/run context、middleware stack、tool schema/result、MCP/artifact/skill metadata
+  或其他 model-facing 稳定输入输出改变；
+- checkpoint、mailbox consumption、approval interrupt/resume、tool retry/error 或
+  runtime close 的状态、事务或恢复语义改变；
+- permission、MCP scope、artifact/backend path、credential/error handling 或其他
+  runtime trust/security boundary 改变。
 
-实现和行为测试是事实权威；若它们与本文冲突，应先修正文字或明确边界，再合入行为
-变化。
+只改变其他子系统的内部实现时更新其所属文档；跨越上述边界时再同步受影响的文档。
