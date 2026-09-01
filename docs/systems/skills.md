@@ -308,7 +308,7 @@ system prompt，正文仍由模型通过 backend filesystem path 读取。
 - `none`、带 parent names 的 `inherit`、显式选择和单个 unknown error：
   [`test_skills_resolver.py`](../../tests/unit/test_skills_resolver.py)；typed worker
   spec 保留特殊 mode 的证据在 [`test_config_loader.py`](../../tests/unit/test_config_loader.py)。
-- 选中 skill 的递归文件复制、view path 形状、已上传 `SKILL.md`/辅助文件和
+- 所选 skill 根目录文件复制、view path 形状、已上传 `SKILL.md`/辅助文件和
   manifest 文件存在：[`test_skills_sync.py`](../../tests/unit/test_skills_sync.py)。
   该测试没有断言 digest 算法、manifest 字段内容或 upload error。
 - Task 的 names/path/hash 绑定、parent effective snapshot 和 SQLite round-trip：
