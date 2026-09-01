@@ -6,11 +6,11 @@ system。它以当前代码、测试和 [架构总览](../architecture.md) 为�
 
 ## 负责什么
 
-Gateway HTTP 层把一个 `GatewayTaskService` 暴露为可被本地进程、channel adapter
+Gateway HTTP 层把 `GatewayTaskModule` facade 暴露为可被本地进程、channel adapter
 和远端 A2A Gateway 调用的 HTTP 协议。server adapter 负责路由组合、认证依赖、HTTP
 状态/头部、流式响应生命周期，以及把 service 的错误转成统一 envelope。
-`gateway_protocol` 负责跨进程 wire contract：DTO、有限大小的 JSON 读写、HTTP
-client/transport、游标、SSE 编解码和 Task-event 的公共投影。
+`gateway_protocol` 负责跨进程 wire contract：DTO、HTTP client/transport 对 JSON
+response/error 的严格有限读取、游标、SSE 编解码和 Task-event 的公共投影。
 
 它不拥有：
 
@@ -68,7 +68,7 @@ HTTP client / channel / A2A client
         ├─ auth + errors + probes + Team Console
         └─ task/event/review/artifact adapters
              ▼
-      GatewayTaskModule / GatewayTaskService
+      GatewayTaskModule facade
         ├─ GatewayProjection (ordinary responses)
         ├─ TaskRouter (local or remote route)
         └─ command store + route state + event ledger
@@ -82,10 +82,17 @@ HTTP client / channel / A2A client
 
 Business request 的主要类别是 agent discovery、task create/input/cancel、task
 list/detail、message page、review list/decision、task webhook 和 artifact download。
-`gateway_protocol.dto` 中的 Pydantic `GatewayDTO` 使用 frozen model、mapping
-payload；wire 输入对字符串、整数、布尔值等使用严格类型，附件、文本、分页和
-列表数量均有界。文档只约定这些 payload 的语义分组，不复制每条 route 的字段表；
-具体 shape 以 [`dto.py`](../../src/ruyi_agent/gateway_protocol/dto.py) 为准。
+`gateway_protocol.dto` 定义 Pydantic wire DTO；其中 public response 的
+`GatewayDTO` 使用 frozen model、mapping payload。DTO 在被相应 server/client consumer
+解析时校验 shape，但这不等于统一的 request-body 或所有字段字符上限。当前没有
+统一 request-body cap；例如
+`TaskInput.content`、`AttachmentInput.data_base64` 和
+`ArtifactDownloadRequest.path` 没有统一的字符数 cap。attachment decoded bytes 和
+artifact downloaded bytes 的大小限制属于 Gateway server/service（当前 `GatewayTaskModule` 默认 attachment
+20 MiB、artifact 50 MiB，分别由 attachment/artifact service 的配置执行），不是
+JSON transport 的 request cap。文档只约定这些 payload 的语义
+分组，不复制每条 route 的字段表；具体 shape 以
+[`dto.py`](../../src/ruyi_agent/gateway_protocol/dto.py) 为准。
 
 典型请求头和参数如下：
 
@@ -117,19 +124,19 @@ bytes，不包装为 JSON。
 | --- | --- |
 | 400 | malformed/invalid request、attachment、delegation context |
 | 401 | `unauthorized`；附 `WWW-Authenticate: Bearer realm="ruyi-agent-gateway"` |
-| 403 | private/unavailable boundary、workspace path 等禁止操作 |
+| 403 | `agent_not_public`、delegation policy、workspace path 等禁止操作 |
 | 404 | agent/task/review/artifact 不存在 |
 | 409 | review/task mismatch、active/routing conflict、idempotency conflict/in-progress/uncertain |
 | 413 | attachment/artifact 超过限制 |
 | 422 | 未实现的 remote executor 等已识别但不可执行的输入 |
 | 429 | delegation budget exhausted |
 | 502 | `upstream_gateway_error` 或 upstream failure |
-| 503 | runtime/agent、attachment、route persistence、durability、history/events、idempotency 不可用 |
+| 503 | `agent_unavailable`、runtime/attachment、route persistence、durability、history/events、idempotency 不可用 |
 | 500 | 未映射的 `GatewayTaskError` 或意外异常；后者只暴露 `internal_error` |
 
 错误 body 是统一 envelope：
 `{"error":{"code":"...","message":"...","details":...}}`，其中 details
-可省略且会被限制为有限 JSON。`GatewayTaskError` 在 service/transport 内可携带
+可省略。`GatewayTaskError` 在 service/transport 内可携带
 effect disposition；HTTP envelope 只暴露适合 wire 的 code/message/details，不泄露
 内部 traceback、凭据或远端私有字段。`idempotency_in_progress`
 额外带 `Retry-After: 1`；not-ready probe 也带 `Retry-After: 1`。
@@ -150,41 +157,51 @@ response 丢失导致的 `possibly_dispatched`。这只描述调用者能安全�
 带 `Idempotency-Key` 的 create/input 先由 command store claim；同一 key/hash 的
 terminal outcome 可精确 replay，冲突为 `idempotency_key_reused`，并发占用为带
 重试提示的 `idempotency_in_progress`。没有 key 时 create 不自动去重。远程 create
-只有在 remote reference 明确声明并验证 `create_idempotency_guaranteed` 时才允许
-把 key 转发给下游；响应丢失或 route activation/persistence 不确定时保留可查询的
-public task identity，并返回 non-retryable/uncertain 语义，不能盲目重新创建。
+会转发显式传入的 inbound `Idempotency-Key`；若没有 external key 而 remote reference
+声明并验证 `ruyi_gateway_v1`/create capability，create workflow 会生成稳定的
+downstream key。这个 capability 决定响应丢失后能否安全 replay，不决定是否允许
+发送 idempotency header。响应丢失或 route activation/persistence 不确定时保留可
+查询的 public task identity，并返回 non-retryable/uncertain 语义，不能盲目重新创建。
 `TaskRouter` 对 pending、failed、uncertain route 返回 `task_route_unavailable`
 等 409，而不是让 transport 层猜测 route state。
 
 `GatewayProtocolClient` 是中立 client facade，提供 JSON、raw、SSE 和 artifact
-操作；channel-facing 的
+操作。它对成功 JSON response 的通用保证只有“解码后是 object”；Task identity/state
+等语义由 Gateway 或具体 consumer 进一步以 DTO 校验，SSE 则由 codec/router 校验。
+channel-facing 的
 [`channels/gateway_client.py`](../../src/ruyi_agent/channels/gateway_client.py)
 在其上把 payload 校验成 channel 使用的 DTO，并把 transport/protocol failure 转
 为 `GatewayClientError`。因此 client/transport 不拥有 command effect 或 route
 recovery。
 
-## 严格且有界的 JSON transport
+## 严格且有界的 JSON response transport
 
 [`gateway_protocol/contracts.py`](../../src/ruyi_agent/gateway_protocol/contracts.py)
-定义 wire-wide limits；当前关键边界是：成功 JSON body 最大 8 MiB，错误 body 最大
-64 KiB，JSON read timeout 5 秒，nesting 最大 100，gateway error text 最大 4096
-字符，error details 最大 64 KiB。各类 event data、lifecycle、review、artifact
-列表和 delta 还有更小的独立 budgets；`assistant.delta` 单段最大 32 KiB，pending
-transient delta 队列默认最多 256 项。
+中的若干常量被 protocol、server/service 和 ledger 复用，但这里的主要边界是
+`GatewayHTTPTransport` 消费 JSON response/error 时的边界：成功 JSON body 最大
+8 MiB，错误 body 最大 64 KiB，JSON read timeout 5 秒，nesting 最大 100，gateway
+error text 最大 4096 字符，error details 最大 64 KiB。它们不是统一的 request-body
+cap；当前也没有把 `TaskInput.content`、`AttachmentInput.data_base64`
+或 `ArtifactDownloadRequest.path` 限成统一字符数。各类 event data、lifecycle、
+review、artifact 列表和 delta 还有各自由 projection/ledger/server 执行的 budgets；
+`assistant.delta` 单段最大 32 KiB，pending transient delta 队列默认最多 256 项。
 
-`GatewayHTTPTransport` 以 streaming read 为基础，在读取 `max+1` bytes 后拒绝
-超限；会检查 sane `Content-Length`，严格解码 UTF-8，拒绝非法 JSON、NaN/Infinity、
-过深对象和未满足 object payload contract 的成功响应。超时、连接失败、非 JSON
-错误和错误状态分别映射到 transport exception，且 response 在成功、错误和异常路径
-都会关闭。错误规范化会替换 surrogate、截断文字，并只保留有界 JSON primitive/list/
-dict。HTTPX 的压缩响应不绕过这些界限；SSE handshake 有单独的有界 timeout，建立
-后由 stream lifecycle 管理长连接。
+`GatewayHTTPTransport` 以 streaming read 为基础，在消费 JSON response/error 时读取
+`max+1` bytes 后拒绝超限；会检查 sane `Content-Length`，严格解码 UTF-8，拒绝非法
+JSON、NaN/Infinity、过深对象和未满足 object payload contract 的成功响应。超时、
+连接失败、非 JSON 错误和错误状态分别映射到 transport exception，且 response 在
+成功、错误和异常路径都会关闭。错误 details 的 bounded normalization（替换
+surrogate、截断文字、只保留有限 JSON primitive/list/dict）是客户端消费边界；它
+不构成 server 的统一 request validation。HTTPX 的压缩 JSON response 不绕过这些
+边界；SSE handshake 有单独的有界 timeout，建立后由 stream lifecycle 管理长连接。
 
 这套限制同时适用于 A2A 下游，因为
 [`integrations/a2a/client.py`](../../src/ruyi_agent/integrations/a2a/client.py)
-复用 `GatewayProtocolClient`；channel artifact client 还可按自身媒体预算拒绝过大
-的 raw download。二进制 artifact 本身不走 JSON decoder，但路径请求和所有错误仍
-经过同一套严格/有界边界。
+复用 `GatewayProtocolClient`；channel artifact client 只有在调用方配置
+`max_download_bytes` 时才按该媒体预算拒绝过大的 raw download，未配置时没有默认
+读取上限。二进制 artifact 本身不走 JSON decoder；其 decoded/下载大小限制属于
+server/service 或显式的 channel media policy，路径请求和 JSON error response 仍按
+各自的 DTO/response 边界处理。
 
 ## Task-event SSE：snapshot、resume 与生命周期
 
@@ -193,26 +210,33 @@ dict。HTTPX 的压缩响应不绕过这些界限；SSE handshake 有单独的�
 [`cursor.py`](../../src/ruyi_agent/gateway_protocol/cursor.py) 和
 [`runtime/task_event_ledger.py`](../../src/ruyi_agent/runtime/task_event_ledger.py)
 共同实现。SSE `Last-Event-ID` 是不透明、版本化且有界的 cursor，内部绑定 public
-task、run 和正整数 durable event id；调用者不能构造或解释它。
+task、run 和正整数 durable event id（在 local ledger 上）。调用方必须将 cursor 当作
+opaque，不应解释、依赖编码或自行拼接；但当前 versioned/base64 表示在技术上并非
+不可构造，服务端仍会执行格式和绑定校验。remote proxy 透传下游 cursor，只按相应
+的 event-id shape 边界验证；event data 的 task/run identity 另行校验，不重编码
+cursor 为 public identity。
 
 一次 stream 的流程是：
 
 1. bearer/API session 通过认证，校验 `run_count` 和可选的 `Last-Event-ID`。
 2. service/router 验证 task、route 和 run binding，打开 ledger subscription。
-3. 新 stream 发送带 durable anchor cursor 的 `task.snapshot`，随后按 durable 顺序
-   发 lifecycle/artifact event，并尽力插入 transient delta。
+3. 新 stream 从 durable anchor/current Task projection 合成并发送带 anchor cursor 的
+   `task.snapshot`，随后按 durable 顺序发 lifecycle/artifact event，并尽力插入
+   transient delta；snapshot 不作为 resume 时重复发送的记录。
 4. 无 event 时发送 `: heartbeat` comment；heartbeat 没有 event name、event id 或
    replay 语义。
 5. 正常终止发送无 id 的 `stream.end`；终止原因与最新 lifecycle state 一致。读取、
    编码或下游 stream 出错时先发一个 `stream.error`，再紧邻发送
    `stream.end(reason=error)`。
 
-恢复使用 `Last-Event-ID` 从 durable ledger 继续，不重新发送 snapshot；cursor 绑定
-错误、run mismatch、格式/大小非法时拒绝。若客户端恢复的是已经结束且当前 run 已
-推进的旧 run，ledger 可重放该历史 durable backlog，最后以 `superseded` 结束；新开
-stream 若 run 不匹配则直接报告错误。远端 A2A stream 也必须遵守这一 fresh/resume
+local resume 使用 `Last-Event-ID` 从 durable ledger 继续，不重新发送 snapshot；local
+cursor 绑定错误、run mismatch、格式/大小非法时拒绝。remote proxy 不在本地重解码或
+重编码 downstream cursor，而是把它透传给下游；若 local client 恢复的是已经结束且
+当前 run 已推进的旧 run，ledger 可重放该历史 durable backlog，最后以 `superseded`
+结束；新开 stream 若 run 不匹配则直接报告错误。远端 A2A stream 也必须遵守这一 fresh/resume
 规则：fresh 首个 event 必须是 snapshot，resume 不得包含 snapshot；下游 event data
-中的 task id 经验证后才重写为 public task id。下游 event id/cursor 只作为已验证的
+中的 task id 经验证后才重写为 public task id。下游 event id/cursor 仅按 event-id
+shape validation 后作为
 不透明值透传以支持下游 resume，不在 proxy 中解码或重编码成 public identity；它不能
 被调用者当作 task id，也不能让普通 event data 泄露 upstream identity。
 
@@ -220,8 +244,8 @@ durability 和 backpressure 的分界如下：
 
 | event | durable / cursor | 用途 |
 | --- | --- | --- |
-| lifecycle（created/running/review requested/completed/failed/cancelled/interrupted） | ledger 中有序保存并可 replay | Task 状态事实 |
-| `task.snapshot`、`task.artifact_published` | 与 durable anchor/record 关联，可恢复 | 新连接的当前投影和 artifact 变更 |
+| lifecycle（created/running/review requested/completed/failed/cancelled/interrupted）与 `task.artifact_published` | ledger 中有序保存并可 replay | Task 状态事实和 artifact 变更 |
+| `task.snapshot` | fresh stream 从 durable anchor/current projection 合成，携带 anchor cursor；不在 resume replay，也不是单独的 ledger replay record | 新连接的当前投影 |
 | `assistant.delta` | transient、无 event id、进程内 best-effort | 实时 UI 增量；慢 subscriber 满队列时可丢弃 |
 | `stream.error`、`stream.end` | 控制帧、无 durable cursor | 本次连接的错误/生命周期收束 |
 
@@ -248,17 +272,22 @@ artifact metadata 在普通 Task/Review response 中由 `GatewayProjection` 投�
 下载成功是 raw binary，不把文件内容塞进 DTO；content type、经过清理的 filename、
 `X-Artifact-Path` 和 task-scoped `X-Artifact-Id` 帮助调用者传递媒体。绝不信任用户
 提供的 `..`、斜杠、反斜杠、控制字符或未授权 workspace path。任何 path、artifact
-not found、too large 或 backend failure 都回到统一 bounded JSON error envelope。
+not found、too large 或 backend failure 都回到统一 JSON error envelope；client
+transport 消费该 error response 时才应用 bounded body/normalization 边界。
 
 ## Channel 与 A2A callers
 
-channel runner 在
-[`entrypoints/main.py`](../../src/ruyi_agent/entrypoints/main.py) 中配置 Gateway
-base URL/bearer，使用 `GatewayHTTPClient`；Telegram/Feishu adapter 通过
+Telegram/Feishu runner 分别在
+[`channels/telegram/runner.py`](../../src/ruyi_agent/channels/telegram/runner.py) 和
+[`channels/feishu/runner.py`](../../src/ruyi_agent/channels/feishu/runner.py) 中配置
+Gateway base URL/bearer 并构造 `GatewayHTTPClient`；CLI/entrypoint 只负责启动这些
+runner（入口见 [`entrypoints/main.py`](../../src/ruyi_agent/entrypoints/main.py)）。
+Telegram/Feishu adapter 通过
 [`ChannelTurnHandler`](../../src/ruyi_agent/channels/turn.py) 消费
-`GatewayTaskClient`，接收已验证的 Gateway DTO，不直接 import httpx、runtime、
-storage 或 SSE codec。channel 自己持久化 session、receipt 和 delivery；Gateway
-task idempotency 不能替代外部消息发送的 receipt/dedup 语义。
+`GatewayTaskClient`，接收由 client/consumer 校验的 Gateway DTO，不直接操作
+Gateway/runtime store，也不直接使用 httpx transport 或 SSE codec internals。adapter
+可以访问自己的 channel session、receipt 和 delivery store；这些状态由 channel
+自己持久化，Gateway task idempotency 不能替代外部消息发送的 receipt/dedup 语义。
 
 远程 route 的 A2A client 使用同一 HTTP route contract（通常是下游挂载的 `/a2a`）
 调用 create/get/messages/events/input/cancel/review，bearer 从
@@ -293,8 +322,9 @@ cookie。
 带 `no-store`、same-origin CORP、same-origin Referrer-Policy、`nosniff`、`DENY` frame
 保护；页面 CSP 限制脚本/样式/connect/img/font 为 self，并禁止 base/form/frame
 外流。marker 成功认证的 business response 也会由
-[`console_routes.py`](../../src/ruyi_agent/channels/http/console_routes.py) 配套的
-middleware 标成 `Cache-Control: no-store`。这些约束防止 bearer、debug 数据和
+[`team_console_auth.py`](../../src/ruyi_agent/channels/http/team_console_auth.py) 中的
+middleware（由 [`routes.py`](../../src/ruyi_agent/channels/http/routes.py) 挂载）标成
+`Cache-Control: no-store`。这些约束防止 bearer、debug 数据和
 console session 被浏览器缓存、跨源嵌入或通过错误页面传播，但不把 Team Console
 升级为通用用户认证体系。
 
@@ -307,9 +337,11 @@ console session 被浏览器缓存、跨源嵌入或通过错误页面传播，�
   在跨 Gateway 时验证并仅重写允许的 event-data 顶层 identity，remote cursor 保持
   opaque 以便下游恢复。local SSE cursor 按 task/run/event 绑定，message cursor 按
   task/checkpoint/offset 绑定，二者都不能跨任务挪用。
-- JSON、SSE line/event、text、delta、review、artifact metadata 和 raw media 都有
-  上限；这同时限制内存、解析深度、连接握持和错误回显。所有长连接在结束、异常、
-  取消和断开路径关闭 response/subscription。
+- JSON response/error、SSE line/event、projection text/delta/review/artifact metadata
+  等各有相应上限；这些不构成统一 request-body 或 raw-media 上限。decoded attachment/
+  artifact 由 server/service policy 限制，raw artifact client 只有显式配置
+  `max_download_bytes` 才有客户端媒体上限。所有长连接在结束、异常、取消和断开
+  路径关闭 response/subscription。
 - route state 是 `pending`、`active`、`failed` 或 `uncertain`；只有 active route
   接受依赖 task 的操作。Task state 是 pending/running/waiting_for_human/
   completed/failed/cancelled/interrupted；terminal lifecycle 进入 durable ledger。
@@ -347,8 +379,10 @@ console session 被浏览器缓存、跨源嵌入或通过错误页面传播，�
 - 路由挂载、bearer/probe、status/error envelope、公共 header、DTO 或 JSON limits；
 - Task-event 类型、durability、snapshot/resume/cursor、heartbeat、delta backpressure、
   remote sanitizer 或 stream cleanup；
-- command idempotency、effect disposition、route state/recovery、A2A capability 或
-  channel `GatewayTaskClient` contract；
+- command idempotency、effect disposition、route state/recovery 或 A2A capability
+  只有在影响 wire-visible retry/error/effect semantics、public query identity 或
+  `GatewayTaskClient` contract 时才触发同步；纯内部状态/算法变化归未来的 Gateway
+  control-plane 文档；
 - artifact workspace/path、download headers、content limits；
 - Team Console 登录、signed cookie、marker、same-origin/transport、CSP、no-store 或
   静态资源边界；
