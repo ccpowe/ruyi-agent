@@ -62,7 +62,9 @@ CLI
 平台 client 的 inbound callback 是 adapter 的直接调用方：Telegram 的轮询循环
 取得一批 update 后调用 `handle_message`，Feishu 的 WebSocket 回调解析消息后
 调用 `handle_message`。两个 adapter 随后共用
-[`ChannelTurnHandler`](../../src/ruyi_agent/channels/turn.py)、
+[`ChannelTurnHandler`](../../src/ruyi_agent/channels/turn.py)，其中普通消息进入
+`handle`，review command、`/agent`、`/resume` 分别进入同一 handler 的
+`handle_review`、`handle_agent_command`、`handle_resume_command` 专用方法；
 [`TaskWatchManager`](../../src/ruyi_agent/channels/task_watch.py) 和
 [`ChannelDeliveryCoordinator`](../../src/ruyi_agent/channels/presentation.py)。
 
@@ -112,8 +114,10 @@ agent 的 Task 当成另一个 agent 的上下文：
 
 ## Turn 选择
 
-所有平台都进入同一个 [`ChannelTurnHandler.handle`](../../src/ruyi_agent/channels/turn.py)，
-差异只在事件和发送能力。选择顺序如下：
+所有平台的普通消息都进入同一个
+[`ChannelTurnHandler.handle`](../../src/ruyi_agent/channels/turn.py)，差异只在事件
+和发送能力；review command、`/agent`、`/resume` 由同一 handler 的专用方法处理。
+选择顺序如下：
 
 | 结果 | 条件 | Channel 动作 |
 | --- | --- | --- |
@@ -132,6 +136,11 @@ metadata 查询最近候选；找不到才走 `create`。`before_continue` 保�
 `telegram:update:<update_id>`，Feishu 使用
 `feishu:event:<event_id 或 message_id>`。这使平台事件重试时，Gateway 自己的
 command 幂等边界仍可生效；Channel 不因此拥有 Gateway command store。
+
+普通 `InboundTurn` 的 turn receipt 只覆盖 `create`/`input`（存储层 operation 为
+`create`/`send`）。`/agent` 带首条消息时只把平台事件 key 传给 Gateway 的 create
+command，不读写 turn receipt；`/agent` 无首条消息、`/resume` 和 review command
+也不使用 turn receipt。
 
 ## 三类 Channel 状态
 
@@ -175,12 +184,14 @@ Task 已完成，也不表示平台 outbound message 已发送。
                               同 key + 不同请求/会话/平台 ────────> conflict
 ```
 
-adapter 在选择 create/input 之前先查 receipt。Gateway 返回成功后，receipt 保存
+对于普通 `InboundTurn`，adapter 在选择 create/input 之前先查 receipt。Gateway 返回成功后，receipt 保存
 请求 hash、operation、Task id 和可重放 response；随后同事件再次到达时直接返回
 该 response，不重复选择或调用 Gateway。不同请求复用同 key 抛出
-`ChannelTurnIdempotencyConflictError`。receipt 解决的是“Gateway effect 已提交、
-但平台 event receipt 还未 processed”的窗口；它不把未知的外部发送结果变成
-exactly-once。
+`ChannelTurnIdempotencyConflictError`。receipt 保护的是“session binding 与 turn
+receipt 已提交、但 platform event receipt 尚未 processed”时的重试。Gateway effect
+已完成到 turn receipt 提交之间的窗口，依靠同一个 Gateway idempotency key 与
+Gateway command store 处理，不是 turn receipt 自身的保证；它也不把未知的外部
+发送结果变成 exactly-once。
 
 ### 3. Delivery intent 与 step：投递 Task observation
 
@@ -206,8 +217,13 @@ exactly-once。
 - `terminal:<run_count>:artifact:<artifact_id>`；
 - 可选的 `terminal:<run_count>:delivered-hook`。
 
-每次外部 effect 的顺序是“检查 step marker → 调用平台 send/upload → 成功后写
-marker”。外部发送与 marker 写入不是一个原子事务：平台已经接受消息而进程随后
+只有由 Task watch 驱动的 review、terminal、artifact 和 delivered hook 才使用
+`ChannelDeliveryStore` 的 durable intent/step，并纳入下文的恢复保证。accepted/
+running ack、命令回复，以及普通消息因已有 pending review 而直接返回的 review
+回复，都是即时平台回复，不创建可恢复的 delivery step。
+
+每次这类 durable delivery 外部 effect 的顺序是“检查 step marker → 调用平台
+send/upload → 成功后写 marker”。外部发送与 marker 写入不是一个原子事务：平台已经接受消息而进程随后
 崩溃、超时或 lease 丢失时，重试可能再次发送。因而 Channel 只承诺跳过已有的
 durable step marker，不承诺跨进程、崩溃或网络边界的绝对去重；使用方必须容忍
 重复消息/文件。
@@ -251,9 +267,10 @@ published artifacts；所有步骤成功后才进入 `terminal_grace`，grace �
 不会混入本次投递。
 
 平台格式化、分片、markdown fallback、文件上传和 reaction/ack 是 adapter hook：
-它们不改变 Gateway Task 状态。Telegram 失败的 MarkdownV2 发送可退回纯文本，
-Feishu 失败的 interactive markdown 可退回文本；这类 fallback 仍属于一次外部
-effect，marker 只在 hook 成功后记录。
+它们不改变 Gateway Task 状态。accepted/running ack、命令回复和普通消息的直接
+pending-review 回复是即时发送；在 watch 驱动的 durable delivery 中，Telegram
+失败的 MarkdownV2 发送可退回纯文本，Feishu 失败的 interactive markdown 可退回
+文本，这类 fallback 仍属于一次外部 effect，marker 只在 hook 成功后记录。
 
 ## 平台差异矩阵
 
@@ -301,9 +318,9 @@ effect，marker 只在 hook 成功后记录。
 
 | 故障 | 结果与恢复 |
 | --- | --- |
-| 平台 inbound handler 在 event receipt 后失败 | 普通失败 release claim；取消时可能保留 lease 到期（Feishu 对清理做 shield，Telegram 依赖过期 reclaim）；Telegram 保留 offset，Feishu 由平台重投，随后可重新 claim |
+| 平台 inbound handler 在 event receipt 后失败 | 普通失败 release claim；取消时可能保留 lease 到期（Feishu 对清理做 shield，Telegram 依赖过期 reclaim）；Telegram 保留 offset；Feishu 若平台重投或同一事件再次到达，则可重新 claim |
 | event claim 过期或旧实例恢复 | 新 owner 可 reclaim；旧 token 被拒绝，不能覆盖新结果 |
-| Gateway create/input 调用失败 | turn 不写成功 receipt；平台事件可重试，已带 key 的 Gateway command 负责其自身 effect 判定 |
+| Gateway create/input 调用失败 | 普通 turn 不写成功 receipt；平台事件可重试，已带 key 的 Gateway command 负责其自身 effect 判定 |
 | Gateway get_task 暂时不可用 | watch 采用 bounded retry；耗尽后 delivery intent 记录 `error`，可由持久 redrive/重启恢复 |
 | 平台 send/upload 失败 | delivery step 不写 marker；本轮按 TaskWatch 的 bounded retry 处理，重启/显式重新 ensure 可恢复；若外部结果不确定，重试可能重复 |
 | lease 在外部发送期间丢失 | heartbeat/fence 让旧 owner 失败；新 owner 可恢复未标记 step，但不能证明旧 send 未被平台接受 |
