@@ -291,8 +291,11 @@ Gateway/runtime store，也不直接使用 httpx transport 或 SSE codec interna
 
 远程 route 的 A2A client 使用同一 HTTP route contract（通常是下游挂载的 `/a2a`）
 调用 create/get/messages/events/input/cancel/review，bearer 从
-remote reference 指定的环境变量取得。它验证下游 DTO/SSE、转发经声明支持的
-idempotency key，并把 public task id 与 upstream task id 分开保存。当前 A2A client
+remote reference 指定的环境变量取得。transport 对成功 JSON 只保证解码结果是 object；
+Task identity/state 由 runtime/Gateway consumer 进一步验证，SSE 则由 codec/router
+约束 shape 与 public projection。它可转发显式传入的 inbound `Idempotency-Key`；声明
+并验证 `ruyi_gateway_v1`/create capability 时，create workflow 在无 external key 时
+生成稳定 downstream key，并据此决定 lost-response 后能否安全 replay。当前 A2A client
 没有远端 artifact download 操作；artifact binary transport 属于各 Gateway 自己的
 HTTP artifact endpoint。内部 worker
 delegation 是另一条 runtime path，不应被描述成 channel 或远端普通 API caller。
@@ -335,8 +338,9 @@ console session 被浏览器缓存、跨源嵌入或通过错误页面传播，�
   upstream public id。
 - public task id、upstream task id、run_count 和 cursor 各自有边界；router/codec
   在跨 Gateway 时验证并仅重写允许的 event-data 顶层 identity，remote cursor 保持
-  opaque 以便下游恢复。local SSE cursor 按 task/run/event 绑定，message cursor 按
-  task/checkpoint/offset 绑定，二者都不能跨任务挪用。
+  opaque 以便下游恢复。local SSE cursor 按 task/run/event 绑定；local message cursor
+  按本地 task/checkpoint/offset 绑定。proxied remote message cursor 保留为 downstream
+  opaque 值，不在本地解码或重新绑定 public task；local cursor 不能跨任务挪用。
 - JSON response/error、SSE line/event、projection text/delta/review/artifact metadata
   等各有相应上限；这些不构成统一 request-body 或 raw-media 上限。decoded attachment/
   artifact 由 server/service policy 限制，raw artifact client 只有显式配置
