@@ -219,8 +219,10 @@ settled (completed|failed|cancelled|interrupted)
    `TaskAlreadyRunningError`，第二个 payload 不会执行。
 5. supervisor 先创建一个由 release event 门控的 run task，再调用
    `TaskManager.mark_running` 写入状态/event，成功后才释放 payload。若 Task/event
-   写入失败，会取消并回收该 run handle；Task 保持原来的 `pending` 与
-   `run_count=0`，payload 不会被执行。
+   写入失败，会取消并回收该 run handle，并恢复 `mark_running` 调用前受保护的
+   Task/review/live-handle 快照；首次 spawn 的快照才是 `pending` 与 `run_count=0`，
+   settled follow-up 保留原 settled 状态，review resume 保留 `waiting_for_human` 及
+   pending review，payload 不会被执行。
 
 `TaskRuntime` 负责决定调用哪个 component，`RunSupervisor` 只负责 admission 与
 生命周期安全，`TaskManager` 只负责状态写入。这个分工避免“Agent 已经开始但
@@ -425,16 +427,19 @@ cleanup 仍会完成，下一次 close 可等待同一结果。这保证 Task �
 跨 repository 的同库写入。下列操作可以在同一个 TaskStore SQLite UoW 内原子提交：
 
 - `insert_task_with_event`：新 Task row 与首个 lifecycle event；
-- `update_task_with_event`：Task row 与对应 lifecycle event；可选的同库写入仍只
-  属于 TaskStore 事务，不扩大为跨数据库原子性；
+- `update_task_with_event`：Task row 与对应 lifecycle event；启用 durable settlement
+  时，settlement intent 也在同一个 SQLite UoW 插入，intent 插入失败会与 row/event
+  一起 rollback；
 - `update_review_transition`：owner Task、pending review、root compatibility
   projection 与事件；
 - 事件 append 与其参与的 Task identity 检查。
 
 因此 event append 失败时，Task row 不会单独留下新状态；review transition 失败时，
 owner/root/review 也不会留下部分更新。`mark_running` 的 admission 写失败时，run
-不会越过 schedule 的 release gate 执行。TaskStore 的单元测试也直接证明了更新与
-event append 的 rollback，以及 review transition 的 rollback；见
+不会越过 schedule 的 release gate 执行。只有由 `_review_memory_transaction` 保护的
+Task state/review/live-handle transition 才同时恢复进程内快照；通用 UoW（例如
+`add_artifact`）不承诺这一内存回滚。TaskStore 的单元测试也直接证明了更新与 event
+append 的 rollback，以及 review transition 的 rollback；见
 [`test_task_store.py`](../../tests/unit/test_task_store.py)。
 
 ### 明确不是跨库事务
@@ -447,8 +452,9 @@ event append 的 rollback，以及 review transition 的 rollback；见
 - `AsyncSqliteSaver` 的 LangGraph checkpoint DB 与 TaskStore 分离。Agent 调用中
   checkpoint 写入和 Task lifecycle event/row 没有跨库 two-phase commit；它们按各自
   的失败、恢复和 projection 边界处理；
-- channel delivery、mailbox、settled outbox、Gateway command claim 等各自拥有
-  自己的 durable 边界，不能被“TaskStore UoW 原子”笼统覆盖。
+- Gateway command claim、channel delivery 以及提交后的 outbox dispatch、mailbox
+  delivery、wakeup 都在 TaskStore UoW 之外；启用 durable settlement 时，只有
+  settlement intent 的插入属于上面的同库原子写入，后续投递是非权威尾部效果。
 
 这一区分意味着：`Task row + lifecycle event` 可原子，不意味着 `route + Task +
 checkpoint + 外部 side effect` 可原子。对可能已经发出的 remote effect，runtime
@@ -462,7 +468,7 @@ runtime 的错误先按是否影响 Task authority 分类：
 | 失败位置 | Task 行为 |
 | --- | --- |
 | admission 关闭、permit 非法、同 Task 已运行 | 直接拒绝；不启动 payload，不改变已有 Task（除已经明确 admission 的清理） |
-| Task row/event/review UoW 写入失败 | 对应 SQLite UoW rollback；内存 Task/review/live-handle 按事务快照恢复；`mark_running` 的 admission 写失败时，run payload 不越过 release gate |
+| Task row/event/review UoW 写入失败 | 对应 SQLite UoW rollback；仅由 `_review_memory_transaction` 保护的 Task state/review/live-handle transition 恢复进程内快照，通用 UoW（如 `add_artifact`）不承诺；`mark_running` 的 admission 写失败时，run payload 不越过 release gate |
 | local Agent 执行异常且 Task 仍 `running` | 规范化异常摘要，提交 `failed` lifecycle event |
 | 一个 run 被显式 cancel | 提交 `cancelled` lifecycle event |
 | 一个 run 被被动取消或 runtime 重启/关闭 | 提交 `interrupted` lifecycle event；远端 unresolved operation 另保留 uncertain marker |
