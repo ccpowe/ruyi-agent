@@ -66,8 +66,8 @@ mailbox。若使用非 durable compatibility mailbox，settled notifier 的 dire
 ```text
 Task input:
 caller -> publish_input/persistent row -> triggering wakeup
-       -> claim(owner/token/lease) -> before_model injection
-       -> graph invocation returns -> acknowledge_task
+       -> claim(owner/lease) -> before_model injection
+       -> graph invocation succeeds -> acknowledge_task
 
 Child settlement:
 child Task state + lifecycle event + outbox intent (one TaskStore UoW)
@@ -120,8 +120,11 @@ run 结束时，`on_run_finished` 还会排一个受 supervisor 管理的 mainte
 SQLite `BEGIN IMMEDIATE` 事务中释放已过期 claim，按创建序选择 pending rows，写入
 当前 owner、随机 claim token、claimed time 和 expiry，再返回这一 token 所属的行。
 recipient Task 精确匹配；没有 `recipient_task_id` 的兼容 row 才按
-`recipient_thread_id` 兜底。两个 store connection 并发 claim 时只有一个能成功，
-旧 owner/token 不能代替新 owner 完成确认。
+`recipient_thread_id` 兜底。两个 store connection 并发 claim 时只有一个能成功。
+普通 input 的 `acknowledge`/`acknowledge_task` 不接收或比较 `claim_token`，只按
+当前 MailboxStore owner（`claimed_by`）和 message/recipient fence 更新；因此同一
+owner 的 stale bulk ack 仍可能确认它当前持有的 claims。claim token fencing 只用于
+settled outbox publish；跨 owner 的 input ack 由 `claimed_by` fence 限制。
 
 [`MailboxMiddleware`](../../src/ruyi_agent/runtime/middleware/mailbox.py) 的
 `before_model`/`abefore_model` 从 LangGraph configurable context 取得当前
@@ -136,12 +139,17 @@ claim 只代表暂时占有，不能单独算作已消费。
 stateDiagram-v2
     [*] --> pending: publish_input commit
     pending --> claimed: before_model claim
-    claimed --> delivered: graph invocation returns
-    claimed --> pending: run error / process loss / lease expiry
+    claimed --> delivered: graph invocation succeeds; ack
+    claimed --> claimed: same-process run error / cancel; no auto release
+    claimed --> pending: owner disappears/restarts; old lease expires
     pending --> claimed: retry or wake at next boundary
     note right of pending
       trigger_run=1 才会唤醒 idle Task
       duplicate idempotency key 不新增 row
+    end note
+    note right of claimed
+      recover_claims 会续租当前 owner 的 claims
+      同进程失败不会自动重投
     end note
 ```
 
@@ -149,14 +157,20 @@ stateDiagram-v2
 
 `LocalTaskExecutor.execute` 只有在 Agent graph invocation 正常返回后才调用
 `acknowledge_task(task_id, thread_id)`；它确认当前 MailboxStore owner 对该
-recipient 的 claims。模型调用抛错、进程崩溃或 ack 前取消时，row 保持 claimed，
-待 lease 到期后回到 pending；下一轮可再次注入。runtime 的 Task failed/interrupted
-写入和 mailbox ack 不是同一个跨对象事务：即使 ack 已提交，之后的 Task outcome
-normalization 或 lifecycle 写入仍可能失败，反之亦然。
+recipient 的 claims。模型调用在同一进程抛错、取消或在 ack 前退出时，不会自动
+release 或重新 claim，row 保持 claimed；维护循环中的 `recover_claims` 还会续租
+当前 store owner 的 claims，这个恢复缺口可能持续。只有 owner 消失/重启，使旧
+lease 到期并由新 owner 接管后，row 才可回到 pending 并再次注入。后续 recipient
+run 的 bulk `acknowledge_task` 只按 owner/recipient fence，且不比较旧 token，因而
+可能把尚未在该次 run 重新注入的旧 claim 标为 delivered；不能承诺自动重投或自动
+恢复。runtime 的 Task failed/interrupted 写入和 mailbox ack 不是同一个跨对象事务：
+即使 ack 已提交，之后的 Task outcome normalization 或 lifecycle 写入仍可能失败，
+反之亦然。
 
 `MailboxStore.recover_claims` 在维护循环中延长本进程仍持有的 live claims，并释放
-已经过期的 claims；重启后的新 owner 不会冒充旧 token，过期后才重新取得 row。
-因此可恢复依据是 mailbox row/status/lease，不是进程内的 asyncio handle。
+已经过期的 claims；重启后的新 owner 不会冒充旧 owner，必须等旧 lease 到期后才
+重新取得 row。因此可恢复依据是 mailbox row/status/lease，不是进程内的 asyncio
+handle；恢复扫描也不会把同进程 run error/cancel 推断成可立即重投。
 
 ## 流程二：child settlement 到 parent mailbox
 
@@ -203,10 +217,17 @@ stateDiagram-v2
     outbox_delivered --> outbox_suppressed: later wait/check
     outbox_suppressed --> outbox_suppressed: retraction reconciliation
 
+    state "parent mailbox pending/claimed" as mailbox_live
+    state "parent mailbox delivered (parent ack)" as mailbox_acked
+    state "parent mailbox retracted" as mailbox_retracted
+    outbox_delivered --> mailbox_live: publish commit
+    mailbox_live --> mailbox_acked: parent acknowledge
+    mailbox_live --> mailbox_retracted: suppression/reconcile
+
     note right of outbox_delivered
-      parent mailbox row 已持久化
+      publish 后 parent row 通常仍为 pending
       child.mailbox_delivered=1
-      不等于 parent 已读
+      不等于 parent 已 ack
     end note
 ```
 
@@ -228,7 +249,9 @@ external operation。核验通过后，它会按 deterministic idempotency ident
 插入 parent mailbox row，同时把 outbox 设为 `delivered`、清空 lease，并把 child
 Task 的 `mailbox_delivered=1` 写入；这些写入彼此原子。token 过期、被 fence 或
 suppression 已先提交时，publish 返回 false，不产生新的 authoritative mailbox
-delivery。
+delivery。新建的 parent row 从 `pending` 开始，通常要等 parent 后续
+acknowledge 才成为 mailbox `delivered`；child 的 `mailbox_delivered=1` 只是已写入
+mailbox 的镜像，不是 parent 已读或已 ack。
 
 publish transaction 成功后，notifier 只把 `mailbox_delivered` 镜像到当前内存记录，
 再检查该 parent row 是否仍是 pending triggering input。它返回需要唤醒的
@@ -250,8 +273,10 @@ identity 的 thread-only row 仍可被 parent thread claim，但没有定向 Tas
 - 将同一 child/run 的 mailbox row 中仍为 pending/claimed 的记录标为 retracted，
   并记录 outbox 的 retraction watermark。
 
-后续 dispatch 会因 Task/outbox suppression 检查失败而被 fence。已经是 delivered 的
-parent mailbox row 不会被伪造为未发送；它保持 delivered，而 suppressed outbox 的
+后续 dispatch 会因 Task/outbox suppression 检查失败而被 fence。即使 publish transaction
+已经提交，只要 parent row 尚未被 parent ack、仍为 pending/claimed，后续 suppression
+仍可把 outbox 改为 suppressed 并将该 row retract。已经是 parent acked `delivered`
+的 mailbox row 不会被伪造为未发送；它保持 delivered，而 suppressed outbox 的
 retraction reconciliation 只确认这项抑制已经收尾。`SettledRunNotifier.reconcile`
 和 `MailboxStore.retract_settled_outbox` 负责补齐尚未撤回的 pending/claimed rows；
 旧的非 outbox 兼容 row 也由 `mailbox.retract` 按 parent thread、child task 和
@@ -286,9 +311,9 @@ dispatch、reconcile 和 wakeup 是提交后的非权威 tail。它们超时、�
 | Task settled UoW 中 event 或 intent 写失败 | Task row、lifecycle event、intent 一起 rollback；不会留下一个可 dispatch 的 settled intent |
 | outbox 已 claim，dispatch 前进程失败 | claim 到期后回到 pending；新的 owner 取得不同 token。显式 release 失败也不改变这一恢复路径 |
 | mailbox publish 写入失败 | same-DB transaction rollback，outbox 仍是 claimed；notifier 尝试 release，之后由 lease/reconcile 重试 |
-| publish transaction 已提交但 wakeup 未运行 | mailbox row、outbox delivered 和 child `mailbox_delivered=1` 已存在；pending trigger 扫描会再次唤醒 recipient |
-| parent claim 后模型调用/进程失败 | claim lease 到期后可再次注入；模型调用或工具效果可能重复，不能称 exactly-once |
-| wait/check 与 dispatch 竞争 | 先提交的一方由同库 suppression/token 检查决定；suppression 胜出时 stale publish 返回 false，publish 胜出时已 delivered row 不被伪造撤销 |
+| publish transaction 已提交但 wakeup 未运行 | mailbox row、outbox delivered 和 child `mailbox_delivered=1` 已存在；新 row 通常仍 pending，pending trigger 扫描会再次推进 recipient。parent ack 前的 pending/claimed row 仍可被 suppression retract |
+| parent claim 后模型调用/进程失败 | 同进程 error/cancel 不会自动 release/reclaim；`recover_claims` 可能续租当前 owner 的 claim。只有 owner 消失/重启且旧 lease 到期后新 owner 才可 reclaim；后续 bulk ack 可能在未再次注入时确认旧 claim，不承诺自动恢复 |
+| wait/check 与 dispatch 竞争 | suppression 先提交时 stale publish 返回 false；publish 先提交时，后续 suppression 仍可把 outbox 改为 suppressed 并 retract 尚未 parent-acked 的 pending/claimed row；只有已 parent-acked 的 delivered row 保持 delivered |
 | remote external operation 未证明 effect | 本地保留 operation identity 与 uncertain marker，不创建/发布新的 authoritative settlement；只有 refresh/权威 payload 证明 effect 后才清除 marker、同步状态并生成相应 intent |
 
 其中 TaskStore 与 MailboxStore 的“同库”只使上表的 same-DB publish/suppression
@@ -313,8 +338,10 @@ interruption，之后才按 bootstrap 的反向创建顺序关闭 `MailboxStore`
 
 ### 安全约束
 
-- claim owner、token、expiry 和每个 outbox 的 deterministic identity 防止过期
-  worker 覆盖新 owner；recipient Task/thread matching 也不能被旧 token 绕过。
+- input claim 的 owner、expiry 和 recipient Task/thread matching 限制跨 owner 的
+  确认；input ack 不接收或比较 claim token，同一 owner 的 stale bulk ack 仍须按上文
+  边界理解。settled outbox 才用 claim token fencing，加上 deterministic identity，
+  防止过期 worker 覆盖新 owner。
 - mailbox content 会被作为 model input 注入，应按不可信的跨 agent/user 内容处理；
   sender 字段是上下文身份，不是 authorization grant。调用方能否访问 parent/child
   由 delegation/Gateway 边界另行校验。
