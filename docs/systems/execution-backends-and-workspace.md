@@ -84,9 +84,10 @@ deepagents 的 `BackendProtocol` 是 runtime 使用的文件 backend 契约。�
 `ls`、`read`、`grep`、`glob`、`write`、`edit`、`upload_files` 和
 `download_files`，以及对应的异步包装；文件方法的输入是 backend path，批量
 upload/download 的结果按输入顺序返回 `FileUploadResponse` 或
-`FileDownloadResponse`。后两者用 `error` 表示 `file_not_found`、`permission_denied`、
-`is_directory`、`invalid_path` 等标准错误，bytes 成功时放在
-`FileDownloadResponse.content`。
+`FileDownloadResponse`。后两者对已翻译的文件失败用 `error` 表示
+`file_not_found`、`permission_denied`、`is_directory`、`invalid_path` 等标准错误，
+bytes 成功时放在 `FileDownloadResponse.content`；这不是无异常保证：path validation、
+普通文件方法和部分未翻译的 SDK/I/O 错误仍可能抛出。
 
 实现 shell 的 backend 还要满足 `SandboxBackendProtocol`：提供 `id` 和
 `execute(command, timeout=...)`/`aexecute`，返回 `ExecuteResponse(output,
@@ -124,8 +125,9 @@ upload/download 会按 backend 分组，随后按原始输入顺序还原结果�
 | `_sandbox` | 可选的 Daytona sandbox；local 为 `None`，仅由 `close()` 使用 |
 
 上层只调用 `create_backend_runtime(settings)`，不自行创建 Daytona SDK 或
-`LocalShellBackend`。创建失败向上抛出；运行期间 backend 自己通过结果对象或执行
-响应报告文件/命令失败。
+`LocalShellBackend`。创建失败向上抛出；运行期间已翻译的命令/批量文件失败可由
+`ExecuteResponse` 或 upload/download response 报告，但 path validation、普通文件
+方法和部分 SDK 错误仍可能抛出。
 
 ## 两套 workspace namespace
 
@@ -142,8 +144,9 @@ upload/download 会按 backend 分组，随后按原始输入顺序还原结果�
 选中的路径会 `expanduser()`、解析为绝对 `Path`，成为
 `settings.backend.workspace`（`settings.workspace` 是兼容 accessor）。
 `LOCAL_BACKEND_ROOT` 是 `apply_runtime_settings_to_env` 的兼容投影；它不会反过来
-覆盖 canonical `[backend].workspace`。配置层还会在 POSIX 上拒绝 Windows-style
-`RUYI_HOME`/workspace 输入。
+覆盖 canonical `[backend].workspace`。POSIX 上的 Windows-style guard 只覆盖
+`RUYI_HOME`、`RUYI_WORKSPACE` 和 CLI/调用方传入的 `workspace` 参数；runtime TOML
+的 `[backend].workspace` 不在这个 guard 的覆盖范围内。
 
 bootstrap 使用这套 host path 构造
 [`SkillCatalog`](../../src/ruyi_agent/runtime/skills/catalog.py)，扫描 host-side
@@ -231,8 +234,10 @@ tool permission/approval（包括 HumanApproval middleware）不属于本文契�
 然后按固定 name：
 
 1. `daytona.get(sandbox_name)` 查找现有 sandbox；
-2. 找到但 `state` 不是 `STARTED` 时调用 `sandbox.start()`，等待 SDK 的 start
-   完成；这就是跨进程启动时的 reuse/start 路径；
+2. 找到但 `str(sandbox.state) != "STARTED"` 时调用 `sandbox.start()`，等待 SDK 的
+   start 完成；SDK 返回的 `state` 是 enum，`str(enum)` 未必等于字面量 `STARTED`，
+   所以当前实现不能可靠保证已经 `STARTED` 的 sandbox 会跳过 `start()`。这是现状的
+   reuse/start 风险，不是已修复的状态判定；
 3. 若 get 抛出 `DaytonaNotFoundError`，用 `CreateSandboxFromSnapshotParams`
    （`name=sandbox_name`、`language="python"`）调用 `daytona.create`；SDK 创建
    路径会等待 sandbox 进入 started；
@@ -244,16 +249,23 @@ tool permission/approval（包括 HumanApproval middleware）不属于本文契�
 
 ### health、按需恢复与隔离边界
 
-`AutoStartDaytonaSandbox` 把“操作前可用”收口在 backend boundary：
+`AutoStartDaytonaSandbox` 只覆写 `execute`、`upload_files`、`download_files`，把这三类
+显式操作的“操作前可用”收口在 backend boundary；`ls`、`read`、`grep`、`glob`、
+`write`、`edit` 沿 `DaytonaSandbox` 的继承实现，不经过这个 auto-start wrapper。
 
-- 每 2 秒 TTL 最多调用一次 `refresh_data()`；
+- `_refresh_if_needed` 只在上述三类操作的 `_ensure_ready` 前置路径中调用；2 秒 TTL
+  只限制这次前置 `refresh_data()` 的频率；
 - `STARTED` 直接继续；`STARTING` 调用 `wait_for_sandbox_start()`；
-  `STOPPED` 调用 `start()`；`ERROR` 且 `recoverable` 时调用 `recover()`；
+  `STOPPED` 调用 `start()`；`ERROR` 且 `recoverable` 时调用 `recover()`。这些
+  start/wait/recover 操作之后还会显式 `refresh_data()` 并更新时间戳，所以一次
+  前置处理可能有额外刷新；`close()` 的 `_stop_sandbox` 也独立刷新，不受该 TTL
+  约束；
 - 其它 state 返回 unavailable 错误文本；准备过程中的异常也转成可读错误，避免
   一次 sandbox 抖动直接让 Agent tool 抛出未翻译异常；
 - `execute` 在准备失败时返回 `ExecuteResponse`（exit code 1），upload 以
   `invalid_path` 响应，download 以 `file_not_found` 响应；准备成功才调用
-  `DaytonaSandbox` 的远端 process/filesystem。
+  `DaytonaSandbox` 的远端 process/filesystem。wrapper 未覆盖的普通文件方法及
+  底层未翻译错误仍可能抛异常。
 
 Daytona 的 shell、文件读写和本项目通过 backend 读取的 artifact bytes 都在
 Daytona sandbox 中执行/保存，因而与 Gateway 进程所在 host 文件系统形成隔离边界。
@@ -465,9 +477,9 @@ backend file
 | 层 | 当前错误/行为 | 恢复边界 |
 | --- | --- | --- |
 | config | unknown shape、无效 workspace、backend kind、Daytona URL/参数会在 settings 边界报 `ConfigError`/`ValueError` | 修正配置并重新 configure；backend 尚未创建时不进入 ready |
-| local file backend | 文件方法返回 `invalid_path`、`file_not_found`、`permission_denied`、`is_directory` 等；virtual path 越界可能返回错误或抛出 path validation error | Agent 可修正 backend path；这不会限制 shell 的 host 能力 |
-| local execute | shell exception/非零 exit/timeout 以 `ExecuteResponse` 返回；进程运行在宿主机权限下 | 由调用方决定重试或人工处理；本文不提供 approval policy |
-| Daytona operation | health refresh 后可对 `STARTING` wait、`STOPPED` start、recoverable `ERROR` recover；不可用状态转换为普通 execute/upload/download 失败响应 | 后续 backend 调用可再次触发 TTL health；不可恢复状态需外部修复或重建，create/get 的非 not-found SDK 错误向上抛出 |
+| local file backend | bulk upload/download 的已翻译失败可返回 `invalid_path`、`file_not_found`、`permission_denied`、`is_directory` 等；virtual path validation、普通文件方法和部分底层错误仍可能抛异常 | Agent 可修正 backend path；这不会限制 shell 的 host 能力 |
+| local execute | 当前实现将常见 shell exception/非零 exit/timeout 以 `ExecuteResponse` 返回；进程运行在宿主机权限下 | 由调用方决定重试或人工处理；本文不提供 approval policy |
+| Daytona operation | 对 wrapper 覆盖的 execute/upload/download，health/preparation 失败可转换为各自的响应对象；`STARTING` wait、`STOPPED` start、recoverable `ERROR` recover 仍按状态推进 | 后续显式 wrapper 调用可再次触发 TTL health；未覆盖的普通文件方法、path validation 和不可翻译的 SDK 错误仍可能抛出；不可恢复状态需外部修复或重建，create/get 的非 not-found SDK 错误向上抛出 |
 | attachment | invalid base64、decoded bytes 超限、workspace path 不可信、upload 结果缺项/报错 | 请求可在验证错误时修正并重试；代码没有宣称 upload batch 具备 rollback |
 | artifact publish | no tracked Task、host/relative/traversal path、backend 文件缺失、bytes 超限、登记失败 | Agent 依据 JSON tool error 修正 path/文件/大小；manifest 只在登记成功后追加 |
 | Gateway download | manifest/path 不可读、backend bytes 缺失或当前 bytes 超限 | 返回 not-found/too-large；不自动改写 manifest，也不把旧的 metadata 当作 bytes |
@@ -504,9 +516,11 @@ Task、route、command 的更广泛 uncertain/replay 状态属于 Gateway/runtim
   的 cwd 是 host workspace；UTF-8 output decoding 和 unknown backend kind 也有覆盖。
 - [`tests/unit/test_runtime_settings.py`](../../tests/unit/test_runtime_settings.py)：
   `[backend]` workspace 与 CLI/env precedence、local/Daytona typed settings、
-  backend kind 兼容拼写与非法值、Windows-style path/strict source shape 有覆盖。
+  backend kind 兼容拼写与非法值、strict source shape 有覆盖。
 - [`tests/unit/test_ruyi_paths.py`](../../tests/unit/test_ruyi_paths.py)：
-  `RUYI_HOME`/project/user home 发现和 POSIX 下 Windows-style workspace 拒绝。
+  `RUYI_HOME`/project/user home 发现；POSIX 下对 `RUYI_HOME`、`RUYI_WORKSPACE`
+  和显式 workspace 参数的 Windows-style path 拒绝。它不覆盖 runtime TOML 的
+  `[backend].workspace` Windows-style guard。
 - [`tests/unit/test_gateway_http_core.py`](../../tests/unit/test_gateway_http_core.py)：
   attachment 名称清理、base64 upload、仅 attachment input、inbox path 注入、非法
   workspace root、不完整 upload；direct/task artifact download、越界拒绝和当前
