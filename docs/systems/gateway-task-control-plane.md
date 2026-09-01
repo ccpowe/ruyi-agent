@@ -13,7 +13,7 @@ Gateway 是外部 Task 的控制面，runtime 是 Agent 执行与协调面。两
 ## 1. 负责范围与明确边界
 
 Gateway Task 控制面负责把一次应用级操作安全地编排到正确的 local 或 public
-remote route，并给调用方一个只含 Gateway public identity 的结果。它负责：
+remote route，并给调用方一个以 Gateway public identity 为控制面边界的结果。它负责：
 
 - 以 [`GatewayTaskModule`](../../src/ruyi_agent/gateway/tasks.py) 作为稳定 facade，
   组合 Agent、Task、command、listing、review 和 artifact application service；
@@ -24,27 +24,35 @@ remote route，并给调用方一个只含 Gateway public identity 的结果。�
 - 预留并激活 route，维护 public Task id 与 local/runtime 或 upstream Task 的绑定，
   处理 route reconciliation 和 effect disposition；
 - 通过 [`GatewayCommandStore`](../../src/ruyi_agent/storage/gateway_command_store.py)
-  为带 `Idempotency-Key` 的 create/input 做 claim、精确 replay、冲突和不确定效果
-  处理；
+  为带 `Idempotency-Key` 的 create/input 做 claim、基于持久化记录的安全重投影、冲突
+  和不确定效果处理；
 - 通过 [`GatewayProjection`](../../src/ruyi_agent/gateway/application.py) 生成稳定的
-  Agent、Task、Review 和 Artifact response projection，并在 remote boundary 清理
-  错误和 identity。
+  Agent、Task、Review 和 Artifact response projection，并参与 remote boundary 的
+  错误和控制面 identity sanitization。
 
 以下行为不属于本控制面：
 
 | 不负责的行为 | 权威边界 |
 | --- | --- |
 | HTTP auth、HTTP status、header/envelope、request parsing、SSE framing 与连接生命周期 | `channels/http` 和 [`gateway_protocol`](../../src/ruyi_agent/gateway_protocol/sse.py)；整体传输说明见 [Gateway HTTP 与 `gateway_protocol`](gateway-http-protocol.md) |
-| DTO 的 wire serialization、HTTP client/transport、opaque cursor 的 wire codec | [`gateway_protocol`](../../src/ruyi_agent/gateway_protocol/contracts.py)；本页只说明应用语义和 projection 边界 |
+| DTO 的 wire serialization、SSE/event cursor 的 wire codec | [`gateway_protocol`](../../src/ruyi_agent/gateway_protocol/contracts.py)、[`cursor.py`](../../src/ruyi_agent/gateway_protocol/cursor.py) 和 [`sse.py`](../../src/ruyi_agent/gateway_protocol/sse.py)；HTTP client/transport 的组合属于传输文档，本页不拥有；listing/review/local-message cursor 的应用语义和 codec 属于 Gateway service |
 | Agent turn 执行、run admission、Task canonical state machine、middleware 和 checkpoint 生命周期 | [`AgentControl`](../../src/ruyi_agent/runtime/delegation/async_runtime.py) 及 runtime；见 [Task execution runtime](task-execution.md) |
 | Task row、lifecycle event、pending review 和 LangGraph checkpoint 的持久化 | runtime 的 TaskStore、TaskEventLedger 与 checkpointer；Gateway 只通过 runtime facade 读写或订阅 |
-| A2A HTTP/SSE transport 的实现、认证读取和下游 wire codec | [`A2A client`](../../src/ruyi_agent/integrations/a2a/client.py) 与 `gateway_protocol`；Gateway 只使用 runtime 的 remote port 并执行 public projection |
+| A2A HTTP/SSE transport 的实现、认证读取和下游 wire codec | [`A2A client`](../../src/ruyi_agent/integrations/a2a/client.py) 与 runtime remote port；Gateway 只使用 remote port 并执行 public projection |
 | Telegram/Feishu session、event receipt、delivery、平台消息发送和 channel state | channel adapter 与 channel stores；Gateway Task idempotency 不替代 channel receipt/delivery |
 | tool permission、Agent 内部 delegation policy、skills、mailbox 和 settled outbox 的执行语义 | runtime、permission、skills 与 mailbox 边界 |
 | runtime 内部 worker delegation | runtime 的 `TaskRuntime`/`RemoteTaskPort`；它不是 public Gateway route，也不经过本页的 route ledger |
 
 因此，“Gateway 负责投影 Task”不等于 Gateway 负责执行 Task；“Gateway 调用远端”
 也不等于 Gateway 拥有 A2A transport。
+
+Cursor 的所有权按用途划分，而不是由 `gateway_protocol` 统一拥有：Task listing 的
+ordering/offset 语义和 codec 由 [`listing.py`](../../src/ruyi_agent/gateway/listing.py)
+负责，pending review 的稳定分页 cursor 由
+[`reviews.py`](../../src/ruyi_agent/gateway/reviews.py) 负责，local message 的
+Task/checkpoint/offset 绑定和 codec 由
+[`message_cursors.py`](../../src/ruyi_agent/gateway/message_cursors.py) 负责。
+`gateway_protocol` 只负责 DTO wire codec 以及 SSE/event cursor 的 wire codec。
 
 ## 2. 入口调用方与依赖方向
 
@@ -75,7 +83,9 @@ HTTP server adapter / channel Gateway client / in-process embedder
          AgentControl (runtime port)
           ┌───────────┴───────────┐
           ▼                       ▼
-    local Agent runtime     public remote route -> A2A boundary
+    local Agent runtime     remote port -> A2A boundary
+           │                         │
+           └──── local TaskRecord / remote proxy TaskRecord ────┘
 ```
 
 同进程只表示共享 bootstrap/lifespan；它不改变调用方向。channel 仍通过 Gateway
@@ -89,22 +99,23 @@ runtime。public remote route 与内部 worker delegation 的差异见第 10 节
 | `GatewayTaskModule` | 稳定 facade，组合应用服务和共享 context；向 caller 暴露 Agent/Task/Review/Artifact 的应用操作 | 不解析 HTTP，不持有 transport connection |
 | `GatewayApplicationContext` | 保存 typed Agent config、主 Agent、`AgentControl`、`TaskRouter`、stores、limits 和 availability map | 不承载业务行为或状态机 |
 | `GatewayAgentService` | 过滤 public catalog，投影 Agent，执行 public/available admission | 不探测每次 run 的实时健康，不执行 Agent |
-| `GatewayProjection` | 把 `TaskRecord`、route metadata、pending review 和 artifact manifest 组装成稳定 public response | 不编码 [`gateway_protocol`](../../src/ruyi_agent/gateway_protocol/projection.py) event，也不持久化 response |
+| `GatewayProjection` | 把 `TaskRecord`、route metadata、pending review 和 artifact manifest 组装成稳定 public response，并参与 remote boundary 的 sanitization | 不编码 [`gateway_protocol`](../../src/ruyi_agent/gateway_protocol/projection.py) event，也不持久化 response |
 | `GatewayTaskService` | 组织 create effect、Task read、input/cancel、message/event 观察、附件准备和远端 webhook | 不决定 runtime Task 状态迁移 |
-| `GatewayCommandService` | 为 create/input 建立 idempotent claim，调用 effect，保存成功/终态结果或释放/失败 claim | 不把没有 key 的旧路径变成自动幂等 |
-| `GatewayListingService` | 从 route ledger 收集 Task，按 durable route 字段预过滤，刷新 local/remote record，排序和分页 | 不把一次远端刷新失败升级为所有 Task 失败 |
+| `GatewayCommandService` | 为 create/input 建立 idempotent claim，调用 effect，保存可安全重投影的成功/终态结果或释放/失败 claim | 不把没有 key 的旧路径变成自动幂等 |
+| `GatewayListingService` | 从 route ledger 收集 Task，按 durable route 字段预过滤，刷新 local/remote record，排序和分页 | 远端刷新失败项静默省略；普通 response 没有 partial/completeness 标记，调用方不能据此推断全量 snapshot |
 | `GatewayReviewService` | 列出/读取 pending review，刷新 review owner，校验 Task/root 归属并提交 decision | 不拥有 review transition 的 Task UoW |
 | `GatewayArtifactService` 与附件 service | 验证 workspace 边界、准备 inbound attachment、按登记的 artifact manifest 读取受限 bytes | 不实现 binary HTTP framing 或远端 A2A artifact transport |
 | `TaskRouter` | 以 public Task id 查 route，选择 local/remote operation，恢复缺失 route，投影 runtime/upstream error | 不拥有 Task state machine 或 A2A wire 实现 |
 | `CreateRouteWorkflow` | 在 create effect 前持久化 reservation/evidence，启动 effect，验证 durable binding，再 activation；负责 create crash window | 不把 route、Task row、checkpoint 和外部 effect 合成一个事务 |
 | `GatewayRouteStore` | 保存 public route、upstream binding、route state、create evidence 和 safe route error | 不保存 Task lifecycle 或 command response |
-| `GatewayCommandStore` | 保存 principal/key/request hash、claim token、effect marker、response/error replay record | 不保存 route 或 runtime Task state |
+| `GatewayCommandStore` | 保存 principal/key/request hash、claim token、effect marker、可安全重投影的 response/error replay record | 不保存 route 或 runtime Task state |
 | `AgentControl` | Gateway 使用的 runtime port：spawn/send/cancel、record、review、message snapshot、event stream 和 remote proxy | 不拥有 Gateway public route/command 或 response projection |
 
 `GatewayTaskModule` 的 facade 分解由
 [`test_gateway_boundaries.py`](../../tests/unit/test_gateway_boundaries.py) 约束；
 应用 service 的签名不依赖 FastAPI，但它们可以使用 `gateway_protocol` 的 typed
-value model。wire 的编码、解析和 SSE 细节仍留在 transport 层。
+value model。DTO/SSE/event cursor 的 wire 编码、解析和 SSE 细节仍留在 transport
+层；listing/review/local-message cursor 的应用 codec 仍由 Gateway service 持有。
 
 ## 4. Agent catalog 与 availability
 
@@ -138,9 +149,9 @@ id。这个 id 在 query、list、message、review、artifact 和错误 details 
 | 字段/概念 | 语义 |
 | --- | --- |
 | `route_kind=local` | public Task 由本地 runtime 执行；route 内部可用相同的 Task id 作为本地 binding，不产生另一个 upstream public identity |
-| `route_kind=remote_ref` | public Task 由配置的 remote Agent/上游 Gateway 执行；route 在 effect 返回并验证后保存 `upstream_task_id` |
+| `route_kind=remote_ref` | public Task 由配置的 remote Agent/上游 Gateway 执行；仍经 `AgentControl`/`TaskRuntime` 建立 local proxy `TaskRecord`，route 在 effect 返回并验证后额外保存 `upstream_task_id` |
 | `task_id` | Gateway public identity，不能被上游 response 或 event 中的 id 覆盖 |
-| `upstream_task_id` | 仅供 public remote route 与上游交互和校验；不能替代 public Task id，也不能出现在未经清理的 public error/projection |
+| `upstream_task_id` | 仅供 public remote route 与上游交互和校验；不能替代 public Task id，也不能作为控制面 identity 出现在未经清理的 public error/projection |
 | `parent_task_id`、`root_task_id`、`depth` | runtime delegation tree 的 Task 关系；它们不是 route binding 或 channel session key |
 
 route state 是独立于 runtime Task state 的控制面状态：
@@ -174,32 +185,39 @@ create 的应用编排如下，transport caller 只看到最终 typed response �
 3. `CreateRouteWorkflow` 在 GatewayRouteStore 中写入 `pending` reservation 和
    create evidence。此时 route 已可查询，但尚未可路由；reservation 失败时不会
    调用 runtime spawn。
-4. 在调用 effect 前，command（若存在）和 route 各自提交 effect boundary marker。
-   随后 `AgentControl` 启动 local runtime Task 或 public remote route。远端若 caller
-   没有 key 且 typed remote reference 声明已验证的 `ruyi_gateway_v1` capability，
+4. 在调用 effect 前，command（若存在）在同一 command marker 更新中一起提交
+   `effect_started`/`replay_safe`，route 另提交自己的 effect boundary marker。
+   随后 `AgentControl`/`TaskRuntime` 建立 local `TaskRecord`；local path 启动本地
+   runtime Task，remote path 将这个 record 作为同一 public id 的 remote proxy，由
+   `RemoteTaskPort` 保存 external-operation/reconciliation marker 后再向上游发起
+   create。远端若
+   caller 没有 key 且 typed remote reference 声明已验证的 `ruyi_gateway_v1` capability，
    workflow 会生成稳定的下游 key；这不把无 key 的 Gateway call 变成可由 caller
    自动 replay 的 command。
-5. 返回 record 必须证明 effect：local 要有非零 run 且不再是 pending；remote 要
-   有 upstream Task id。验证失败会把 route 留在安全的失败/不确定分类，而不把一个
-   effect-less record 当作 active。
+5. 返回 record 必须证明 effect：local 要有非零 run 且不再是 pending；remote proxy
+   要经 runtime reconciliation 验证 upstream Task id。验证失败会把 route 留在安全的
+   失败/不确定分类，而不把一个 effect-less record 当作 active。
 6. workflow 把 reservation activation 为 active，并写入已验证的 upstream binding
    （remote）或 local binding；随后 `GatewayProjection` 生成 public Task response。
 
-如果同一个 key 重试而 route 已 active，workflow 读取既有 record 并完成 replay，
-不会再次 spawn。route 已 failed/uncertain 时，重试得到不可安全创建的 terminal
-结果，而不是以同一 public id 盲目创建第二个 effect。
+如果同一个 key 重试而 route 已 active，workflow 读取既有 record 并安全重投影，
+不会再次 spawn，也不承诺响应字段逐字相同。route 已 failed/uncertain 时，重试得到
+不可安全创建的 terminal 结果，而不是以同一 public id 盲目创建第二个 effect。
 
 ### 6.2 Input：按 active route 发送一次后续 effect
 
 input 先按 public Task id 找 route，并要求 active。带 key 时，command ledger 以
 输入 body 的 request hash claim；local input 准备附件并生成稳定的 mailbox/message
 identity，remote input 把 caller key 作为下游 idempotency key。effect 返回后，
-command 保存 response；同 key 的成功 response 可精确 replay。没有 key 的旧 input
-路径直接发送，不能被文档解释为自动去重。
+command 保存持久化记录；同 key 的成功 response 从安全字段重投影并返回 `replayed=true`，
+不重复 effect，也不承诺响应字段逐字相同。没有 key 的旧 input 路径直接发送，不能被
+文档解释为自动去重。
 
 runtime 会拒绝一个仍有 active run 的 Task；Gateway 只把这个 admission/error 作为
-public Task command 结果投影，不自行改变 runtime state。remote record 返回前会
-经过 public identity projection；上游私有 error 和 payload 不越过边界。
+public Task command 结果投影，不自行改变 runtime state。remote proxy record 返回前
+会经 runtime reconciliation、`public_errors` 和 Gateway projection 共同处理；raw
+上游 error 和控制面 identity 不直接越过边界，normalized payload 仍是可能含下游
+字节/标识的不可信任务内容。
 
 ### 6.3 Cancel：控制已绑定的 route
 
@@ -218,10 +236,10 @@ command；Task 是否变成 `cancelled` 或 `interrupted` 仍由 runtime authori
 
 列表由 `GatewayListingService` 从 route ledger 收集候选，先按 durable `agent_name`
 和 metadata 做过滤，再按需要读取 record；remote refresh 使用有界并发，单个远端
-失败只省略该项，不把整个列表误报为成功的全量 snapshot。结果按稳定的更新时间和
-Task id 排序并分页。`TaskRouter` 还可从 runtime 已持久化的 descendant record
-恢复缺失 route，但只接受 Gateway root 的 ancestor；孤立 Task 不能凭空获得 public
-route。
+失败项静默省略，返回普通 list response，不带 `partial` 或 `completeness` 标记；
+调用方不能据此推断这是全量 snapshot。结果按稳定的更新时间和 Task id 排序并分页。
+`TaskRouter` 还可从 runtime 已持久化的 descendant record 恢复缺失 route，但只接受
+Gateway root 的 ancestor；孤立 Task 不能凭空获得 public route。
 
 ### 6.5 Message 与 event observation
 
@@ -229,8 +247,8 @@ message page 要求 active route。local page 由 runtime 从精确或 latest ch
 snapshot 建立文本 projection，cursor 绑定 local Task/checkpoint/offset；Gateway 不
 持久化 checkpoint。remote page 先验证下游顶层 `task_id` 等于 route 保存的
 upstream id，再只把顶层 identity 改写为 public Task id，并保留 `items` 与 opaque
-cursor。保留字段不能被 Gateway 当成 public identity，也不能在本地重新解释 remote
-cursor。
+cursor。保留的 message items/cursor 是不可信任务内容，可能含下游字节或标识；它们
+不能被 Gateway 当成控制面 public identity，也不能在本地重新解释 remote cursor。
 
 event observation 同样要求 active route。local stream 来自 runtime 的
 TaskEventLedger；remote stream 由 runtime remote port 打开，Gateway 校验 Task/run/
@@ -238,6 +256,9 @@ event 形状、fresh stream 的 snapshot 与 resume stream 的边界，并把已
 投影到 public Task id。SSE line、heartbeat、frame 和 response close 不属于本页，
 由 [`gateway_protocol`](../../src/ruyi_agent/gateway_protocol/sse.py) 与 HTTP adapter
 负责。`assistant.delta` 仍是 transient 观察，不成为 Gateway recovery 的依据。
+
+这里的 event cursor 仅涉及 protocol 的 wire codec；listing、review 和 local-message
+cursor 的语义与 codec 仍分别归 Gateway 的 listing、review 和 message-cursor service。
 
 ### 6.6 Review：以 review owner 和 root 归属编排
 
@@ -249,8 +270,9 @@ review 的 owner route；remote owner 的状态先经 public record refresh。�
 decision 先验证 public Task 与 review owner/root 的关系，再要求 owner route active，
 最后交给 `AgentControl` 的 review port。runtime 负责 review transition、resume run
 和 Task state；Gateway 负责归属检查、route 选择和 `ReviewResponse`/Task response
-projection。review decision 没有被包装成 command-store idempotency；其 audit 和
-后续执行属于 runtime 的非 transport 语义。
+projection。normalized review payload 是不可信任务内容，可能保留下游字节或标识；
+review decision 没有被包装成 command-store idempotency，其 audit 和后续执行属于
+runtime 的非 transport 语义。
 
 ### 6.7 Artifact 与 remote event webhook
 
@@ -272,8 +294,8 @@ transport status 当成 Task state authority。
 | ledger | 保存什么 | 权威问题 |
 | --- | --- | --- |
 | Gateway route ledger | public Task → local/remote route、Agent/kind、metadata、webhook、upstream id、route state/error、create key scope/replay policy/effect boundary | 这个 public identity 现在能否安全路由，是否有可信 upstream binding |
-| Gateway command ledger | principal、Idempotency-Key、operation/target/request hash、claim token、Task/mailbox identity、effect marker、成功 response 或 terminal error | 这个 caller command 是否已被 claim、完成、可 replay，或必须保守地标为 uncertain |
-| runtime Task/event ledger | `TaskRecord`、Task state/run_count、review/artifact projection、durable lifecycle event；checkpoint 另有自己的 DB | runtime 对 Task/run 的状态和生命周期事实是什么 |
+| Gateway command ledger | principal、Idempotency-Key、operation/target/request hash、claim token、Task/mailbox identity、同一 command marker 中的 `effect_started`/`replay_safe`、成功 response 或 terminal error | 这个 caller command 是否已被 claim、完成、可从持久化记录安全重投影，或必须保守地标为 uncertain |
+| runtime Task/event ledger | `TaskRecord`、Task state/run_count、review/artifact projection、durable lifecycle event；remote proxy 另保存 external-operation/uncertainty marker；checkpoint 另有自己的 DB | runtime 对 Task/run 的状态和生命周期事实是什么 |
 
 route state 与 Task state 不能互相替代。例如 Task row 可能已存在但 route 仍
 uncertain；此时 Task 可以被查询为 interrupted/synthetic observation，却不能被 Gateway
@@ -287,7 +309,9 @@ event；review transition 也受 runtime 自己的事务边界保护。但当前
 command、Task、checkpoint 或外部 effect 组成 two-phase commit：
 
 - `GatewayRouteStore` 的 reservation/activation 与 TaskStore 的 Task row/event 是
-  不同 ledger；二者不在一个事务中。
+  不同 ledger；二者不在一个事务中。public remote create 的 route、Gateway command
+  （若有 key）和 runtime local proxy `TaskRecord`/external-operation marker 也分别
+  提交；三者没有一个共同事务。
 - bootstrap 当前把 `GatewayRouteStore` 指向 `gateway_route_db`，并把
   `GatewayCommandStore` 与 `TaskStore` 配置为 `task_db`。command 与 Task 即使物理上
   共用 SQLite 路径，仍是不同 table/store、不同 claim/UoW 操作；共址不产生跨
@@ -331,9 +355,10 @@ principal 独立使用；同一 principal 下只要 operation、target 或 reque
 | `replay` | 已保存成功 response | 读取并重新投影，返回 `replayed=true`，不重复 effect |
 | `terminal` | 已保存终态错误 | 从安全字段重建 public error，不重复 effect |
 
-成功 response 和终态 error 都是 ledger 中的 replay record。command store 在 effect
-开始前后分别记录 `effect_started` 与 `replay_safe`，使“是否可以再次调用”不依赖
-caller 对网络错误的猜测：
+成功 response 和终态 error 都是 ledger 中的 replay record。effect 前，command store
+在同一个 command marker 更新中一起持久化 `effect_started` 与 `replay_safe`；effect
+只有在这个 marker 提交后才开始。这样“是否可以再次调用”不依赖 caller 对网络错误
+的猜测：
 
 - **明确未 dispatch**：route evidence 证明 effect boundary 仍是 reserved，或
   transport 明确没有发出请求。Gateway 将 route 恢复到可重试的 reservation，并
@@ -341,7 +366,7 @@ caller 对网络错误的猜测：
   重新执行。
 - **权威拒绝**：已知 Agent/runtime/upstream 拒绝且 effect outcome 可分类为
   not-started。create route 进入 failed，command 保存 terminal error；后续同 key
-  exact replay 该错误。
+  从安全字段重建并 replay 该终态错误，不重复 effect。
 - **结果未知**：timeout、response 丢失、取消或 exception 发生在 effect boundary
   之后。local 或没有已验证 remote replay contract 的 effect 不能盲目重试：route
   进入 uncertain，unsafe started command 在重启时成为
@@ -394,36 +419,48 @@ Gateway 使用 [`GatewayEffectDisposition`](../../src/ruyi_agent/gateway/errors.
 | `AUTHORITATIVE_REJECTION` | runtime/upstream 已明确拒绝 | route failed 或返回稳定拒绝，不自动重试 effect |
 | `OUTCOME_UNKNOWN` | effect 可能已发出但结果未知 | 保留 identity；按 replay contract 选择安全 replay 或 uncertain terminal |
 
-[`public_errors.py`](../../src/ruyi_agent/gateway/public_errors.py) 只允许有限的
-upstream error code 和 operation-level message。remote response、异常文本、私有 URL
-和 upstream Task id 不直接进入 public response、route error 或 command replay；错误
-details 只重建 public `task_id`、可查询 URL、route state、retryability 和 effect
-outcome 等必要字段。`public_remote_record` 把 remote record 的顶层 task/thread/error
-投影到 public identity，并把 pending review 的 source identity 一并 relabel。
+remote boundary 的保证必须收窄理解：raw upstream error payload、异常文本、私有 URL
+和控制面 identity 不直接透传到 public response、route error 或 command replay。
+[`RemoteTaskPort`](../../src/ruyi_agent/runtime/delegation/remote_port.py) 的
+reconciliation 先验证远端 Task identity/state/run 并记录 external-operation 的不确定
+性；[`public_errors.py`](../../src/ruyi_agent/gateway/public_errors.py) 再把有限的
+upstream error code 和 operation-level message 映射为安全字段；最后
+`GatewayProjection` 负责 public response 的顶层 identity/projection。这三层共同完成
+sanitization，不能把全部保证归给 `GatewayProjection`。
 
-这层 sanitization 不承诺所有保留的 message item、opaque cursor 或用户输入文本都
-不含任何下游字节；它保证的是 Gateway 不主动把 upstream identity、credential、
-traceback 和私有 endpoint 作为控制面 identity/error 泄露。
+normalized Task result、review payload、message items、opaque cursor 和用户输入仍是
+不可信的保留任务内容，可能含下游字节或标识；它们不能被 Gateway 当成控制面
+identity。错误 details 只从安全字段重建 public `task_id`、可查询 URL、route state、
+retryability 和 effect outcome 等必要字段；`public_remote_record` 还会把 pending
+review 的 source identity 一并 relabel。
 
 ## 10. 安全与信任边界
 
 ### 10.1 Public remote route 与 runtime internal delegation 严格分开
 
-两者都可能在更底层使用 A2A，但 ownership 和 recovery 完全不同：
+两者都可能在更底层使用 A2A，也可以复用 `AgentControl`/`TaskRuntime`/`RemoteTaskPort`
+的 effect path；真正的控制面差异是 public identity 和 route ownership，delegation
+context 仍属于 runtime：
 
 | 维度 | public Gateway remote route | runtime internal worker delegation |
 | --- | --- | --- |
-| 入口 | public Gateway application caller 经 facade/`TaskRouter` | runtime delegation tool/`TaskCommandPort` 经 `AgentControl` |
-| identity | Gateway 先创建 public Task id，再绑定 upstream Task id | runtime 创建/维护内部 proxy Task、delegation context 和 operation marker |
-| durable ledger | `GatewayRouteStore` +（若有 key）`GatewayCommandStore` | runtime TaskStore、mailbox/settled outbox 与 delegation reconciliation |
-| effect owner | Gateway route workflow 编排 reservation/activation/error projection；runtime remote port 发起下游操作 | `TaskRuntime`/`RemoteTaskPort` 负责 proxy state、run 和 recovery |
-| 不经过的边界 | 不把 upstream id 变成 public id | 不经过 Gateway route reservation，不凭空建立 public route |
-| unknown effect | public route 保留 queryable public identity，按 route/command evidence 决定 uncertain/replay | runtime proxy 以 `interrupted`/uncertain marker 和 delegation reconciliation 表达 |
+| 入口 | public Gateway application caller 经 facade/`TaskRouter`/`CreateRouteWorkflow`，再进入 `AgentControl` | runtime delegation tool/`TaskCommandPort` 经 `AgentControl` |
+| identity | public Task id、Gateway route/upstream binding，以及由 runtime 建立的 local proxy `TaskRecord` | runtime 内部 proxy `TaskRecord`、parent/root/delegation context；不建立 public Gateway identity |
+| durable ledger | runtime TaskStore 的 proxy record + `GatewayRouteStore` +（若有 key）`GatewayCommandStore`；三者独立提交 | runtime TaskStore、mailbox/settled outbox 与 delegation reconciliation |
+| effect owner | `AgentControl`/`TaskRuntime`/`RemoteTaskPort` 发起 external operation 并 reconciliation；Gateway 额外编排 route reservation/activation/projection | `TaskRuntime`/`RemoteTaskPort` 负责 proxy state、run 和 recovery |
+| 不经过的边界 | 不把 upstream id 变成 public id；不跳过 Gateway route reservation | 不经过 Gateway route reservation，不凭空建立 public route |
+| unknown effect | runtime external-operation marker 与 Gateway route/command evidence 共同分类；public id 保持可查询，route 可为 uncertain | runtime proxy 以 `interrupted`/uncertain marker 和 delegation reconciliation 表达 |
 
-Gateway 文档不能把 internal worker child Task 写成 public remote route，也不能把
-public remote create 的 route state 写成 runtime delegation state。具体 A2A transport
-仍归 [`A2A client`](../../src/ruyi_agent/integrations/a2a/client.py) 和 runtime
-integration 边界。
+public remote create 不是 Gateway 绕过 runtime 直接调用 A2A：`AgentControl.spawn_task`
+进入 `TaskRuntime.spawn_task`，remote branch 先建立 local proxy `TaskRecord`，由
+`RemoteTaskPort` 在下游 effect 前保存 external-operation marker，并在返回或失败后
+reconcile。Gateway 在此之外拥有 public route 和可选 command ledger；route、command
+和 runtime Task ledger 之间没有跨库事务。internal worker delegation 可以复用同一
+runtime effect path，但只拥有 runtime identity/ledger，不拥有 Gateway route。Gateway
+文档不能把 internal worker child Task 写成 public remote route，也不能把 public remote
+create 的 route state 写成 runtime delegation state。具体 A2A transport 仍归
+[`A2A client`](../../src/ruyi_agent/integrations/a2a/client.py) 和 runtime integration
+边界。
 
 ### 10.2 输入、凭据与 workspace
 
@@ -450,7 +487,7 @@ integration 边界。
 | route reservation before effect、binding 不可重写、local/remote state、activation failure、descendant recovery | [`test_gateway_task_router.py`](../../tests/unit/test_gateway_task_router.py)、[`test_gateway_route_crash_evidence.py`](../../tests/unit/test_gateway_route_crash_evidence.py) |
 | command claim/release/restart、principal/key uniqueness、成功/终态 replay、unsafe started effect | [`test_gateway_command_store.py`](../../tests/unit/test_gateway_command_store.py)、[`test_gateway_command_route_boundary.py`](../../tests/unit/test_gateway_command_route_boundary.py) |
 | caller cancellation cleanup、NOT_DISPATCHED/OUTCOME_UNKNOWN、safe remote replay 与同 identity recovery | [`test_gateway_create_effect_disposition.py`](../../tests/unit/test_gateway_create_effect_disposition.py)、[`test_gateway_route_security_recovery.py`](../../tests/unit/test_gateway_route_security_recovery.py)、[`test_gateway_idempotency_flow.py`](../../tests/integration/test_gateway_idempotency_flow.py) |
-| remote public/upstream identity、错误 sanitization、remote route persistence 与非 active route 拒绝 dispatch | [`test_gateway_http_remote.py`](../../tests/unit/test_gateway_http_remote.py)、[`test_a2a_client.py`](../../tests/unit/test_a2a_client.py) |
+| remote public/upstream identity、local proxy/external-operation reconciliation、错误 sanitization、remote route persistence 与非 active route 拒绝 dispatch | [`test_gateway_http_remote.py`](../../tests/unit/test_gateway_http_remote.py)、[`test_async_subagent_task_runtime.py`](../../tests/unit/test_async_subagent_task_runtime.py)、[`test_a2a_client.py`](../../tests/unit/test_a2a_client.py) |
 | list prefilter、bounded remote refresh、review owner refresh、cursor snapshot 与 unavailable owner 处理 | [`test_gateway_listing_concurrency.py`](../../tests/unit/test_gateway_listing_concurrency.py) |
 | local/remote message identity 与 opaque cursor、event disconnect/resume 的跨 Gateway 观察结果 | [`test_gateway_message_history_flow.py`](../../tests/integration/test_gateway_message_history_flow.py)、[`test_gateway_sse_flow.py`](../../tests/integration/test_gateway_sse_flow.py)、[`test_a2a_task_events.py`](../../tests/unit/test_a2a_task_events.py) |
 
@@ -466,18 +503,23 @@ Gateway route/command ledger 测试。
   admission 或 `GatewayProjection` 的稳定字段/identity 语义改变；
 - local/remote route 选择、reservation、activation、binding、route state、create
   evidence、descendant recovery 或 reconciliation 改变；
-- public Task id 与 upstream Task id 的绑定、remote record/error sanitization、
-  message/review/artifact public projection 改变；
-- `GatewayCommandStore` 的 principal/key/request-hash claim、replay、effect marker、
-  uncertain terminal、cross-ledger reopen 或 no-key 行为改变；
+- public Task id 与 upstream Task id 的绑定、runtime remote proxy/external-operation
+  reconciliation、remote record/error sanitization、message/review/artifact public
+  projection 改变；
+- listing/review/local-message cursor 的语义或 codec，或 SSE/event cursor 的 wire
+  codec 改变；
+- `GatewayCommandStore` 的 principal/key/request-hash claim、基于安全字段的 replay
+  projection、同一 marker 的 effect_started/replay_safe、uncertain terminal、
+  cross-ledger reopen 或 no-key 行为改变；
 - bootstrap 的 route/command/task store wiring、物理 DB placement 或任何 ledger/UoW
   边界改变；
 - runtime `AgentControl`、Task state/event/message/review/artifact 语义变化到达
   Gateway 应用观察面时，同时更新 [Task execution runtime](task-execution.md)。
 
 以下变化通常由所属文档负责：HTTP auth/status/header、DTO/JSON transport、SSE
-framing/codec、channel session/receipt/delivery、tool permission 或 A2A wire
-implementation；只有它们同时改变本页的 public application semantics、identity 或
-恢复分类时，才需要同步更新本页，并连同
+framing、SSE/event cursor wire codec、channel session/receipt/delivery、tool permission
+或 A2A wire implementation；listing/review/local-message cursor 仍由本页的 Gateway
+service 所属代码负责。只有这些变化同时改变本页的 public application semantics、
+identity 或恢复分类时，才需要同步更新本页，并连同
 [Gateway HTTP 与 `gateway_protocol`](gateway-http-protocol.md) 或 runtime 文档一起
 核对。实现与测试是最终事实来源，本文不扩展为逐 route 或逐函数的 API 清单。
