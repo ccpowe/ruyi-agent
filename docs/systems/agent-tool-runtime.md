@@ -81,12 +81,15 @@ artifact callback、review audit store 和 MCP scope 传给 `create_runtime_agen
 
 bootstrap 传入同一个 `AsyncSqliteSaver` 给所有 local Agent graph；它也把同一个
 checkpointer 交给 [`TaskMessageStateReader`](../../src/ruyi_agent/runtime/message_history.py)。
-每次 run 的 context 由
+每次 run 的 `RunnableConfig` 由
 [`LocalTaskExecutor.build_run_config`](../../src/ruyi_agent/runtime/delegation/local_executor.py)
-生成，包含 `thread_id`、`task_id`、`parent_task_id`、`root_task_id`、
-`delegation_depth`、`agent_name`、`permission_profile`、effective skill names、
-skill view path/hash。middleware 通过 `get_config()` 或 `ToolRuntime.config` 读取
-这些字段；后续输入和 review resume 复用同一 `thread_id`，因此是同一 graph 会话。
+生成；当前项目写入的 `configurable` 字段是 `thread_id`、`task_id`、
+`parent_task_id`、`root_task_id`、`delegation_depth`、`agent_name`、
+`permission_profile`、`effective_skill_names`、`skill_view_path` 和
+`skill_view_hash`。middleware 通过 `get_config()` 或完整的 `ToolRuntime.config`
+读取这些字段（artifact helper 也接受 `metadata.task_id`）；后续输入和 review
+resume 复用同一 `thread_id`，因此是同一 graph 会话。`RunnableConfig` 还可能带有
+框架的其它键，不能把它描述成只含 run context。
 
 有 `astream` 时 executor 以 `stream_mode=["messages", "values"]`、`version="v2"`
 运行 graph，保存最新 values 和 interrupts，并只把带公开 provenance 的 assistant
@@ -109,7 +112,7 @@ phase 的 before/after 调度仍由其 middleware API 决定。即使条件组�
 | 3 | `MailboxMiddleware` | 仅有 mailbox 时加入，在 model 前 claim 当前 task/thread 的消息并注入 `HumanMessage`。 |
 | 4 | `ToolCallProtocolMiddleware` | 总是加入；紧跟 mailbox，修复 mailbox 输入可能造成的 tool-call/result 不相邻。 |
 | 5 | `ToolSearchMiddleware` | 有 registry 且 `system_tools` 未限制，或显式启用 `tool_search`/`call_tool` 时加入；工具列表还会按 enabled set 过滤。 |
-| 6 | `ArtifactPublishingMiddleware` | 有 `register_artifact` callback 且 `publish_artifact` 未被禁用时加入。 |
+| 6 | `ArtifactPublishingMiddleware` | 有 `register_artifact` callback，且 `system_tools` 未限制或启用了 `publish_artifact` 时加入。工具可以被暴露但在没有 tracked `task_id` 的调用中返回 `no_active_task`。 |
 | 7 | `RuyiSkillsMiddleware` | 总是加入；根据本次 run 的 skill view context 暴露 metadata。 |
 | 8 | `FilesystemMiddleware` | `system_tools` 未限制，或启用了至少一个 filesystem tool 时加入，并按名字过滤。 |
 | 9 | summarization、`PatchToolCallsMiddleware` | 总是加入；前者使用 model/backend 的 deepagents summarization，后者提供第三方 tool-call compatibility patch。 |
@@ -147,8 +150,11 @@ request。
 - `ToolErrorMiddleware` 在执行后把异常转换成可供模型重新规划的结构化错误。
 
 直接工具来自 Agent spec 的 `tools`；system tools 来自条件 middleware（filesystem、
-artifact、MCP search/call、delegation）。`ToolRuntime.config` 只携带当前 run context，
-不把 host secret 或 public Gateway DTO 传给工具。
+artifact、MCP search/call、delegation）。`ToolRuntime.config` 是完整的
+`RunnableConfig`，不是只携带当前 run context 的专用对象；`call_tool` 会把整个 config
+传给底层 MCP tool 的 `ainvoke`/`invoke`，artifact 则从 `configurable` 或 `metadata`
+读取 `task_id`。runtime 不应把它当作 secret boundary，也不应依赖它自动过滤
+public Gateway DTO。
 
 ### Task hydration、mailbox 与 tool-call repair
 
@@ -196,18 +202,21 @@ Filesystem middleware 由 deepagents adapter 提供 `ls`、`read_file`、`write_
 全面隔离。尤其 local backend 的 shell 仍以宿主用户权限执行；请参阅
 [backend 文档的 shell 与 virtual root 边界](execution-backends-and-workspace.md)。
 
-只有 tracked Task 且 callback 存在时才暴露
+有 `register_artifact` callback 且 `system_tools` 未限制或启用了 `publish_artifact` 时，
+就暴露
 [`publish_artifact`](../../src/ruyi_agent/runtime/middleware/artifact_publishing.py)：
 
-1. 从 `ToolRuntime.config` 的 `configurable`/`metadata` 读取非空 `task_id`；没有
-   tracked Task 返回 `no_active_task`。
+1. 从完整 `ToolRuntime.config` 的 `configurable`/`metadata` 读取非空 `task_id`；
+   没有 tracked Task 时工具仍可见，但调用返回 `no_active_task`。
 2. 要求 POSIX backend workspace absolute path；拒绝空值、反斜杠、Windows drive
    path、相对路径和任意 `..`。除根为 `/` 的情况外，还要求规范 path 位于传入的
    normalized `workspace_root` 下。`name` 只取安全 basename，caption/content type
    也在登记前规范化。
-3. 通过 backend `download_files([path])` 读取 bytes；backend error、空响应、非
-   bytes 统一为 `file_not_found`，超过默认 50 MiB（或构造时的 `max_bytes`）返回
-   `file_too_large`。
+3. 通过 backend `download_files([path])` 读取 bytes；download response 的 `error`
+   字段、空响应或非 bytes 统一为 `file_not_found`，超过默认 50 MiB（或构造时的
+   `max_bytes`）返回 `file_too_large`。如果 `download_files` 本身抛异常，middleware
+   不在这里捕获；异常进入外层 `ToolErrorMiddleware` 的分类、有限重试和
+   `ToolMessage` 路径。
 4. 调用 `LocalTaskExecutor.register_artifact` callback 生成带 `artifact_id`、path、
    name、caption、content type、size 和当前 `run_count` 的 manifest，并交给
    `TaskManager.add_artifact`。bytes 仍留在 backend namespace。
@@ -285,9 +294,11 @@ backend kind、workspace、thread/task id。多个 call 中 allow 的保留，de
 TaskStore/TaskManager 中的 pending review identity 是权威审批资源；
 [`ReviewAuditStore`](../../src/ruyi_agent/storage/review_audit.py) 只记录
 `permission_evaluated`、`review_requested`、`review_decision`、`tool_denied` 等审计
-事件，不是状态机权威。Task 状态或 review transition 已提交后，audit append 失败
-只记录日志，不能反转已提交状态；具体 Task transition 仍见
-[Task execution runtime](task-execution.md)。
+事件，不是状态机权威。HumanApprovalMiddleware 内联调用这些 audit append 时不捕获
+异常：写入失败可以在 interrupt 或 decision 应用前中止 graph，最终使该 run 失败。
+另有 LocalTaskExecutor 在权威 Task/review transition 提交后的 task audit；这类
+post-commit audit failure 会被 catch/log，不反转已提交状态。具体 Task transition
+仍见 [Task execution runtime](task-execution.md)。
 
 ## ToolError 分类、重试与错误状态
 
@@ -304,8 +315,10 @@ TaskStore/TaskManager 中的 pending review identity 是权威审批资源；
 | `network` | broken resource/connect/network/remote protocol error | 是 |
 | `unexpected` | 其它错误 | 否 |
 
-一次 tool call 最多两次尝试（首次加一次 retry），且总 retry window 为 15 秒；只有
-分类为可重试且尚未达到预算才重试。`KeyboardInterrupt`、`SystemExit` 和纯
+一次 tool call 最多两次尝试（首次加一次 retry）。首次失败只有在该 call 启动后 15
+秒内才允许触发这一次 retry；这不是单次工具执行 timeout，也不是整个 run 的总
+timeout。retry 一旦获准，第二次尝试可以在 15 秒之后结束；它失败时因 attempt
+预算耗尽而直接生成错误。`KeyboardInterrupt`、`SystemExit` 和纯
 `CancelledError` group 继续抛出；混合了取消与 MCP transport error 的 exception
 group 视为 transport tool failure，可转为 ToolMessage。
 
@@ -326,9 +339,11 @@ review resource projection 和 public event 由 [Task execution runtime](task-ex
 安全上，tool search 只允许 registry scope 内的 qualified name，MCP args 先做 schema
 validation；permission gate 在 tool execution 前做 policy decision；artifact 只接收
 backend workspace path。上述是 runtime guardrail，不是 host-level sandbox：local
-backend 的 `execute`、网络、绝对 host path 和进程权限仍按 backend 实际边界运行。真实
-provider/MCP/A2A secret 由配置/integrations 的命名环境变量解析，不进入 prompt、Task
-DTO 或普通 tool error。
+backend 的 `execute`、网络、绝对 host path 和进程权限仍按 backend 实际边界运行。
+provider/MCP/A2A secret 由配置/integrations 的命名环境变量解析；普通 `ToolError`
+不主动注入 secret，但会把 exception class/message 原样扁平化且不做 redaction，
+因此底层 tool/provider exception 文本不得包含凭据。`ToolRuntime.config` 也不是
+secret boundary，runtime 不应把它当作凭据过滤器。
 
 ## 依赖与行为证据
 
