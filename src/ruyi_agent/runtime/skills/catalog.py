@@ -33,7 +33,7 @@ class SkillCatalog:
     def scan(self) -> SkillCatalogSnapshot:
         skills: dict[str, SkillEntry] = {}
         for source_root in self.roots_by_precedence:
-            if not source_root.is_dir():
+            if source_root.is_symlink() or not source_root.is_dir():
                 continue
             for child in sorted(source_root.iterdir()):
                 entry = _read_skill_entry(child, source_root)
@@ -44,16 +44,29 @@ class SkillCatalog:
 
 
 def _read_skill_entry(skill_dir: Path, source_root: Path) -> SkillEntry | None:
-    if not skill_dir.is_dir():
+    if (
+        source_root.is_symlink()
+        or not source_root.is_dir()
+        or skill_dir.is_symlink()
+        or not skill_dir.is_dir()
+        or not _is_contained(skill_dir, source_root)
+    ):
         return None
     skill_file = skill_dir / "SKILL.md"
-    if not skill_file.is_file():
+    if (
+        skill_file.is_symlink()
+        or not skill_file.is_file()
+        or not _is_contained(skill_file, skill_dir)
+        or not _is_contained(skill_file, source_root)
+    ):
         return None
+    # This is a static check, not an atomic no-follow open. A concurrent
+    # replacement after the checks above can still change what read_text opens.
     content = skill_file.read_text(encoding="utf-8")
     metadata = _parse_frontmatter(content)
     name = _metadata_string(metadata, "name")
     description = _metadata_string(metadata, "description")
-    if not name or not description:
+    if not _is_safe_skill_name(name) or not description:
         return None
     return SkillEntry(
         name=name,
@@ -80,3 +93,26 @@ def _parse_frontmatter(content: str) -> dict[str, Any]:
 def _metadata_string(metadata: dict[str, Any], key: str) -> str:
     value = metadata.get(key)
     return value.strip() if isinstance(value, str) else ""
+
+
+def _is_safe_skill_name(name: object) -> bool:
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and bool(name.strip())
+        and name not in {".", ".."}
+        and name != ".manifest.json"
+        and not name.startswith("/")
+        and "/" not in name
+        and "\\" not in name
+        and "\0" not in name
+    )
+
+
+def _is_contained(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        path.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
