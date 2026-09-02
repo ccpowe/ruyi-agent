@@ -142,7 +142,7 @@ def test_refresh_populates_statuses_and_inventory(monkeypatch: pytest.MonkeyPatc
     assert deepwiki_status.tool_count == 0
     assert "deepwiki unavailable" in (deepwiki_status.error or "")
     assert secret not in (deepwiki_status.error or "")
-    assert "Authorization: [REDACTED]" in (deepwiki_status.error or "")
+    assert "Authorization: Bearer [REDACTED]" in (deepwiki_status.error or "")
 
     tools = asyncio.run(registry.list_tools())
     assert [tool.qualified_name for tool in tools] == [

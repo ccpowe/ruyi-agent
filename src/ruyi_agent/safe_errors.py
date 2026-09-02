@@ -21,24 +21,57 @@ _SENSITIVE_KEY_PATTERN = (
     r"auth(?:orization)?|bearer|token|password|passwd|client[_-]?secret|"
     r"secret|private[_-]?key)"
 )
-_HEADER_KEY_PATTERN = (
-    r"(?:authorization|proxy-authorization|x-api-key|api-key|"
-    r"x-auth-token|x-access-token|cookie|set-cookie)"
+_AUTHORIZATION_HEADER_KEY_PATTERN = r"(?:authorization|proxy-authorization)"
+_CREDENTIAL_HEADER_KEY_PATTERN = (
+    r"(?:x-api-key|api-key|x-auth-token|x-access-token)"
 )
+_COOKIE_HEADER_KEY_PATTERN = r"(?:cookie|set-cookie)"
+_CREDENTIAL_TOKEN_PATTERN = r"[A-Za-z0-9._~+/=-]+"
+_CREDENTIAL_LIKE_VALUE_PATTERN = (
+    r"(?=[A-Za-z0-9._~+/=-]{8,}(?=$|[,;\s}\]\[\r\n]))"
+    r"(?=[A-Za-z0-9._~+/=-]*[0-9.=+/~\-])"
+    r"[A-Za-z0-9._~+/=-]+"
+)
+_TOKEN_BOUNDARY_CHAR_CLASS = r"A-Za-z0-9._~+/=\-"
+_MIN_UNBOUNDED_KNOWN_SECRET_CHARS = 8
 _URL_SENSITIVE_PARAM_RE = re.compile(
     rf"(?i)(?P<prefix>[?&;]{_SENSITIVE_KEY_PATTERN}=)(?P<value>[^&#\s]+)"
 )
-_HEADER_RE = re.compile(
-    rf"(?i)(?P<prefix>(?<![\w-]){_HEADER_KEY_PATTERN}(?![\w-])\s*[:=]\s*)"
-    r"(?P<value>(?:bearer\s+)?[^,;\r\n]+)"
+_AUTHORIZATION_HEADER_RE = re.compile(
+    rf"(?im)(?P<prefix>(?<![\w-]){_AUTHORIZATION_HEADER_KEY_PATTERN}"
+    rf"(?![\w-])\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?)"
+    rf"(?P<value>{_CREDENTIAL_TOKEN_PATTERN})(?=\s*(?:$|[,;\r\n]))"
+)
+_AUTHORIZATION_HEADER_LEADING_CREDENTIAL_RE = re.compile(
+    rf"(?im)(?P<prefix>(?<![\w-]){_AUTHORIZATION_HEADER_KEY_PATTERN}"
+    rf"(?![\w-])\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?)"
+    rf"(?P<value>{_CREDENTIAL_LIKE_VALUE_PATTERN})"
+)
+_CREDENTIAL_HEADER_RE = re.compile(
+    rf"(?im)(?P<prefix>(?<![\w-]){_CREDENTIAL_HEADER_KEY_PATTERN}"
+    rf"(?![\w-])\s*[:=]\s*)"
+    rf"(?P<value>{_CREDENTIAL_TOKEN_PATTERN})(?=\s*(?:$|[,;\r\n]))"
+)
+_CREDENTIAL_HEADER_LEADING_CREDENTIAL_RE = re.compile(
+    rf"(?im)(?P<prefix>(?<![\w-]){_CREDENTIAL_HEADER_KEY_PATTERN}"
+    rf"(?![\w-])\s*[:=]\s*)"
+    rf"(?P<value>{_CREDENTIAL_LIKE_VALUE_PATTERN})"
+)
+_COOKIE_HEADER_RE = re.compile(
+    rf"(?im)(?P<prefix>(?<![\w-]){_COOKIE_HEADER_KEY_PATTERN}"
+    rf"(?![\w-])\s*[:=]\s*)(?P<value>[^\r\n]*=[^\r\n]*)"
 )
 _QUOTED_KEY_VALUE_RE = re.compile(
     rf"(?i)(?P<prefix>(?<![\w-])['\"]?{_SENSITIVE_KEY_PATTERN}['\"]?\s*"
     r"[:=]\s*)(?P<quote>['\"])(?P<value>[^'\"\r\n]*)(?P=quote)"
 )
-_UNQUOTED_KEY_VALUE_RE = re.compile(
+_UNQUOTED_EQUALS_KEY_VALUE_RE = re.compile(
     rf"(?i)(?P<prefix>(?<![\w-])['\"]?{_SENSITIVE_KEY_PATTERN}['\"]?\s*"
-    r"[:=]\s*)(?P<value>[^,;\s}\]\[\r\n]+)"
+    r"=\s*)(?P<value>[^,;\s}\]\[\r\n]+)"
+)
+_UNQUOTED_COLON_KEY_VALUE_RE = re.compile(
+    rf"(?i)(?P<prefix>(?<![\w-])['\"]?{_SENSITIVE_KEY_PATTERN}['\"]?\s*"
+    rf":\s*)(?P<value>{_CREDENTIAL_LIKE_VALUE_PATTERN})"
 )
 _JWT_RE = re.compile(
     r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\."
@@ -64,6 +97,7 @@ _PEM_PRIVATE_KEY_RE = re.compile(
 _PEM_PRIVATE_KEY_START_RE = re.compile(
     r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"
 )
+_TOKEN_LITERAL_RE = re.compile(rf"^[{_TOKEN_BOUNDARY_CHAR_CLASS}]+$")
 
 
 def safe_error_text(
@@ -129,9 +163,15 @@ def _safe_error_text(
     value = _replace_known_secrets(value, known_secrets)
     value = _redact_pem_private_keys(value)
     value = _URL_SENSITIVE_PARAM_RE.sub(_redact_match, value)
-    value = _HEADER_RE.sub(_redact_match, value)
+    value = _COOKIE_HEADER_RE.sub(_redact_match, value)
+    value = _AUTHORIZATION_HEADER_LEADING_CREDENTIAL_RE.sub(_redact_match, value)
+    value = _CREDENTIAL_HEADER_LEADING_CREDENTIAL_RE.sub(_redact_match, value)
+    value = _AUTHORIZATION_HEADER_RE.sub(_redact_match, value)
+    value = _CREDENTIAL_HEADER_RE.sub(_redact_match, value)
     value = _QUOTED_KEY_VALUE_RE.sub(_redact_match, value)
-    value = _UNQUOTED_KEY_VALUE_RE.sub(_redact_match, value)
+    value = _UNQUOTED_EQUALS_KEY_VALUE_RE.sub(_redact_match, value)
+    value = _UNQUOTED_COLON_KEY_VALUE_RE.sub(_redact_match, value)
+    value = _redact_known_short_structured_values(value, known_secrets)
     value = _JWT_RE.sub(REDACTED_VALUE, value)
     value = _COMMON_KEY_PREFIX_RE.sub(REDACTED_VALUE, value)
     return _one_line_and_bound(value, max_length=max_length)
@@ -144,8 +184,59 @@ def _normalize_known_secrets(known_secrets: Iterable[str]) -> tuple[str, ...]:
 
 def _replace_known_secrets(value: str, known_secrets: tuple[str, ...]) -> str:
     for secret in known_secrets:
-        value = value.replace(secret, REDACTED_VALUE)
+        if len(secret) >= _MIN_UNBOUNDED_KNOWN_SECRET_CHARS:
+            value = value.replace(secret, REDACTED_VALUE)
+        elif _is_credential_like_token(secret):
+            value = _replace_bounded_token(value, secret)
     return value
+
+
+def _redact_known_short_structured_values(
+    value: str,
+    known_secrets: tuple[str, ...],
+) -> str:
+    """Redact otherwise ambiguous short values only in explicit secret fields."""
+
+    for secret in known_secrets:
+        if (
+            len(secret) >= _MIN_UNBOUNDED_KNOWN_SECRET_CHARS
+            or not _is_token_literal(secret)
+        ):
+            continue
+        colon_pattern = re.compile(
+            rf"(?i)(?P<prefix>(?<![\w-])['\"]?{_SENSITIVE_KEY_PATTERN}"
+            rf"['\"]?\s*:\s*)(?P<value>{re.escape(secret)})"
+            r"(?=$|[,;\s}\]\[\r\n])"
+        )
+        header_pattern = re.compile(
+            rf"(?im)(?P<prefix>(?<![\w-])(?:{_AUTHORIZATION_HEADER_KEY_PATTERN}|"
+            rf"{_CREDENTIAL_HEADER_KEY_PATTERN})(?![\w-])\s*[:=]\s*"
+            rf"(?:(?:bearer|basic|token)\s+)?)"
+            rf"(?P<value>{re.escape(secret)})(?=$|[,;\s\r\n])"
+        )
+        value = colon_pattern.sub(_redact_match, value)
+        value = header_pattern.sub(_redact_match, value)
+    return value
+
+
+def _is_credential_like_token(value: str) -> bool:
+    """Reject short word-like values before exact configured-secret matching."""
+
+    return _is_token_literal(value) and any(
+        char.isdigit() or char in ".=+/~-" for char in value
+    )
+
+
+def _is_token_literal(value: str) -> bool:
+    return bool(_TOKEN_LITERAL_RE.fullmatch(value))
+
+
+def _replace_bounded_token(value: str, secret: str) -> str:
+    pattern = re.compile(
+        rf"(?<![{_TOKEN_BOUNDARY_CHAR_CLASS}]){re.escape(secret)}"
+        rf"(?![{_TOKEN_BOUNDARY_CHAR_CLASS}])"
+    )
+    return pattern.sub(REDACTED_VALUE, value)
 
 
 def _redact_pem_private_keys(value: str) -> str:

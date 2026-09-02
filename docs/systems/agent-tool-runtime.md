@@ -219,7 +219,9 @@ Filesystem middleware 由 deepagents adapter 提供 `ls`、`read_file`、`write_
    `ToolMessage` 路径。
 4. 调用 `LocalTaskExecutor.register_artifact` callback 生成带 `artifact_id`、path、
    name、caption、content type、size 和当前 `run_count` 的 manifest，并交给
-   `TaskManager.add_artifact`。bytes 仍留在 backend namespace。
+   `TaskManager.add_artifact`。callback 失败时返回 `artifact_registration_failed`
+   error `ToolMessage`，其 hint 先使用有界安全异常摘要；成功 manifest/bytes 仍留在
+   backend namespace，且不做输出扫描。
 
 middleware path check 与 Gateway artifact download 的 check 是两个边界；本文不
 负责后者的 HTTP auth、公共 DTO 或 bytes 下载。
@@ -252,6 +254,9 @@ delegation system tools 允许时，才构造 `worker_tools`；stack 随后加�
 
 middleware 不创建 delegation tree，也不执行深度/数量预算；工具调用最终回到
 `TaskCommandPort`/`TaskRuntime`，该 ownership 见 [Task execution runtime](task-execution.md)。
+这些工具的普通错误返回，以及 failed/interrupted `TaskRecord` 的 agent-facing 文本
+projection，都只在 error path 使用同一有界安全摘要；不会改变 target scope、retry、
+cancel 或 completed result 的语义。
 
 ## 权限、审批与 LangGraph interrupt
 
@@ -342,11 +347,12 @@ validation；permission gate 在 tool execution 前做 policy decision；artifac
 backend workspace path。上述是 runtime guardrail，不是 host-level sandbox：local
 backend 的 `execute`、网络、绝对 host path 和进程权限仍按 backend 实际边界运行。
 Provider/A2A 命名环境变量由 `integrations` 解析；MCP 配置保留 raw connection dict
-并交给底层 client；`ToolError` 在异常文本离开 tool boundary 时只做有界、单行的
-摘要，处理 header/key-value、URL 敏感参数、JWT、常见 key 前缀和 private-key PEM
-等高置信形状。它不扫描环境、历史 checkpoint 或成功 tool output，也不是“所有异常/
-日志都已脱敏”的保证。`ToolRuntime.config` 同样不是 secret boundary，runtime 不应把
-它当作凭据过滤器。
+并交给底层 client。`ToolError`、artifact registration、delegation error render，以及
+selected runtime failure logs/checkpoint-facing notification errors，在异常文本离开这些
+边界时只做有界、单行的摘要，处理 header/key-value、URL 敏感参数、JWT、常见 key
+前缀和 private-key PEM 等高置信形状。它不扫描环境、历史 checkpoint 或成功 tool
+output，也不是“所有异常/日志都已脱敏”的保证。`ToolRuntime.config` 同样不是 secret
+boundary，runtime 不应把它当作凭据过滤器。
 
 ## 依赖
 

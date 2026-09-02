@@ -20,6 +20,7 @@ from ruyi_agent.runtime.delegation.contracts import (
     UnknownAgentTargetError,
     UnavailableAgentTargetError,
 )
+from ruyi_agent.safe_errors import REDACTED_VALUE
 from ruyi_agent.task_models import TaskRecord
 
 from tests.support.async_subagent_runtime import (
@@ -553,6 +554,94 @@ def test_spawn_unknown_agent_raises_clear_error(
     assert "Unknown agent target" in message
     assert "background_research" in message
     assert "remote_code_wiki" in message
+
+
+def test_delegation_error_text_and_task_error_view_are_redacted() -> None:
+    manager, tools, command_port = _direct_tools()
+    secret = "delegation-error-secret"
+    command_port.spawn_error = ValueError(f"Authorization: Bearer {secret}")
+
+    spawn_result = asyncio.run(
+        tools.spawn_agent(
+            "background_research",
+            "research this",
+            command_port=command_port,
+        )
+    )
+    record = manager.create_task_record(
+        "failed-task",
+        "background_research",
+        parent_task_id=None,
+        root_task_id="failed-task",
+        depth=1,
+    )
+    manager.mark_failed(record.task_id, f"api_key={secret}")
+    checkpoint_result = asyncio.run(
+        tools.check_agent(record.task_id, command_port=command_port)
+    )
+
+    assert secret not in spawn_result
+    assert REDACTED_VALUE in spawn_result
+    assert "ValueError:" in spawn_result
+    assert secret not in checkpoint_result
+    assert REDACTED_VALUE in checkpoint_result
+    assert "state=failed" in checkpoint_result
+
+
+def test_settled_notification_log_redacts_publish_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    manager = TaskManager()
+    record = manager.create_task_record(
+        "notification-task",
+        "background_research",
+        parent_task_id=None,
+        root_task_id="notification-task",
+        depth=1,
+        parent_thread_id="parent-thread",
+    )
+    manager.mark_completed(record.task_id, "done")
+    secret = "notification-log-secret"
+
+    class FailingMailbox:
+        def publish_settled(self, **kwargs: object) -> None:
+            del kwargs
+            raise RuntimeError(f"api_key={secret}")
+
+    notifier = SettledRunNotifier(manager, FailingMailbox())
+
+    assert notifier.publish_settled_message(record.task_id) == []
+    assert secret not in caplog.text
+    assert REDACTED_VALUE in caplog.text
+    assert "direct publish task=notification-task" in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+def test_settled_notification_claim_checkpoint_error_is_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = TaskManager()
+    notifier = SettledRunNotifier(manager, None)
+    checkpoint_errors: list[str] = []
+    secret = "notification-checkpoint-secret"
+
+    class ClaimedIntent:
+        outbox_key = "outbox-1"
+
+    def release_claim(_intent: object, *, error: str) -> bool:
+        checkpoint_errors.append(error)
+        return False
+
+    monkeypatch.setattr(manager, "release_settled_outbox_claim", release_claim)
+    notifier._release_failed_claim(
+        ClaimedIntent(),
+        RuntimeError(f"Authorization: Bearer {secret}"),
+    )
+
+    assert checkpoint_errors == [
+        f"RuntimeError: Authorization: Bearer {REDACTED_VALUE}"
+    ]
+    assert secret not in checkpoint_errors[0]
 
 
 def test_build_tools_exposes_available_agent_names(

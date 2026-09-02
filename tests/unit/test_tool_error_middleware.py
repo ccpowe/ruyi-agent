@@ -66,7 +66,7 @@ def test_awrap_tool_call_returns_structured_error_message_without_leaking_to_log
     assert "tool=web_search_exa" in str(result.content)
     assert "category=unexpected" in str(result.content)
     assert "retriable=false" in str(result.content)
-    assert "RuntimeError: Authorization: [REDACTED]" in str(result.content)
+    assert "RuntimeError: Authorization: Bearer [REDACTED]" in str(result.content)
     assert secret not in str(result.content)
     assert secret not in caplog.text
 

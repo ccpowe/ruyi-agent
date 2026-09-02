@@ -14,6 +14,7 @@ from ruyi_agent.runtime.agent_factory import create_runtime_agent
 from ruyi_agent.runtime.middleware.artifact_publishing import (
     ArtifactPublishingMiddleware,
 )
+from ruyi_agent.safe_errors import REDACTED_VALUE
 
 
 class MemoryBackend:
@@ -206,3 +207,55 @@ def test_publish_artifact_tool_uses_agent_task_config() -> None:
         }
     ]
     assert json.loads(str(tool_messages[0].content))["ok"] is True
+
+
+def test_publish_artifact_registration_error_is_redacted_in_tool_message() -> None:
+    backend = MemoryBackend()
+    backend.files["/report.html"] = b"<html>ok</html>"
+    secret = "artifact-registration-secret"
+
+    def register_artifact(*, task_id: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        del task_id, artifact
+        raise RuntimeError(f"Authorization: Bearer {secret}")
+
+    model = FakeToolCallingModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "publish_artifact",
+                        "args": {"path": "/report.html"},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    agent = create_runtime_agent(
+        model=model,
+        tools=[],
+        system_prompt="Test artifact publishing",
+        backend=backend,
+        workspace_root="/",
+        register_artifact=register_artifact,
+    )
+
+    async def scenario() -> list[ToolMessage]:
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": "publish it"}]},
+            config={"configurable": {"thread_id": "task-1", "task_id": "task-1"}},
+            version="v2",
+        )
+        messages = result.value["messages"] if hasattr(result, "value") else result["messages"]
+        return [message for message in messages if isinstance(message, ToolMessage)]
+
+    tool_messages = asyncio.run(scenario())
+    payload = json.loads(str(tool_messages[0].content))
+
+    assert payload["error"] == "artifact_registration_failed"
+    assert secret not in str(tool_messages[0].content)
+    assert REDACTED_VALUE in payload["hint"]
+    assert "RuntimeError:" in payload["hint"]

@@ -55,10 +55,72 @@ def test_safe_error_text_replaces_known_secrets_longest_first() -> None:
     assert summary == f"provider failed with {REDACTED_VALUE}"
 
 
+def test_safe_error_text_bounds_short_known_token_replacement() -> None:
+    secret = "abc123"
+    source = "The abc token is prose; abc123x is a longer identifier."
+
+    summary = safe_error_text(source, known_secrets=("abc", secret))
+
+    assert summary == source
+    assert safe_error_text(
+        f"provider rejected {secret}", known_secrets=(secret,)
+    ) == f"provider rejected {REDACTED_VALUE}"
+
+
 def test_safe_error_text_keeps_benign_token_and_password_words() -> None:
     source = "The token password wording is documentation, not an assignment."
 
     assert safe_error_text(source) == source
+
+
+def test_safe_error_text_keeps_unstructured_colon_reasons() -> None:
+    source = "expected token: identifier after password: field"
+
+    assert safe_error_text(source) == source
+
+
+def test_safe_error_text_redacts_one_header_token_without_consuming_reason() -> None:
+    source = "Authorization: Bearer abc rejected by upstream"
+    secret = "header-secret-value"
+    header_with_reason = f"Authorization: Bearer {secret} rejected by upstream"
+
+    assert safe_error_text(source) == source
+    summary = safe_error_text(header_with_reason)
+    assert secret not in summary
+    assert summary.endswith("rejected by upstream")
+
+
+def test_safe_error_text_respects_crlf_and_quoted_value_boundaries() -> None:
+    source = (
+        "Authorization: Bearer header-secret-value\r\n"
+        "password: \"quoted-secret\"\r\n"
+        "password=unquoted-secret\r\n"
+        "password: unquoted-secret\r\n"
+        "next=kept"
+    )
+
+    summary = safe_error_text(source)
+
+    for secret in (
+        "header-secret-value",
+        "quoted-secret",
+        "unquoted-secret",
+    ):
+        assert secret not in summary
+    assert summary.count(REDACTED_VALUE) == 4
+    assert "next=kept" in summary
+    assert "\n" not in summary
+
+
+def test_safe_error_text_redacts_cookie_header_without_consuming_next_line() -> None:
+    secret = "cookie-secret"
+    summary = safe_error_text(
+        f"Cookie: session={secret}; theme=dark\r\nreason=kept"
+    )
+
+    assert secret not in summary
+    assert REDACTED_VALUE in summary
+    assert "reason=kept" in summary
 
 
 def test_safe_error_text_is_bounded_after_redaction() -> None:
