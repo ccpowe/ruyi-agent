@@ -120,14 +120,44 @@ def test_spawn_remote_ref_runs_via_a2a_gateway(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    factory = FakeAgentFactory()
-    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", factory)
     monkeypatch.setenv("REMOTE_CODE_WIKI_TOKEN", "remote-secret")
 
     remote_db = str(tmp_path / "remote-tasks.sqlite")
     remote_task_store = TaskStore(remote_db)
     remote_mailbox_store = MailboxStore(remote_db)
     remote_mailbox = AgentMailbox(remote_mailbox_store)
+
+    factory = FakeAgentFactory()
+    claimed_batches: list[list] = []
+    claim_inputs: list[tuple[str, str, str]] = []
+    second_run_claimed = asyncio.Event()
+
+    def create_follow_up_agent(**kwargs):
+        agent = factory(**kwargs)
+        original_ainvoke = agent.ainvoke
+
+        async def ainvoke(payload, *, config, version):
+            result = await original_ainvoke(payload, config=config, version=version)
+            if len(agent.calls) == 2:
+                configurable = config["configurable"]
+                task_id = configurable["task_id"]
+                thread_id = configurable["thread_id"]
+                run_id = configurable["mailbox_run_id"]
+                claim_inputs.append((task_id, thread_id, run_id))
+                claimed_batches.append(
+                    remote_mailbox.claim(
+                        recipient_task_id=task_id,
+                        recipient_thread_id=thread_id,
+                        run_id=run_id,
+                    )
+                )
+                second_run_claimed.set()
+            return result
+
+        agent.ainvoke = ainvoke
+        return agent
+
+    monkeypatch.setattr(agent_factory_module, "create_runtime_agent", create_follow_up_agent)
     remote_control = async_subagent_runtime.AgentControl(
         {
             "code_wiki": LocalWorkerSpec(
@@ -179,13 +209,51 @@ def test_spawn_remote_ref_runs_via_a2a_gateway(
             task_id = started.task_id
             status_before = control.get_task_record(task_id)
             status_after = await control.refresh_task(task_id)
-            sent = await control.send_task_input(task_id, "follow up")
             [downstream] = remote_control.list_persisted_task_records()
-            claimed = remote_mailbox.claim(
-                recipient_task_id=downstream.task_id,
-                recipient_thread_id=downstream.thread_id,
+            initial_downstream = await wait_for_task_state(
+                remote_control,
+                downstream.task_id,
+                states={"completed"},
             )
-            remote_mailbox.acknowledge([message.message_id for message in claimed])
+            assert initial_downstream.run_count == 1
+            sent = await control.send_task_input(task_id, "follow up")
+
+            [agent] = factory.created
+            async with asyncio.timeout(5):
+                await second_run_claimed.wait()
+            completed_downstream = await wait_for_task_state(
+                remote_control,
+                downstream.task_id,
+                states={"completed"},
+            )
+            assert completed_downstream.run_count == 2
+            await remote_control.wake_pending_mailbox_tasks()
+            after_recovery = remote_control.get_task_record(downstream.task_id)
+            assert after_recovery.state == "completed"
+            assert after_recovery.run_count == 2
+            message_rows = remote_mailbox_store._conn.execute(
+                """
+                SELECT content, status
+                FROM agent_mailbox_messages
+                WHERE recipient_task_id = ?
+                ORDER BY message_id
+                """,
+                (downstream.task_id,),
+            ).fetchall()
+            assert [(row["content"], row["status"]) for row in message_rows] == [
+                ("follow up", "delivered")
+            ]
+            assert remote_mailbox.has_triggering_messages(downstream.task_id) is False
+            assert len(agent.calls) == 2
+            assert len(claimed_batches) == 1
+            assert [message.content for message in claimed_batches[0]] == ["follow up"]
+            assert claim_inputs == [
+                (
+                    downstream.task_id,
+                    downstream.thread_id,
+                    agent.calls[1]["config"]["configurable"]["mailbox_run_id"],
+                )
+            ]
             final = await control.refresh_task(task_id)
             return task_id, status_before, status_after, sent, final
         finally:
