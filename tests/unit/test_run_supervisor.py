@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from copy import copy, deepcopy
 from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from deepagents.backends import StateBackend
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from pydantic import Field
 import pytest
 
 import ruyi_agent.runtime.delegation.run_supervisor as supervisor_module
+from ruyi_agent.config.agent_runtime import LocalWorkerSpec
 from ruyi_agent.runtime.delegation.async_runtime import AgentControl
 import ruyi_agent.runtime.agent_factory as agent_factory_module
 from ruyi_agent.runtime.delegation.contracts import (
@@ -76,6 +83,44 @@ class MultiBlockingAgent:
             self.all_started.set()
         await asyncio.Event().wait()
         raise AssertionError("cancelled run must not return")
+
+
+class CompiledMailboxModel(BaseChatModel):
+    outcome: str
+    mailbox_seen: Any = Field(default_factory=asyncio.Event)
+    mailbox_started: Any = Field(default_factory=asyncio.Event)
+
+    @property
+    def _llm_type(self) -> str:
+        return "compiled-mailbox-model"
+
+    def bind_tools(
+        self,
+        tools: Sequence[Any],
+        **kwargs: Any,
+    ) -> "CompiledMailboxModel":
+        del tools, kwargs
+        return self
+
+    @staticmethod
+    def _result() -> ChatResult:
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content="done"))]
+        )
+
+    def _generate(self, messages: Any, **kwargs: Any) -> ChatResult:
+        del messages, kwargs
+        return self._result()
+
+    async def _agenerate(self, messages: Any, **kwargs: Any) -> ChatResult:
+        del kwargs
+        contents = [str(getattr(message, "content", "")) for message in messages]
+        if any("durable mailbox input" in content for content in contents):
+            self.mailbox_seen.set()
+            if self.outcome == "cancel":
+                self.mailbox_started.set()
+                await asyncio.Event().wait()
+        return self._result()
 
 
 class ParentSpawningAgent:
@@ -591,6 +636,91 @@ async def test_cancelled_local_run_releases_its_mailbox_claim(
         await control.close()
         mailbox_store.close()
         store.close()
+
+
+@pytest.mark.parametrize("outcome", ["success", "cancel"])
+@async_test
+async def test_compiled_graph_mailbox_claims_follow_executor_run_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    model = CompiledMailboxModel(outcome=outcome)
+    db_path = tmp_path / "tasks.sqlite"
+    task_store = TaskStore(str(db_path))
+    mailbox_store = MailboxStore(str(db_path))
+    mailbox = AgentMailbox(mailbox_store)
+    claimed_run_ids: list[str | None] = []
+    original_claim = mailbox.claim
+
+    def record_claim(
+        *,
+        recipient_task_id: str | None,
+        recipient_thread_id: str,
+        run_id: str | None = None,
+    ) -> list[Any]:
+        claimed_run_ids.append(run_id)
+        return original_claim(
+            recipient_task_id=recipient_task_id,
+            recipient_thread_id=recipient_thread_id,
+            run_id=run_id,
+        )
+
+    monkeypatch.setattr(mailbox, "claim", record_claim)
+    control = AgentControl(
+        {
+            "background_research": LocalWorkerSpec(
+                name="background_research",
+                description="compiled mailbox test worker",
+                system_prompt="return a concise answer",
+                model=model,
+                tools=[],
+                memory=[],
+                skills=[],
+                system_tools=frozenset(),
+            )
+        },
+        checkpointer=None,
+        backend=StateBackend(),
+        task_store=task_store,
+        mailbox=mailbox,
+        shutdown_grace_period=0,
+    )
+    try:
+        record = await control.spawn_task("background_research", "initial input")
+        await wait_for_task_state(control, record.task_id, states={"completed"})
+        await control.send_task_input(record.task_id, "durable mailbox input")
+
+        if outcome == "cancel":
+            await asyncio.wait_for(model.mailbox_started.wait(), timeout=2)
+            await control.cancel_task(record.task_id)
+        else:
+            await wait_for_task_state(
+                control,
+                record.task_id,
+                states={"completed"},
+            )
+
+        assert model.mailbox_seen.is_set()
+        assert len(claimed_run_ids) >= 2
+        assert all(isinstance(run_id, str) and run_id for run_id in claimed_run_ids)
+        assert len(set(claimed_run_ids)) >= 2
+
+        remaining = mailbox.claim(
+            recipient_task_id=record.task_id,
+            recipient_thread_id=record.thread_id,
+        )
+        if outcome == "success":
+            assert remaining == []
+        else:
+            assert [message.content for message in remaining] == [
+                "durable mailbox input"
+            ]
+            mailbox.acknowledge(remaining)
+    finally:
+        await control.close()
+        mailbox_store.close()
+        task_store.close()
 
 
 @async_test

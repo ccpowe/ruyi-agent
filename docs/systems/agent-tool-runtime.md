@@ -86,7 +86,10 @@ checkpointer 交给 [`TaskMessageStateReader`](../../src/ruyi_agent/runtime/mess
 生成；当前项目写入的 `configurable` 字段是 `thread_id`、`task_id`、
 `parent_task_id`、`root_task_id`、`delegation_depth`、`agent_name`、
 `permission_profile`、`effective_skill_names`、`skill_view_path` 和
-`skill_view_hash`。middleware 通过 `get_config()` 或完整的 `ToolRuntime.config`
+`skill_view_hash`、`mailbox_run_id`。`mailbox_run_id` 是每次 executor invocation
+新建的 process-local identity：只有启用 mailbox 的 invocation 用它把 claim token
+绑定到精确 Run，并 fence 该 Run 的 ack/release；它不是持久 Task identity，也不构成
+对外的 Gateway context。middleware 通过 `get_config()` 或完整的 `ToolRuntime.config`
 读取这些字段（artifact helper 也接受 `metadata.task_id`）；后续输入和 review
 resume 复用同一 `thread_id`，因此是同一 graph 会话。`RunnableConfig` 还可能带有
 框架的其它键，不能把它描述成只含 run context。

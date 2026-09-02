@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from ruyi_agent.runtime.mailbox.service import AgentMailbox, render_mailbox_messages
 import ruyi_agent.runtime.middleware.mailbox as mailbox_middleware_module
 from ruyi_agent.runtime.middleware.mailbox import MailboxMiddleware
@@ -412,6 +414,119 @@ def test_stale_owner_or_token_cannot_acknowledge_or_release_reclaimed_message(
     finally:
         second_store.close()
         first_store.close()
+
+
+def test_legacy_message_id_acknowledges_latest_reclaimed_token_and_clears_cache(
+    tmp_path,
+) -> None:
+    store = MailboxStore(str(tmp_path / "mailbox.sqlite"))
+    try:
+        mailbox = AgentMailbox(store)
+        mailbox.publish_input(
+            recipient_task_id="task-1",
+            recipient_thread_id="thread-1",
+            content="retry with latest token",
+            message_id="message-1",
+        )
+        first = mailbox.claim(
+            recipient_task_id="task-1",
+            recipient_thread_id="thread-1",
+        )
+        assert len(first) == 1
+        first_token = first[0].claim_token
+        assert first_token is not None
+        with store._lock:
+            store._conn.execute(
+                """
+                UPDATE agent_mailbox_messages
+                SET claim_expires_at = '2000-01-01T00:00:00+00:00'
+                WHERE message_id = 'message-1'
+                """
+            )
+            store._conn.commit()
+
+        reclaimed = mailbox.claim(
+            recipient_task_id="task-1",
+            recipient_thread_id="thread-1",
+        )
+        assert len(reclaimed) == 1
+        latest_token = reclaimed[0].claim_token
+        assert latest_token is not None and latest_token != first_token
+        assert mailbox._legacy_claim_tokens == {"message-1": latest_token}
+
+        mailbox.acknowledge(["message-1"])
+
+        row = store._conn.execute(
+            """
+            SELECT status FROM agent_mailbox_messages WHERE message_id = 'message-1'
+            """
+        ).fetchone()
+        assert row is not None and row["status"] == "delivered"
+        assert mailbox._legacy_claim_tokens == {}
+    finally:
+        store.close()
+
+
+def test_recovery_releases_expired_claims_before_renew_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    store = MailboxStore(str(tmp_path / "mailbox.sqlite"))
+    try:
+        mailbox = AgentMailbox(store)
+        mailbox.publish_input(
+            recipient_task_id="task-1",
+            recipient_thread_id="thread-1",
+            content="expired before renewal",
+        )
+        calls: list[str] = []
+        original_recover = store.recover_claims
+
+        def record_recover() -> None:
+            calls.append("recover")
+            original_recover()
+
+        def fail_renew(
+            claim_tokens: list[str],
+            *,
+            lease_seconds: int = 300,
+        ) -> set[str]:
+            del claim_tokens, lease_seconds
+            calls.append("renew")
+            raise RuntimeError("renew failed")
+
+        monkeypatch.setattr(store, "recover_claims", record_recover)
+        monkeypatch.setattr(store, "renew_claim_tokens", fail_renew)
+        with mailbox.run_scope("run-1"):
+            claimed = mailbox.claim(
+                recipient_task_id="task-1",
+                recipient_thread_id="thread-1",
+            )
+            assert len(claimed) == 1
+            with store._lock:
+                store._conn.execute(
+                    """
+                    UPDATE agent_mailbox_messages
+                    SET claim_expires_at = '2000-01-01T00:00:00+00:00'
+                    WHERE message_id = ?
+                    """,
+                    (claimed[0].message_id,),
+                )
+                store._conn.commit()
+
+            with pytest.raises(RuntimeError, match="renew failed"):
+                mailbox.recover_claims()
+
+            row = store._conn.execute(
+                """
+                SELECT status FROM agent_mailbox_messages WHERE message_id = ?
+                """,
+                (claimed[0].message_id,),
+            ).fetchone()
+            assert row is not None and row["status"] == "pending"
+            assert calls == ["recover", "renew"]
+    finally:
+        store.close()
 
 
 def test_recovery_renews_only_live_run_tokens_and_never_revives_expired_claims(

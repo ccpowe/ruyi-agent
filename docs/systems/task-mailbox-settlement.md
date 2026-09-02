@@ -275,9 +275,10 @@ run_count 处理。
 
 bootstrap 在 Gateway readiness 打开前先推进 pending settlement、过期 claim、
 suppression retraction 和 recipient wakeup；随后由 supervisor 管理维护循环，继续
-dispatch/reconcile outbox、续租仍活跃 executor run 的 owner+token batches、释放可恢复
-的 lease 并唤醒 pending recipient。maintenance 不会按 owner 盲续租：已结束的 run、
-未知 token 或已过期 token 都不续租，也不会把过期 claim 复活。dispatch、reconcile
+dispatch/reconcile outbox、先释放过期 lease，再从活跃 executor run 的 snapshot 续租
+仍未过期的 owner+token batches，并唤醒 pending recipient。maintenance 不会按 owner
+盲续租：已结束的 run、未知 token 或已过期 token 都不续租，也不会把过期 claim
+复活；即使续租本身失败，先前的 expiry recovery 仍已生效。dispatch、reconcile
 和 wakeup 是提交后的非权威 tail：它们失败或进程退出时，已提交的 Task/event/intent
 与 parent mailbox row 仍按 SQLite 状态保留，由后续 startup 或 maintenance 再推进；
 wakeup 成功也不能替代 parent 真正 claim 和模型 ack。

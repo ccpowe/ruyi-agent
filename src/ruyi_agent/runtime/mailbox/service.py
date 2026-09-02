@@ -115,7 +115,7 @@ class AgentMailbox:
         self._seen_message_keys: set[tuple[str, str, int]] = set()
         self._seen_input_idempotency_keys: set[str] = set()
         self._active_run_claims: dict[str, dict[str, str]] = {}
-        self._legacy_claim_tokens: dict[str, list[str]] = {}
+        self._legacy_claim_tokens: dict[str, str] = {}
 
     @property
     def is_durable(self) -> bool:
@@ -332,9 +332,7 @@ class AgentMailbox:
                 if active_claims is not None:
                     active_claims[message.message_id] = message.claim_token
                 else:
-                    self._legacy_claim_tokens.setdefault(message.message_id, []).append(
-                        message.claim_token
-                    )
+                    self._legacy_claim_tokens[message.message_id] = message.claim_token
         return messages
 
     def acknowledge(self, messages: list[InterAgentMessage] | list[str]) -> None:
@@ -358,6 +356,9 @@ class AgentMailbox:
             if not claims:
                 return
             self._store.acknowledge_claim_tokens(list(set(claims.values())))
+            for message_id, claim_token in claims.items():
+                if self._legacy_claim_tokens.get(message_id) == claim_token:
+                    self._legacy_claim_tokens.pop(message_id, None)
             claims.clear()
 
     def release_run(self, run_id: str) -> None:
@@ -370,6 +371,9 @@ class AgentMailbox:
             if not claims:
                 return
             self._store.release_claim_tokens(list(set(claims.values())))
+            for message_id, claim_token in claims.items():
+                if self._legacy_claim_tokens.get(message_id) == claim_token:
+                    self._legacy_claim_tokens.pop(message_id, None)
             claims.clear()
 
     def has_triggering_messages(self, recipient_task_id: str) -> bool:
@@ -383,10 +387,11 @@ class AgentMailbox:
             )
 
     def recover_claims(self) -> None:
-        """Renew live run claims, then release every expired durable lease."""
+        """Release expired leases, then renew the surviving active run claims."""
 
         if self._store is not None:
             with self._lock:
+                self._store.recover_claims()
                 tokens = {
                     claim_token
                     for claims in self._active_run_claims.values()
@@ -398,7 +403,6 @@ class AgentMailbox:
                         for message_id, claim_token in tuple(claims.items()):
                             if claim_token not in live_tokens:
                                 claims.pop(message_id, None)
-                self._store.recover_claims()
 
     def drain(self, recipient_thread_id: str) -> list[InterAgentMessage]:
         """
@@ -571,9 +575,7 @@ class AgentMailbox:
                     else None
                 )
                 if claim_token is None:
-                    legacy_tokens = self._legacy_claim_tokens.get(message_id)
-                    if legacy_tokens:
-                        claim_token = legacy_tokens[0]
+                    claim_token = self._legacy_claim_tokens.get(message_id)
                 if claim_token is not None:
                     pairs.append((message_id, claim_token))
             return list(dict.fromkeys(pairs))
@@ -584,15 +586,8 @@ class AgentMailbox:
                 for active_claims in self._active_run_claims.values():
                     if active_claims.get(message_id) == claim_token:
                         active_claims.pop(message_id, None)
-                legacy_tokens = self._legacy_claim_tokens.get(message_id)
-                if legacy_tokens is not None:
-                    remaining = [
-                        token for token in legacy_tokens if token != claim_token
-                    ]
-                    if remaining:
-                        self._legacy_claim_tokens[message_id] = remaining
-                    else:
-                        self._legacy_claim_tokens.pop(message_id, None)
+                if self._legacy_claim_tokens.get(message_id) == claim_token:
+                    self._legacy_claim_tokens.pop(message_id, None)
 
 
 def render_mailbox_messages(messages: list[InterAgentMessage]) -> str:
