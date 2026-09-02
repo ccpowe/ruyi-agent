@@ -111,6 +111,9 @@ def safe_error_text(
 ) -> str:
     """Return a bounded, one-line error text with narrow high-confidence redaction."""
 
+    if max_length < 1:
+        return ""
+
     normalized_secrets = _normalize_known_secrets(known_secrets)
     value = _limit_input(_exception_text(text), max_input_chars=max_input_chars)
     if _contains_ambiguous_short_known_secret(value, normalized_secrets):
@@ -219,10 +222,11 @@ def _contains_ambiguous_short_known_secret(
     """Detect a standalone 1--7 character configured value without rewriting it."""
 
     for secret in known_secrets:
-        if (
-            len(secret) >= _MIN_UNBOUNDED_KNOWN_SECRET_CHARS
-            or not _is_token_literal(secret)
-        ):
+        if len(secret) >= _MIN_UNBOUNDED_KNOWN_SECRET_CHARS:
+            continue
+        if not _is_token_literal(secret):
+            if secret in value:
+                return True
             continue
         pattern = re.compile(
             rf"(?<![{_SHORT_SECRET_BOUNDARY_CHAR_CLASS}]){re.escape(secret)}"

@@ -107,6 +107,53 @@ def test_safe_exception_summary_keeps_diagnostics_without_short_secret() -> None
     assert summary == "RuntimeError: provider rejected an invalid format"
 
 
+@pytest.mark.parametrize("secret", ["@@", "密", "a b"])
+def test_safe_error_entries_fall_back_for_matching_non_token_short_secret(
+    secret: str,
+) -> None:
+    reason = f"provider rejected {secret}"
+
+    assert safe_error_text(
+        reason,
+        known_secrets=(secret,),
+    ) == "Sensitive error details redacted."
+    assert safe_exception_summary(
+        RuntimeError(reason),
+        known_secrets=(secret,),
+    ) == "RuntimeError: Sensitive error details redacted."
+
+
+@pytest.mark.parametrize("secret", ["@@", "密", "a b"])
+def test_safe_error_entries_keep_diagnostics_without_non_token_short_secret(
+    secret: str,
+) -> None:
+    reason = "provider rejected an invalid format"
+
+    assert safe_error_text(reason, known_secrets=(secret,)) == reason
+    assert safe_exception_summary(
+        RuntimeError(reason),
+        known_secrets=(secret,),
+    ) == f"RuntimeError: {reason}"
+
+
+@pytest.mark.parametrize("max_length", [0, -1])
+def test_safe_error_entries_return_empty_before_short_secret_fallback(
+    max_length: int,
+) -> None:
+    reason = "Expected 1 result"
+
+    assert safe_error_text(
+        reason,
+        known_secrets=("1",),
+        max_length=max_length,
+    ) == ""
+    assert safe_exception_summary(
+        ValueError(reason),
+        known_secrets=("1",),
+        max_length=max_length,
+    ) == ""
+
+
 def test_safe_exception_summary_downgrades_group_reasons_for_short_secret() -> None:
     summary = safe_exception_summary(
         ExceptionGroup(
