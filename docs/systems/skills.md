@@ -24,7 +24,7 @@ Skills 子系统负责：
 
 - 安装、外部下载、更新、删除或热重载 skills。当前的 backend upload/download
   只是把已选 host 文件复制到运行时 view、再从 view 读取内容，不是 skill
-  包管理器；
+  包管理器；它也不会自动清理内容变化后留下的历史 backend view；
 - tool permission、approval 或 `allowed-tools` 的强制执行。`allowed-tools` 目前
   只在 middleware 中解析成 metadata，不会据此过滤或拒绝 tool call；
 - 通用 filesystem/tool runtime、workspace 的完整 ACL、shell 隔离，或 backend
@@ -78,7 +78,8 @@ skill view。没有 `TaskStore` 的进程内模式仍可执行解析和物化，
 ## Host roots、catalog snapshot 与有效性
 
 [`SkillCatalog`](../../src/ruyi_agent/runtime/skills/catalog.py) 只把以下三个固定
-root 当作 discovery roots；这些 roots 是发现来源，不是 resolved containment boundary。
+root 当作 discovery roots，并把每个有效 skill 的已解析路径限制在其 discovery root
+内。
 
 | 扫描顺序（低到高） | root |
 | --- | --- |
@@ -96,16 +97,21 @@ catalog key。冲突时后扫描的条目覆盖前一条，因此同名优先级
 roots 不是“任何 Ruyi home 下的 skills_dir”别名。workspace root 则来自已经解析的
 `settings.backend.workspace`，不是 backend namespace 中的 `/`。
 
-一个目录只有在存在可解析的 `SKILL.md`、frontmatter 是 YAML mapping 且包含非空
-字符串 `name`/`description` 时才会成为 `SkillEntry`。无效项会被跳过，目录名不
-需要等于 frontmatter name；catalog 只解析发现和选择所需的 metadata，不在这一层
-解析正文或 `allowed-tools`。源文件的普通读取异常会在扫描边界暴露为 bootstrap
-失败，目录不存在则没有该 root 的条目。
+一个目录只有在 source root、skill directory 和 `SKILL.md` 都不是 symlink，且
+directory/`SKILL.md` 的已解析路径仍在 source root 内时，才会继续作为候选。随后
+`SKILL.md` 必须可解析、frontmatter 是 YAML mapping，并包含非空字符串
+`name`/`description`。name 是一个安全的单路径段：不能是绝对路径、`.`/`..`、包含
+`/`、反斜杠或 NUL；这不限制 Unicode、大小写或点号。无效项会被跳过，目录名不需要
+等于 frontmatter name；catalog 只解析发现和选择所需的 metadata，不在这一层解析
+正文或 `allowed-tools`。源文件的普通读取异常会在扫描边界暴露为 bootstrap 失败，目录
+不存在则没有该 root 的条目。
 
 bootstrap 只扫描一次，保存的是 name、description、host directory 和 source root
 的 snapshot；它不是后台 watcher。新增或删除的目录要到下一次 bootstrap 才能进入
-catalog。snapshot 保存路径而不是预读的全部 bytes，因此对一个已发现目录的文件
-修改，会在之后一次新的 view materialization 时重新读取和 hash。
+catalog。catalog snapshot 保存路径而不是预读的全部 bytes；每次新的 view
+materialization 会再次验证 entry，并为每个选中的 skill 形成一次按相对 POSIX path
+排序的文件 snapshot。每个文件只读取一次，读取到的同一份 bytes 同时用于 hash 和
+upload。
 
 ## Agent 声明与 effective skills
 
@@ -154,18 +160,15 @@ view 根由 backend runtime 提供：当前 local 为
   "view_hash": "...",
   "skills": {
     "skill-name": {
-      "hash": "...",
-      "source": "/host/path/to/skill"
+      "hash": "..."
     }
   }
 }
 ```
 
-manifest 是 view 的内部物化记录；`source` 是 host 路径，不是模型的公开路径、稳定
-API、权限证明或外部 locator。它已上传到 backend view，拥有 filesystem tool 的模型
-可能直接读取 `<view_path>/.manifest.json` 并看到该 source。模型 metadata 中的
-`path` 是 backend view 下的 `SKILL.md` path，`.manifest.json` 不会被列成 skill
-metadata。
+manifest 是 view 的内部物化记录，只记录 view hash 和各 skill 的内容 hash，不包含
+host source path。模型 metadata 中的 `path` 是 backend view 下的 `SKILL.md` path，
+`.manifest.json` 不会被列成 skill metadata。
 
 任何 upload response 带 error 时，syncer 汇总错误并抛出
 `ValueError("Failed to sync skills: ...")`；调用方不能把部分已上传文件视为成功的
@@ -173,20 +176,24 @@ Task view。
 
 ## Host 到 backend 的信任边界
 
-host catalog 是运行进程信任的来源边界：runtime 读取 host 上选中的 skill source
-并将内容上传到 backend，backend 不按 manifest 的 `source` 回读 host 路径。skill
-source 和 frontmatter `name` 应视为 trusted input。当前实现不保证 source/view 的
-resolved containment、不保证 atomic materialization，也不保证 manifest 中
-source path 的 confidentiality；这些都不是现有安全保证。选中的 skill 内容会成为
-模型可读的指令数据，tool permission、shell 隔离和 backend 访问边界仍由各自系统
-负责。
+host catalog 是运行进程读取并上传 skill 内容的来源边界。catalog 拒绝会依赖 symlink
+或离开 discovery root 的 skill directory/`SKILL.md`；syncer 在 materialization 前
+再次验证每个 `SkillEntry`，因此不可信的伪造 entry 也不能把根外路径或任意
+文件/目录 symlink 上传到 view。backend 不从 manifest 回读 host 路径，且新 manifest
+不暴露 host source path。
+
+这些检查不把 host 文件系统变成原子快照，也不提供签名、来源信任、内容限额或 backend
+view 的自动回滚/清理。选中的 skill 内容仍应被视为模型可读的指令数据，tool
+permission、shell 隔离和 backend 访问边界仍由各自系统负责。
 
 Task 已绑定的 view 不会因为 host 变化而隐式切换：修改已存在目录的文件不会改写
 现有 TaskRecord 的 names/path/hash，新增或删除 root 下目录也不会更新当前进程的
 catalog。之后创建的新 Task 可能在同一 snapshot 的已有 name 上看到新的文件 hash
 （并得到新的 view），而显式选择新目录要等下一次 bootstrap。现有 Task 的后续 run
 仍使用其持久的 backend path/hash；skills 系统没有 watcher、re-materialize 或
-“最新内容”语义，也不在 middleware 中用 source path 重新同步。
+“最新内容”语义，也不在 middleware 中用 source path 重新同步。新 hash 创建的 view
+不会自动删除历史 view；历史 view 是否保留和何时回收由 backend 生命周期或外部运维
+负责。
 
 ## Task binding 与运行生命周期
 
@@ -274,6 +281,6 @@ system prompt，正文仍由模型通过 backend filesystem path 读取。
 - Task binding、bootstrap/lifespan、materialization 或 view reuse 的状态、事务或恢复
   语义改变；
 - skill source/name 的信任假设、resolved containment、atomic materialization、manifest
-  source-path confidentiality 或其他 trust/security boundary 改变。
+  host-path confidentiality 或其他 trust/security boundary 改变。
 
 只改变其他子系统的内部实现时更新其所属文档；跨越上述边界时再同步受影响的文档。
