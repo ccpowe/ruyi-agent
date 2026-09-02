@@ -9,6 +9,10 @@ from typing import Any
 from ruyi_agent.runtime.skills.types import SkillEntry, SkillView
 
 
+_SKILL_HASH_DOMAIN = b"ruyi-agent.skill.v2\0"
+_VIEW_HASH_DOMAIN = b"ruyi-agent.skill-view.v2\0"
+
+
 class SkillSyncer:
     """Materialize selected host-side skills into a backend-readable view."""
 
@@ -156,19 +160,24 @@ def _is_safe_skill_name(name: object) -> bool:
 
 def _hash_skill(files: Sequence[tuple[str, bytes]]) -> str:
     digest = hashlib.sha256()
+    digest.update(_SKILL_HASH_DOMAIN)
     for relative, content in files:
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
+        relative_bytes = relative.encode("utf-8")
+        digest.update(len(relative_bytes).to_bytes(8, byteorder="big"))
+        digest.update(relative_bytes)
+        digest.update(len(content).to_bytes(8, byteorder="big"))
         digest.update(content)
-        digest.update(b"\0")
     return digest.hexdigest()
 
 
 def _hash_view(names: tuple[str, ...], skill_hashes: Mapping[str, str]) -> str:
     digest = hashlib.sha256()
+    digest.update(_VIEW_HASH_DOMAIN)
     for name in names:
-        digest.update(name.encode("utf-8"))
-        digest.update(b":")
-        digest.update(skill_hashes[name].encode("ascii"))
-        digest.update(b"\0")
+        name_bytes = name.encode("utf-8")
+        skill_hash_bytes = skill_hashes[name].encode("ascii")
+        digest.update(len(name_bytes).to_bytes(8, byteorder="big"))
+        digest.update(name_bytes)
+        digest.update(len(skill_hash_bytes).to_bytes(8, byteorder="big"))
+        digest.update(skill_hash_bytes)
     return digest.hexdigest()[:16]

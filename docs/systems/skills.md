@@ -145,10 +145,12 @@ local Agent 的 `skills` 在配置边界接受三种形态；最终由
 <views_root>/<view_hash>/<skill-name>/<relative-file>
 ```
 
-每个 skill 的 hash 是文件相对路径与 bytes 的 SHA-256；view hash 再按 effective
-names 顺序组合各 skill hash，取前 16 个十六进制字符。相同 names、顺序和内容会
-指向同一个 backend view path；hash 不包含 host source path，也不在 middleware
-使用时重新验证 view bytes。
+每个 skill 的 hash 使用版本化的 v2 SHA-256 framing：固定 skill domain separator
+后，每个相对路径 bytes 和 content bytes 各自以前置的 8-byte big-endian 长度编码。view hash
+同样使用独立的 v2 domain separator，并按 effective names 顺序为 name 和 skill hash
+分别加入长度帧，再取 SHA-256 的前 16 个十六进制字符。这样二进制内容中的 NUL 和
+不同文件分割不会形成相同的 hash 输入；相同 names、顺序和内容仍会指向同一个 backend
+view path。hash 不包含 host source path，也不在 middleware 使用时重新验证 view bytes。
 
 view 根由 backend runtime 提供：当前 local 为
 `/.ruyi_agent/runtime/skill-views`，Daytona 为 sandbox user home 下的同一相对
@@ -197,7 +199,8 @@ catalog。之后创建的新 Task 可能在同一 snapshot 的已有 name 上看
 仍使用其持久的 backend path/hash；skills 系统没有 watcher、re-materialize 或
 “最新内容”语义，也不在 middleware 中用 source path 重新同步。新 hash 创建的 view
 不会自动删除历史 view；历史 view 是否保留和何时回收由 backend 生命周期或外部运维
-负责。
+负责。v2 framing 升级会让之后 materialize 的既有相同 skill 得到新的 view hash；已
+持久化的旧 Task/view 不会迁移、重同步或自动清理。
 
 ## Task binding 与运行生命周期
 

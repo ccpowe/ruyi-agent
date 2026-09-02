@@ -54,6 +54,24 @@ def write_skill(root: Path, name: str) -> SkillEntry:
     )
 
 
+def write_binary_skill(root: Path, files: dict[str, bytes]) -> SkillEntry:
+    skill_dir = root / "frontend"
+    skill_dir.mkdir(parents=True)
+    skill_dir.joinpath("SKILL.md").write_bytes(
+        b"---\nname: frontend\ndescription: frontend desc\n---\n"
+    )
+    for relative, content in files.items():
+        file_path = skill_dir / relative
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(content)
+    return SkillEntry(
+        name="frontend",
+        description="frontend desc",
+        path=skill_dir,
+        source_root=root,
+    )
+
+
 def test_skill_syncer_materializes_selected_skills_to_backend_view(
     tmp_path: Path,
 ) -> None:
@@ -258,22 +276,66 @@ def test_skill_syncer_snapshots_stable_files_once_and_reuses_bytes(
         (path.relative_to(frontend.path).as_posix(), expected_files[path])
         for path in sorted(expected_files)
     ]
-    skill_digest = hashlib.sha256()
+    skill_digest = hashlib.sha256(b"ruyi-agent.skill.v2\0")
     for relative, content in ordered_files:
-        skill_digest.update(relative.encode("utf-8"))
-        skill_digest.update(b"\0")
+        relative_bytes = relative.encode("utf-8")
+        skill_digest.update(len(relative_bytes).to_bytes(8, byteorder="big"))
+        skill_digest.update(relative_bytes)
+        skill_digest.update(len(content).to_bytes(8, byteorder="big"))
         skill_digest.update(content)
-        skill_digest.update(b"\0")
-    view_digest = hashlib.sha256()
-    view_digest.update(b"frontend:")
-    view_digest.update(skill_digest.hexdigest().encode("ascii"))
-    view_digest.update(b"\0")
+    view_digest = hashlib.sha256(b"ruyi-agent.skill-view.v2\0")
+    name_bytes = b"frontend"
+    skill_hash_bytes = skill_digest.hexdigest().encode("ascii")
+    view_digest.update(len(name_bytes).to_bytes(8, byteorder="big"))
+    view_digest.update(name_bytes)
+    view_digest.update(len(skill_hash_bytes).to_bytes(8, byteorder="big"))
+    view_digest.update(skill_hash_bytes)
 
     assert rglob_calls == 1
     assert read_counts == {path: 1 for path in expected_files}
     assert view.view_hash == view_digest.hexdigest()[:16]
     for relative, content in ordered_files:
         assert backend.files[f"{view.path}/frontend/{relative}"] == content
+
+
+def test_skill_syncer_v2_hash_separates_nul_framing_collisions(
+    tmp_path: Path,
+) -> None:
+    first = write_binary_skill(
+        tmp_path / "first",
+        {"a": b"X\0b\0Y"},
+    )
+    second = write_binary_skill(
+        tmp_path / "second",
+        {"a": b"X", "b": b"Y"},
+    )
+    backend = MemoryUploadBackend()
+    syncer = SkillSyncer(backend=backend, views_root="/skill-views")
+
+    first_view = syncer.ensure_view({"frontend": first}, ("frontend",))
+    second_view = syncer.ensure_view({"frontend": second}, ("frontend",))
+
+    assert first_view.view_hash != second_view.view_hash
+    assert first_view.path != second_view.path
+    assert backend.files[f"{first_view.path}/frontend/a"] == b"X\0b\0Y"
+    assert f"{first_view.path}/frontend/b" not in backend.files
+    assert backend.files[f"{second_view.path}/frontend/a"] == b"X"
+    assert backend.files[f"{second_view.path}/frontend/b"] == b"Y"
+
+
+def test_skill_syncer_v2_hash_is_deterministic_for_same_stable_contents(
+    tmp_path: Path,
+) -> None:
+    first = write_binary_skill(tmp_path / "first", {"payload.bin": b"ordinary"})
+    second = write_binary_skill(tmp_path / "second", {"payload.bin": b"ordinary"})
+    backend = MemoryUploadBackend()
+    syncer = SkillSyncer(backend=backend, views_root="/skill-views")
+
+    first_view = syncer.ensure_view({"frontend": first}, ("frontend",))
+    second_view = syncer.ensure_view({"frontend": second}, ("frontend",))
+
+    assert first_view.view_hash == second_view.view_hash
+    assert first_view.path == second_view.path
 
 
 def test_skill_syncer_allows_safe_unicode_uppercase_and_dot_name(tmp_path: Path) -> None:
