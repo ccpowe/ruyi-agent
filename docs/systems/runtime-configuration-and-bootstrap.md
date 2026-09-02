@@ -95,7 +95,9 @@ TOML 校验后覆盖 Gateway `host`、`port`、`base_url`，保留 TOML bearer t
 
 Provider 的 `api_key_env` 在构建模型时由 integrations 读取；remote-ref 只保留
 `auth.token_env`，请求发送前才读取。缺少变量只使对应 Provider/remote Agent
-unavailable，不把 secret 写入 task/config projection、事件或错误详情。starter 和
+unavailable，不把 secret 写入 task/config projection、事件或错误详情。local Agent
+构造失败进入 `unavailable_agents` 前会生成有界单行摘要：保留 exception class 与
+非敏感原因，并只精确替换该 Agent 已配置 Provider key，不扫描整个环境。starter 和
 跟踪配置只提供空 credential 字段或变量名。
 
 ## CLI、bootstrap、恢复与生命周期
@@ -115,7 +117,8 @@ bootstrap 的资源顺序是：
 1. 按 typed backend settings 创建 backend，扫描 host workspace 的 `SkillCatalog`
    并建立 backend skill view；
 2. 独立加载 Agent/Provider/permission，创建 policy，加载 MCP raw dict 并执行一次
-   `refresh()`；单个 MCP server 刷新失败按 server 隔离；
+   `refresh()`；单个 MCP server 刷新失败按 server 隔离，failed status（以及 bootstrap
+   stdout）只使用 registry 已生成的安全异常摘要；
 3. 打开 checkpoint DB，创建 route、command、Task、mailbox、review-audit stores；
 4. 组装 local worker specs 和 remote refs。单个 local Agent 构建失败记录在
    `unavailable_agents`，不会使其他 specs 消失；
@@ -153,7 +156,8 @@ Agent/Provider/permission schema、缺少必需文件、MCP raw 根结构或基�
   token，并由部署环境负责 HTTPS 与网络访问控制。
 - `RUYI_HOME`、workspace 和 storage 在配置边界规范化并做平台检查；个人运行宜用
   仓库外的绝对 `RUYI_HOME`。真实 Provider、channel、remote、Gateway、Daytona
-  secret 只能来自命名环境变量或未跟踪凭据，不能进入 starter、日志、DTO 或错误文本。
+  secret 只能来自命名环境变量或未跟踪凭据，不能进入 starter、DTO 或这里定义的 public
+  error summaries。安全摘要只处理进入该边界的异常文本，不扫描环境、历史数据或成功输出。
 - `backend.kind=local` 的文件工具受 typed workspace 映射约束，但 shell 仍以当前
   用户权限运行；需要进程/文件系统隔离时选择 Daytona。
 

@@ -323,9 +323,10 @@ timeout。retry 一旦获准，第二次尝试可以在 15 秒之后结束；它
 group 视为 transport tool failure，可转为 ToolMessage。
 
 最终错误返回 `ToolMessage(status="error")`，保留 tool name 和 tool_call id（缺失
-id 时使用 `unknown`），content 包含 `category`、`retriable`、扁平化异常摘要和
-suggestion。这样一个并行 tool call 的失败不会吞掉其它成功结果，模型能看到结构化
-错误并重新规划；正常成功结果则原样保留为 success ToolMessage。
+id 时使用 `unknown`），content 包含 `category`、`retriable`、有界单行的 leaf 异常
+摘要和 suggestion。摘要保留异常 class 与非敏感原因，并在写入 ToolMessage 或 Ruyi
+日志前应用窄范围的高置信凭据替换。这样一个并行 tool call 的失败不会吞掉其它成功
+结果，模型能看到结构化错误并重新规划；正常成功结果则原样保留为 success ToolMessage。
 
 ## 状态、恢复与安全边界
 
@@ -341,10 +342,11 @@ validation；permission gate 在 tool execution 前做 policy decision；artifac
 backend workspace path。上述是 runtime guardrail，不是 host-level sandbox：local
 backend 的 `execute`、网络、绝对 host path 和进程权限仍按 backend 实际边界运行。
 Provider/A2A 命名环境变量由 `integrations` 解析；MCP 配置保留 raw connection dict
-并交给底层 client；普通 `ToolError`
-不主动注入 secret，但会把 exception class/message 原样扁平化且不做 redaction，
-因此底层 tool/provider exception 文本不得包含凭据。`ToolRuntime.config` 也不是
-secret boundary，runtime 不应把它当作凭据过滤器。
+并交给底层 client；`ToolError` 在异常文本离开 tool boundary 时只做有界、单行的
+摘要，处理 header/key-value、URL 敏感参数、JWT、常见 key 前缀和 private-key PEM
+等高置信形状。它不扫描环境、历史 checkpoint 或成功 tool output，也不是“所有异常/
+日志都已脱敏”的保证。`ToolRuntime.config` 同样不是 secret boundary，runtime 不应把
+它当作凭据过滤器。
 
 ## 依赖
 
@@ -370,8 +372,9 @@ secret boundary，runtime 不应把它当作凭据过滤器。
   [`test_tool_search_middleware.py`](../../tests/unit/test_tool_search_middleware.py)。
 - permission profiles、execute risk、approval interrupt/resume 与 review audit：
   [`test_human_approval_middleware.py`](../../tests/unit/test_human_approval_middleware.py)。
-- ToolError 分类、retry、取消传播与并行 success/error：
-  [`test_tool_error_middleware.py`](../../tests/unit/test_tool_error_middleware.py)。
+- ToolError 分类、retry、取消传播、并行 success/error 与安全摘要：
+  [`test_tool_error_middleware.py`](../../tests/unit/test_tool_error_middleware.py)、
+  [`test_safe_errors.py`](../../tests/unit/test_safe_errors.py)。
 
 ## 同步触发
 

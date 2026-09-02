@@ -18,6 +18,7 @@ from ruyi_agent.config.provider_models import LLMProviderSpec
 from ruyi_agent.config.system_tools import resolve_system_tools
 from ruyi_agent.integrations.mcp.registry import MCPRegistry
 from ruyi_agent.integrations.model_providers import build_chat_model
+from ruyi_agent.safe_errors import safe_exception_summary
 
 
 @dataclass(slots=True)
@@ -180,8 +181,28 @@ async def build_all_local_worker_specs(
         except Exception as exc:
             if unavailable_errors is None:
                 raise
-            unavailable_errors[agent_name] = str(exc) or exc.__class__.__name__
+            unavailable_errors[agent_name] = safe_exception_summary(
+                exc,
+                known_secrets=_configured_provider_secrets(config, providers, getenv),
+            )
     return specs
+
+
+def _configured_provider_secrets(
+    config: LocalAgentConfig,
+    providers: dict[str, LLMProviderSpec],
+    getenv: Callable[[str], str | None],
+) -> tuple[str, ...]:
+    """Read only the configured provider key when an unavailable reason is emitted."""
+
+    provider = providers.get(config.provider)
+    if provider is None or provider.api_key_env is None:
+        return ()
+    try:
+        value = getenv(provider.api_key_env)
+    except Exception:
+        return ()
+    return (value,) if isinstance(value, str) and value else ()
 
 
 async def build_all_remote_refs(

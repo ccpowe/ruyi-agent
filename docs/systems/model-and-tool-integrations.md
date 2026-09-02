@@ -94,7 +94,9 @@ bootstrap 先分别加载 Agent、Provider 和 permission 配置，再调用
 Agent 仍可继续构造。解析阶段的配置错误（例如 Provider table 或 Agent 字段非法）
 仍会在 bootstrap 前置阶段失败；“单 Agent unavailable”是已解析配置进入构造后
 对单个构造失败的隔离，不是对错误配置的静默接受。Gateway 随后把该记录投影为
-Agent 的 `available`/`unavailable_reason`，但这不是 Provider 边界的状态机。
+Agent 的 `available`/`unavailable_reason`，但这不是 Provider 边界的状态机。该记录
+在成为 public reason 前会使用有界单行异常摘要，保留 class 与非敏感原因；构造时已
+读取的 Provider key 会作为已知值精确替换，而不是扫描整个环境。
 
 ### OpenAI Codex 的认证边界
 
@@ -203,9 +205,11 @@ adapter 仍可按自己的约定解释特定字段，例如 stdio adapter 的 `e
 - `RefreshResult` 汇总 server 总数、成功/失败数、tool 总数和按配置顺序排列的
   status 列表；空配置也是合法的空 inventory。
 
-`ServerLoadStatus.error` 保存底层异常的原始 `str(exc)` 文本，bootstrap 当前也会把
-它直接输出为 `[mcp] ... error=...`；这两个边界都没有统一 redaction。MCP/tool/provider
-底层异常不得含凭据，调用方应把 status/bootstrap 输出当作不可信错误文本处理。
+`ServerLoadStatus.error` 保存有界单行的安全异常摘要，而不是底层原始 `str(exc)`；
+bootstrap 输出的 `[mcp] ... error=...` 使用同一 status，因此不会重新回显原始错误。
+摘要保留 exception class 与非敏感原因，并只处理 header/key-value、URL 敏感参数、
+JWT、常见 key 前缀和 private-key PEM 等高置信形状。它不解释 MCP raw dict、扫描
+环境或处理成功 tool result，因此不是全局 redaction 保证。
 
 刷新完成后，Registry 一次性替换 process-local 的 server status、按 server 分组的
 tool inventory、qualified-name 索引和可执行 tool 索引。`list_tools()`、`pick_tools()`、
@@ -286,7 +290,8 @@ Registry 从底层 tool 的 `args_schema` 读取参数契约：已有 dict 直�
 ### MCP 错误与 secret 边界
 
 MCP 的配置 table 错误或 refresh 外层无法建立 client 时会阻断 bootstrap；单个
-server 的 `get_tools()` 异常则收敛到该 server 的 failed status 和空 inventory。
+server 的 `get_tools()` 异常则以安全摘要收敛到该 server 的 failed status 和空
+inventory。
 读路径还会报告 refresh 前访问、未知 server/tool、raw name 歧义、Agent injection
 重名、越界 qualified name、非法 schema/arguments，以及底层 tool invoke 错误。
 这些错误分别属于配置、目录、scope 或调用边界，不会被伪装成 Provider 错误。

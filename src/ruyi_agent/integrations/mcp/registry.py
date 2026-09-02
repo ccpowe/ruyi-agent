@@ -11,6 +11,8 @@ from jsonschema import exceptions as jsonschema_exceptions
 from jsonschema.validators import validator_for
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
+from ruyi_agent.safe_errors import safe_exception_summary
+
 MCP_SERVER_METADATA_KEYS = {"description"}
 DEFAULT_MCP_REFRESH_CONCURRENCY = 4
 
@@ -149,7 +151,7 @@ class MCPRegistry:
                     server_name=server_name,
                     ok=False,
                     tool_count=0,
-                    error=str(exc),
+                    error=safe_exception_summary(exc),
                     refreshed_at=refreshed_at,
                 )
 

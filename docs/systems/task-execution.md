@@ -344,7 +344,7 @@ Task row/event 已在同一事务中提交，反之亦然。
 
 - 用户/调用方显式取消得到 `cancelled`，并清理 pending review；
 - supervisor、事件循环或等待者导致的被动取消得到 `interrupted`，错误摘要保留
-  `Task interrupted: ...`；
+  `Task interrupted: ...`，其中异常部分是有界单行的安全摘要；
 - 一个等待者自己被取消（例如 `wait=True` 的观察协程）不会取消 supervisor 所有
   的 run；它只停止等待，run 仍会继续，除非调用方另行 cancel Task；
 - Task 已 settled 且没有活跃 handle 时，cancel 是 no-op，保留原 settled 状态。
@@ -464,7 +464,7 @@ runtime 的错误先按是否影响 Task authority 分类：
 | --- | --- |
 | admission 关闭、permit 非法、同 Task 已运行 | 直接拒绝；不启动 payload，不改变已有 Task（除已经明确 admission 的清理） |
 | Task row/event/review UoW 写入失败 | 对应 SQLite UoW rollback；仅由 `_review_memory_transaction` 保护的 Task state/review/live-handle transition 恢复进程内快照，通用 UoW（如 `add_artifact`）不承诺；`mark_running` 的 admission 写失败时，run payload 不越过 release gate |
-| local Agent 执行异常且 Task 仍 `running` | 规范化异常摘要，提交 `failed` lifecycle event |
+| local Agent 执行异常且 Task 仍 `running` | 规范化为有界单行的安全异常摘要，再提交 `failed` TaskRecord/lifecycle event |
 | 一个 run 被显式 cancel | 提交 `cancelled` lifecycle event |
 | 一个 run 被被动取消或 runtime 重启/关闭 | 提交 `interrupted` lifecycle event；远端 unresolved operation 另保留 uncertain marker |
 | checkpoint/message 重建失败 | 报 `TaskMessageHistoryUnavailableError` 或精确 checkpoint not found；不伪造 message |

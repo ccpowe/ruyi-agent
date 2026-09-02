@@ -12,6 +12,10 @@ from ruyi_agent.task_models import (
     SETTLED_TASK_STATES,
     PublishedArtifact,
 )
+from ruyi_agent.safe_errors import (
+    DEFAULT_SAFE_ERROR_SUMMARY_CHARS,
+    safe_exception_summary,
+)
 
 # 显式把已登记的目标写进 tool description，
 # 这样模型在调用 spawn_agent 时能拿到合法名称，也能区分本地 worker 和远端引用。
@@ -174,30 +178,6 @@ def _validate_remote_task_identity(
         )
 
 
-def _flatten_exception_messages(exc: BaseException) -> list[str]:
-    """
-    展开异常或异常组中的可读错误信息
-
-    Args:
-        exc: 捕获到的异常对象
-
-    Returns:
-        展平后的异常摘要列表
-    """
-    # 为什么单独展开异常组：TaskGroup / ExceptionGroup 的 str() 信息太弱，
-    # 必须把真正的子异常拿出来才能定位并发任务失败原因。
-    if isinstance(exc, BaseExceptionGroup):
-        messages: list[str] = []
-        for sub_exc in exc.exceptions:
-            messages.extend(_flatten_exception_messages(sub_exc))
-        return messages
-
-    message = str(exc).strip()
-    if not message:
-        message = exc.__class__.__name__
-    return [f"{exc.__class__.__name__}: {message}"]
-
-
 def _format_exception_summary(exc: BaseException) -> str:
     """
     格式化任务失败摘要
@@ -208,18 +188,17 @@ def _format_exception_summary(exc: BaseException) -> str:
     Returns:
         去重后的单行错误摘要
     """
-    # 为什么统一格式化异常：任务状态里需要稳定、可读、可截断的错误摘要。
-    messages = _flatten_exception_messages(exc)
-    unique_messages: list[str] = []
-    for message in messages:
-        if message not in unique_messages:
-            unique_messages.append(message)
-    return " | ".join(unique_messages)
+    # 为什么统一格式化异常：任务状态里需要稳定、可读、可截断且不会泄露凭据的错误摘要。
+    return safe_exception_summary(exc)
 
 
 def _format_interrupted_error(exc: BaseException) -> str:
     """Format a runtime interruption as a stable, user-readable task error."""
-    return "Task interrupted: " + _format_exception_summary(exc)
+    prefix = "Task interrupted: "
+    return prefix + safe_exception_summary(
+        exc,
+        max_length=DEFAULT_SAFE_ERROR_SUMMARY_CHARS - len(prefix),
+    )
 
 
 def _parse_task_timestamp(value: Any, *, fallback: datetime) -> datetime:
