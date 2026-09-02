@@ -456,6 +456,144 @@ async def test_close_cancels_timeout_run_and_persists_interrupted(
 
 
 @async_test
+async def test_failed_local_run_releases_only_its_mailbox_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    active_mailbox: list[AgentMailbox] = []
+
+    class FailingMailboxAgent:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.claimed = asyncio.Event()
+
+        async def ainvoke(
+            self,
+            payload: Any,
+            *,
+            config: Any,
+            version: str,
+        ) -> dict[str, Any]:
+            del version
+            self.calls += 1
+            if self.calls == 1:
+                return {"messages": [{"role": "assistant", "content": "done"}]}
+            assert payload == {"messages": []}
+            messages = active_mailbox[0].claim(
+                recipient_task_id=config["configurable"]["task_id"],
+                recipient_thread_id=config["configurable"]["thread_id"],
+            )
+            assert [message.content for message in messages] == ["retry me"]
+            self.claimed.set()
+            raise RuntimeError("agent failed after mailbox injection")
+
+    agent = FailingMailboxAgent()
+    control, store, mailbox_store = _durable_control(
+        monkeypatch,
+        tmp_path,
+        lambda **kwargs: agent,
+        mailbox=True,
+    )
+    assert mailbox_store is not None
+    mailbox = control._task_runtime._mailbox
+    assert isinstance(mailbox, AgentMailbox)
+    active_mailbox.append(mailbox)
+    try:
+        record = await control.spawn_task("background_research", "first")
+        await wait_for_task_state(control, record.task_id, states={"completed"})
+        await control.send_task_input(record.task_id, "retry me")
+        await agent.claimed.wait()
+        failed = await wait_for_task_state(
+            control,
+            record.task_id,
+            states={"failed"},
+        )
+
+        reclaimed = mailbox.claim(
+            recipient_task_id=record.task_id,
+            recipient_thread_id=record.thread_id,
+        )
+        assert failed.state == "failed"
+        assert [message.content for message in reclaimed] == ["retry me"]
+        mailbox.acknowledge(reclaimed)
+    finally:
+        await control.close()
+        mailbox_store.close()
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "explicit_cancel",
+    [True, False],
+)
+@async_test
+async def test_cancelled_local_run_releases_its_mailbox_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    explicit_cancel: bool,
+) -> None:
+    active_mailbox: list[AgentMailbox] = []
+
+    class BlockingMailboxAgent:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.claimed = asyncio.Event()
+
+        async def ainvoke(
+            self,
+            payload: Any,
+            *,
+            config: Any,
+            version: str,
+        ) -> dict[str, Any]:
+            del version
+            self.calls += 1
+            if self.calls == 1:
+                return {"messages": [{"role": "assistant", "content": "done"}]}
+            assert payload == {"messages": []}
+            messages = active_mailbox[0].claim(
+                recipient_task_id=config["configurable"]["task_id"],
+                recipient_thread_id=config["configurable"]["thread_id"],
+            )
+            assert [message.content for message in messages] == ["cancel me"]
+            self.claimed.set()
+            await asyncio.Event().wait()
+            raise AssertionError("cancelled mailbox run must not return")
+
+    agent = BlockingMailboxAgent()
+    control, store, mailbox_store = _durable_control(
+        monkeypatch,
+        tmp_path,
+        lambda **kwargs: agent,
+        mailbox=True,
+    )
+    assert mailbox_store is not None
+    mailbox = control._task_runtime._mailbox
+    assert isinstance(mailbox, AgentMailbox)
+    active_mailbox.append(mailbox)
+    try:
+        record = await control.spawn_task("background_research", "first")
+        await wait_for_task_state(control, record.task_id, states={"completed"})
+        await control.send_task_input(record.task_id, "cancel me")
+        await agent.claimed.wait()
+        if explicit_cancel:
+            await control.cancel_task(record.task_id)
+        else:
+            await control.close()
+
+        reclaimed = mailbox.claim(
+            recipient_task_id=record.task_id,
+            recipient_thread_id=record.thread_id,
+        )
+        assert [message.content for message in reclaimed] == ["cancel me"]
+        mailbox.acknowledge(reclaimed)
+    finally:
+        await control.close()
+        mailbox_store.close()
+        store.close()
+
+
+@async_test
 async def test_close_interrupts_multiple_active_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

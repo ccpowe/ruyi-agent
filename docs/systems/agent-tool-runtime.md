@@ -166,8 +166,9 @@ parent thread 的可见任务，不拥有 Task 状态。
 [`MailboxMiddleware`](../../src/ruyi_agent/runtime/middleware/mailbox.py) 在
 `before_model`/`abefore_model` 读取 `thread_id` 和可选 `task_id`，调用 mailbox 的
 `claim`，把结果用 `render_mailbox_messages` 组成一条带 source/message ids 的
-`HumanMessage`。一次 graph invocation 完成后，`LocalTaskExecutor` 调用
-`acknowledge_task`。claim、ack、recovery 的 durability 不属于本文。
+`HumanMessage`。一次 graph invocation 正常返回时，`LocalTaskExecutor` 只确认
+绑定到该 Run 的 claim token；异常或取消则只释放这些 token。claim、ack、recovery
+的 durability 不属于本文。
 
 [`ToolCallProtocolMiddleware`](../../src/ruyi_agent/runtime/middleware/tool_call_protocol.py)
 在每个 model boundary 做 repair：把 history 中已有的 `ToolMessage` 移到所属
