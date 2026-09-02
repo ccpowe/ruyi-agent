@@ -67,6 +67,27 @@ def test_safe_error_text_avoids_partial_short_known_secret_replacement() -> None
     ) == "Sensitive error details redacted."
 
 
+@pytest.mark.parametrize(
+    ("secret", "source"),
+    [
+        ("abc", "abc.def/abc/def"),
+        ("1", "1.0"),
+        ("a+b", "a+b.ext"),
+    ],
+)
+def test_safe_error_text_keeps_short_known_secret_inside_credential_token(
+    secret: str,
+    source: str,
+) -> None:
+    assert safe_error_text(source, known_secrets=(secret,)) == source
+
+
+def test_safe_error_text_redacts_structured_short_known_secret() -> None:
+    assert safe_error_text("api_key=1", known_secrets=("1",)) == (
+        f"api_key={REDACTED_VALUE}"
+    )
+
+
 @pytest.mark.parametrize("secret", ["a", "abcdefg", "1", "1234567"])
 def test_safe_exception_summary_falls_back_for_standalone_short_known_secret(
     secret: str,

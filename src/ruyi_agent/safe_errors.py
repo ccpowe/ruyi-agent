@@ -34,7 +34,6 @@ _CREDENTIAL_LIKE_VALUE_PATTERN = (
     r"[A-Za-z0-9._~+/=-]+"
 )
 _TOKEN_BOUNDARY_CHAR_CLASS = r"A-Za-z0-9._~+/=\-"
-_SHORT_SECRET_BOUNDARY_CHAR_CLASS = r"A-Za-z0-9_-"
 _MIN_UNBOUNDED_KNOWN_SECRET_CHARS = 8
 _URL_SENSITIVE_PARAM_RE = re.compile(
     rf"(?i)(?P<prefix>[?&;]{_SENSITIVE_KEY_PATTERN}=)(?P<value>[^&#\s]+)"
@@ -229,8 +228,8 @@ def _contains_ambiguous_short_known_secret(
                 return True
             continue
         pattern = re.compile(
-            rf"(?<![{_SHORT_SECRET_BOUNDARY_CHAR_CLASS}]){re.escape(secret)}"
-            rf"(?![{_SHORT_SECRET_BOUNDARY_CHAR_CLASS}])"
+            rf"(?<![{_TOKEN_BOUNDARY_CHAR_CLASS}]){re.escape(secret)}"
+            rf"(?![{_TOKEN_BOUNDARY_CHAR_CLASS}])"
         )
         if pattern.search(value) is not None:
             return True
