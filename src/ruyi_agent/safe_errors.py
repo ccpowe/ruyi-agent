@@ -22,6 +22,10 @@ _SENSITIVE_KEY_PATTERN = (
     r"auth(?:orization)?|bearer|token|password|passwd|client[_-]?secret|"
     r"secret|private[_-]?key)"
 )
+_STRONG_SENSITIVE_KEY_PATTERN = (
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|"
+    r"authorization|password|passwd|client[_-]?secret|private[_-]?key)"
+)
 _AUTHORIZATION_HEADER_KEY_PATTERN = r"(?:authorization|proxy-authorization)"
 _CREDENTIAL_HEADER_KEY_PATTERN = (
     r"(?:x-api-key|api-key|x-auth-token|x-access-token)"
@@ -42,6 +46,11 @@ _AUTHORIZATION_HEADER_RE = re.compile(
     rf"(?im)(?P<prefix>(?<![\w-]){_AUTHORIZATION_HEADER_KEY_PATTERN}"
     rf"(?![\w-])[ \t]*[:=][ \t]*(?:(?:bearer|basic|token)[ \t]+)?)"
     rf"(?P<value>{_CREDENTIAL_TOKEN_PATTERN})(?=[ \t]*(?:$|[,;\r\n]))"
+)
+_AUTHORIZATION_SCHEME_CREDENTIAL_RE = re.compile(
+    rf"(?im)(?P<prefix>(?<![\w-]){_AUTHORIZATION_HEADER_KEY_PATTERN}"
+    rf"(?![\w-])[ \t]*[:=][ \t]*(?:bearer|basic|token)[ \t]+)"
+    r"(?P<value>[^ \t\r\n]+)"
 )
 _AUTHORIZATION_HEADER_LEADING_CREDENTIAL_RE = re.compile(
     rf"(?im)(?P<prefix>(?<![\w-]){_AUTHORIZATION_HEADER_KEY_PATTERN}"
@@ -73,6 +82,10 @@ _UNQUOTED_EQUALS_KEY_VALUE_RE = re.compile(
 _UNQUOTED_COLON_KEY_VALUE_RE = re.compile(
     rf"(?i)(?P<prefix>(?<![\w-])['\"]?{_SENSITIVE_KEY_PATTERN}['\"]?[ \t]*"
     rf":[ \t]*)(?P<value>{_CREDENTIAL_LIKE_VALUE_PATTERN})"
+)
+_STRONG_UNQUOTED_COLON_KEY_VALUE_RE = re.compile(
+    rf"(?i)(?P<prefix>(?<![\w-])['\"]?{_STRONG_SENSITIVE_KEY_PATTERN}['\"]?[ \t]*"
+    rf":[ \t]*)(?P<value>[A-Za-z0-9._~+/=-]{{8,}})"
 )
 _JWT_RE = re.compile(
     r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\."
@@ -190,12 +203,14 @@ def _safe_error_text(
     value = _redact_pem_private_keys(value)
     value = _URL_SENSITIVE_PARAM_RE.sub(_redact_match, value)
     value = _COOKIE_HEADER_RE.sub(_redact_match, value)
+    value = _AUTHORIZATION_SCHEME_CREDENTIAL_RE.sub(_redact_match, value)
     value = _AUTHORIZATION_HEADER_LEADING_CREDENTIAL_RE.sub(_redact_match, value)
     value = _CREDENTIAL_HEADER_LEADING_CREDENTIAL_RE.sub(_redact_match, value)
     value = _AUTHORIZATION_HEADER_RE.sub(_redact_match, value)
     value = _CREDENTIAL_HEADER_RE.sub(_redact_match, value)
     value = _QUOTED_KEY_VALUE_RE.sub(_redact_match, value)
     value = _UNQUOTED_EQUALS_KEY_VALUE_RE.sub(_redact_match, value)
+    value = _STRONG_UNQUOTED_COLON_KEY_VALUE_RE.sub(_redact_match, value)
     value = _UNQUOTED_COLON_KEY_VALUE_RE.sub(_redact_match, value)
     value = _JWT_RE.sub(REDACTED_VALUE, value)
     value = _COMMON_KEY_PREFIX_RE.sub(REDACTED_VALUE, value)

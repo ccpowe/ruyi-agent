@@ -201,15 +201,66 @@ def test_safe_error_text_keeps_unstructured_colon_reasons() -> None:
     assert safe_error_text(source) == source
 
 
-def test_safe_error_text_redacts_one_header_token_without_consuming_reason() -> None:
-    source = "Authorization: Bearer abc rejected by upstream"
-    secret = "header-secret-value"
-    header_with_reason = f"Authorization: Bearer {secret} rejected by upstream"
+@pytest.mark.parametrize(
+    ("scheme", "credential"),
+    [
+        ("Bearer", "abc"),
+        ("Basic", "@@"),
+        ("Token", "\u5bc6"),
+    ],
+)
+def test_safe_error_text_redacts_authorization_scheme_credential_and_keeps_reason(
+    scheme: str,
+    credential: str,
+) -> None:
+    source = f"Authorization: {scheme} {credential} rejected by upstream"
 
+    summary = safe_error_text(source)
+
+    assert credential not in summary
+    assert summary == (
+        f"Authorization: {scheme} {REDACTED_VALUE} rejected by upstream"
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "credential"),
+    [
+        ("password", "huntertwo"),
+        ("api_key", "abcdefgh"),
+    ],
+)
+def test_safe_error_text_redacts_strong_colon_credential_and_keeps_reason(
+    key: str,
+    credential: str,
+) -> None:
+    source = f"{key}:{credential} rejected by upstream"
+
+    summary = safe_error_text(source)
+
+    assert credential not in summary
+    assert summary == f"{key}:{REDACTED_VALUE} rejected by upstream"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "password: field",
+        "expected token: identifier after password: field",
+    ],
+)
+def test_safe_error_text_keeps_short_colon_prose(source: str) -> None:
     assert safe_error_text(source) == source
-    summary = safe_error_text(header_with_reason)
-    assert secret not in summary
-    assert summary.endswith("rejected by upstream")
+
+
+def test_safe_error_text_redacts_scheme_credential_without_crossing_crlf() -> None:
+    credential = "abc"
+    summary = safe_error_text(
+        f"Authorization: Bearer {credential}\r\nreason=kept"
+    )
+
+    assert credential not in summary
+    assert summary == f"Authorization: Bearer {REDACTED_VALUE} reason=kept"
 
 
 def test_safe_error_text_respects_crlf_and_quoted_value_boundaries() -> None:
