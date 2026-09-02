@@ -12,6 +12,7 @@ from daytona import (
     Daytona,
     DaytonaConfig,
     DaytonaNotFoundError,
+    SandboxState,
 )
 from daytona.common.errors import DaytonaError
 from deepagents.backends import CompositeBackend, LocalShellBackend
@@ -298,8 +299,6 @@ def _create_sandbox(settings: RuntimeSettings) -> Any:
     sandbox_name = settings.backend.daytona.sandbox_name
     try:
         sandbox = daytona.get(sandbox_name)
-        if str(sandbox.state) != "STARTED":
-            sandbox.start()
     except DaytonaNotFoundError:
         sandbox = daytona.create(
             CreateSandboxFromSnapshotParams(
@@ -307,6 +306,10 @@ def _create_sandbox(settings: RuntimeSettings) -> Any:
                 language="python",
             )
         )
+    else:
+        state = sandbox.state
+        if state not in (SandboxState.STARTED, "started", "STARTED"):
+            sandbox.start()
     return sandbox
 
 

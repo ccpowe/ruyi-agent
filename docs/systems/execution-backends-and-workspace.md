@@ -96,14 +96,14 @@ default，`home_dir=/`。
 
 ## Daytona backend
 
-### 创建、复用与 enum/start 风险
+### 创建、复用与启动状态
 
 `_create_sandbox` 用 typed `api_key`、`api_url`、`target`、`sandbox_name` 创建
-Daytona client：先 `get(sandbox_name)`；找到但 `str(sandbox.state) != "STARTED"` 就
-调用 `start()`，所以 SDK 返回 enum 时，即使语义上已 STARTED，字符串比较也可能再次
-start。这是当前 reuse/start 风险，不是可靠的 started skip 保证。只有
-`DaytonaNotFoundError` 才走 `create`（`name` 固定、`language="python"`）；get 的
-其它错误继续向上，不静默创建另一个 sandbox。创建后取得 user home，建立
+Daytona client：先 `get(sandbox_name)`；复用到的官方 `SandboxState.STARTED` 不调用
+`start()`，并兼容已有测试替身使用的 `"started"`/`"STARTED"` 字符串。其它明确状态和
+未知/`None` 状态保守地调用一次 `start()`。只有 `get` 的 `DaytonaNotFoundError` 才走
+一次 `create`（`name` 固定、`language="python"`），且该创建路径不额外 `start()`；state
+读取或 `start()` 的错误继续向上，不静默创建另一个 sandbox。创建后取得 user home，建立
 `AutoStartDaytonaSandbox`/CompositeBackend；不挂载 host workspace，也不注入 host env。
 
 ### auto-start 与隔离
