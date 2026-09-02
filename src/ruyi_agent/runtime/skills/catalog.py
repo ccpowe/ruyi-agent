@@ -60,6 +60,8 @@ def _read_skill_entry(skill_dir: Path, source_root: Path) -> SkillEntry | None:
         or not _is_contained(skill_file, source_root)
     ):
         return None
+    # This is a static check, not an atomic no-follow open. A concurrent
+    # replacement after the checks above can still change what read_text opens.
     content = skill_file.read_text(encoding="utf-8")
     metadata = _parse_frontmatter(content)
     name = _metadata_string(metadata, "name")
@@ -99,6 +101,7 @@ def _is_safe_skill_name(name: object) -> bool:
         and bool(name)
         and bool(name.strip())
         and name not in {".", ".."}
+        and name != ".manifest.json"
         and not name.startswith("/")
         and "/" not in name
         and "\\" not in name

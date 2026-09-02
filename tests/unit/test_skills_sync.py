@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from ruyi_agent.runtime.skills.sync import SkillSyncer
+from ruyi_agent.runtime.skills.sync import SkillSyncer, _sort_snapshot_paths
 from ruyi_agent.runtime.skills.types import SkillEntry
 
 
@@ -83,9 +83,19 @@ def test_skill_syncer_materializes_selected_skills_to_backend_view(
 
 @pytest.mark.parametrize(
     "name",
-    ["", "   ", ".", "..", "/absolute", "nested/name", r"nested\name", "bad\0name"],
+    [
+        "",
+        "   ",
+        ".",
+        "..",
+        ".manifest.json",
+        "/absolute",
+        "nested/name",
+        r"nested\name",
+        "bad\0name",
+    ],
 )
-def test_skill_syncer_rejects_unsafe_forged_entry_name_before_upload(
+def test_skill_syncer_rejects_unsafe_or_reserved_forged_entry_name_before_upload(
     tmp_path: Path,
     name: str,
 ) -> None:
@@ -132,7 +142,7 @@ def test_skill_syncer_rejects_forged_entry_outside_source_root_before_upload(
 
 
 @pytest.mark.parametrize("symlink_kind", ["directory", "skill-file"])
-def test_skill_syncer_rejects_symlinked_entry_before_upload(
+def test_skill_syncer_rejects_static_symlinked_entry_before_upload(
     tmp_path: Path,
     symlink_kind: str,
 ) -> None:
@@ -173,7 +183,7 @@ def test_skill_syncer_rejects_symlinked_entry_before_upload(
 
 
 @pytest.mark.parametrize("is_directory", [False, True])
-def test_skill_syncer_rejects_nested_symlinks_before_upload(
+def test_skill_syncer_rejects_static_nested_symlinks_before_upload(
     tmp_path: Path,
     is_directory: bool,
 ) -> None:
@@ -201,7 +211,7 @@ def test_skill_syncer_rejects_nested_symlinks_before_upload(
     assert backend.upload_calls == []
 
 
-def test_skill_syncer_snapshots_each_file_once_and_reuses_bytes(
+def test_skill_syncer_snapshots_stable_files_once_and_reuses_bytes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -242,12 +252,12 @@ def test_skill_syncer_snapshots_each_file_once_and_reuses_bytes(
         ("frontend",),
     )
 
-    ordered_files = sorted(
-        (
-            (path.relative_to(frontend.path).as_posix(), content)
-            for path, content in expected_files.items()
-        ),
-    )
+    # This stable fixture verifies one read shared by hashing and upload. It
+    # does not model a replacement racing validation with the open operation.
+    ordered_files = [
+        (path.relative_to(frontend.path).as_posix(), expected_files[path])
+        for path in sorted(expected_files)
+    ]
     skill_digest = hashlib.sha256()
     for relative, content in ordered_files:
         skill_digest.update(relative.encode("utf-8"))
@@ -268,7 +278,7 @@ def test_skill_syncer_snapshots_each_file_once_and_reuses_bytes(
 
 def test_skill_syncer_allows_safe_unicode_uppercase_and_dot_name(tmp_path: Path) -> None:
     source_root = tmp_path / "skills"
-    name = "Skill.技能"
+    name = ".Skill.技能"
     skill = write_skill(source_root, name)
     backend = MemoryUploadBackend()
 
@@ -278,3 +288,54 @@ def test_skill_syncer_allows_safe_unicode_uppercase_and_dot_name(tmp_path: Path)
     )
 
     assert f"{view.path}/{name}/SKILL.md" in backend.files
+
+
+class SnapshotOrderPath:
+    def __init__(self, *, platform_rank: int, posix_text: str) -> None:
+        self.platform_rank = platform_rank
+        self.posix_text = posix_text
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, SnapshotOrderPath):
+            return NotImplemented
+        return self.platform_rank < other.platform_rank
+
+    def as_posix(self) -> str:
+        return self.posix_text
+
+
+def test_snapshot_sort_keeps_path_order_not_posix_text_order() -> None:
+    platform_first = SnapshotOrderPath(platform_rank=0, posix_text="z")
+    platform_second = SnapshotOrderPath(platform_rank=1, posix_text="a")
+    paths = [platform_second, platform_first]
+
+    _sort_snapshot_paths(paths)  # type: ignore[arg-type]
+
+    assert paths == [platform_first, platform_second]
+
+
+def test_skill_syncer_rejects_static_symlinked_source_root_before_upload(
+    tmp_path: Path,
+) -> None:
+    target_root = tmp_path / "target-skills"
+    ordinary = write_skill(target_root, "frontend")
+    linked_root = tmp_path / "linked-skills"
+    try:
+        linked_root.symlink_to(target_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable in this test environment: {exc}")
+    forged = SkillEntry(
+        name="frontend",
+        description=ordinary.description,
+        path=linked_root / "frontend",
+        source_root=linked_root,
+    )
+    backend = MemoryUploadBackend()
+
+    with pytest.raises(ValueError, match="source root"):
+        SkillSyncer(backend=backend, views_root="/skill-views").ensure_view(
+            {"frontend": forged},
+            ("frontend",),
+        )
+
+    assert backend.upload_calls == []

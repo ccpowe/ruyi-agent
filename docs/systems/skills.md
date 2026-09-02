@@ -97,21 +97,22 @@ catalog key。冲突时后扫描的条目覆盖前一条，因此同名优先级
 roots 不是“任何 Ruyi home 下的 skills_dir”别名。workspace root 则来自已经解析的
 `settings.backend.workspace`，不是 backend namespace 中的 `/`。
 
-一个目录只有在 source root、skill directory 和 `SKILL.md` 都不是 symlink，且
-directory/`SKILL.md` 的已解析路径仍在 source root 内时，才会继续作为候选。随后
-`SKILL.md` 必须可解析、frontmatter 是 YAML mapping，并包含非空字符串
-`name`/`description`。name 是一个安全的单路径段：不能是绝对路径、`.`/`..`、包含
-`/`、反斜杠或 NUL；这不限制 Unicode、大小写或点号。无效项会被跳过，目录名不需要
-等于 frontmatter name；catalog 只解析发现和选择所需的 metadata，不在这一层解析
-正文或 `allowed-tools`。源文件的普通读取异常会在扫描边界暴露为 bootstrap 失败，目录
-不存在则没有该 root 的条目。
+在稳定的目录树中，一个目录只有在 source root、skill directory 和 `SKILL.md` 都
+不是 symlink，且 directory/`SKILL.md` 的已解析路径仍在 source root 内时，才会继续
+作为候选。随后 `SKILL.md` 必须可解析、frontmatter 是 YAML mapping，并包含非空字符串
+`name`/`description`。name 是一个安全的单路径段：不能是绝对路径、`.`/`..`、保留名
+`.manifest.json`、包含 `/`、反斜杠或 NUL；这不限制其他 Unicode、大小写或点号。无效项
+会被跳过，目录名不需要等于 frontmatter name；catalog 只解析发现和选择所需的 metadata，
+不在这一层解析正文或 `allowed-tools`。源文件的普通读取异常会在扫描边界暴露为 bootstrap
+失败，目录不存在则没有该 root 的条目。
 
 bootstrap 只扫描一次，保存的是 name、description、host directory 和 source root
 的 snapshot；它不是后台 watcher。新增或删除的目录要到下一次 bootstrap 才能进入
 catalog。catalog snapshot 保存路径而不是预读的全部 bytes；每次新的 view
-materialization 会再次验证 entry，并为每个选中的 skill 形成一次按相对 POSIX path
-排序的文件 snapshot。每个文件只读取一次，读取到的同一份 bytes 同时用于 hash 和
-upload。
+materialization 会再次验证 entry，并在稳定树中为每个选中的 skill 形成一次沿用既有
+platform `Path` 排序的文件 snapshot。每个文件只读取一次，读取到的同一份 bytes 同时
+用于 hash 和 upload；这只消除了 hash/upload 的两次读取差异，并不使验证和打开文件
+成为原子操作。
 
 ## Agent 声明与 effective skills
 
@@ -137,8 +138,8 @@ local Agent 的 `skills` 在配置边界接受三种形态；最终由
 
 [`SkillSyncer.ensure_view`](../../src/ruyi_agent/runtime/skills/sync.py) 收到 catalog
 和 effective names 后，对每个选中的
-`SkillEntry` 递归枚举 skill directory 下的文件，按相对 POSIX path 排序上传。上传
-路径为：
+`SkillEntry` 递归枚举 skill directory 下的文件，沿用既有 `Path` 排序来计算 hash；
+同一 snapshot 的 relative POSIX path 用于 upload path。上传路径为：
 
 ```text
 <views_root>/<view_hash>/<skill-name>/<relative-file>
@@ -176,15 +177,18 @@ Task view。
 
 ## Host 到 backend 的信任边界
 
-host catalog 是运行进程读取并上传 skill 内容的来源边界。catalog 拒绝会依赖 symlink
-或离开 discovery root 的 skill directory/`SKILL.md`；syncer 在 materialization 前
-再次验证每个 `SkillEntry`，因此不可信的伪造 entry 也不能把根外路径或任意
-文件/目录 symlink 上传到 view。backend 不从 manifest 回读 host 路径，且新 manifest
-不暴露 host source path。
+host catalog 是运行进程读取并上传 skill 内容的来源边界。在稳定树中，catalog 拒绝
+symlinked source root、skill directory/`SKILL.md` 及离开 discovery root 的路径；
+syncer 在 materialization 前再次进行相同的静态检查，并拒绝 tree 中的静态文件/目录
+symlink。因此，不可信的伪造 entry 不能在这些检查时指向根外路径或静态 symlink。
+backend 不从 manifest 回读 host 路径，且新 manifest 不暴露 host source path。
 
-这些检查不把 host 文件系统变成原子快照，也不提供签名、来源信任、内容限额或 backend
-view 的自动回滚/清理。选中的 skill 内容仍应被视为模型可读的指令数据，tool
-permission、shell 隔离和 backend 访问边界仍由各自系统负责。
+这些检查不是原子的 `openat`/`O_NOFOLLOW` 遍历：并发修改者仍可在验证与 `read_text`/
+`read_bytes` 打开之间替换文件或目录。因此系统不承诺在敌手竞态下绝不读取或上传根外
+内容；本实现只确保稳定树的静态检查，并消除同一 materialization 中 hash 与 upload
+分别读取文件的 TOCTOU。它也不提供签名、来源信任、内容限额或 backend view 的自动
+回滚/清理。选中的 skill 内容仍应被视为模型可读的指令数据，tool permission、shell
+隔离和 backend 访问边界仍由各自系统负责。
 
 Task 已绑定的 view 不会因为 host 变化而隐式切换：修改已存在目录的文件不会改写
 现有 TaskRecord 的 names/path/hash，新增或删除 root 下目录也不会更新当前进程的

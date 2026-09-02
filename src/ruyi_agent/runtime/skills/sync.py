@@ -80,15 +80,24 @@ def _snapshot_skill_files(entry: SkillEntry) -> tuple[tuple[str, bytes], ...]:
     _validate_skill_entry(entry)
     skill_dir = entry.path
     paths = list(skill_dir.rglob("*"))
+    _sort_snapshot_paths(paths)
     for path in paths:
         _validate_tree_path(path, skill_dir, entry.source_root, entry.name)
-    paths.sort(key=lambda path: path.relative_to(skill_dir).as_posix())
 
     files: list[tuple[str, bytes]] = []
     for path in paths:
         if path.is_file():
+            # For a stable tree, reuse this read for both hashing and upload.
+            # Validation and read_bytes are not an atomic no-follow operation:
+            # a concurrent replacement remains outside this boundary.
             files.append((path.relative_to(skill_dir).as_posix(), path.read_bytes()))
     return tuple(files)
+
+
+def _sort_snapshot_paths(paths: list[Path]) -> None:
+    """Keep the existing platform-specific Path ordering for skill hashes."""
+
+    paths.sort()
 
 
 def _validate_skill_entry(entry: SkillEntry) -> None:
@@ -137,6 +146,7 @@ def _is_safe_skill_name(name: object) -> bool:
         and bool(name)
         and bool(name.strip())
         and name not in {".", ".."}
+        and name != ".manifest.json"
         and not name.startswith("/")
         and "/" not in name
         and "\\" not in name

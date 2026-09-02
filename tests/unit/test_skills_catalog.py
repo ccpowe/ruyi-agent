@@ -59,7 +59,9 @@ def test_catalog_scans_fixed_roots_with_workspace_precedence(tmp_path: Path) -> 
     assert catalog.skills["personal"].source_root == user_skills
 
 
-def test_catalog_skips_symlinked_skill_directory_and_skill_file(tmp_path: Path) -> None:
+def test_catalog_skips_static_symlinked_skill_directory_and_skill_file(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "workspace"
     home = tmp_path / "home"
     source_root = home / ".agents" / "skills"
@@ -88,9 +90,22 @@ def test_catalog_skips_symlinked_skill_directory_and_skill_file(tmp_path: Path) 
 
 @pytest.mark.parametrize(
     "name",
-    ["", "   ", ".", "..", "/absolute", "nested/name", r"nested\name", "bad\0name"],
+    [
+        "",
+        "   ",
+        ".",
+        "..",
+        ".manifest.json",
+        "/absolute",
+        "nested/name",
+        r"nested\name",
+        "bad\0name",
+    ],
 )
-def test_catalog_rejects_unsafe_frontmatter_names(tmp_path: Path, name: str) -> None:
+def test_catalog_rejects_unsafe_or_reserved_frontmatter_names(
+    tmp_path: Path,
+    name: str,
+) -> None:
     workspace = tmp_path / "workspace"
     home = tmp_path / "home"
     source_root = home / ".agents" / "skills"
@@ -105,9 +120,23 @@ def test_catalog_allows_safe_unicode_uppercase_and_dot_name(tmp_path: Path) -> N
     workspace = tmp_path / "workspace"
     home = tmp_path / "home"
     source_root = home / ".agents" / "skills"
-    name = "Skill.技能"
+    name = ".Skill.技能"
     write_skill(source_root, "skill-directory", "description", metadata_name=name)
 
     catalog = SkillCatalog(workspace_root=workspace, home_dir=home).scan()
 
     assert tuple(catalog.skills) == (name,)
+
+
+def test_catalog_skips_static_symlinked_source_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    home = tmp_path / "home"
+    linked_root = home / ".agents" / "skills"
+    target_root = tmp_path / "target-skills"
+    write_skill(target_root, "frontend", "description")
+    linked_root.parent.mkdir(parents=True)
+    create_symlink(linked_root, target_root, is_directory=True)
+
+    catalog = SkillCatalog(workspace_root=workspace, home_dir=home).scan()
+
+    assert catalog.skills == {}
