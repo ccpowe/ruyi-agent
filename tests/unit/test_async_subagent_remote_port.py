@@ -36,25 +36,29 @@ from tests.unit.gateway_http_support import build_local_agent_config
 
 def test_format_exception_summary_expands_exception_group() -> None:
     # 为什么测异常组展开：当前最需要的是把 TaskGroup 包裹下的真实错误显示出来。
+    secret = "task-summary-secret-value"
     exc = ExceptionGroup(
         "outer",
         [
             ValueError("bad input"),
-            RuntimeError("boom"),
+            RuntimeError(f"password={secret}"),
         ],
     )
 
     summary = _format_exception_summary(exc)
 
     assert "ValueError: bad input" in summary
-    assert "RuntimeError: boom" in summary
+    assert "RuntimeError: password=[REDACTED]" in summary
+    assert secret not in summary
     assert "sub-exception" not in summary
 
 
 def test_run_agent_turn_records_expanded_exception_summary(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     # 为什么测失败落库：展开后的异常信息要真正进入 task 状态，而不是只停留在 helper 层。
+    secret = "task-record-secret-value"
     class FailingFactory:
         def __call__(self, **kwargs):
             return FailingAgent()
@@ -71,15 +75,17 @@ def test_run_agent_turn_records_expanded_exception_summary(
                 "outer",
                 [
                     ValueError("bad input"),
-                    RuntimeError("boom"),
+                    RuntimeError(f"api_key={secret}"),
                 ],
             )
 
+    store = TaskStore(str(tmp_path / "task-errors.sqlite"))
     control = async_subagent_runtime.AgentControl(
         build_specs(),
         build_test_remote_refs(),
         checkpointer=object(),
         backend=object(),
+        task_store=store,
     )
 
     async def scenario() -> TaskRecord:
@@ -90,11 +96,24 @@ def test_run_agent_turn_records_expanded_exception_summary(
             states={"completed", "failed", "cancelled", "interrupted"},
         )
 
-    status = asyncio.run(scenario())
+    try:
+        status = asyncio.run(scenario())
+        events = store.list_task_events(
+            task_id=status.task_id,
+            run_count=status.run_count,
+            after_event_id=0,
+        )
+    finally:
+        asyncio.run(control.close())
+        store.close()
 
     assert status.state == "failed"
     assert "ValueError: bad input" in (status.error or "")
-    assert "RuntimeError: boom" in (status.error or "")
+    assert "RuntimeError: api_key=[REDACTED]" in (status.error or "")
+    assert secret not in (status.error or "")
+    failed_event = next(event for event in events if event.event_type == "task.failed")
+    assert secret not in str(failed_event.data)
+    assert failed_event.data["error"] == status.error
 
 
 def test_spawn_remote_ref_runs_via_a2a_gateway(

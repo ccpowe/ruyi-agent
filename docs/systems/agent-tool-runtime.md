@@ -223,7 +223,9 @@ Filesystem middleware 由 deepagents adapter 提供 `ls`、`read_file`、`write_
    `ToolMessage` 路径。
 4. 调用 `LocalTaskExecutor.register_artifact` callback 生成带 `artifact_id`、path、
    name、caption、content type、size 和当前 `run_count` 的 manifest，并交给
-   `TaskManager.add_artifact`。bytes 仍留在 backend namespace。
+   `TaskManager.add_artifact`。callback 失败时返回 `artifact_registration_failed`
+   error `ToolMessage`，其 hint 先使用有界安全异常摘要；成功 manifest/bytes 仍留在
+   backend namespace，且不做输出扫描。
 
 middleware path check 与 Gateway artifact download 的 check 是两个边界；本文不
 负责后者的 HTTP auth、公共 DTO 或 bytes 下载。
@@ -256,6 +258,9 @@ delegation system tools 允许时，才构造 `worker_tools`；stack 随后加�
 
 middleware 不创建 delegation tree，也不执行深度/数量预算；工具调用最终回到
 `TaskCommandPort`/`TaskRuntime`，该 ownership 见 [Task execution runtime](task-execution.md)。
+这些工具的普通错误返回，以及 failed/interrupted `TaskRecord` 的 agent-facing 文本
+projection，都只在 error path 使用同一有界安全摘要；不会改变 target scope、retry、
+cancel 或 completed result 的语义。
 
 ## 权限、审批与 LangGraph interrupt
 
@@ -327,9 +332,10 @@ timeout。retry 一旦获准，第二次尝试可以在 15 秒之后结束；它
 group 视为 transport tool failure，可转为 ToolMessage。
 
 最终错误返回 `ToolMessage(status="error")`，保留 tool name 和 tool_call id（缺失
-id 时使用 `unknown`），content 包含 `category`、`retriable`、扁平化异常摘要和
-suggestion。这样一个并行 tool call 的失败不会吞掉其它成功结果，模型能看到结构化
-错误并重新规划；正常成功结果则原样保留为 success ToolMessage。
+id 时使用 `unknown`），content 包含 `category`、`retriable`、有界单行的 leaf 异常
+摘要和 suggestion。摘要保留异常 class 与非敏感原因，并在写入 ToolMessage 或 Ruyi
+日志前应用窄范围的高置信凭据替换。这样一个并行 tool call 的失败不会吞掉其它成功
+结果，模型能看到结构化错误并重新规划；正常成功结果则原样保留为 success ToolMessage。
 
 ## 状态、恢复与安全边界
 
@@ -345,10 +351,12 @@ validation；permission gate 在 tool execution 前做 policy decision；artifac
 backend workspace path。上述是 runtime guardrail，不是 host-level sandbox：local
 backend 的 `execute`、网络、绝对 host path 和进程权限仍按 backend 实际边界运行。
 Provider/A2A 命名环境变量由 `integrations` 解析；MCP 配置保留 raw connection dict
-并交给底层 client；普通 `ToolError`
-不主动注入 secret，但会把 exception class/message 原样扁平化且不做 redaction，
-因此底层 tool/provider exception 文本不得包含凭据。`ToolRuntime.config` 也不是
-secret boundary，runtime 不应把它当作凭据过滤器。
+并交给底层 client。`ToolError`、artifact registration、delegation error render，以及
+selected runtime failure logs/checkpoint-facing notification errors，在异常文本离开这些
+边界时只做有界、单行的摘要，处理 header/key-value、URL 敏感参数、JWT、常见 key
+前缀和 private-key PEM 等高置信形状。它不扫描环境、历史 checkpoint 或成功 tool
+output，也不是“所有异常/日志都已脱敏”的保证。`ToolRuntime.config` 同样不是 secret
+boundary，runtime 不应把它当作凭据过滤器。
 
 ## 依赖
 
@@ -374,8 +382,9 @@ secret boundary，runtime 不应把它当作凭据过滤器。
   [`test_tool_search_middleware.py`](../../tests/unit/test_tool_search_middleware.py)。
 - permission profiles、execute risk、approval interrupt/resume 与 review audit：
   [`test_human_approval_middleware.py`](../../tests/unit/test_human_approval_middleware.py)。
-- ToolError 分类、retry、取消传播与并行 success/error：
-  [`test_tool_error_middleware.py`](../../tests/unit/test_tool_error_middleware.py)。
+- ToolError 分类、retry、取消传播、并行 success/error 与安全摘要：
+  [`test_tool_error_middleware.py`](../../tests/unit/test_tool_error_middleware.py)、
+  [`test_safe_errors.py`](../../tests/unit/test_safe_errors.py)。
 
 ## 同步触发
 

@@ -27,6 +27,7 @@ from ruyi_agent.gateway_protocol.dto import TaskResponse
 from ruyi_agent.gateway.tasks import GatewayTaskModule
 from ruyi_agent.channels.http.routes import create_gateway_app
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
+from ruyi_agent.safe_errors import safe_exception_summary
 from ruyi_agent.storage.gateway_command_store import GatewayCommandStore
 from ruyi_agent.storage.gateway_route_store import GatewayRouteStore
 from ruyi_agent.storage.mailbox_store import MailboxStore
@@ -448,9 +449,13 @@ def test_get_agents_returns_public_targets_only(
 def test_unavailable_agent_does_not_block_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    secret = "gateway-unavailable-secret-value"
+    unavailable_reason = safe_exception_summary(
+        ValueError(f"provider rejected api_key={secret}")
+    )
     app, _ = build_app(
         monkeypatch,
-        unavailable_agents={"main": "missing provider credential"},
+        unavailable_agents={"main": unavailable_reason},
     )
     with TestClient(app) as client:
         listed = client.get("/agents", headers=auth_headers())
@@ -462,7 +467,8 @@ def test_unavailable_agent_does_not_block_gateway(
 
     main = next(item for item in listed.json()["items"] if item["name"] == "main")
     assert main["available"] is False
-    assert main["unavailable_reason"] == "missing provider credential"
+    assert main["unavailable_reason"] == "ValueError: provider rejected api_key=[REDACTED]"
+    assert secret not in main["unavailable_reason"]
     assert created.status_code == 503
     assert created.json()["error"]["code"] == "agent_unavailable"
 

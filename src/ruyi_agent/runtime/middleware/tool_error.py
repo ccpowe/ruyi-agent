@@ -10,6 +10,8 @@ from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
+from ruyi_agent.safe_errors import safe_exception_summary
+
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_RETRY_ATTEMPTS = 2
@@ -35,16 +37,6 @@ def _contains_unrecoverable_exception(exc: BaseException) -> bool:
     # CancelledError + ConnectTimeout/BrokenResourceError; those are tool
     # transport failures and should become ToolMessage errors instead.
     return bool(leaves) and all(isinstance(leaf, asyncio.CancelledError) for leaf in leaves)
-
-
-def _flatten_exception_messages(exc: BaseException) -> list[str]:
-    messages: list[str] = []
-    for leaf in _iter_leaf_exceptions(exc):
-        message = str(leaf).strip() or leaf.__class__.__name__
-        rendered = f"{leaf.__class__.__name__}: {message}"
-        if rendered not in messages:
-            messages.append(rendered)
-    return messages
 
 
 def _read_status_code(exc: BaseException) -> int | None:
@@ -127,7 +119,7 @@ def _read_tool_call_id(request: Any) -> str:
 
 def _format_error_content(tool_name: str, exc: BaseException) -> str:
     category, retriable, suggestion = _classify_exception(exc)
-    summary = " | ".join(_flatten_exception_messages(exc))
+    summary = safe_exception_summary(exc)
     retriable_text = "true" if retriable else "false"
     return "\n".join(
         [
@@ -171,7 +163,7 @@ def _handle_tool_exception(
             "Retrying tool call after recoverable error: tool=%s attempt=%s error=%s",
             tool_name,
             attempt + 1,
-            " | ".join(_flatten_exception_messages(exc)),
+            safe_exception_summary(exc),
         )
         return _RETRY
 
@@ -181,7 +173,7 @@ def _handle_tool_exception(
         tool_name,
         category,
         retriable,
-        " | ".join(_flatten_exception_messages(exc)),
+        safe_exception_summary(exc),
     )
     return _build_error_tool_message(request, tool_name, exc)
 

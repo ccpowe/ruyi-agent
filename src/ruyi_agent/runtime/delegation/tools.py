@@ -31,6 +31,7 @@ from ruyi_agent.runtime.delegation.registry import (
 from ruyi_agent.runtime.delegation.notifications import SettledRunNotifier
 from ruyi_agent.runtime.delegation.policy import DelegationPolicy
 from ruyi_agent.runtime.delegation.task_manager import TaskManager
+from ruyi_agent.safe_errors import safe_error_text, safe_exception_summary
 from ruyi_agent.storage.task_store import (
     TaskRootBudgetExceededError as MaxTasksPerRootError,
 )
@@ -84,7 +85,7 @@ class DelegationTools:
         if record.state == "completed" and record.result:
             parts.append(f"result={record.result}")
         if record.state in {"failed", "interrupted"} and record.error:
-            parts.append(f"error={record.error}")
+            parts.append(f"error={safe_error_text(record.error)}")
         return " | ".join(parts)
 
     async def _resolve_pending_reviews_from_config(
@@ -102,8 +103,11 @@ class DelegationTools:
             result = resolver()
             if inspect.isawaitable(result):
                 result = await result
-        except Exception:
-            logger.exception("Pending review resolver failed during wait_agent.")
+        except Exception as exc:
+            logger.warning(
+                "Pending review resolver failed during wait_agent: %s",
+                safe_exception_summary(exc),
+            )
             return False
         return bool(result)
 
@@ -268,7 +272,8 @@ class DelegationTools:
     ) -> str:
         return (
             f"{self._format_task_record(record)} | "
-            f"warning=remote_status_temporarily_unavailable: {exc}"
+            "warning=remote_status_temporarily_unavailable: "
+            f"{safe_exception_summary(exc)}"
         )
 
     def _build_tools(self, *, command_port: TaskCommandPort, allowed_targets: set[str] | None = None, caller_agent_name: str | None = None, enabled_tools: frozenset[str] | None = None) -> list[StructuredTool]:  # fmt: skip
@@ -325,7 +330,7 @@ class DelegationTools:
                     allowed_targets=allowed_targets,
                 )
             except UnknownWorkerTaskError as exc:
-                return str(exc)
+                return safe_exception_summary(exc)
             return await self.wait_agent(
                 task_id,
                 config,
@@ -345,7 +350,7 @@ class DelegationTools:
                     allowed_targets=allowed_targets,
                 )
             except UnknownWorkerTaskError as exc:
-                return str(exc)
+                return safe_exception_summary(exc)
             return await self.check_agent(
                 task_id,
                 config,
@@ -366,7 +371,7 @@ class DelegationTools:
                     allowed_targets=allowed_targets,
                 )
             except UnknownWorkerTaskError as exc:
-                return str(exc)
+                return safe_exception_summary(exc)
             return await self.send_input(task_id, message, command_port=command_port)
 
         async def scoped_cancel_agent(
@@ -382,7 +387,7 @@ class DelegationTools:
                     allowed_targets=allowed_targets,
                 )
             except UnknownWorkerTaskError as exc:
-                return str(exc)
+                return safe_exception_summary(exc)
             return await self.cancel_agent(task_id, command_port=command_port)
 
         async def scoped_list_agents(
@@ -501,15 +506,15 @@ class DelegationTools:
         except UnknownAgentTargetError as exc:
             available = ", ".join(self._registry.list_target_names())
             # 工具参数错误返回普通文本，而不是抛异常打断整轮 agent 执行。
-            return f"{exc}. Available: {available}"
+            return f"{safe_exception_summary(exc)}. Available: {available}"
         except MaxDelegationDepthError as exc:
             return self._policy.format_depth_limit_error(exc)
         except MaxTasksPerRootError as exc:
             return self._policy.format_task_budget_error(exc)
         except UnknownWorkerTaskError as exc:
-            return str(exc)
+            return safe_exception_summary(exc)
         except (RemoteExecutorNotImplementedError, A2AClientError, ValueError) as exc:
-            return str(exc)
+            return safe_exception_summary(exc)
         return (
             f"Started worker task: task_id={record.task_id} agent={agent_name} "
             f"route={record.route_kind}"
@@ -539,7 +544,7 @@ class DelegationTools:
         try:
             record = self._task_manager.get_task(task_id)
         except UnknownWorkerTaskError as exc:
-            return str(exc)
+            return safe_exception_summary(exc)
         self._notifier.suppress_mailbox_delivery(record)
         if record.route_kind == "remote_ref":
             try:
@@ -559,7 +564,7 @@ class DelegationTools:
                     self._task_manager.get_task(task_id), exc
                 )
             except ValueError as exc:
-                return str(exc)
+                return safe_exception_summary(exc)
         while True:
             run_task = self._task_manager.get_live_run(task_id)
             if run_task is not None:
@@ -607,13 +612,13 @@ class DelegationTools:
                 self._notifier.suppress_mailbox_delivery(record)
             return self._format_task_record(record)
         except UnknownWorkerTaskError as exc:
-            return str(exc)
+            return safe_exception_summary(exc)
         except A2AClientError as exc:
             return self._format_remote_status_unavailable(
                 self._task_manager.get_task(task_id), exc
             )
         except ValueError as exc:
-            return str(exc)
+            return safe_exception_summary(exc)
 
     async def send_input(
         self,
@@ -636,12 +641,12 @@ class DelegationTools:
         try:
             record = await command_port.send_task_input(task_id, message)
         except UnknownWorkerTaskError as exc:
-            return str(exc)
+            return safe_exception_summary(exc)
         except TaskAlreadyRunningError:
             # 同一个 task 同一时间只允许一个活跃 run，避免线程语义混乱。
             return f"Worker task is still running: {task_id}. Wait for it before sending more input."
         except (A2AClientError, ValueError) as exc:
-            return str(exc)
+            return safe_exception_summary(exc)
         return f"Sent input to worker task: task_id={record.task_id}"
 
     async def cancel_agent(
@@ -663,9 +668,9 @@ class DelegationTools:
         try:
             record = await command_port.cancel_task(task_id)
         except UnknownWorkerTaskError as exc:
-            return str(exc)
+            return safe_exception_summary(exc)
         except (A2AClientError, ValueError) as exc:
-            return str(exc)
+            return safe_exception_summary(exc)
         if record.state == "cancelled":
             return f"Cancelled current worker run: task_id={record.task_id}"
         return (

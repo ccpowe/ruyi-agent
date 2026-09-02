@@ -101,6 +101,7 @@ def test_pre_refresh_access_raises_runtime_error(monkeypatch: pytest.MonkeyPatch
 
 def test_refresh_populates_statuses_and_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
     # 为什么测刷新结果：这是 registry 最核心的职责，既要收工具，也要沉淀 server 状态。
+    secret = "mcp-status-secret-value"
     responses = {
         "exa": [
             FakeTool(
@@ -114,7 +115,9 @@ def test_refresh_populates_statuses_and_inventory(monkeypatch: pytest.MonkeyPatc
                 args_schema=FakeArgsSchema({"type": "object", "title": "FetchArgs"}),
             ),
         ],
-        "deepwiki": RuntimeError("deepwiki unavailable"),
+        "deepwiki": RuntimeError(
+            f"deepwiki unavailable; Authorization: Bearer {secret}"
+        ),
     }
     registry, created = build_registry(monkeypatch, responses)
 
@@ -138,6 +141,8 @@ def test_refresh_populates_statuses_and_inventory(monkeypatch: pytest.MonkeyPatc
     assert deepwiki_status.ok is False
     assert deepwiki_status.tool_count == 0
     assert "deepwiki unavailable" in (deepwiki_status.error or "")
+    assert secret not in (deepwiki_status.error or "")
+    assert "Authorization: Bearer [REDACTED]" in (deepwiki_status.error or "")
 
     tools = asyncio.run(registry.list_tools())
     assert [tool.qualified_name for tool in tools] == [

@@ -15,6 +15,9 @@ class ConnectError(Exception):
     pass
 
 
+TOOL_ERROR_SECRET = "integration-tool-secret-value"
+
+
 class FakeToolCallingModel(BaseChatModel):
     responses: list[Any]
     i: int = 0
@@ -71,7 +74,7 @@ async def ok_tool(query: str) -> str:
 async def bad_tool(query: str) -> str:
     """Raise a transient network-style error."""
     await asyncio.sleep(0.01)
-    raise ConnectError(f"dns failed for {query}")
+    raise ConnectError(f"dns failed for {query}; api_key={TOOL_ERROR_SECRET}")
 
 
 def test_agent_survives_parallel_tool_failure_and_keeps_tool_metadata() -> None:
@@ -126,7 +129,10 @@ def test_agent_survives_parallel_tool_failure_and_keeps_tool_metadata() -> None:
     assert bad_message.tool_call_id == "call-2"
     assert "tool=bad_tool" in str(bad_message.content)
     assert "category=network" in str(bad_message.content)
-    assert "ConnectError: dns failed for beta" in str(bad_message.content)
+    assert "ConnectError: dns failed for beta; api_key=[REDACTED]" in str(
+        bad_message.content
+    )
+    assert TOOL_ERROR_SECRET not in str(bad_message.content)
 
     final_message = messages[-1]
     assert isinstance(final_message, AIMessage)

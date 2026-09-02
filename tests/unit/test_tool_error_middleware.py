@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -45,12 +46,16 @@ def test_awrap_tool_call_falls_back_when_tool_call_id_is_missing() -> None:
     assert result.tool_call_id == "unknown"
 
 
-def test_awrap_tool_call_returns_structured_error_message() -> None:
+def test_awrap_tool_call_returns_structured_error_message_without_leaking_to_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     middleware = ToolErrorMiddleware()
     request = build_request()
+    secret = "tool-error-secret-value"
+    caplog.set_level(logging.WARNING, logger="ruyi_agent.runtime.middleware.tool_error")
 
     async def handler(_request):
-        raise RuntimeError("boom")
+        raise RuntimeError(f"Authorization: Bearer {secret}")
 
     result = asyncio.run(middleware.awrap_tool_call(request, handler))
 
@@ -61,7 +66,9 @@ def test_awrap_tool_call_returns_structured_error_message() -> None:
     assert "tool=web_search_exa" in str(result.content)
     assert "category=unexpected" in str(result.content)
     assert "retriable=false" in str(result.content)
-    assert "RuntimeError: boom" in str(result.content)
+    assert "RuntimeError: Authorization: Bearer [REDACTED]" in str(result.content)
+    assert secret not in str(result.content)
+    assert secret not in caplog.text
 
 
 def test_awrap_tool_call_classifies_source_not_available() -> None:

@@ -20,6 +20,8 @@ from langgraph.config import get_config
 from langgraph.prebuilt import ToolRuntime
 from pydantic import BaseModel, Field
 
+from ruyi_agent.safe_errors import safe_exception_summary
+
 
 DEFAULT_ARTIFACT_MAX_BYTES = 50 * 1024 * 1024
 
@@ -159,7 +161,10 @@ class ArtifactPublishingMiddleware(AgentMiddleware[object, ContextT, ResponseT])
             return _json_error(
                 "artifact_registration_failed",
                 path=path,
-                hint=f"Runtime could not register this artifact: {exc}",
+                hint=(
+                    "Runtime could not register this artifact: "
+                    f"{safe_exception_summary(exc)}"
+                ),
             )
         return json.dumps({"ok": True, **registered}, ensure_ascii=False, sort_keys=True)
 

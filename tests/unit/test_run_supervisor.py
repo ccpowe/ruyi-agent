@@ -32,6 +32,7 @@ from ruyi_agent.runtime.delegation.remote_port import RemoteTaskPort
 from ruyi_agent.runtime.delegation.local_executor import LocalTaskExecutor
 from ruyi_agent.runtime.task_event_ledger import TaskEventLedger
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
+from ruyi_agent.safe_errors import REDACTED_VALUE
 from ruyi_agent.storage.mailbox_store import MailboxStore
 from ruyi_agent.storage.task_store import TaskStore
 from tests.support.async_subagent_runtime import (
@@ -1397,7 +1398,7 @@ async def test_unhandled_run_failure_is_consumed_and_persisted_interrupted(
     )
 
     async def broken_runner() -> None:
-        raise RuntimeError("run exploded")
+        raise RuntimeError("Authorization: Bearer run-log-secret")
 
     await supervisor.schedule("broken", broken_runner)
     for _ in range(3):
@@ -1405,6 +1406,9 @@ async def test_unhandled_run_failure_is_consumed_and_persisted_interrupted(
 
     assert manager.get_task("broken").state == "interrupted"
     assert "Task run broken failed" in caplog.text
+    assert "run-log-secret" not in caplog.text
+    assert REDACTED_VALUE in caplog.text
+    assert "Traceback" not in caplog.text
     await supervisor.close()
 
 

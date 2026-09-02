@@ -6,6 +6,7 @@ import logging
 
 from ruyi_agent.runtime.delegation.task_manager import TaskManager
 from ruyi_agent.runtime.mailbox.service import AgentMailbox
+from ruyi_agent.safe_errors import safe_error_text, safe_exception_summary
 from ruyi_agent.storage.settled_outbox import SettledOutboxIntent
 from ruyi_agent.task_models import SETTLED_TASK_STATES, TaskRecord
 
@@ -57,8 +58,10 @@ class SettledRunNotifier:
         """Preserve the non-durable compatibility path with safe retry state."""
 
         assert self._mailbox is not None
-        content = (
-            record.result or record.error or f"Task run ended with state={record.state}"
+        content = record.result or (
+            safe_error_text(record.error)
+            if record.error
+            else f"Task run ended with state={record.state}"
         )
         try:
             published = self._mailbox.publish_settled(
@@ -137,7 +140,7 @@ class SettledRunNotifier:
         try:
             self._task_manager.release_settled_outbox_claim(
                 intent,
-                error=f"{type(exc).__name__}: {exc}",
+                error=safe_exception_summary(exc),
             )
         except Exception as release_exc:
             self._record_error(
@@ -207,6 +210,5 @@ class SettledRunNotifier:
         logger.warning(
             "Settled notification %s failed: %s",
             context,
-            exc,
-            exc_info=(type(exc), exc, exc.__traceback__),
+            safe_exception_summary(exc),
         )

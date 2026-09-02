@@ -11,6 +11,7 @@ from typing import Any, Literal, Protocol, TypeVar
 
 from ruyi_agent.runtime.delegation.contracts import TaskAlreadyRunningError
 from ruyi_agent.runtime.delegation.task_manager import TaskManager
+from ruyi_agent.safe_errors import safe_exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -497,8 +498,12 @@ class RunSupervisor:
         if completion_port is not None:
             try:
                 completion_port.on_run_finished(task_id, task)
-            except Exception:
-                logger.exception("Run completion callback failed: %s", task_id)
+            except Exception as exc:
+                logger.error(
+                    "Run completion callback failed: %s: %s",
+                    task_id,
+                    safe_exception_summary(exc),
+                )
 
     def _create_maintenance_task(
         self,
@@ -536,10 +541,11 @@ class RunSupervisor:
             record = self._task_manager.get_task(task_id)
             if record.state == "running":
                 self._task_manager.mark_interrupted(task_id, error)
-        except Exception:
-            logger.exception(
-                "Failed to persist interrupted state during runtime shutdown: %s",
+        except Exception as exc:
+            logger.error(
+                "Failed to persist interrupted state during runtime shutdown: %s: %s",
                 task_id,
+                safe_exception_summary(exc),
             )
         finally:
             self._task_manager.discard_live_run(task_id)
@@ -558,9 +564,9 @@ class RunSupervisor:
             return None
         if error is not None:
             logger.error(
-                "%s failed",
+                "%s failed: %s",
                 label,
-                exc_info=(type(error), error, error.__traceback__),
+                safe_exception_summary(error),
             )
         return error
 

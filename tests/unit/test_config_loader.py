@@ -970,10 +970,11 @@ def test_build_local_worker_spec_rejects_non_worker_kind() -> None:
 
 def test_build_all_local_specs_isolates_unavailable_agent(monkeypatch) -> None:
     healthy_spec = object()
+    secret = "unavailable-agent-secret-value"
 
     async def fake_build(agent_name, *_args, **_kwargs):
         if agent_name == "broken":
-            raise ValueError("Environment variable 'BROKEN_API_KEY' is not set")
+            raise ValueError(f"Provider rejected raw credential {secret}")
         return healthy_spec
 
     monkeypatch.setattr(agent_runtime, "build_local_worker_spec", fake_build)
@@ -999,8 +1000,14 @@ def test_build_all_local_specs_isolates_unavailable_agent(monkeypatch) -> None:
         config_loader.build_all_local_worker_specs(
             configs,
             FakeRegistry([]),
-            providers={},
-            getenv=lambda _name: None,
+            providers={
+                "provider": config_loader.LLMProviderSpec(
+                    name="provider",
+                    kind="openai",
+                    api_key_env="BROKEN_API_KEY",
+                )
+            },
+            getenv=lambda name: secret if name == "BROKEN_API_KEY" else None,
             home_dir="/workspace",
             skills_root="/skills",
             unavailable_errors=errors,
@@ -1008,7 +1015,10 @@ def test_build_all_local_specs_isolates_unavailable_agent(monkeypatch) -> None:
     )
 
     assert specs == {"main": healthy_spec}
-    assert errors == {"broken": "Environment variable 'BROKEN_API_KEY' is not set"}
+    assert errors == {
+        "broken": "ValueError: Provider rejected raw credential [REDACTED]"
+    }
+    assert secret not in errors["broken"]
 
 
 def test_build_remote_ref_returns_remote_spec() -> None:
