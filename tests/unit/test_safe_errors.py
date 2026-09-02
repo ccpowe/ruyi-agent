@@ -55,16 +55,70 @@ def test_safe_error_text_replaces_known_secrets_longest_first() -> None:
     assert summary == f"provider failed with {REDACTED_VALUE}"
 
 
-def test_safe_error_text_bounds_short_known_token_replacement() -> None:
+def test_safe_error_text_avoids_partial_short_known_secret_replacement() -> None:
     secret = "abc123"
-    source = "The abc token is prose; abc123x is a longer identifier."
+    source = "The abcx token is prose; abc123x is a longer identifier."
 
     summary = safe_error_text(source, known_secrets=("abc", secret))
 
     assert summary == source
     assert safe_error_text(
         f"provider rejected {secret}", known_secrets=(secret,)
-    ) == f"provider rejected {REDACTED_VALUE}"
+    ) == "Sensitive error details redacted."
+
+
+@pytest.mark.parametrize("secret", ["a", "abcdefg", "1", "1234567"])
+def test_safe_exception_summary_falls_back_for_standalone_short_known_secret(
+    secret: str,
+) -> None:
+    summary = safe_exception_summary(
+        RuntimeError(f"provider rejected {secret}"),
+        known_secrets=(secret,),
+    )
+
+    assert summary == "RuntimeError: Sensitive error details redacted."
+
+
+def test_safe_exception_summary_keeps_nonstandalone_short_known_secret_text() -> None:
+    summary = safe_exception_summary(
+        ValueError("validation failed"),
+        known_secrets=("a",),
+    )
+
+    assert summary == "ValueError: validation failed"
+
+
+def test_safe_exception_summary_falls_back_for_a_standalone_short_number() -> None:
+    summary = safe_exception_summary(
+        ValueError("Expected 1 result"),
+        known_secrets=("1",),
+    )
+
+    assert summary == "ValueError: Sensitive error details redacted."
+    assert "Expected 1 result" not in summary
+
+
+def test_safe_exception_summary_keeps_diagnostics_without_short_secret() -> None:
+    summary = safe_exception_summary(
+        RuntimeError("provider rejected an invalid format"),
+        known_secrets=("1234567",),
+    )
+
+    assert summary == "RuntimeError: provider rejected an invalid format"
+
+
+def test_safe_exception_summary_downgrades_group_reasons_for_short_secret() -> None:
+    summary = safe_exception_summary(
+        ExceptionGroup(
+            "outer",
+            [ValueError("normal diagnostic"), RuntimeError("provider rejected a")],
+        ),
+        known_secrets=("a",),
+    )
+
+    assert "ValueError: Sensitive error details redacted." in summary
+    assert "RuntimeError: Sensitive error details redacted." in summary
+    assert "normal diagnostic" not in summary
 
 
 def test_safe_error_text_keeps_benign_token_and_password_words() -> None:
@@ -121,6 +175,25 @@ def test_safe_error_text_redacts_cookie_header_without_consuming_next_line() -> 
     assert secret not in summary
     assert REDACTED_VALUE in summary
     assert "reason=kept" in summary
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("Authorization:\r\nreason=kept", "Authorization: reason=kept"),
+        ("Cookie:\r\nreason=kept", "Cookie: reason=kept"),
+        ("password:\r\nreason=kept", "password: reason=kept"),
+        ("password=\r\nreason=kept", "password= reason=kept"),
+    ],
+)
+def test_safe_error_text_does_not_cross_crlf_after_empty_structured_value(
+    source: str,
+    expected: str,
+) -> None:
+    summary = safe_error_text(source, known_secrets=("1",))
+
+    assert summary == expected
+    assert "\n" not in summary
 
 
 def test_safe_error_text_is_bounded_after_redaction() -> None:
