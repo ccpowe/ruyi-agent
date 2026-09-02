@@ -86,7 +86,10 @@ checkpointer 交给 [`TaskMessageStateReader`](../../src/ruyi_agent/runtime/mess
 生成；当前项目写入的 `configurable` 字段是 `thread_id`、`task_id`、
 `parent_task_id`、`root_task_id`、`delegation_depth`、`agent_name`、
 `permission_profile`、`effective_skill_names`、`skill_view_path` 和
-`skill_view_hash`。middleware 通过 `get_config()` 或完整的 `ToolRuntime.config`
+`skill_view_hash`、`mailbox_run_id`。`mailbox_run_id` 是每次 executor invocation
+新建的 process-local identity：只有启用 mailbox 的 invocation 用它把 claim token
+绑定到精确 Run，并 fence 该 Run 的 ack/release；它不是持久 Task identity，也不构成
+对外的 Gateway context。middleware 通过 `get_config()` 或完整的 `ToolRuntime.config`
 读取这些字段（artifact helper 也接受 `metadata.task_id`）；后续输入和 review
 resume 复用同一 `thread_id`，因此是同一 graph 会话。`RunnableConfig` 还可能带有
 框架的其它键，不能把它描述成只含 run context。
@@ -166,8 +169,9 @@ parent thread 的可见任务，不拥有 Task 状态。
 [`MailboxMiddleware`](../../src/ruyi_agent/runtime/middleware/mailbox.py) 在
 `before_model`/`abefore_model` 读取 `thread_id` 和可选 `task_id`，调用 mailbox 的
 `claim`，把结果用 `render_mailbox_messages` 组成一条带 source/message ids 的
-`HumanMessage`。一次 graph invocation 完成后，`LocalTaskExecutor` 调用
-`acknowledge_task`。claim、ack、recovery 的 durability 不属于本文。
+`HumanMessage`。一次 graph invocation 正常返回时，`LocalTaskExecutor` 只确认
+绑定到该 Run 的 claim token；异常或取消则只释放这些 token。claim、ack、recovery
+的 durability 不属于本文。
 
 [`ToolCallProtocolMiddleware`](../../src/ruyi_agent/runtime/middleware/tool_call_protocol.py)
 在每个 model boundary 做 repair：把 history 中已有的 `ToolMessage` 移到所属

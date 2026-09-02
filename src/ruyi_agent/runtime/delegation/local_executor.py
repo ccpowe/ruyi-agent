@@ -65,7 +65,7 @@ class LocalTaskExecutor:
 
     # fmt: off
     def build_run_config(self, record: TaskRecord) -> dict[str, Any]:
-        return {"configurable": {"thread_id": record.thread_id, "task_id": record.task_id, "parent_task_id": record.parent_task_id, "root_task_id": record.root_task_id, "delegation_depth": record.depth, "agent_name": record.agent_name, "permission_profile": record.permission_profile, "effective_skill_names": list(record.effective_skill_names), "skill_view_path": record.skill_view_path, "skill_view_hash": record.skill_view_hash}}  # fmt: skip
+        return {"configurable": {"thread_id": record.thread_id, "task_id": record.task_id, "parent_task_id": record.parent_task_id, "root_task_id": record.root_task_id, "delegation_depth": record.depth, "agent_name": record.agent_name, "permission_profile": record.permission_profile, "effective_skill_names": list(record.effective_skill_names), "skill_view_path": record.skill_view_path, "skill_view_hash": record.skill_view_hash, "mailbox_run_id": uuid.uuid4().hex}}  # fmt: skip
     # fmt: on
 
     def register_artifact(
@@ -151,9 +151,31 @@ class LocalTaskExecutor:
         record: TaskRecord,
     ) -> Any:
         """Invoke the explicit compiled agent with the explicit graph payload."""
-        result = await self._invoke_agent_payload(agent, payload, run_config, record)
-        self._mailbox is not None and self._mailbox.acknowledge_task(task_id, record.thread_id)
-        return result
+        del task_id
+        if self._mailbox is None:
+            return await self._invoke_agent_payload(agent, payload, run_config, record)
+        configurable = run_config.setdefault("configurable", {})
+        run_id = configurable.get("mailbox_run_id")
+        if not isinstance(run_id, str) or not run_id:
+            run_id = uuid.uuid4().hex
+            configurable["mailbox_run_id"] = run_id
+        with self._mailbox.run_scope(run_id):
+            try:
+                result = await self._invoke_agent_payload(
+                    agent,
+                    payload,
+                    run_config,
+                    record,
+                )
+            except BaseException:
+                self._mailbox.release_run(run_id)
+                raise
+            try:
+                self._mailbox.acknowledge_run(run_id)
+            except BaseException:
+                self._mailbox.release_run(run_id)
+                raise
+            return result
     # fmt: on
 
     async def _invoke_agent_payload(

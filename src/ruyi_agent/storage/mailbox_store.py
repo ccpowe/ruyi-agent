@@ -226,12 +226,12 @@ class MailboxStore:
         recipient_thread_id: str,
         lease_seconds: int = 300,
     ) -> list[dict[str, Any]]:
-        now = datetime.now(UTC)
-        expires_at = now + timedelta(seconds=lease_seconds)
         claim_token = uuid.uuid4().hex
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                now = datetime.now(UTC)
+                expires_at = now + timedelta(seconds=lease_seconds)
                 self._release_expired_claims_locked(now, commit=False)
                 suppression = self._authoritative_suppression_clause_locked("message")
                 if recipient_task_id:
@@ -290,47 +290,149 @@ class MailboxStore:
                 raise
             return [dict(row) for row in claimed_rows]
 
-    def acknowledge(self, message_ids: list[str]) -> None:
-        if not message_ids:
-            return
-        with self._lock:
-            placeholders = ",".join("?" for _ in message_ids)
-            self._conn.execute(
-                f"""
-                UPDATE agent_mailbox_messages
-                SET status = 'delivered', delivered_at = ?, claim_expires_at = NULL,
-                    claim_token = NULL
-                WHERE message_id IN ({placeholders}) AND status = 'claimed'
-                  AND claimed_by = ?
-                """,
-                (datetime.now(UTC).isoformat(), *message_ids, self._owner_id),
-            )
-            self._conn.commit()
+    def acknowledge(self, claims: list[tuple[str, str]]) -> int:
+        """Acknowledge exact, still-live message claims owned by this store."""
 
-    def acknowledge_task(
-        self,
-        recipient_task_id: str,
-        recipient_thread_id: str,
-    ) -> None:
-        """Acknowledge this runtime's claims after graph execution is durable."""
+        if not claims:
+            return 0
+        changed = 0
         with self._lock:
-            self._conn.execute(
-                """
-                UPDATE agent_mailbox_messages
-                SET status = 'delivered', delivered_at = ?, claim_expires_at = NULL,
-                    claim_token = NULL
-                WHERE status = 'claimed' AND claimed_by = ?
-                  AND (recipient_task_id = ? OR (
-                       recipient_task_id IS NULL AND recipient_thread_id = ?))
-                """,
-                (
-                    datetime.now(UTC).isoformat(),
-                    self._owner_id,
-                    recipient_task_id,
-                    recipient_thread_id,
-                ),
-            )
-            self._conn.commit()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = datetime.now(UTC).isoformat()
+                for message_id, claim_token in dict.fromkeys(claims):
+                    cursor = self._conn.execute(
+                        """
+                        UPDATE agent_mailbox_messages
+                        SET status = 'delivered', delivered_at = ?,
+                            claim_expires_at = NULL, claim_token = NULL
+                        WHERE message_id = ? AND status = 'claimed'
+                          AND claimed_by = ? AND claim_token = ?
+                          AND claim_expires_at > ?
+                        """,
+                        (
+                            now,
+                            message_id,
+                            self._owner_id,
+                            claim_token,
+                            now,
+                        ),
+                    )
+                    changed += cursor.rowcount
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return changed
+
+    def acknowledge_claim_tokens(self, claim_tokens: list[str]) -> int:
+        """Acknowledge every still-live claim in this run's token batches."""
+
+        tokens = list(dict.fromkeys(token for token in claim_tokens if token))
+        if not tokens:
+            return 0
+        placeholders = ",".join("?" for _ in tokens)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = datetime.now(UTC).isoformat()
+                cursor = self._conn.execute(
+                    f"""
+                    UPDATE agent_mailbox_messages
+                    SET status = 'delivered', delivered_at = ?,
+                        claim_expires_at = NULL, claim_token = NULL
+                    WHERE status = 'claimed' AND claimed_by = ?
+                      AND claim_token IN ({placeholders})
+                      AND claim_expires_at > ?
+                    """,
+                    (now, self._owner_id, *tokens, now),
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return cursor.rowcount
+
+    def release_claim_tokens(self, claim_tokens: list[str]) -> int:
+        """Release only this owner's still-live token batches back to pending."""
+
+        tokens = list(dict.fromkeys(token for token in claim_tokens if token))
+        if not tokens:
+            return 0
+        placeholders = ",".join("?" for _ in tokens)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = datetime.now(UTC).isoformat()
+                cursor = self._conn.execute(
+                    f"""
+                    UPDATE agent_mailbox_messages
+                    SET status = 'pending', claimed_at = NULL,
+                        claim_expires_at = NULL, claimed_by = NULL,
+                        claim_token = NULL
+                    WHERE status = 'claimed' AND claimed_by = ?
+                      AND claim_token IN ({placeholders})
+                      AND claim_expires_at > ?
+                    """,
+                    (self._owner_id, *tokens, now),
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return cursor.rowcount
+
+    def renew_claim_tokens(
+        self,
+        claim_tokens: list[str],
+        *,
+        lease_seconds: int = 300,
+    ) -> set[str]:
+        """Renew only owned, unexpired token batches and return those still live."""
+
+        tokens = list(dict.fromkeys(token for token in claim_tokens if token))
+        if not tokens:
+            return set()
+        placeholders = ",".join("?" for _ in tokens)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = datetime.now(UTC)
+                expires_at = now + timedelta(seconds=lease_seconds)
+                now_value = now.isoformat()
+                rows = self._conn.execute(
+                    f"""
+                    SELECT DISTINCT claim_token
+                    FROM agent_mailbox_messages
+                    WHERE status = 'claimed' AND claimed_by = ?
+                      AND claim_token IN ({placeholders})
+                      AND claim_expires_at > ?
+                    """,
+                    (self._owner_id, *tokens, now_value),
+                ).fetchall()
+                live_tokens = {str(row[0]) for row in rows}
+                if live_tokens:
+                    live_placeholders = ",".join("?" for _ in live_tokens)
+                    self._conn.execute(
+                        f"""
+                        UPDATE agent_mailbox_messages
+                        SET claim_expires_at = ?
+                        WHERE status = 'claimed' AND claimed_by = ?
+                          AND claim_token IN ({live_placeholders})
+                          AND claim_expires_at > ?
+                        """,
+                        (
+                            expires_at.isoformat(),
+                            self._owner_id,
+                            *live_tokens,
+                            now_value,
+                        ),
+                    )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return live_tokens
 
     def retract_settled(
         self,
@@ -370,17 +472,9 @@ class MailboxStore:
             return row is not None
 
     def recover_claims(self) -> None:
-        """Release only expired claims; live replicas retain their leases."""
+        """Release expired claims; renewal is fenced by active run token elsewhere."""
         with self._lock:
             now = datetime.now(UTC)
-            self._conn.execute(
-                """
-                UPDATE agent_mailbox_messages
-                SET claim_expires_at = ?
-                WHERE status = 'claimed' AND claimed_by = ?
-                """,
-                ((now + timedelta(seconds=300)).isoformat(), self._owner_id),
-            )
             self._release_expired_claims_locked(now)
 
     def close(self) -> None:

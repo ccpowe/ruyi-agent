@@ -28,6 +28,9 @@ Agent Mailbox - agent 间 run settled 消息通道
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import threading
@@ -40,6 +43,12 @@ from ruyi_agent.task_models import SETTLED_TASK_STATES, TaskState, parse_task_st
 
 
 TaskSettledStatus: TypeAlias = TaskState
+
+
+_ACTIVE_MAILBOX_RUN: ContextVar[tuple[int, str] | None] = ContextVar(
+    "active_mailbox_run",
+    default=None,
+)
 
 
 @dataclass(slots=True)
@@ -72,6 +81,7 @@ class InterAgentMessage:
     sender_task_id: str | None = None
     sender_agent_name: str | None = None
     trigger_run: bool = True
+    claim_token: str | None = None
 
 
 class AgentMailbox:
@@ -100,10 +110,12 @@ class AgentMailbox:
     def __init__(self, store: MailboxStore | None = None) -> None:
         """初始化空 mailbox"""
         self._store = store
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._messages_by_recipient: dict[str, list[InterAgentMessage]] = {}
         self._seen_message_keys: set[tuple[str, str, int]] = set()
         self._seen_input_idempotency_keys: set[str] = set()
+        self._active_run_claims: dict[str, dict[str, str]] = {}
+        self._legacy_claim_tokens: dict[str, str] = {}
 
     @property
     def is_durable(self) -> bool:
@@ -113,6 +125,33 @@ class AgentMailbox:
 
     def shares_database(self, db_path: str) -> bool:
         return self._store is not None and self._store.shares_database(db_path)
+
+    @contextmanager
+    def run_scope(self, run_id: str) -> Iterator[None]:
+        """Bind durable mailbox claims to one in-process executor run."""
+
+        if self._store is None:
+            yield
+            return
+        if not run_id:
+            raise ValueError("Mailbox run identity must not be empty")
+        with self._lock:
+            if run_id in self._active_run_claims:
+                raise RuntimeError(f"Mailbox run is already active: {run_id}")
+            self._active_run_claims[run_id] = {}
+        context_token = _ACTIVE_MAILBOX_RUN.set((id(self), run_id))
+        try:
+            yield
+        finally:
+            try:
+                _ACTIVE_MAILBOX_RUN.reset(context_token)
+            except ValueError:
+                # A coroutine can be finalized from a different Context after
+                # its task has gone away.  The run registry below is still the
+                # authority for maintenance, so it must be removed either way.
+                pass
+            with self._lock:
+                self._active_run_claims.pop(run_id, None)
 
     def publish_settled(
         self,
@@ -268,27 +307,74 @@ class AgentMailbox:
         *,
         recipient_task_id: str | None,
         recipient_thread_id: str,
+        run_id: str | None = None,
     ) -> list[InterAgentMessage]:
         """Claim pending messages before the recipient's next model call."""
         if self._store is None:
             return self.drain(recipient_thread_id)
+        active_run_id = self._resolve_active_run_id(run_id)
         rows = self._store.claim(
             recipient_task_id=recipient_task_id,
             recipient_thread_id=recipient_thread_id,
         )
-        return [self._message_from_row(row) for row in rows]
+        messages = [self._message_from_row(row) for row in rows]
+        if not messages:
+            return messages
+        with self._lock:
+            active_claims = (
+                self._active_run_claims.get(active_run_id)
+                if active_run_id is not None
+                else None
+            )
+            for message in messages:
+                if message.claim_token is None:
+                    continue
+                if active_claims is not None:
+                    active_claims[message.message_id] = message.claim_token
+                else:
+                    self._legacy_claim_tokens[message.message_id] = message.claim_token
+        return messages
 
-    def acknowledge(self, message_ids: list[str]) -> None:
-        if self._store is not None:
-            self._store.acknowledge(message_ids)
+    def acknowledge(self, messages: list[InterAgentMessage] | list[str]) -> None:
+        """Acknowledge exact claims supplied by message objects or local claim ids."""
 
-    def acknowledge_task(
-        self,
-        recipient_task_id: str,
-        recipient_thread_id: str,
-    ) -> None:
-        if self._store is not None:
-            self._store.acknowledge_task(recipient_task_id, recipient_thread_id)
+        if self._store is None or not messages:
+            return
+        claims = self._claim_pairs(messages)
+        if not claims:
+            return
+        self._store.acknowledge(claims)
+        self._forget_claim_pairs(claims)
+
+    def acknowledge_run(self, run_id: str) -> None:
+        """Acknowledge only token batches injected during one successful run."""
+
+        if self._store is None:
+            return
+        with self._lock:
+            claims = self._active_run_claims.get(run_id)
+            if not claims:
+                return
+            self._store.acknowledge_claim_tokens(list(set(claims.values())))
+            for message_id, claim_token in claims.items():
+                if self._legacy_claim_tokens.get(message_id) == claim_token:
+                    self._legacy_claim_tokens.pop(message_id, None)
+            claims.clear()
+
+    def release_run(self, run_id: str) -> None:
+        """Release only token batches injected during one failed or cancelled run."""
+
+        if self._store is None:
+            return
+        with self._lock:
+            claims = self._active_run_claims.get(run_id)
+            if not claims:
+                return
+            self._store.release_claim_tokens(list(set(claims.values())))
+            for message_id, claim_token in claims.items():
+                if self._legacy_claim_tokens.get(message_id) == claim_token:
+                    self._legacy_claim_tokens.pop(message_id, None)
+            claims.clear()
 
     def has_triggering_messages(self, recipient_task_id: str) -> bool:
         if self._store is not None:
@@ -301,8 +387,22 @@ class AgentMailbox:
             )
 
     def recover_claims(self) -> None:
+        """Release expired leases, then renew the surviving active run claims."""
+
         if self._store is not None:
-            self._store.recover_claims()
+            with self._lock:
+                self._store.recover_claims()
+                tokens = {
+                    claim_token
+                    for claims in self._active_run_claims.values()
+                    for claim_token in claims.values()
+                }
+                live_tokens = self._store.renew_claim_tokens(list(tokens))
+                if live_tokens != tokens:
+                    for claims in self._active_run_claims.values():
+                        for message_id, claim_token in tuple(claims.items()):
+                            if claim_token not in live_tokens:
+                                claims.pop(message_id, None)
 
     def drain(self, recipient_thread_id: str) -> list[InterAgentMessage]:
         """
@@ -320,7 +420,7 @@ class AgentMailbox:
                     recipient_task_id=None,
                     recipient_thread_id=recipient_thread_id,
                 )
-                self.acknowledge([message.message_id for message in messages])
+                self.acknowledge(messages)
                 return messages
             return self._messages_by_recipient.pop(recipient_thread_id, [])
 
@@ -433,7 +533,61 @@ class AgentMailbox:
             content=str(row["content"]),
             created_at=created_at,
             trigger_run=bool(row["trigger_run"]),
+            claim_token=(
+                str(row["claim_token"])
+                if row.get("claim_token") is not None
+                else None
+            ),
         )
+
+    def _resolve_active_run_id(self, run_id: str | None) -> str | None:
+        candidate = run_id
+        if candidate is None:
+            current = _ACTIVE_MAILBOX_RUN.get()
+            if current is not None and current[0] == id(self):
+                candidate = current[1]
+        if candidate is None:
+            return None
+        with self._lock:
+            return candidate if candidate in self._active_run_claims else None
+
+    def _claim_pairs(
+        self,
+        messages: list[InterAgentMessage] | list[str],
+    ) -> list[tuple[str, str]]:
+        active_run_id = self._resolve_active_run_id(None)
+        with self._lock:
+            active_claims = (
+                self._active_run_claims.get(active_run_id)
+                if active_run_id is not None
+                else None
+            )
+            pairs: list[tuple[str, str]] = []
+            for item in messages:
+                if isinstance(item, InterAgentMessage):
+                    if item.claim_token is not None:
+                        pairs.append((item.message_id, item.claim_token))
+                    continue
+                message_id = item
+                claim_token = (
+                    active_claims.get(message_id)
+                    if active_claims is not None
+                    else None
+                )
+                if claim_token is None:
+                    claim_token = self._legacy_claim_tokens.get(message_id)
+                if claim_token is not None:
+                    pairs.append((message_id, claim_token))
+            return list(dict.fromkeys(pairs))
+
+    def _forget_claim_pairs(self, claims: list[tuple[str, str]]) -> None:
+        with self._lock:
+            for message_id, claim_token in claims:
+                for active_claims in self._active_run_claims.values():
+                    if active_claims.get(message_id) == claim_token:
+                        active_claims.pop(message_id, None)
+                if self._legacy_claim_tokens.get(message_id) == claim_token:
+                    self._legacy_claim_tokens.pop(message_id, None)
 
 
 def render_mailbox_messages(messages: list[InterAgentMessage]) -> str:

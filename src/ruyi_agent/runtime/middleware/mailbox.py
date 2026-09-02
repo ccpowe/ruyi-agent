@@ -30,10 +30,13 @@ class MailboxMiddleware(AgentMiddleware[object, ContextT, ResponseT]):
         thread_id = (config.get("configurable") or {}).get("thread_id")
         if not isinstance(thread_id, str) or not thread_id:
             return None
-        task_id = (config.get("configurable") or {}).get("task_id")
+        configurable = config.get("configurable") or {}
+        task_id = configurable.get("task_id")
+        run_id = configurable.get("mailbox_run_id")
         messages = self._mailbox.claim(
             recipient_task_id=(task_id if isinstance(task_id, str) else None),
             recipient_thread_id=thread_id,
+            run_id=(run_id if isinstance(run_id, str) else None),
         )
         if not messages:
             return None
