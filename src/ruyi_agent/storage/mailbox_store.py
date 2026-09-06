@@ -8,7 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from ruyi_agent.storage.settled_outbox import SettledOutboxIntent
-from ruyi_agent.storage.task_schema import sanitize_legacy_remote_public_projections
+from ruyi_agent.storage.task_schema import (
+    backfill_mailbox_wakeup_watermarks,
+    sanitize_legacy_remote_public_projections,
+)
 
 
 class MailboxStore:
@@ -200,7 +203,7 @@ class MailboxStore:
             ).fetchone()
         return row is not None
 
-    def list_pending_trigger_recipient_task_ids(self) -> list[str]:
+    def list_pending_trigger_recipient_task_ids(self, *, after_sequence: int = 0) -> list[str]:
         """List Task identities whose durable input still needs a wakeup."""
 
         now = datetime.now(UTC)
@@ -213,9 +216,11 @@ class MailboxStore:
                 FROM agent_mailbox_messages AS message
                 WHERE message.recipient_task_id IS NOT NULL
                   AND message.trigger_run = 1 AND message.status = 'pending'
+                  AND message.wakeup_sequence > ?
                   {suppression}
                 ORDER BY message.recipient_task_id
-                """
+                """,
+                (after_sequence,),
             ).fetchall()
         return [str(row[0]) for row in rows]
 
@@ -454,22 +459,26 @@ class MailboxStore:
             )
             self._conn.commit()
 
-    def has_triggering(self, recipient_task_id: str) -> bool:
+    def has_triggering(self, recipient_task_id: str, *, after_sequence: int = 0) -> bool:
+        return self.max_triggering_sequence(recipient_task_id) > after_sequence
+
+    def max_triggering_sequence(self, recipient_task_id: str) -> int:
+        """Return the newest effective pending trigger."""
         now = datetime.now(UTC)
         with self._lock:
             self._release_expired_claims_locked(now)
             suppression = self._authoritative_suppression_clause_locked("message")
             row = self._conn.execute(
                 f"""
-                SELECT 1 FROM agent_mailbox_messages AS message
+                SELECT COALESCE(MAX(message.wakeup_sequence), 0)
+                FROM agent_mailbox_messages AS message
                 WHERE message.recipient_task_id = ? AND message.trigger_run = 1
                   AND message.status = 'pending'
                   {suppression}
-                LIMIT 1
                 """,
                 (recipient_task_id,),
             ).fetchone()
-            return row is not None
+            return int(row[0])
 
     def recover_claims(self) -> None:
         """Release expired claims; renewal is fenced by active run token elsewhere."""
@@ -504,6 +513,7 @@ class MailboxStore:
             self._conn.execute("PRAGMA busy_timeout = 30000")
             if self._db_path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode = WAL")
+            self._conn.execute("BEGIN IMMEDIATE")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS agent_mailbox_messages (
@@ -529,6 +539,7 @@ class MailboxStore:
             )
             self._ensure_column("claimed_by", "TEXT")
             self._ensure_column("claim_token", "TEXT")
+            self._initialize_wakeup_sequences()
             self._conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_agent_mailbox_pending_recipient
@@ -547,6 +558,48 @@ class MailboxStore:
             )
             sanitize_legacy_remote_public_projections(self._conn)
             self._conn.commit()
+
+    def _initialize_wakeup_sequences(self) -> None:
+        """Allocate stable monotonic identities without relying on SQLite rowids."""
+        self._ensure_column("wakeup_sequence", "INTEGER NOT NULL DEFAULT 0")
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_mailbox_sequence "
+            "(singleton INTEGER PRIMARY KEY CHECK (singleton = 1), value INTEGER NOT NULL)"
+        )
+        self._conn.execute("INSERT OR IGNORE INTO agent_mailbox_sequence VALUES (1, 0)")
+        self._conn.execute(
+            """
+            WITH numbered AS MATERIALIZED (
+                SELECT message_id, ROW_NUMBER() OVER (ORDER BY created_at, message_id)
+                    + (SELECT value FROM agent_mailbox_sequence WHERE singleton = 1) AS seq
+                FROM agent_mailbox_messages WHERE wakeup_sequence = 0
+            )
+            UPDATE agent_mailbox_messages
+            SET wakeup_sequence = (SELECT seq FROM numbered WHERE numbered.message_id = agent_mailbox_messages.message_id)
+            WHERE wakeup_sequence = 0
+            """
+        )
+        self._conn.execute(
+            "UPDATE agent_mailbox_sequence SET value = MAX(value, "
+            "(SELECT COALESCE(MAX(wakeup_sequence), 0) FROM agent_mailbox_messages))"
+        )
+        self._conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS agent_mailbox_assign_wakeup_sequence
+            AFTER INSERT ON agent_mailbox_messages
+            BEGIN
+                UPDATE agent_mailbox_sequence SET value = value + 1 WHERE singleton = 1;
+                UPDATE agent_mailbox_messages
+                SET wakeup_sequence = (SELECT value FROM agent_mailbox_sequence WHERE singleton = 1)
+                WHERE message_id = NEW.message_id;
+            END
+            """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_mailbox_wakeup_sequence "
+            "ON agent_mailbox_messages (recipient_task_id, status, trigger_run, wakeup_sequence)"
+        )
+        backfill_mailbox_wakeup_watermarks(self._conn)
 
     def _resolve_settled_message_locked(self, intent: SettledOutboxIntent) -> None:
         """Bind a true legacy row or insert the deterministic mailbox identity."""

@@ -226,25 +226,59 @@ class TaskRuntime(TaskCommandPort, RunCompletionPort):
         *,
         permit: _MutationPermit | None = None,
     ) -> asyncio.Task[None]:
-        return await self._supervisor.schedule(task_id, lambda: self._run_agent_payload(task_id, {"messages": [{"role": "user", "content": user_input}]}), completion_port=self, permit=permit)  # fmt: skip
+        return await self._supervisor.schedule(task_id, lambda: self._run_agent_payload(task_id, {"messages": [{"role": "user", "content": user_input}]}), completion_port=self, permit=permit, mailbox_wakeup_sequence=self._mailbox_wakeup_sequence(task_id))  # fmt: skip
+
+    def _mailbox_wakeup_sequence(self, task_id: str) -> int | None:
+        if self._mailbox is None:
+            return None
+        return self._mailbox.max_triggering_sequence(task_id)
 
     async def _ensure_task_awake(self, task_id: str) -> TaskRecord:  # fmt: skip
         lock = self._task_input_locks.setdefault(task_id, asyncio.Lock())
-        async with lock:
-            record = self._task_manager.get_task(task_id)
-            if not self._supervisor.is_accepting:
-                return record
-            if self._mailbox is None or record.route_kind != "local":
-                return record
-            if self._task_manager.has_active_run(task_id):
-                return record
-            if record.state not in RESUMABLE_TASK_STATES or not self._mailbox.has_triggering_messages(task_id):
-                return record
+        operation: _OperationPermit | None = None
+        try:
+            async with lock:
+                record = self._task_manager.get_task(task_id)
+                if not self._supervisor.is_accepting:
+                    return record
+                if self._mailbox is None or record.route_kind != "local":
+                    return record
+                if self._task_manager.has_active_run(task_id):
+                    return record
+                if record.state not in RESUMABLE_TASK_STATES:
+                    return record
+                sequence = self._mailbox.max_triggering_sequence(task_id)
+                if sequence <= max(record.mailbox_wakeup_sequence, 0):
+                    return record
+                try:
+                    self._registry.get_spec(record.agent_name)
+                except ValueError as exc:
+                    error = _format_exception_summary(exc)
+                    permit = await self._supervisor.acquire_mutation()
+                    try:
+                        self._task_manager.reject_mailbox_run(
+                            task_id,
+                            error,
+                            mailbox_wakeup_sequence=sequence,
+                        )
+                        operation = await self._supervisor.promote_to_operation(permit)
+                    finally:
+                        await self._supervisor.cleanup_mutation(permit)
+                else:
+                    try:
+                        await self._supervisor.schedule(task_id, lambda: self._run_agent_payload(task_id, {"messages": []}), completion_port=self, mailbox_wakeup_sequence=sequence)  # fmt: skip
+                    except RuntimeClosingError:
+                        pass
+                    return self._task_manager.get_task(task_id)
+            # Settlement can wake other Tasks; do not hold this Task's input lock.
             try:
-                await self._supervisor.schedule(task_id, lambda: self._run_agent_payload(task_id, {"messages": []}), completion_port=self)  # fmt: skip
-            except RuntimeClosingError:
-                pass
+                await self._after_settled(task_id)
+            except Exception:
+                logger.exception("Non-authoritative rejected admission tail failed: %s", task_id)
             return self._task_manager.get_task(task_id)
+        finally:
+            if operation is not None:
+                await self._supervisor.cleanup_operation(operation)
 
     async def _wake_tasks(self, task_ids: list[str] | set[str]) -> None:  # fmt: skip
         await asyncio.gather(*(self._ensure_task_awake(task_id) for task_id in sorted(set(task_ids))))  # fmt: skip
@@ -302,7 +336,7 @@ class TaskRuntime(TaskCommandPort, RunCompletionPort):
     async def _resume_run(self, task_id: str, decisions: list[dict[str, Any]], *, permit: _MutationPermit | None = None) -> asyncio.Task[None]:  # fmt: skip
         record = self._task_manager.get_task(task_id)
         review_id = (record.pending_review or {}).get("review_id")
-        run_task = await self._supervisor.schedule(task_id, lambda: self._run_agent_payload(task_id, Command(resume={"decisions": decisions})), completion_port=self, permit=permit)  # fmt: skip
+        run_task = await self._supervisor.schedule(task_id, lambda: self._run_agent_payload(task_id, Command(resume={"decisions": decisions})), completion_port=self, permit=permit, mailbox_wakeup_sequence=self._mailbox_wakeup_sequence(task_id))  # fmt: skip
         try:
             self._local_executor.audit_task_review("task_review_resumed", record, payload={"review_id": review_id, "decisions": decisions})  # fmt: skip
         except Exception:

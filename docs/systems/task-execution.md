@@ -196,6 +196,12 @@ settled (completed|failed|cancelled|interrupted)
 否则使用最后的 assistant 文本进入 `completed`。执行异常只在 Task 仍是 `running`
 时转为 `failed`；已 settled 后发生的尾部异常不能倒写旧状态。
 
+本地 mailbox 自动准入还受持久化 `mailbox_wakeup_sequence` 约束：已用于准入的
+旧输入不能因仍为 pending 而再次启动 run，包括失败、取消、中断或成功未消费的
+情况。新的触发消息仍可继续同一 Task/thread。Agent 已删除、不可用或变为 remote
+时，准入拒绝会创建一个只有 `task.failed` 的新代次，与唤醒水位原子保存，不先写
+`task.running`。具体恢复与升级语义见 [Task Mailbox](task-mailbox-settlement.md)。
+
 ## Admission 与调度
 
 所有会改变 Task 或可能启动外部工作的 runtime mutation 先通过

@@ -648,7 +648,13 @@ class TaskManager:
             1 for record in self._tasks.values() if record.root_task_id == root_task_id
         )
 
-    def mark_running(self, task_id: str, run_task: asyncio.Task[None]) -> None:
+    def mark_running(
+        self,
+        task_id: str,
+        run_task: asyncio.Task[None],
+        *,
+        mailbox_wakeup_sequence: int | None = None,
+    ) -> None:
         """
         标记任务进入 running 状态
 
@@ -660,6 +666,10 @@ class TaskManager:
         record = self.get_task(task_id)
         root = self._root_record(record)
         with self._review_memory_transaction(record, root):
+            if mailbox_wakeup_sequence is not None:
+                record.mailbox_wakeup_sequence = max(
+                    record.mailbox_wakeup_sequence, mailbox_wakeup_sequence
+                )
             record.state = "running"
             record.updated_at = _now()
             self._live_runs.register(task_id, run_task)
@@ -798,6 +808,25 @@ class TaskManager:
         root = self._root_record(record)
         with self._review_memory_transaction(record, root):
             record.state = "failed"
+            record.error = normalize_task_event_text(error)
+            record.updated_at = _now()
+            self._clear_pending_review_and_save(record)
+
+    def reject_mailbox_run(
+        self, task_id: str, error: str, *, mailbox_wakeup_sequence: int
+    ) -> None:
+        """Commit one rejected admission without rewriting the preceding run."""
+        record = self.get_task(task_id)
+        root = self._root_record(record)
+        with self._review_memory_transaction(record, root):
+            record.run_count += 1
+            record.mailbox_wakeup_sequence = max(
+                record.mailbox_wakeup_sequence, mailbox_wakeup_sequence
+            )
+            record.mailbox_suppressed = False
+            record.mailbox_delivered = False
+            record.state = "failed"
+            record.result = None
             record.error = normalize_task_event_text(error)
             record.updated_at = _now()
             self._clear_pending_review_and_save(record)

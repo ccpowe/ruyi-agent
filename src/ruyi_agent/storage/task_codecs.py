@@ -45,6 +45,7 @@ TASK_WRITE_COLUMNS = (
     "external_operation_identity",
     "external_operation_run_count",
     "external_outcome_uncertain",
+    "mailbox_wakeup_sequence",
 )
 TASK_SELECT_COLUMNS = ", ".join(TASK_WRITE_COLUMNS)
 
@@ -136,6 +137,7 @@ def task_record_values(record: TaskRecord) -> tuple[Any, ...]:
         record.external_operation_identity,
         record.external_operation_run_count,
         int(record.external_outcome_uncertain),
+        record.mailbox_wakeup_sequence,
     )
 
 
@@ -183,6 +185,7 @@ def row_to_task_record(row: tuple[Any, ...]) -> TaskRecord:
         external_operation_identity=row[29],
         external_operation_run_count=row[30],
         external_outcome_uncertain=bool(row[31]),
+        mailbox_wakeup_sequence=int(row[32]),
     )
 
 

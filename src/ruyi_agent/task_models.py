@@ -103,6 +103,7 @@ class TaskRecord:
     external_operation_identity: str | None = None
     external_operation_run_count: int | None = None
     external_outcome_uncertain: bool = False
+    mailbox_wakeup_sequence: int = 0
 
 
 @dataclass(frozen=True, slots=True)

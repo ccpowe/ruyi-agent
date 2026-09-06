@@ -27,6 +27,7 @@ def initialize_task_database(database: TaskDatabase) -> None:
         with database.transaction(immediate=True) as connection:
             _create_tables(connection)
             _ensure_legacy_columns(connection)
+            backfill_mailbox_wakeup_watermarks(connection)
             sanitize_legacy_remote_public_projections(connection)
             backfill_pending_reviews(connection)
             _backfill_pending_review_cursor_order(connection)
@@ -69,7 +70,8 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             external_operation TEXT,
             external_operation_identity TEXT,
             external_operation_run_count INTEGER,
-            external_outcome_uncertain INTEGER NOT NULL DEFAULT 0
+            external_outcome_uncertain INTEGER NOT NULL DEFAULT 0,
+            mailbox_wakeup_sequence INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -203,6 +205,7 @@ def _ensure_legacy_columns(connection: sqlite3.Connection) -> None:
         ("external_operation_identity", "TEXT"),
         ("external_operation_run_count", "INTEGER"),
         ("external_outcome_uncertain", "INTEGER NOT NULL DEFAULT 0"),
+        ("mailbox_wakeup_sequence", "INTEGER NOT NULL DEFAULT -1"),
     ):
         _ensure_column(
             connection,
@@ -927,5 +930,27 @@ def _backfill_pending_review_cursor_order(connection: sqlite3.Connection) -> Non
         UPDATE agent_task_pending_reviews
         SET cursor_order_updated_at = updated_at
         WHERE cursor_order_updated_at IS NULL OR cursor_order_updated_at = ''
+        """
+    )
+
+
+def backfill_mailbox_wakeup_watermarks(connection: sqlite3.Connection) -> None:
+    """Fence old unsuccessful runs after both stores have migrated their schema."""
+    task_columns = {row[1] for row in connection.execute("PRAGMA table_info(agent_tasks)")}
+    mailbox_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(agent_mailbox_messages)")
+    }
+    if "mailbox_wakeup_sequence" not in task_columns or "wakeup_sequence" not in mailbox_columns:
+        return
+    connection.execute(
+        """
+        UPDATE agent_tasks
+        SET mailbox_wakeup_sequence = CASE
+            WHEN state IN ('failed', 'cancelled', 'interrupted', 'running') THEN (
+                SELECT COALESCE(MAX(message.wakeup_sequence), 0)
+                FROM agent_mailbox_messages AS message
+                WHERE message.recipient_task_id = agent_tasks.task_id
+            ) ELSE 0 END
+        WHERE mailbox_wakeup_sequence = -1
         """
     )

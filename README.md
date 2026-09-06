@@ -69,6 +69,11 @@ uv run ruyi --all
 
 `--all` 会跳过缺少必要凭据的 Telegram/Feishu 入口，但仍启动 Gateway。
 
+本地任务不会仅因旧 mailbox 消息未消费而无限重试。每批唤醒信号在准入时持久化
+记录；失败、取消或中断后，消息仍保留，但需要新的触发消息才能继续同一任务。
+修复 Agent 配置并重启服务后，可向原任务发送新的续写输入；重复同一幂等输入不会
+重新触发执行。详情见 [Task Mailbox](docs/systems/task-mailbox-settlement.md)。
+
 ## 常用命令和代码入口
 
 ```bash

@@ -711,24 +711,24 @@ def test_parent_wake_retries_after_targeted_trigger_probe_failure(
         agent_factory=factory,
     )
     active_mailbox.append(mailbox)
-    original_has_triggering = AgentMailbox.has_triggering_messages
+    original_trigger_sequence = AgentMailbox.max_triggering_sequence
     probe_attempts = 0
 
     def fail_first_target_probe(
         store: AgentMailbox,
         recipient_task_id: str,
-    ) -> bool:
+    ) -> int:
         nonlocal probe_attempts
         if recipient_task_id == parent.task_id and not parent_message_claimed.is_set():
             probe_attempts += 1
             if probe_attempts == 1:
                 first_probe_failed.set()
                 raise RuntimeError("target mailbox probe unavailable")
-        return original_has_triggering(store, recipient_task_id)
+        return original_trigger_sequence(store, recipient_task_id)
 
     monkeypatch.setattr(
         AgentMailbox,
-        "has_triggering_messages",
+        "max_triggering_sequence",
         fail_first_target_probe,
     )
 

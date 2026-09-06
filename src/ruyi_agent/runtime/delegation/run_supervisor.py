@@ -193,6 +193,7 @@ class RunSupervisor:
         *,
         completion_port: RunCompletionPort | None = None,
         permit: _MutationPermit | None = None,
+        mailbox_wakeup_sequence: int | None = None,
     ) -> asyncio.Task[None]:
         """Persist and release one local run without an execution-before-save gap."""
 
@@ -217,7 +218,11 @@ class RunSupervisor:
                         name=f"ruyi-task-run:{task_id}",
                     )
                     try:
-                        self._task_manager.mark_running(task_id, run_task)
+                        self._task_manager.mark_running(
+                            task_id,
+                            run_task,
+                            mailbox_wakeup_sequence=mailbox_wakeup_sequence,
+                        )
                     except BaseException:
                         run_task.cancel()
 

@@ -82,6 +82,7 @@ class InterAgentMessage:
     sender_agent_name: str | None = None
     trigger_run: bool = True
     claim_token: str | None = None
+    wakeup_sequence: int = 0
 
 
 class AgentMailbox:
@@ -116,6 +117,7 @@ class AgentMailbox:
         self._seen_input_idempotency_keys: set[str] = set()
         self._active_run_claims: dict[str, dict[str, str]] = {}
         self._legacy_claim_tokens: dict[str, str] = {}
+        self._next_wakeup_sequence = 1
 
     @property
     def is_durable(self) -> bool:
@@ -216,6 +218,8 @@ class AgentMailbox:
                 # this process may safely suppress another identical attempt.
                 self._seen_message_keys.add(key)
                 return message if published else None
+            message.wakeup_sequence = self._next_wakeup_sequence
+            self._next_wakeup_sequence += 1
             self._messages_by_recipient.setdefault(recipient_thread_id, []).append(
                 message
             )
@@ -297,6 +301,8 @@ class AgentMailbox:
                 return None
             if idempotency_key is not None:
                 self._seen_input_idempotency_keys.add(idempotency_key)
+            message.wakeup_sequence = self._next_wakeup_sequence
+            self._next_wakeup_sequence += 1
             self._messages_by_recipient.setdefault(recipient_thread_id, []).append(
                 message
             )
@@ -384,6 +390,22 @@ class AgentMailbox:
                 message.recipient_task_id == recipient_task_id and message.trigger_run
                 for messages in self._messages_by_recipient.values()
                 for message in messages
+            )
+
+    def max_triggering_sequence(self, recipient_task_id: str) -> int:
+        """Return the newest pending wake signal, independently of consumption."""
+        if self._store is not None:
+            return self._store.max_triggering_sequence(recipient_task_id)
+        with self._lock:
+            return max(
+                (
+                    message.wakeup_sequence
+                    for messages in self._messages_by_recipient.values()
+                    for message in messages
+                    if message.recipient_task_id == recipient_task_id
+                    and message.trigger_run
+                ),
+                default=0,
             )
 
     def recover_claims(self) -> None:
@@ -533,6 +555,7 @@ class AgentMailbox:
             content=str(row["content"]),
             created_at=created_at,
             trigger_run=bool(row["trigger_run"]),
+            wakeup_sequence=int(row.get("wakeup_sequence", 0)),
             claim_token=(
                 str(row["claim_token"])
                 if row.get("claim_token") is not None

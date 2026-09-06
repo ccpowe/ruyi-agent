@@ -104,7 +104,7 @@ parent mailbox，不表示 parent 已经调用模型或读到了通知。
 ### Trigger 与 wakeup
 
 发布提交后，runtime 先尝试 `_ensure_task_awake`：它只为 local、没有 active run、
-处于 `RESUMABLE_TASK_STATES` 且存在 pending triggering input 的 Task 调度一个
+处于 `RESUMABLE_TASK_STATES` 且存在尚未用于准入的 pending triggering input 的 Task 调度一个
 空 payload run。这个空 payload 不是业务输入；真正的输入由 middleware 在 model
 前读取。active run 不会被第二次调度，输入留在 mailbox，等待该 run 的下一个安全
 model boundary。
@@ -112,7 +112,29 @@ model boundary。
 run 结束时，`on_run_finished` 还会排一个受 supervisor 管理的 maintenance wakeup，
 用于覆盖“输入到达时 Task 正在收尾”的窗口。wakeup 只是推进器：它失败、进程在
 发布后退出或 parent 当时正在运行，都不改变 pending row；后续扫描仍以 SQLite
-中的 row 为准。
+中的 row 和任务唤醒水位为准。
+
+每条 durable mailbox 消息有独立单调递增的 `wakeup_sequence`，Task 保存
+`mailbox_wakeup_sequence`。只有 pending trigger 的序号大于 Task 水位才能启动
+下一轮；准入时将当前 pending trigger 的最大序号与 `running`、`run_count` 和
+事件在同一事务提交。水位不是消费确认：执行失败释放的消息仍可被后续新输入
+触发的 run 读取，但不能单独再触发执行。成功返回却没有读取 mailbox 时也遵守
+同一规则，避免空转。重复发布相同幂等输入不会产生新序号或重置水位。
+
+自动唤醒先校验 Agent 仍存在、可用且为 local。校验失败时，将拒绝作为独立
+`run_count` 的 `failed` 与水位原子提交，只写失败事件，不写 `running` 或调用
+Agent，也不改写上一代的结算通知。修复配置后，需要新的触发消息才能继续。
+本地 mailbox 不对旧输入执行通用自动重试，因为失败前可能已经产生外部副作用。
+
+新消息在运行中到达而未被消费时，其序号仍可驱动收尾后的下一轮。水位在准入时
+截取，因此运行中才到达、被 claim 后又因失败释放的新消息也可能驱动下一轮；
+下一轮准入会覆盖它的序号，不会由同一条消息形成无界重试。
+
+水位跨重启保留。新输入提交后、调度前崩溃，启动恢复仍可找到未使用的触发信号；
+已经准入的旧输入在失败、取消或中断后不会因重启而自动重放。升级旧数据库时，
+已有 `failed`、`cancelled`、`interrupted` 及遗留 `running` 任务的现存消息被纳入初始水位，保留
+内容但停止自动唤醒；发送新输入可继续。这项迁移不删除既有任务事件，也不会
+自动缩小已经膨胀的 SQLite 文件。
 
 ### Claim lease 与 model 前注入
 
@@ -291,7 +313,7 @@ wakeup 成功也不能替代 parent 真正 claim 和模型 ack。
 | outbox 已 claim，dispatch 前进程失败 | claim 到期后回到 pending；新的 owner 取得不同 token。显式 release 失败也不改变这一恢复路径 |
 | mailbox publish 写入失败 | same-DB transaction rollback，outbox 仍是 claimed；notifier 尝试 release，之后由 lease/reconcile 重试 |
 | publish transaction 已提交但 wakeup 未运行 | mailbox row、outbox delivered 和 child `mailbox_delivered=1` 已存在；新 row 通常仍 pending，pending trigger 扫描会再次推进 recipient。parent ack 前的 pending/claimed row 仍可被 suppression retract |
-| parent claim 后模型调用失败或取消 | 当前进程只释放该 run 的 owner+token batches，下一次 run 可以立即 reclaim；其余 claim 不受影响。进程崩溃则由 lease 到期后的新 owner reclaim |
+| parent claim 后模型调用失败或取消 | 当前进程只释放该 run 的 owner+token batches；其余 claim 不受影响。后续新触发消息准入的 run 可 reclaim，旧消息本身不绕过水位。进程崩溃后的 claim 由 lease 到期释放 |
 | wait/check 与 dispatch 竞争 | suppression 先提交时 stale publish 返回 false；publish 先提交时，后续 suppression 仍可把 outbox 改为 suppressed 并 retract 尚未 parent-acked 的 pending/claimed row；只有已 parent-acked 的 delivered row 保持 delivered |
 | remote external operation 未证明 effect | 本地保留 operation identity 与 uncertain marker，不创建/发布新的 authoritative settlement；只有 refresh/权威 payload 证明 effect 后才清除 marker、同步状态并生成相应 intent |
 
